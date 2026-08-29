@@ -8,3 +8,4 @@ pub mod cli;
 pub mod core;
 pub mod record_tape;
 pub mod replay;
+pub mod ui;
