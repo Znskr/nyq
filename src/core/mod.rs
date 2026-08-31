@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod execution;
+pub mod feedback;
 pub mod hooks;
 pub mod input;
 pub mod modes;
@@ -13,6 +14,7 @@ pub mod mods;
 pub mod notifications;
 pub mod output;
 pub mod session;
+pub mod skills;
 pub mod shared;
 pub mod terminal;
 pub mod tooling;

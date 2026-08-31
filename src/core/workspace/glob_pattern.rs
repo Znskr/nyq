@@ -15,7 +15,7 @@ pub enum CompileError {
 
 /// Borrowed, pre-split glob pattern for matching workspace paths.
 pub struct Pattern<'a> {
-    raw: &'a [u8],
+    pub raw: &'a [u8],
     segments: Vec<&'a [u8]>,
     has_path_separator: bool,
 }
