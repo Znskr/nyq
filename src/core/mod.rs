@@ -18,5 +18,6 @@ pub mod skills;
 pub mod shared;
 pub mod terminal;
 pub mod tooling;
+pub mod upgrade;
 pub mod shell_command;
 pub mod workspace;
