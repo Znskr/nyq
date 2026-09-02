@@ -10,3 +10,4 @@ pub mod usage_report;
 pub mod generation_usage_provider;
 pub mod profile_usage_store;
 pub mod session_relationship_index_codec;
+pub mod web_fetch_artifacts;

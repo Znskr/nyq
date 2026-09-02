@@ -6,3 +6,5 @@ pub mod build_checkpoint;
 pub mod code_highlight;
 pub mod footer_layout;
 pub mod frame_scroll_plan;
+pub mod assistant_wrap;
+pub mod transcript_measure;

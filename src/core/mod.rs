@@ -1,9 +1,11 @@
 //! Core subsystems (ported 1:1 from zig-reference/src/core).
 
+pub mod agent;
 pub mod auth;
 pub mod config;
 pub mod execution;
 pub mod feedback;
+pub mod hosts;
 pub mod hooks;
 pub mod input;
 pub mod modes;
