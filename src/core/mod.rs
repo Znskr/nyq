@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod auth;
+pub mod background;
 pub mod config;
 pub mod execution;
 pub mod feedback;
