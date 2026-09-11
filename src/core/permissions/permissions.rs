@@ -5,6 +5,12 @@
 
 use crate::core::shared::types::{PermissionGrant, ToolPermissionDecision};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionCallTarget {
+    pub role: Vec<u8>,
+    pub path: Vec<u8>,
+}
+
 pub fn permission_decision_from_index(index: u8) -> ToolPermissionDecision {
     match index {
         0 => ToolPermissionDecision::Once,
