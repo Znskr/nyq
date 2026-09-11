@@ -268,7 +268,15 @@ pub fn open_or_create_verified_private_dir(
     match fs::symlink_metadata(&path) {
         Ok(m) if m.file_type().is_symlink() || !m.is_dir() => return Err(Error::DurablePathUnsafe),
         Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Tolerate a concurrent creator, matching the Zig reference
+            // (error.PathAlreadyExists => {} in openOrCreateVerifiedPrivateChild).
+            if let Err(e) = fs::create_dir(&path) {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e.into());
+                }
+            }
+        }
         Err(e) => return Err(e.into()),
     }
     set_mode(&path, 0o700).map_err(|_| Error::PrivateStatePermissionsUnsupported)?;
