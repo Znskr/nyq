@@ -21,6 +21,14 @@ impl Identity {
     }
 }
 
+/// Public SHA-256 helper for modules that need the same digest primitive
+/// Zig's `std.crypto.hash.sha2.Sha256` provides.
+pub fn sha256(data: &[u8]) -> [u8; DIGEST_LENGTH] {
+    let mut hash = Sha256::new();
+    hash.update(data);
+    hash.finalize()
+}
+
 /// Derives a persistable, non-secret identity. Gateway sources use the
 /// selected credential slot; provider subscriptions require a stable
 /// account ID.

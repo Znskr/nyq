@@ -385,6 +385,14 @@ impl FileReview {
         self.deletions = 0;
     }
 
+    pub fn additions(&self) -> usize {
+        self.additions
+    }
+
+    pub fn deletions(&self) -> usize {
+        self.deletions
+    }
+
     pub fn row_count(&self) -> usize {
         let changed = self.additions + self.deletions;
         if changed == 0 {
