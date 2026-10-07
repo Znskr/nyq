@@ -156,7 +156,13 @@ impl Agent {
         self.push_counted(input);
         for _ in 0..MAX_STEPS {
             self.sync_estimate();
+            // One oversized item (an attached image, a huge paste) must not be
+            // summarized away: compaction clears the transcript. An image still
+            // sitting in a trailing user message has not been shown to the model
+            // yet — compacting now would drop a `view_image` result the same way.
             if !self.suppress_auto_compact
+                && self.items.len() >= 2
+                && !tail_holds_unsent_image(&self.items)
                 && self.context_window > 0
                 && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT
             {
@@ -347,7 +353,7 @@ impl Agent {
 
         ui.tool_start(name, &summary);
         let before = self.undo.len();
-        self.undo.snapshot(&self.cwd, name, &args);
+        self.undo.snapshot(&self.cwd, self.sandbox.mode, name, &args);
         let out = if tool.handles_cancel() {
             tool.run(args, &ctx).await
         } else {
@@ -488,15 +494,24 @@ fn text_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(4)
 }
 
+/// Flat cost for one image. Base64 length is not the model's token cost.
+const IMAGE_TOKENS: u64 = 1_500;
+
+/// True when a user message that the model has not been sent yet carries an image.
+fn tail_holds_unsent_image(items: &[Item]) -> bool {
+    items
+        .iter()
+        .rev()
+        .take_while(|item| matches!(item, Item::User { .. }))
+        .any(|item| matches!(item, Item::User { images, .. } if !images.is_empty()))
+}
+
 fn item_tokens(item: &Item) -> u64 {
     match item {
-        Item::User { text, images } => {
-            text_tokens(text) + images.iter().map(|image| text_tokens(&image.data)).sum::<u64>()
-        }
+        Item::User { text, images } => text_tokens(text) + images.len() as u64 * IMAGE_TOKENS,
         Item::Assistant { text } => text_tokens(text),
-        Item::Reasoning { summary, encrypted, .. } => {
-            text_tokens(summary) + encrypted.as_deref().map(text_tokens).unwrap_or(0)
-        }
+        // `encrypted` is opaque provider state, not text the model re-reads.
+        Item::Reasoning { summary, .. } => text_tokens(summary),
         Item::ToolCall { id, name, arguments } => text_tokens(id) + text_tokens(name) + text_tokens(arguments),
         Item::ToolResult { id, output, .. } => text_tokens(id) + text_tokens(output),
         Item::Compaction { summary } => text_tokens(&crate::types::compaction_text(summary)),
@@ -1008,7 +1023,7 @@ mod tests {
         let mut agent = agent(Response::default(), None);
         agent.cwd = dir.path().to_path_buf();
         std::fs::write(dir.path().join("f.txt"), "a").unwrap();
-        agent.undo.snapshot(&agent.cwd, "edit_file", &json!({"path": "f.txt"}));
+        agent.undo.snapshot(&agent.cwd, crate::sandbox::Mode::WorkspaceWrite, "edit_file", &json!({"path": "f.txt"}));
         assert_eq!(agent.undo.len(), 1);
         agent.suppress_auto_compact = true;
         agent.context_estimated = true;
@@ -1159,5 +1174,148 @@ mod tests {
         let mut dropped = script(false);
         dropped.turn(Item::user("go"), &mut QuietUi, CancellationToken::new()).await.unwrap();
         assert_eq!(dropped.undo.len(), 0);
+    }
+
+    #[test]
+    fn images_and_encrypted_blobs_have_a_flat_cost() {
+        use crate::types::Image;
+        let image = Image { media_type: "image/png".into(), data: "A".repeat(400_000) };
+        let item = Item::User { text: "why".into(), images: vec![image.clone(), image] };
+        let tokens = item_tokens(&item);
+        assert_eq!(tokens, text_tokens("why") + 2 * IMAGE_TOKENS);
+        assert!(tokens < 10_000, "{tokens}");
+
+        let reasoning = Item::Reasoning {
+            id: None,
+            summary: "abcd".into(),
+            encrypted: Some("z".repeat(80_000)),
+        };
+        assert_eq!(item_tokens(&reasoning), 1);
+        let mut agent = agent(Response::default(), None);
+        agent.system.clear();
+        agent.items = vec![reasoning];
+        agent.adopt_transcript();
+        assert_eq!(agent.context_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn single_oversized_message_is_not_compacted() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use crate::types::Image;
+
+        struct Probe {
+            saw_compact: Arc<AtomicBool>,
+            saw_image: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for Probe {
+            fn name(&self) -> &str { "fake" }
+            fn model(&self) -> &str { "fake" }
+            fn set_model(&mut self, _: String) {}
+            fn fork(&self) -> Box<dyn Provider> { unimplemented!() }
+            async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> Result<Response> {
+                if req.items.iter().any(|i| matches!(i, Item::User { text, .. } if text == COMPACT_PROMPT)) {
+                    self.saw_compact.store(true, Ordering::SeqCst);
+                }
+                if req.items.iter().any(|i| matches!(i, Item::User { images, .. } if !images.is_empty())) {
+                    self.saw_image.store(true, Ordering::SeqCst);
+                }
+                Ok(Response {
+                    items: vec![Item::Assistant { text: "answer".into() }],
+                    usage: Some(Usage { input_tokens: 10, output_tokens: 1, cached_tokens: 0 }),
+                })
+            }
+        }
+
+        let saw_compact = Arc::new(AtomicBool::new(false));
+        let saw_image = Arc::new(AtomicBool::new(false));
+        let mut agent = agent(Response::default(), None);
+        agent.provider = Box::new(Probe { saw_compact: saw_compact.clone(), saw_image: saw_image.clone() });
+        agent.items.clear();
+        agent.context_tokens = 0;
+        agent.context_window = 1000;
+        let item = Item::User {
+            text: "why".into(),
+            images: vec![Image { media_type: "image/png".into(), data: "A".repeat(20_000) }],
+        };
+        agent.turn(item, &mut QuietUi, CancellationToken::new()).await.unwrap();
+        assert!(!saw_compact.load(Ordering::SeqCst));
+        assert!(saw_image.load(Ordering::SeqCst));
+        assert!(agent.items.iter().any(|i| matches!(i, Item::User { images, .. } if !images.is_empty())));
+    }
+
+    #[tokio::test]
+    async fn viewed_image_is_not_compacted_before_the_model_sees_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use crate::tools::{Tool, ToolOutput};
+        use crate::types::{Image, ToolSpec};
+
+        struct Probe {
+            saw_compact: Arc<AtomicBool>,
+            saw_image: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for Probe {
+            fn name(&self) -> &str { "fake" }
+            fn model(&self) -> &str { "fake" }
+            fn set_model(&mut self, _: String) {}
+            fn fork(&self) -> Box<dyn Provider> {
+                Box::new(Probe { saw_compact: self.saw_compact.clone(), saw_image: self.saw_image.clone() })
+            }
+            async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> Result<Response> {
+                if req.items.iter().any(|i| matches!(i, Item::User { text, .. } if text == COMPACT_PROMPT)) {
+                    self.saw_compact.store(true, Ordering::SeqCst);
+                    return Ok(Response { items: vec![Item::Assistant { text: "summary".into() }], usage: None });
+                }
+                if req.items.iter().any(|i| matches!(i, Item::User { images, .. } if !images.is_empty())) {
+                    self.saw_image.store(true, Ordering::SeqCst);
+                    return Ok(Response {
+                        items: vec![Item::Assistant { text: "A pixel.".into() }],
+                        usage: Some(Usage { input_tokens: 10, output_tokens: 1, cached_tokens: 0 }),
+                    });
+                }
+                Ok(Response {
+                    items: vec![Item::ToolCall {
+                        id: "1".into(),
+                        name: "view_image".into(),
+                        arguments: r#"{"path":"shot.png"}"#.into(),
+                    }],
+                    usage: Some(Usage { input_tokens: 10, output_tokens: 1, cached_tokens: 0 }),
+                })
+            }
+        }
+
+        struct ImageTool;
+        #[async_trait::async_trait]
+        impl Tool for ImageTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec { name: "view_image".into(), description: String::new(), parameters: serde_json::json!({}) }
+            }
+            fn summary(&self, _: &Value) -> String { "shot.png".into() }
+            async fn run(&self, _: Value, _: &crate::tools::ToolCtx) -> ToolOutput {
+                ToolOutput {
+                    content: "Loaded shot.png".into(),
+                    images: vec![Image { media_type: "image/png".into(), data: "A".repeat(20_000) }],
+                    ..ToolOutput::default()
+                }
+            }
+        }
+
+        let saw_compact = Arc::new(AtomicBool::new(false));
+        let saw_image = Arc::new(AtomicBool::new(false));
+        let mut agent = agent(Response::default(), None);
+        agent.provider = Box::new(Probe { saw_compact: saw_compact.clone(), saw_image: saw_image.clone() });
+        agent.tools.add(Box::new(ImageTool));
+        agent.items.clear();
+        agent.context_tokens = 0;
+        agent.context_window = 1000;
+        agent.context_estimated = false;
+        agent.turn(Item::user("inspect the screenshot"), &mut QuietUi, CancellationToken::new()).await.unwrap();
+        assert!(!saw_compact.load(Ordering::SeqCst));
+        assert!(saw_image.load(Ordering::SeqCst));
     }
 }

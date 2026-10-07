@@ -117,7 +117,7 @@ pub fn banner(version: &str) {
 pub fn list(lines: &[String]) {
     match tui::active() {
         Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_list(lines),
-        None => lines.iter().for_each(|l| eprintln!("{l}")),
+        None => lines.iter().for_each(|l| eprintln!("{}", sanitize_text(l))),
     }
 }
 
