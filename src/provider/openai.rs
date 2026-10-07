@@ -11,6 +11,7 @@ use super::{sse, EventSink, Provider};
 use crate::types::{Item, Request, Response, StreamEvent, Usage};
 
 pub struct OpenAiProvider {
+    pub label: String,
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
@@ -18,11 +19,42 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
+        Self::with_label("openai".into(), base_url, api_key, model)
+    }
+
+    pub fn with_label(
+        label: String,
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+    ) -> Self {
         Self {
+            label,
             base_url,
             api_key,
             model,
         }
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct Catalog {
+            data: Vec<Model>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Model {
+            id: String,
+        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let mut request = client.get(format!("{}/models", self.base_url.trim_end_matches('/')));
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let catalog: Catalog = sse::checked(request.send().await?).await?.json().await?;
+        Ok(catalog.data.into_iter().map(|m| m.id).collect())
     }
 
     fn body(&self, req: Request<'_>) -> Value {
@@ -38,13 +70,20 @@ impl OpenAiProvider {
                 }
             }
             match item {
-                Item::User { text, images } if images.is_empty() => messages.push(json!({"role":"user","content":text})),
+                Item::User { text, images } if images.is_empty() => {
+                    messages.push(json!({"role":"user","content":text}))
+                }
                 Item::User { text, images } => {
                     let mut content = vec![json!({"type":"text","text":text})];
-                    content.extend(images.iter().map(|i| json!({"type":"image_url","image_url":{"url":i.data_url()}})));
+                    content.extend(
+                        images
+                            .iter()
+                            .map(|i| json!({"type":"image_url","image_url":{"url":i.data_url()}})),
+                    );
                     messages.push(json!({"role":"user","content":content}))
                 }
-                Item::Compaction { summary } => messages.push(json!({"role":"user","content":crate::types::compaction_text(summary)})),
+                Item::Compaction { summary } => messages
+                    .push(json!({"role":"user","content":crate::types::compaction_text(summary)})),
                 Item::ToolResult { id, output, .. } => {
                     messages.push(json!({"role":"tool","tool_call_id":id,"content":output}))
                 }
@@ -93,7 +132,7 @@ struct Call {
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
-        "openai"
+        &self.label
     }
     fn model(&self) -> &str {
         &self.model
@@ -220,6 +259,23 @@ mod tests {
         provider::sse::tests::{events, server},
         types::ToolSpec,
     };
+
+    #[tokio::test]
+    async fn models_endpoint() {
+        let (url, mut requests, task) = server(vec![(
+            200,
+            json!({"data":[{"id":"a"},{"id":"b"}]}).to_string(),
+        )])
+        .await;
+        let provider =
+            OpenAiProvider::with_label("ollama".into(), url, Some("test-key".into()), "a".into());
+        assert_eq!(provider.name(), "ollama");
+        assert_eq!(provider.list_models().await.unwrap(), vec!["a", "b"]);
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("get /models "));
+        assert!(request.contains("authorization: bearer test-key"));
+        task.await.unwrap();
+    }
 
     #[test]
     fn request_body() {

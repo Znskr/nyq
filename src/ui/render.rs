@@ -3,8 +3,8 @@
 
 use nu_ansi_term::{Color, Style};
 
-const CODE_BLOCK: Color = Color::Fixed(109);
-const INLINE_CODE: Color = Color::Fixed(116);
+const CODE_BLOCK: Color = Color::Rgb(208, 208, 208);
+const INLINE_CODE: Color = Color::Rgb(138, 138, 138);
 
 pub fn dim() -> Style {
     Style::new().dimmed()

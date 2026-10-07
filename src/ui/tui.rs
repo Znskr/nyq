@@ -1,7 +1,7 @@
-//! Pi-style inline terminal UI. The transcript is printed into the normal
+//! fx-style inline terminal UI. The transcript is printed into the normal
 //! scrollback; below it a pane stays pinned to the bottom with the streaming
-//! line, a status rule, queued messages, the editor (always accepting input,
-//! even while the agent works) and a footer.
+//! line, the running tool group, a status line, queued messages, the input
+//! (always accepting text, even while the agent works), menus, and a footer.
 
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
@@ -22,20 +22,26 @@ use unicode_width::UnicodeWidthChar;
 use super::editor::{Action, Editor};
 use super::render::{diff, looks_like_diff, one_line, Markdown};
 use crate::agent::{Approval, ApprovalRequest, Ui};
+use crate::models::ModelChoice;
 use crate::tools::ToolOutput;
 use crate::types::{Item, StreamEvent, Usage};
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const USER_BG: Color = Color::Rgb(52, 53, 65);
-const TOOL_BG: Color = Color::Rgb(40, 50, 40);
-const ERROR_BG: Color = Color::Rgb(62, 36, 36);
-const ACCENT: Color = Color::Rgb(138, 173, 244);
+const BRIGHT: Color = Color::Rgb(238, 238, 238);
+const MID: Color = Color::Rgb(208, 208, 208);
+const GRAY: Color = Color::Rgb(138, 138, 138);
+const FAINT: Color = Color::Rgb(88, 88, 88);
+const RED: Color = Color::Rgb(215, 95, 95);
+const YELLOW: Color = Color::Rgb(215, 175, 95);
 const MAX_PREVIEW: usize = 14;
-const TOOL_TAIL: usize = 6;
+const MENU_ROWS: usize = 8;
 
 /// What the app loop receives from the input task.
 pub enum Command {
     Submit(String),
+    /// A model picked in the switcher.
+    SetModel(ModelChoice),
+    /// Shift+Tab: next reasoning effort.
+    CycleEffort,
     Exit,
 }
 
@@ -50,6 +56,7 @@ pub struct Footer {
     pub cwd: String,
     pub provider: String,
     pub model: String,
+    pub effort: Option<String>,
     pub sandbox: String,
     pub yolo: bool,
     pub usage: Usage,
@@ -62,14 +69,60 @@ enum Block {
     None,
     Text,
     Reasoning,
-    Tool,
+    Tools,
     User,
     Info,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Running,
+    Ok,
+    Failed,
+}
+
+struct ToolRow {
+    tool: String,
+    verb: String,
+    target: String,
+    note: String,
+    detail: Vec<String>,
+    status: Status,
+}
+
 struct PendingApproval {
+    title: String,
     lines: Vec<String>,
     reply: oneshot::Sender<Approval>,
+}
+
+struct MenuItem {
+    label: String,
+    detail: String,
+    tag: String,
+}
+
+/// The model switcher.
+struct ModelMenu {
+    choices: Vec<ModelChoice>,
+    tabs: Vec<String>,
+    tab: usize,
+    filter: String,
+    selected: usize,
+    loading: bool,
+    warnings: Vec<String>,
+}
+
+impl ModelMenu {
+    fn visible(&self) -> Vec<&ModelChoice> {
+        let tab = &self.tabs[self.tab];
+        let f = self.filter.to_lowercase();
+        self.choices
+            .iter()
+            .filter(|c| tab == "All" || &c.provider == tab)
+            .filter(|c| f.is_empty() || c.model.to_lowercase().contains(&f) || c.provider.contains(&f))
+            .collect()
+    }
 }
 
 pub struct Screen {
@@ -83,17 +136,22 @@ pub struct Screen {
     live_block: Block,
     last_block: Block,
     md: Markdown,
+    fence: Option<String>,
     busy: Option<(String, Instant)>,
+    thinking_since: Option<Instant>,
     frame: usize,
     pub editor: Editor,
     pub queue: Vec<(Queued, String)>,
     approval: Option<PendingApproval>,
+    tools: Vec<ToolRow>,
+    menu: Option<ModelMenu>,
+    slash_selected: usize,
     pub footer: Footer,
     cancel: Option<CancellationToken>,
-    tool_started: Option<Instant>,
     history: Vec<String>,
-    /// A one-off hint shown in the status rule until the next key.
+    /// A one-off hint shown in the status area until the next key.
     hint: Option<String>,
+    home: PathBuf,
 }
 
 static SCREEN: Mutex<Option<Arc<Mutex<Screen>>>> = Mutex::new(None);
@@ -107,12 +165,16 @@ fn lock(s: &Arc<Mutex<Screen>>) -> MutexGuard<'_, Screen> {
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn paint(style: Style, s: &str) -> String {
-    style.paint(s).to_string()
+fn fg(c: Color) -> Style {
+    Style::new().fg(c)
 }
 
-fn dim() -> Style {
-    Style::new().dimmed()
+fn paint(style: Style, s: &str) -> String {
+    if s.is_empty() {
+        String::new()
+    } else {
+        style.paint(s).to_string()
+    }
 }
 
 /// Display width of text that may contain ANSI escapes.
@@ -133,17 +195,24 @@ fn visible_width(s: &str) -> usize {
     w
 }
 
-/// Cut plain text to at most `width` columns.
+/// Cut plain text to at most `width` columns, marking the cut with `…`.
 fn truncate(s: &str, width: usize) -> String {
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= width {
+        return s.to_string();
+    }
     let mut out = String::new();
     let mut w = 0;
     for c in s.chars() {
         let cw = c.width().unwrap_or(0);
-        if w + cw > width {
+        if w + cw + 1 > width {
             break;
         }
         w += cw;
         out.push(c);
+    }
+    if width > 0 {
+        out.push('…');
     }
     out
 }
@@ -164,21 +233,27 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// A full-width row with a background color (pi's message blocks).
-fn block_row(text: &str, bg: Color, width: usize) -> String {
-    let pad = width.saturating_sub(visible_width(text) + 1);
-    // Re-apply the background after any reset inside `text`.
-    let bg_code = Style::new().on(bg).prefix().to_string();
-    let body = text.replace("\x1b[0m", &format!("\x1b[0m{bg_code}"));
-    format!("{bg_code} {body}{}\x1b[0m", " ".repeat(pad))
+fn rule(width: usize) -> String {
+    paint(fg(FAINT), &"─".repeat(width))
 }
 
-fn rule(width: usize, label: &str) -> String {
-    if label.is_empty() {
-        return paint(dim(), &"─".repeat(width));
+/// `left` and `right` on one row, right-aligned when they fit.
+fn spread(left: &str, right: &str, width: usize) -> String {
+    let gap = width.saturating_sub(visible_width(left) + visible_width(right));
+    if right.is_empty() || gap < 2 {
+        left.to_string()
+    } else {
+        format!("{left}{}{right}", " ".repeat(gap))
     }
-    let rest = width.saturating_sub(visible_width(label) + 4);
-    format!("{} {label} {}", paint(dim(), "──"), paint(dim(), &"─".repeat(rest)))
+}
+
+/// Key hints like fx: bright key, gray action.
+fn hints(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, a)| format!("{} {}", paint(fg(BRIGHT), k), paint(fg(GRAY), a)))
+        .collect::<Vec<_>>()
+        .join("     ")
 }
 
 fn tilde(path: &str) -> String {
@@ -196,27 +271,81 @@ fn tokens(n: u64) -> String {
     }
 }
 
-/// One collapsed line for a reasoning block: its first line (summaries from
-/// Codex start with a bold title) plus how much was hidden.
-fn thinking_summary(text: &str, width: usize) -> String {
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    let first = lines.first().map_or("", |l| l.trim_matches('*'));
-    let more = if lines.len() > 1 { format!(" (+{} lines of thinking)", lines.len() - 1) } else { String::new() };
-    let first = truncate(first, width.saturating_sub(more.chars().count() + 1));
-    format!("{first}{more}")
+/// A label with a moving highlight, fx's "shimmer".
+fn shimmer(label: &str, frame: usize) -> String {
+    let n = label.chars().count();
+    if n == 0 {
+        return String::new();
+    }
+    let pos = frame % (n + 6);
+    label
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            let d = (i as isize - pos as isize).unsigned_abs();
+            let color = match d {
+                0 => BRIGHT,
+                1 => MID,
+                _ => GRAY,
+            };
+            paint(fg(color), &c.to_string())
+        })
+        .collect()
 }
 
-/// How a tool call is titled in its block.
-fn tool_title(tool: &str, summary: &str, width: usize) -> String {
-    let summary = truncate(&one_line(summary, 400), width.saturating_sub(tool.len() + 1));
+/// How a tool call reads in the transcript: a verb and its target.
+fn describe_tool(tool: &str, summary: &str) -> (String, String) {
+    let verb = match tool {
+        "read_file" => "Read",
+        "write_file" => "Wrote",
+        "edit_file" => "Edited",
+        "bash" => "Ran",
+        "grep" => "Searched",
+        "glob" => "Found",
+        "list_dir" => "Listed",
+        "view_image" => "Viewed",
+        _ => "",
+    };
+    if verb.is_empty() {
+        let name = match tool.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
+            Some((server, t)) => format!("{server}.{t}"),
+            None => tool.to_string(),
+        };
+        return ("Called".into(), format!("{name} {}", one_line(summary, 200)));
+    }
+    (verb.into(), one_line(summary, 400))
+}
+
+fn tool_kind(tool: &str) -> &'static str {
     match tool {
-        "bash" => format!("{} {}", paint(Style::new().bold(), "$"), paint(Style::new().bold(), &summary)),
-        _ => format!("{} {}", paint(Style::new().bold(), tool), paint(Style::new().fg(ACCENT), &summary)),
+        "read_file" | "grep" | "glob" | "list_dir" | "view_image" => "read",
+        "write_file" | "edit_file" => "edit",
+        "bash" => "command",
+        _ => "tool",
+    }
+}
+
+/// "+3 / -1" from a unified diff.
+fn diff_stat(d: &str) -> String {
+    let add = d.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+    let del = d.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+    format!("+{add} / -{del}")
+}
+
+/// One collapsed line for a reasoning block.
+fn thinking_summary(text: &str, secs: u64, width: usize) -> String {
+    let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").trim_matches('*');
+    let head = if secs > 0 { format!("• Thought for {secs}s") } else { "• Thought".to_string() };
+    let rest = width.saturating_sub(head.chars().count() + 3);
+    if first.is_empty() || rest < 8 {
+        head
+    } else {
+        format!("{head} · {}", truncate(first, rest))
     }
 }
 
 impl Screen {
-    fn new(footer: Footer, editor: Editor, history: Vec<String>) -> Self {
+    fn new(footer: Footer, editor: Editor, history: Vec<String>, home: PathBuf) -> Self {
         let (w, h) = terminal::size().unwrap_or((80, 24));
         Screen {
             out: io::stdout(),
@@ -228,16 +357,21 @@ impl Screen {
             live_block: Block::None,
             last_block: Block::None,
             md: Markdown::default(),
+            fence: None,
             busy: None,
+            thinking_since: None,
             frame: 0,
             editor,
             queue: Vec::new(),
             approval: None,
+            tools: Vec::new(),
+            menu: None,
+            slash_selected: 0,
             footer,
             cancel: None,
-            tool_started: None,
             history,
             hint: None,
+            home,
         }
     }
 
@@ -252,100 +386,237 @@ impl Screen {
         self.cursor_row = 0;
     }
 
+    fn tool_rows(&self, rows: &mut Vec<String>, live: bool) {
+        let w = self.width;
+        let n = self.tools.len();
+        if n == 0 {
+            return;
+        }
+        let row_text = |t: &ToolRow, lead: &str| {
+            let verb_style = match t.status {
+                Status::Failed => fg(RED),
+                Status::Running if live => fg(MID),
+                _ => fg(GRAY),
+            };
+            let note = if t.note.is_empty() { String::new() } else { format!(" {}", t.note) };
+            let target = truncate(&t.target, w.saturating_sub(lead.chars().count() + t.verb.len() + note.len() + 2));
+            let verb = if t.status == Status::Running && live { shimmer(&t.verb, self.frame) } else { paint(verb_style, &t.verb) };
+            format!("{lead}{verb} {}{}", paint(fg(GRAY), &target), paint(fg(GRAY), &note))
+        };
+        let detail = |t: &ToolRow, rows: &mut Vec<String>, bar: &str| {
+            let style = if t.status == Status::Failed { fg(RED) } else { fg(FAINT) };
+            for d in &t.detail {
+                rows.push(format!("{}{}", paint(fg(FAINT), bar), paint(style, &truncate(d, w.saturating_sub(4)))));
+            }
+        };
+        if n == 1 {
+            let t = &self.tools[0];
+            rows.push(row_text(t, &format!("{} ", paint(fg(BRIGHT), "●"))).replacen(&paint(fg(GRAY), &t.verb), &paint(fg(BRIGHT), &t.verb), 1));
+            detail(t, rows, "  │ ");
+            return;
+        }
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for t in &self.tools {
+            let k = tool_kind(&t.tool);
+            match counts.iter_mut().find(|(c, _)| *c == k) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((k, 1)),
+            }
+        }
+        let parts: Vec<String> = counts
+            .iter()
+            .map(|(k, c)| match (*k, *c) {
+                ("edit", 1) => "1 edit".into(),
+                ("edit", c) => format!("{c} edits"),
+                ("command", 1) => "1 command".into(),
+                ("command", c) => format!("{c} commands"),
+                ("tool", 1) => "1 tool".into(),
+                ("tool", c) => format!("{c} tools"),
+                (k, c) => format!("{c} {k}"),
+            })
+            .collect();
+        rows.push(format!("{} {}", paint(fg(BRIGHT), "●"), paint(fg(GRAY), &format!("{n} tool calls · {}", parts.join(" · ")))));
+        for (i, t) in self.tools.iter().enumerate() {
+            let last = i + 1 == n;
+            rows.push(row_text(t, &paint(fg(GRAY), if last { "└ " } else { "├ " })));
+            detail(t, rows, if last { "  │ " } else { "│ │ " });
+        }
+    }
+
     fn pane(&self) -> (Vec<String>, usize, usize) {
         let w = self.width;
         let mut rows = Vec::new();
-        if self.live_block == Block::Reasoning {
-            // Thinking stays collapsed: just its latest line, live.
-            if let Some(last) = self.live.lines().rev().find(|l| !l.trim().is_empty()) {
-                rows.push(paint(dim().italic(), &truncate(last.trim(), w)));
+        match self.live_block {
+            Block::Reasoning => {}
+            _ if !self.live.is_empty() => {
+                for r in wrap(&self.live, w.saturating_sub(2)) {
+                    rows.push(format!("  {r}"));
+                }
             }
-        } else if !self.live.is_empty() {
-            rows.extend(wrap(&self.live, w));
+            _ => {}
         }
-        let status = match (&self.busy, &self.approval) {
-            (_, Some(_)) => paint(Style::new().fg(Color::Yellow), "Approval needed"),
-            (Some((label, start)), None) => {
-                let secs = start.elapsed().as_secs();
-                let time = if secs >= 2 { format!(" {secs}s") } else { String::new() };
-                format!(
-                    "{} {}{}",
-                    paint(Style::new().fg(ACCENT), SPINNER[self.frame % SPINNER.len()]),
-                    paint(Style::new().fg(ACCENT), &format!("{label}…")),
-                    paint(dim(), &format!("{time} · esc to interrupt"))
-                )
+        self.tool_rows(&mut rows, true);
+
+        // Status: what the agent is doing.
+        if let Some((label, start)) = &self.busy {
+            let secs = start.elapsed().as_secs();
+            let detail = if self.live_block == Block::Reasoning {
+                let last = self.live.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                truncate(last, w.saturating_sub(label.len() + 30))
+            } else {
+                String::new()
+            };
+            let mut line = format!("{} {}", paint(fg(BRIGHT), "•"), shimmer(label, self.frame));
+            line.push_str(&paint(fg(GRAY), &format!(" ({secs}s · esc to interrupt)")));
+            if !detail.is_empty() {
+                line.push_str(&paint(fg(FAINT).italic(), &format!(" {detail}")));
             }
-            (None, None) => match &self.hint {
-                Some(h) => paint(Style::new().fg(Color::Yellow), h),
-                None => paint(dim(), "ctrl+d or /exit to quit"),
-            },
-        };
-        rows.push(rule(w, &status));
+            if !rows.is_empty() {
+                rows.push(String::new());
+            }
+            rows.push(line);
+        }
+        if let Some(h) = &self.hint {
+            rows.push(paint(fg(YELLOW), h));
+        }
         for (kind, text) in &self.queue {
             let tag = match kind {
-                Queued::Steer => "steer",
-                Queued::FollowUp => "follow-up",
+                Queued::Steer => " (steer)",
+                Queued::FollowUp => " (follow-up)",
             };
-            let text = truncate(&one_line(text, w), w.saturating_sub(tag.len() + 5));
-            rows.push(format!("  {} {}", paint(Style::new().fg(Color::Yellow), &format!("{tag} ›")), paint(dim(), &text)));
+            let text = truncate(&one_line(text, w), w.saturating_sub(tag.len() + 3));
+            rows.push(format!("{} {}{}", paint(fg(FAINT), "┃"), paint(fg(GRAY), &text), paint(fg(FAINT), tag)));
         }
-        if !self.queue.is_empty() {
-            rows.push(paint(dim(), "  alt+↑ to edit queued messages"));
+        if !rows.is_empty() {
+            rows.push(String::new());
         }
+
+        // Input, or the approval prompt in its place.
         let (cursor_row, cursor_col);
         if let Some(a) = &self.approval {
-            rows.extend(a.lines.iter().cloned());
-            rows.push(format!(
-                "{}  {} once   {} always   {} deny",
-                paint(Style::new().fg(Color::Yellow).bold(), "Allow?"),
-                paint(Style::new().bold(), "y"),
-                paint(Style::new().bold(), "a"),
-                paint(Style::new().bold(), "n")
-            ));
+            rows.push(format!("{} {}", paint(fg(YELLOW), "┃"), a.title));
             cursor_row = rows.len() - 1;
-            cursor_col = 6;
+            cursor_col = 2;
+            rows.push(rule(w));
+            rows.push(paint(fg(BRIGHT).bold(), "Approve"));
+            rows.push(String::new());
+            rows.extend(a.lines.iter().cloned());
+            rows.push(rule(w));
+            rows.push(hints(&[("y", "Once"), ("a", "Always"), ("n", "Deny")]));
         } else {
             let view = self.editor.render(w.saturating_sub(2).max(1));
             let top = rows.len();
-            for (i, l) in view.lines.iter().enumerate() {
-                let lead = if i == 0 { paint(Style::new().fg(ACCENT).bold(), "› ") } else { "  ".into() };
-                rows.push(format!("{lead}{l}"));
+            for l in &view.lines {
+                rows.push(format!("{} {l}", paint(fg(BRIGHT), "┃")));
             }
             cursor_row = top + view.cursor_row;
             cursor_col = 2 + view.cursor_col;
-            for (cmd, desc) in self.editor.suggestions() {
-                rows.push(format!("  {}  {}", paint(Style::new().fg(ACCENT), &format!("{cmd:<10}")), paint(dim(), &truncate(&desc, w.saturating_sub(15)))));
+            if !self.menu_rows(&mut rows) {
+                rows.push(String::new());
+                rows.push(self.footer_line());
             }
         }
-        rows.push(rule(w, ""));
-        let f = &self.footer;
-        let mut left = tilde(&f.cwd);
-        if !f.sandbox.is_empty() {
-            left.push_str(&format!(" · {}", f.sandbox));
-        }
-        if f.yolo {
-            left.push_str(" · yolo");
-        }
-        rows.push(paint(dim(), &truncate(&left, w)));
-        let mut stats = format!("↑{} ↓{}", tokens(f.usage.input_tokens), tokens(f.usage.output_tokens));
-        if f.usage.cached_tokens > 0 {
-            stats.push_str(&format!(" R{}", tokens(f.usage.cached_tokens)));
-        }
-        if f.context_window > 0 {
-            let pct = f.context_tokens as f64 * 100.0 / f.context_window as f64;
-            stats.push_str(&format!(" {pct:.1}%/{}", tokens(f.context_window)));
-        }
-        let model = format!("({}) {}", f.provider, f.model);
-        let gap = w.saturating_sub(visible_width(&stats) + visible_width(&model));
-        let line = if gap >= 2 { format!("{stats}{}{model}", " ".repeat(gap)) } else { truncate(&stats, w) };
-        rows.push(paint(dim(), &line));
 
-        // Keep the pane on screen: drop streaming rows first.
+        // Keep the pane on screen: drop rows above the cursor first.
         let max = self.height.saturating_sub(1).max(4);
         let excess = rows.len().saturating_sub(max);
         let dropped = excess.min(cursor_row);
         rows.drain(..dropped);
+        rows.truncate(max);
         (rows, cursor_row - dropped, cursor_col)
+    }
+
+    fn footer_line(&self) -> String {
+        let f = &self.footer;
+        let effort = f.effort.as_deref().unwrap_or("auto");
+        let left = format!("{} {} {}", paint(fg(MID), effort), paint(fg(GRAY), "·"), paint(fg(GRAY), &f.model));
+        let mut right = vec![f.provider.clone()];
+        if f.context_window > 0 && f.context_tokens > 0 {
+            right.push(format!("{:.0}% of {}", f.context_tokens as f64 * 100.0 / f.context_window as f64, tokens(f.context_window)));
+        }
+        if f.usage.input_tokens + f.usage.output_tokens > 0 {
+            right.push(format!("↑{} ↓{}", tokens(f.usage.input_tokens), tokens(f.usage.output_tokens)));
+        }
+        right.push(f.sandbox.clone());
+        if f.yolo {
+            right.push("yolo".into());
+        }
+        right.push(tilde(&f.cwd));
+        let mut right = right.join(" · ");
+        let room = self.width.saturating_sub(visible_width(&left) + 4);
+        right = truncate(&right, room);
+        spread(&left, &paint(fg(FAINT), &right), self.width)
+    }
+
+    /// The slash-command or model menu under the input. Returns false if none.
+    fn menu_rows(&self, rows: &mut Vec<String>) -> bool {
+        let w = self.width;
+        let (header, items, selected, keys): (String, Vec<MenuItem>, usize, Vec<(&str, &str)>) = if let Some(m) = &self.menu {
+            let visible = m.visible();
+            let tabs: Vec<String> = m
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| if i == m.tab { paint(fg(BRIGHT), &format!("[{t}]")) } else { paint(fg(GRAY), t) })
+                .collect();
+            let filter = if m.filter.is_empty() { paint(fg(FAINT), "Type to filter") } else { paint(fg(MID), &m.filter) };
+            let header = format!("{} {}  {}  {}", paint(fg(BRIGHT).bold(), "Models"), paint(fg(GRAY), &visible.len().to_string()), tabs.join(" "), filter);
+            let current = (self.footer.provider.as_str(), self.footer.model.as_str());
+            let items = visible
+                .iter()
+                .map(|c| MenuItem {
+                    label: c.model.clone(),
+                    detail: [
+                        if (c.provider.as_str(), c.model.as_str()) == current { "current".to_string() } else { String::new() },
+                        c.context_window.map(|n| format!("{} ctx", tokens(n))).unwrap_or_default(),
+                        if c.efforts.is_empty() { String::new() } else { format!("effort {}", c.efforts.join("/")) },
+                    ]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                    tag: c.provider.clone(),
+                })
+                .collect();
+            (header, items, m.selected, vec![("↑↓", "Navigate"), ("Tab", "Provider"), ("Enter", "Use"), ("Esc", "Close")])
+        } else {
+            let s = self.editor.suggestions();
+            if s.is_empty() || self.approval.is_some() {
+                return false;
+            }
+            let header = format!("{} {}", paint(fg(BRIGHT).bold(), "Commands"), paint(fg(GRAY), &s.len().to_string()));
+            let items = s.into_iter().map(|(c, d)| MenuItem { label: c, detail: d, tag: String::new() }).collect();
+            (header, items, self.slash_selected, vec![("↑↓", "Navigate"), ("Enter", "Use"), ("Tab", "Complete"), ("Esc", "Close")])
+        };
+        rows.push(rule(w));
+        rows.push(header);
+        rows.push(String::new());
+        if let Some(m) = &self.menu {
+            if m.loading {
+                rows.push(paint(fg(GRAY), "  Loading models…"));
+            } else if items.is_empty() {
+                rows.push(paint(fg(GRAY), "  No models found."));
+            }
+            for warn in &m.warnings {
+                rows.push(paint(fg(YELLOW), &truncate(&format!("  {warn}"), w)));
+            }
+        }
+        let selected = selected.min(items.len().saturating_sub(1));
+        let start = selected.saturating_sub(MENU_ROWS - 1);
+        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0).min(32) + 3;
+        for (i, item) in items.iter().enumerate().skip(start).take(MENU_ROWS) {
+            let sel = i == selected;
+            let lead = if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() };
+            let label = format!("{:<label_w$}", truncate(&item.label, label_w - 1));
+            let label = if sel { paint(fg(BRIGHT).bold(), &label) } else { paint(fg(MID), &label) };
+            let room = w.saturating_sub(label_w + 4 + item.tag.len());
+            let left = format!("{lead}{label}{}", paint(fg(GRAY), &truncate(&item.detail, room)));
+            rows.push(spread(&left, &paint(fg(GRAY), &item.tag), w));
+        }
+        rows.push(rule(w));
+        let range = if items.is_empty() { String::new() } else { format!("{}–{}", start + 1, (start + MENU_ROWS).min(items.len())) };
+        rows.push(spread(&hints(&keys), &paint(fg(GRAY), &range), w));
+        true
     }
 
     fn draw_pane(&mut self) {
@@ -384,7 +655,7 @@ impl Screen {
 
     /// Start a new block, separated from the previous one by a blank line.
     fn begin(&mut self, block: Block) -> Vec<String> {
-        let gap = self.last_block != Block::None && (self.last_block != block || matches!(block, Block::Tool | Block::User));
+        let gap = self.last_block != Block::None && (self.last_block != block || block == Block::User);
         self.last_block = block;
         if gap {
             vec![String::new()]
@@ -396,49 +667,87 @@ impl Screen {
     // ------------------------------------------------------------ content
 
     pub fn print_info(&mut self, text: &str, style: Style) {
-        self.flush_live();
+        self.flush_all();
         let mut rows = self.begin(Block::Info);
         rows.extend(text.lines().map(|l| paint(style, l)));
         self.emit(&rows);
     }
 
+    pub fn print_error(&mut self, text: &str) {
+        self.flush_all();
+        let mut rows = self.begin(Block::Info);
+        for (i, l) in text.lines().enumerate() {
+            let lead = if i == 0 { paint(fg(RED), "● ") } else { "  ".into() };
+            rows.push(format!("{lead}{}", paint(fg(MID), l)));
+        }
+        self.emit(&rows);
+    }
+
     pub fn print_user(&mut self, text: &str) {
-        self.flush_live();
+        self.flush_all();
         let w = self.width;
         let mut rows = self.begin(Block::User);
-        rows.push(block_row("", USER_BG, w));
         for line in text.trim().lines() {
             for r in wrap(line, w.saturating_sub(2)) {
-                rows.push(block_row(&r, USER_BG, w));
+                rows.push(format!("{} {}", paint(fg(BRIGHT), "┃"), paint(Style::new().bold(), &r)));
             }
         }
-        rows.push(block_row("", USER_BG, w));
         self.emit(&rows);
     }
 
     pub fn print_markdown(&mut self, text: &str) {
-        self.flush_live();
+        self.flush_all();
         let mut rows = self.begin(Block::Text);
-        let mut md = Markdown::default();
-        rows.extend(text.trim().lines().map(|l| md.line(l, true)));
+        self.md = Markdown::default();
+        self.fence = None;
+        for l in text.trim().lines() {
+            rows.push(self.render_line(l));
+        }
         self.emit(&rows);
     }
 
-    pub fn print_tool_call(&mut self, tool: &str, summary: &str) {
-        let w = self.width;
-        let mut rows = self.begin(Block::Tool);
-        rows.push(block_row("", TOOL_BG, w));
-        rows.push(block_row(&tool_title(tool, summary, w.saturating_sub(2)), TOOL_BG, w));
-        rows.push(block_row("", TOOL_BG, w));
-        self.emit(&rows);
+    /// A finished tool call (resumed transcripts and `!` commands).
+    pub fn print_tool(&mut self, tool: &str, summary: &str, output: Option<&ToolOutput>) {
+        self.flush_all();
+        self.tool_start(tool, summary);
+        match output {
+            Some(o) => self.tool_end(o),
+            None => {
+                if let Some(t) = self.tools.last_mut() {
+                    t.status = Status::Ok;
+                }
+            }
+        }
+    }
+
+    /// Markdown line, indented, with fx-style frames around code blocks.
+    fn render_line(&mut self, line: &str) -> String {
+        let t = line.trim_start();
+        if let Some(lang) = t.strip_prefix("```").or_else(|| t.strip_prefix("~~~")) {
+            return if self.fence.take().is_some() {
+                format!("  {}", paint(fg(FAINT), &"─".repeat(34)))
+            } else {
+                let lang = if lang.trim().is_empty() { "code" } else { lang.trim() };
+                self.fence = Some(lang.to_string());
+                format!("  {} {} {}", paint(fg(FAINT), "─"), paint(fg(GRAY), lang), paint(fg(FAINT), &"─".repeat(32usize.saturating_sub(lang.len()))))
+            };
+        }
+        if self.fence.is_some() {
+            return format!("  {}", paint(fg(MID), line));
+        }
+        format!("  {}", self.md.line(line, true))
     }
 
     fn stream(&mut self, block: Block, text: &str) {
         if self.live_block != block {
             self.flush_live();
+            self.flush_tools();
             self.live_block = block;
-            if block == Block::Text {
-                self.md = Markdown::default();
+            if block == Block::Reasoning {
+                self.thinking_since = Some(Instant::now());
+                self.set_label("Thinking");
+            } else {
+                self.set_label("Working");
             }
         }
         self.live.push_str(text);
@@ -450,7 +759,7 @@ impl Screen {
             let done: String = self.live.drain(..=i).collect();
             let mut rows = self.begin(block);
             for line in done.trim_end_matches('\n').split('\n') {
-                rows.push(self.render_line(block, line));
+                rows.push(self.render_line(line));
             }
             self.emit(&rows);
         } else {
@@ -458,65 +767,79 @@ impl Screen {
         }
     }
 
-    fn render_line(&mut self, _block: Block, line: &str) -> String {
-        self.md.line(line, true)
-    }
-
     fn flush_live(&mut self) {
+        let block = self.live_block;
+        self.live_block = Block::None;
         if self.live.is_empty() {
             return;
         }
         let text = std::mem::take(&mut self.live);
-        let block = self.live_block;
         let mut rows = self.begin(block);
         if block == Block::Reasoning {
-            rows.push(paint(dim().italic(), &thinking_summary(&text, self.width)));
+            let secs = self.thinking_since.take().map_or(0, |t| t.elapsed().as_secs());
+            rows.push(paint(fg(GRAY).italic(), &thinking_summary(&text, secs, self.width)));
         } else {
-            rows.push(self.render_line(block, &text));
+            rows.push(self.render_line(&text));
         }
         self.emit(&rows);
     }
 
-    /// Show the result of a command the user ran with `!`.
-    pub fn print_tool_output(&mut self, output: &ToolOutput, started: Instant) {
-        self.tool_started = Some(started);
-        self.tool_result(output);
+    /// Commit the running tool group to the scrollback.
+    fn flush_tools(&mut self) {
+        if self.tools.is_empty() {
+            return;
+        }
+        let mut rows = self.begin(Block::Tools);
+        self.tool_rows(&mut rows, false);
+        self.tools.clear();
+        self.emit(&rows);
     }
 
-    fn tool_result(&mut self, output: &ToolOutput) {
-        let w = self.width;
-        let inner = w.saturating_sub(2);
-        let bg = if output.is_error { ERROR_BG } else { TOOL_BG };
-        let mut rows = Vec::new();
-        let body: Vec<String> = match &output.display {
-            Some(d) if looks_like_diff(d) => diff(d, true, 40, "").lines().map(str::to_string).collect(),
-            _ => {
-                let lines: Vec<&str> = output.content.trim_end().lines().collect();
-                let skip = lines.len().saturating_sub(TOOL_TAIL);
-                let mut v = Vec::new();
-                if skip > 0 {
-                    v.push(paint(dim(), &format!("… ({skip} earlier lines)")));
-                }
-                let style = if output.is_error { Style::new().fg(Color::Rgb(240, 160, 160)) } else { dim() };
-                v.extend(lines[skip..].iter().map(|l| paint(style, &truncate(l, inner))));
-                v
+    fn flush_all(&mut self) {
+        self.flush_live();
+        self.flush_tools();
+    }
+
+    fn tool_start(&mut self, tool: &str, summary: &str) {
+        self.flush_live();
+        let (verb, target) = describe_tool(tool, summary);
+        self.tools.push(ToolRow { tool: tool.into(), verb, target, note: String::new(), detail: Vec::new(), status: Status::Running });
+        self.set_label(&format!("Running {}", tool.replace('_', " ")));
+        self.redraw();
+    }
+
+    fn tool_end(&mut self, output: &ToolOutput) {
+        let Some(t) = self.tools.iter_mut().rev().find(|t| t.status == Status::Running) else { return };
+        t.status = if output.is_error { Status::Failed } else { Status::Ok };
+        if let Some(d) = output.display.as_deref().filter(|d| looks_like_diff(d)) {
+            t.note = diff_stat(d);
+        }
+        let lines: Vec<&str> = output.content.trim_end().lines().filter(|l| !l.trim().is_empty()).collect();
+        if output.is_error {
+            t.detail = lines.iter().take(3).map(|l| l.to_string()).collect();
+        } else if t.tool == "bash" && !lines.is_empty() {
+            let skip = lines.len().saturating_sub(3);
+            if skip > 0 {
+                t.detail.push(format!("… {skip} lines more"));
             }
-        };
-        for r in body {
-            rows.push(block_row(&r, bg, w));
+            t.detail.extend(lines[skip..].iter().map(|l| l.to_string()));
         }
-        if let Some(start) = self.tool_started.take() {
-            rows.push(block_row("", bg, w));
-            rows.push(block_row(&paint(dim(), &format!("Took {:.1}s", start.elapsed().as_secs_f64())), bg, w));
+        self.set_label("Working");
+        self.redraw();
+    }
+
+    fn set_label(&mut self, label: &str) {
+        if let Some((l, _)) = &mut self.busy {
+            *l = label.to_string();
         }
-        rows.push(block_row("", bg, w));
-        self.last_block = Block::Tool;
-        self.emit(&rows);
     }
 
     // ------------------------------------------------------------ state
 
     pub fn set_busy(&mut self, label: Option<&str>, cancel: Option<CancellationToken>) {
+        if label.is_none() {
+            self.flush_all();
+        }
         self.busy = label.map(|l| (l.to_string(), Instant::now()));
         self.cancel = cancel;
         self.redraw();
@@ -539,11 +862,68 @@ impl Screen {
         self.editor.set_text(&parts.join("\n\n"));
     }
 
+    /// Open the model switcher; `models` arrive later via `set_models`.
+    pub fn open_models(&mut self) {
+        self.menu = Some(ModelMenu { choices: Vec::new(), tabs: vec!["All".into()], tab: 0, filter: String::new(), selected: 0, loading: true, warnings: Vec::new() });
+        self.redraw();
+    }
+
+    pub fn set_models(&mut self, choices: Vec<ModelChoice>, warnings: Vec<String>) {
+        let Some(m) = &mut self.menu else { return };
+        let mut tabs = vec!["All".to_string()];
+        for c in &choices {
+            if !tabs.contains(&c.provider) {
+                tabs.push(c.provider.clone());
+            }
+        }
+        m.selected = choices.iter().position(|c| c.provider == self.footer.provider && c.model == self.footer.model).unwrap_or(0);
+        m.choices = choices;
+        m.tabs = tabs;
+        m.warnings = warnings;
+        m.loading = false;
+        self.redraw();
+    }
+
     fn remember(&mut self, text: &str) {
         self.editor.push_history(text);
         if self.history.last().map(String::as_str) != Some(text) {
             self.history.push(text.to_string());
         }
+    }
+
+    fn on_menu_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        let Some(m) = &mut self.menu else { return };
+        let count = m.visible().len();
+        match key.code {
+            KeyCode::Esc => self.menu = None,
+            KeyCode::Up => m.selected = m.selected.checked_sub(1).unwrap_or(count.saturating_sub(1)),
+            KeyCode::Down => m.selected = if count == 0 { 0 } else { (m.selected + 1) % count },
+            KeyCode::Tab => {
+                m.tab = (m.tab + 1) % m.tabs.len();
+                m.selected = 0;
+            }
+            KeyCode::BackTab => {
+                m.tab = (m.tab + m.tabs.len() - 1) % m.tabs.len();
+                m.selected = 0;
+            }
+            KeyCode::Backspace => {
+                m.filter.pop();
+                m.selected = 0;
+            }
+            KeyCode::Enter => {
+                if let Some(c) = m.visible().get(m.selected).map(|c| (*c).clone()) {
+                    let _ = commands.send(Command::SetModel(c));
+                    self.menu = None;
+                }
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.menu = None,
+            KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                m.filter.push(ch);
+                m.selected = 0;
+            }
+            _ => {}
+        }
+        self.redraw();
     }
 
     fn on_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
@@ -563,6 +943,57 @@ impl Screen {
             }
             self.redraw();
             return;
+        }
+        if self.menu.is_some() {
+            return self.on_menu_key(key, commands);
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('l') {
+            let _ = commands.send(Command::Submit("/model".into()));
+            return;
+        }
+        if key.code == KeyCode::BackTab {
+            let _ = commands.send(Command::CycleEffort);
+            return;
+        }
+        // The slash menu takes arrows and Enter while it is showing.
+        let suggestions = self.editor.suggestions();
+        if !suggestions.is_empty() {
+            match key.code {
+                KeyCode::Up => {
+                    self.slash_selected = self.slash_selected.checked_sub(1).unwrap_or(suggestions.len() - 1);
+                    return self.redraw();
+                }
+                KeyCode::Down => {
+                    self.slash_selected = (self.slash_selected + 1) % suggestions.len();
+                    return self.redraw();
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    let cmd = suggestions[self.slash_selected.min(suggestions.len() - 1)].0.clone();
+                    self.editor.set_text("");
+                    self.slash_selected = 0;
+                    self.remember(&cmd);
+                    if self.is_busy() {
+                        self.hint = Some(format!("{cmd} runs when the current task finishes"));
+                        self.queue.push((Queued::FollowUp, cmd));
+                    } else {
+                        let _ = commands.send(Command::Submit(cmd));
+                    }
+                    return self.redraw();
+                }
+                KeyCode::Tab => {
+                    let cmd = suggestions[self.slash_selected.min(suggestions.len() - 1)].0.clone();
+                    self.editor.set_text(&format!("{cmd} "));
+                    self.slash_selected = 0;
+                    return self.redraw();
+                }
+                KeyCode::Esc => {
+                    self.editor.set_text("");
+                    self.slash_selected = 0;
+                    return self.redraw();
+                }
+                _ => {}
+            }
         }
         let busy = self.is_busy();
         let was_empty = self.editor.is_empty();
@@ -594,7 +1025,7 @@ impl Screen {
                 } else if exit && !busy {
                     let _ = commands.send(Command::Exit);
                 } else if was_empty && !busy {
-                    self.hint = Some("press ctrl+c again to exit".into());
+                    self.hint = Some("Press ctrl+c again to exit".into());
                 }
             }
             Action::Exit => {
@@ -605,6 +1036,7 @@ impl Screen {
             }
             Action::Dequeue => self.dequeue(),
         }
+        self.slash_selected = self.slash_selected.min(self.editor.suggestions().len().saturating_sub(1));
         self.redraw();
     }
 }
@@ -621,12 +1053,13 @@ pub struct Tui {
 }
 
 impl Tui {
-    pub fn start(footer: Footer, history_path: PathBuf, commands: Vec<(String, String)>) -> io::Result<Self> {
+    pub fn start(footer: Footer, home: PathBuf, commands: Vec<(String, String)>) -> io::Result<Self> {
+        let history_path = home.join("nyq").join("history");
         // One JSON string per line (multi-line prompts); plain lines are accepted too.
         let history: Vec<String> = std::fs::read_to_string(&history_path)
             .map(|s| s.lines().filter(|l| !l.is_empty()).map(|l| serde_json::from_str(l).unwrap_or_else(|_| l.to_string())).collect())
             .unwrap_or_default();
-        let screen = Arc::new(Mutex::new(Screen::new(footer, Editor::new(history.clone(), commands), history)));
+        let screen = Arc::new(Mutex::new(Screen::new(footer, Editor::new(history.clone(), commands), history, home)));
         terminal::enable_raw_mode()?;
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
         let mut out = io::stdout();
@@ -652,7 +1085,7 @@ impl Tui {
                     match ev {
                         Event::Key(k) if k.kind != KeyEventKind::Release => s.on_key(k, &tx),
                         Event::Paste(text) => {
-                            if s.approval.is_none() {
+                            if s.approval.is_none() && s.menu.is_none() {
                                 s.editor.paste(&text);
                             }
                             s.redraw();
@@ -671,7 +1104,7 @@ impl Tui {
         let ticker = {
             let screen = screen.clone();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_millis(90));
+                let mut tick = tokio::time::interval(Duration::from_millis(80));
                 loop {
                     tick.tick().await;
                     let mut s = lock(&screen);
@@ -689,6 +1122,20 @@ impl Tui {
         lock(&self.screen)
     }
 
+    /// Open the model switcher and fill it in the background.
+    pub fn open_models(&self) {
+        let home = {
+            let mut s = self.screen();
+            s.open_models();
+            s.home.clone()
+        };
+        let screen = self.screen.clone();
+        tokio::spawn(async move {
+            let (choices, warnings) = crate::models::list(&home).await;
+            lock(&screen).set_models(choices, warnings);
+        });
+    }
+
     /// The `agent::Ui` for one run.
     pub fn ui(&self, cwd: PathBuf) -> TuiUi {
         TuiUi { screen: self.screen.clone(), cwd }
@@ -702,6 +1149,7 @@ impl Drop for Tui {
         }
         {
             let mut s = lock(&self.screen);
+            s.flush_all();
             s.clear_pane();
             let _ = s.out.flush();
             let skip = s.history.len().saturating_sub(1000);
@@ -753,9 +1201,8 @@ impl Ui for TuiUi {
             StreamEvent::Text(t) => s.stream(Block::Text, t),
             StreamEvent::Reasoning(t) => s.stream(Block::Reasoning, t),
             StreamEvent::ToolCallStart { name, .. } => {
-                if let Some((label, _)) = &mut s.busy {
-                    *label = format!("Calling {name}");
-                }
+                s.flush_live();
+                s.set_label(&format!("Preparing {}", name.replace('_', " ")));
                 s.redraw();
             }
         }
@@ -764,30 +1211,21 @@ impl Ui for TuiUi {
     fn end_message(&mut self) {
         let mut s = self.s();
         s.flush_live();
-        if let Some((label, _)) = &mut s.busy {
-            *label = "Working".into();
-        }
+        s.set_label("Working");
         s.redraw();
     }
 
     fn tool_start(&mut self, tool: &str, summary: &str) {
-        let mut s = self.s();
-        s.flush_live();
-        s.print_tool_call(tool, summary);
-        s.tool_started = Some(Instant::now());
-        if let Some((label, _)) = &mut s.busy {
-            *label = format!("Running {tool}");
-        }
-        s.redraw();
+        self.s().tool_start(tool, summary);
     }
 
-    fn tool_end(&mut self, _tool: &str, output: &ToolOutput) {
+    fn tool_end(&mut self, tool: &str, output: &ToolOutput) {
         let mut s = self.s();
-        s.tool_result(output);
-        if let Some((label, _)) = &mut s.busy {
-            *label = "Working".into();
+        // A denied call never started; show it as a failed row.
+        if !s.tools.iter().any(|t| t.status == Status::Running) {
+            s.tool_start(tool, "");
         }
-        s.redraw();
+        s.tool_end(output);
     }
 
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
@@ -796,26 +1234,32 @@ impl Ui for TuiUi {
             let mut s = self.s();
             s.flush_live();
             let w = s.width;
-            let mut lines = vec![tool_title(req.tool, req.summary, w)];
+            let (verb, target) = describe_tool(req.tool, req.summary);
+            let title = format!("{} {}", paint(fg(BRIGHT), &verb), paint(fg(GRAY), &truncate(&target, w.saturating_sub(verb.len() + 3))));
+            let mut lines = Vec::new();
             if let Some(p) = req.preview {
                 let body: Vec<String> = if looks_like_diff(p) {
                     diff(p, true, usize::MAX, "  ").lines().map(str::to_string).collect()
                 } else {
-                    p.lines().map(|l| paint(dim(), &format!("  {}", truncate(l, w.saturating_sub(2))))).collect()
+                    p.lines().map(|l| paint(fg(GRAY), &format!("  {}", truncate(l, w.saturating_sub(2))))).collect()
                 };
                 let more = body.len().saturating_sub(MAX_PREVIEW);
                 lines.extend(body.into_iter().take(MAX_PREVIEW));
                 if more > 0 {
-                    lines.push(paint(dim(), &format!("  … {more} more lines")));
+                    lines.push(paint(fg(GRAY), &format!("  … {more} lines more")));
+                }
+            } else if req.tool == "bash" {
+                for l in req.summary.lines().take(MAX_PREVIEW) {
+                    lines.push(format!("  {}", paint(fg(MID), &truncate(l, w.saturating_sub(2)))));
                 }
             }
-            s.approval = Some(PendingApproval { lines, reply: tx });
+            s.approval = Some(PendingApproval { title, lines, reply: tx });
             s.redraw();
         }
         let answer = rx.await.unwrap_or(Approval::No);
         if answer == Approval::No {
-            // The loop reports the denial through tool_end; show the call first.
-            self.s().print_tool_call(req.tool, req.summary);
+            // The loop reports the denial through tool_end.
+            self.s().tool_start(req.tool, req.summary);
         }
         answer
     }
@@ -830,7 +1274,7 @@ impl Ui for TuiUi {
     }
 
     fn notice(&mut self, msg: &str) {
-        self.s().print_info(msg, dim());
+        self.s().print_info(&format!("  {msg}"), fg(GRAY));
     }
 
     fn take_steering(&mut self) -> Vec<Item> {
@@ -846,7 +1290,8 @@ impl Ui for TuiUi {
     fn take_follow_up(&mut self) -> Option<Item> {
         let text = {
             let mut s = self.s();
-            let i = s.queue.iter().position(|(k, _)| *k == Queued::FollowUp)?;
+            // Slash commands queued while busy are run by the app loop.
+            let i = s.queue.iter().position(|(k, t)| *k == Queued::FollowUp && !t.starts_with('/'))?;
             s.queue.remove(i).1
         };
         Some(self.deliver(text))
@@ -860,7 +1305,8 @@ mod tests {
     #[test]
     fn widths_and_wrapping() {
         assert_eq!(visible_width("\x1b[1mab\x1b[0m界"), 4);
-        assert_eq!(truncate("ab界c", 3), "ab");
+        assert_eq!(truncate("ab界c", 3), "ab…");
+        assert_eq!(truncate("abc", 3), "abc");
         assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"]);
         assert_eq!(wrap("", 4), vec![""]);
         assert_eq!(tokens(950), "950");
@@ -870,15 +1316,24 @@ mod tests {
 
     #[test]
     fn thinking_collapses_to_one_line() {
-        assert_eq!(thinking_summary("**Planning**\n\nstep one\nstep two", 80), "Planning (+2 lines of thinking)");
-        assert_eq!(thinking_summary("just this", 80), "just this");
-        assert!(visible_width(&thinking_summary(&"x".repeat(200), 40)) <= 40);
+        assert_eq!(thinking_summary("**Planning**\n\nstep one", 3, 80), "• Thought for 3s · Planning");
+        assert_eq!(thinking_summary("", 0, 80), "• Thought");
+        assert!(visible_width(&thinking_summary(&"x".repeat(200), 1, 40)) <= 40);
     }
 
     #[test]
-    fn block_rows_fill_the_width() {
-        let row = block_row("hi", TOOL_BG, 10);
-        assert_eq!(visible_width(&row), 10);
-        assert!(row.ends_with("\x1b[0m"));
+    fn tools_read_like_fx() {
+        assert_eq!(describe_tool("read_file", "src/main.rs"), ("Read".into(), "src/main.rs".into()));
+        assert_eq!(describe_tool("bash", "cargo test"), ("Ran".into(), "cargo test".into()));
+        assert_eq!(describe_tool("mcp__wiki__ask", "{}").0, "Called");
+        assert!(describe_tool("mcp__wiki__ask", "{}").1.starts_with("wiki.ask"));
+        assert_eq!(diff_stat("--- a/x\n+++ b/x\n@@\n-old\n+new\n+more\n"), "+2 / -1");
+        assert_eq!(tool_kind("grep"), "read");
+    }
+
+    #[test]
+    fn spread_aligns_right() {
+        assert_eq!(spread("ab", "cd", 8), "ab    cd");
+        assert_eq!(spread("abcdef", "cd", 8), "abcdef");
     }
 }

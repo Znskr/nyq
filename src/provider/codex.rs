@@ -37,8 +37,14 @@ struct Auth {
 impl Auth {
     fn parse(bytes: &[u8]) -> Result<Self> {
         let v: Value = serde_json::from_slice(bytes)?;
-        let Some(t) = v.get("tokens") else { return Ok(serde_json::from_value(v)?) };
-        let field = |k: &str| t[k].as_str().map(str::to_owned).with_context(|| format!("codex auth file missing tokens.{k}"));
+        let Some(t) = v.get("tokens") else {
+            return Ok(serde_json::from_value(v)?);
+        };
+        let field = |k: &str| {
+            t[k].as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("codex auth file missing tokens.{k}"))
+        };
         let access_token = field("access_token")?;
         Ok(Self {
             version: Value::Null,
@@ -55,8 +61,12 @@ impl Auth {
 pub fn jwt_exp_ms(token: &str) -> Option<i64> {
     use base64::Engine;
     let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
-    serde_json::from_slice::<Value>(&bytes).ok()?["exp"].as_i64().map(|s| s * 1000)
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok()?["exp"]
+        .as_i64()
+        .map(|s| s * 1000)
 }
 
 impl CodexProvider {
@@ -69,6 +79,64 @@ impl CodexProvider {
             session_id: uuid::Uuid::new_v4().to_string(),
             client: reqwest::Client::new(),
         }
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<crate::models::ModelChoice>> {
+        #[derive(Deserialize)]
+        struct Catalog {
+            models: Vec<Model>,
+        }
+        #[derive(Deserialize)]
+        struct Model {
+            slug: String,
+            visibility: String,
+            supported_in_api: Option<bool>,
+            #[serde(default)]
+            priority: i64,
+            #[serde(default)]
+            supported_reasoning_levels: Vec<Level>,
+            context_window: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        struct Level {
+            effort: String,
+        }
+        let url = std::env::var("NYQ_CODEX_MODELS_URL").unwrap_or_else(|_| {
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.148.0".into()
+        });
+        let send = |auth: Auth| {
+            self.client
+                .get(&url)
+                .bearer_auth(auth.access_token)
+                .header("chatgpt-account-id", auth.account_id)
+                .header("originator", "nyq")
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+        };
+        let auth = self.token(None).await?;
+        let mut http = send(auth.clone()).await?;
+        if http.status() == reqwest::StatusCode::UNAUTHORIZED {
+            http = send(self.token(Some(&auth.access_token)).await?).await?;
+        }
+        let mut catalog: Catalog = sse::checked(http).await?.json().await?;
+        catalog
+            .models
+            .retain(|m| m.visibility == "list" && m.supported_in_api != Some(false));
+        catalog.models.sort_by_key(|m| m.priority);
+        Ok(catalog
+            .models
+            .into_iter()
+            .map(|m| crate::models::ModelChoice {
+                provider: "codex".into(),
+                model: m.slug,
+                context_window: m.context_window,
+                efforts: m
+                    .supported_reasoning_levels
+                    .into_iter()
+                    .map(|l| l.effort)
+                    .collect(),
+            })
+            .collect())
     }
 
     fn body(&self, req: Request<'_>) -> Value {
@@ -108,7 +176,10 @@ impl CodexProvider {
         if !expired && rejected != Some(auth.access_token.as_str()) {
             return Ok(auth.clone());
         }
-        anyhow::ensure!(!auth.read_only, "the codex CLI login has expired; run `codex` once to refresh it");
+        anyhow::ensure!(
+            !auth.read_only,
+            "the codex CLI login has expired; run `codex` once to refresh it"
+        );
         let url = std::env::var("NYQ_CODEX_TOKEN_URL")
             .unwrap_or_else(|_| "https://auth.openai.com/oauth/token".into());
         let result: Value = sse::checked(self.client.post(url).json(&json!({"client_id":"app_EMoamEEZ73f0CkXaXp7hrann","grant_type":"refresh_token","refresh_token":auth.refresh_token})).send().await?).await?.json().await?;
@@ -219,6 +290,13 @@ impl Provider for CodexProvider {
         self.model = model;
     }
 
+    fn effort(&self) -> Option<&str> {
+        self.effort.as_deref()
+    }
+    fn set_effort(&mut self, effort: Option<String>) {
+        self.effort = effort.filter(|e| e != "auto");
+    }
+
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
         let body = self.body(req);
         let url = std::env::var("NYQ_CODEX_URL")
@@ -301,6 +379,52 @@ mod tests {
         let path = dir.path().join("auth.json");
         std::fs::write(&path, json!({"version":1,"access_token":"old","refresh_token":"refresh","expires_at_ms":expires,"account_id":"account"}).to_string()).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn models_endpoint() {
+        let _lock = ENV.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = CodexProvider::new(auth_file(&dir, i64::MAX), "test".into(), None);
+        provider.set_effort(Some("high".into()));
+        assert_eq!(provider.effort(), Some("high"));
+        provider.set_effort(Some("auto".into()));
+        assert_eq!(provider.effort(), None);
+        let (url, mut requests, task) = server(vec![(200, json!({"models":[
+            {"slug":"later","visibility":"list","supported_in_api":true,"priority":2,"context_window":272000,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
+            {"slug":"hidden","visibility":"hide","priority":0},
+            {"slug":"unsupported","visibility":"list","supported_in_api":false,"priority":0},
+            {"slug":"first","visibility":"list","priority":1}
+        ]}).to_string())]).await;
+        let old = std::env::var_os("NYQ_CODEX_MODELS_URL");
+        std::env::set_var(
+            "NYQ_CODEX_MODELS_URL",
+            format!("{url}/models?client_version=0.148.0"),
+        );
+        let result = provider.list_models().await;
+        if let Some(old) = old {
+            std::env::set_var("NYQ_CODEX_MODELS_URL", old);
+        } else {
+            std::env::remove_var("NYQ_CODEX_MODELS_URL");
+        }
+        let models = result.unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
+            vec!["first", "later"]
+        );
+        assert_eq!(models[1].efforts, vec!["low", "high"]);
+        assert_eq!(models[1].context_window, Some(272000));
+        assert_eq!(models[0].provider, "codex");
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("get /models?client_version=0.148.0 "));
+        for header in [
+            "authorization: bearer old",
+            "chatgpt-account-id: account",
+            "originator: nyq",
+        ] {
+            assert!(request.contains(header));
+        }
+        task.await.unwrap();
     }
 
     #[test]
@@ -611,3 +735,4 @@ mod tests {
         token_task.await.unwrap();
     }
 }
+

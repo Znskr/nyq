@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod mcp;
+mod models;
 mod prompt;
 mod provider;
 mod sandbox;
@@ -67,7 +68,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a fresh conversation"),
     ("/resume", "resume a saved conversation: /resume [id]"),
     ("/sessions", "list saved conversations"),
-    ("/model", "show or switch model: /model [name]"),
+    ("/model", "switch model or provider (ctrl+l); /model NAME sets the model id"),
     ("/compact", "summarize the conversation to free up context"),
     ("/tools", "list available tools"),
     ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
@@ -115,7 +116,7 @@ async fn run() -> Result<()> {
         context_tokens: 0,
         sandbox: std::sync::Arc::new(sandbox_policy(&cli)?),
     };
-    agent.context_window = config::context_window(agent.provider.name());
+    agent.context_window = config::context_window_for(agent.provider.name(), None);
 
     let resume = cli.resume.clone().or_else(|| cli.continue_last.then(|| "last".to_string()));
     let mut resumed = None;
@@ -153,7 +154,7 @@ async fn run() -> Result<()> {
 
     let footer = Footer { cwd: cwd.display().to_string(), sandbox: sandbox_label(&agent.sandbox), ..Footer::default() };
     let commands = COMMANDS.iter().map(|(c, d)| (c.to_string(), d.to_string())).collect();
-    let mut tui = Tui::start(footer, home.join("nyq").join("history"), commands)?;
+    let mut tui = Tui::start(footer, home.clone(), commands)?;
     sync_footer(&tui, &agent);
     ui::banner(env!("CARGO_PKG_VERSION"));
     ui::info(&sandbox::describe(&agent.sandbox));
@@ -162,14 +163,25 @@ async fn run() -> Result<()> {
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     }
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
-    let mut pending = (!text.trim().is_empty()).then_some(text);
+    let mut pending: std::collections::VecDeque<String> = (!text.trim().is_empty()).then_some(text).into_iter().collect();
+    // The model's catalog entry, once picked in the switcher (for its efforts).
+    let mut current: Option<models::ModelChoice> = None;
 
     loop {
         sync_footer(&tui, &agent);
-        let line = match pending.take() {
+        let line = match pending.pop_front() {
             Some(t) => t,
             None => match tui.commands.recv().await {
                 Some(UiCommand::Submit(t)) => t,
+                Some(UiCommand::SetModel(choice)) => {
+                    switch_model(&home, &mut agent, &choice);
+                    current = Some(choice);
+                    continue;
+                }
+                Some(UiCommand::CycleEffort) => {
+                    cycle_effort(&home, &mut agent, current.as_ref());
+                    continue;
+                }
                 Some(UiCommand::Exit) | None => break,
             },
         };
@@ -182,6 +194,10 @@ async fn run() -> Result<()> {
             continue;
         }
         if line.starts_with('/') {
+            if line.trim() == "/model" {
+                tui.open_models();
+                continue;
+            }
             match slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir, &tui).await {
                 Ok(true) => continue,
                 Ok(false) => break,
@@ -219,14 +235,17 @@ async fn run() -> Result<()> {
                 s.queue.drain(..).map(|(_, t)| t).collect::<Vec<_>>()
             }
         };
+        let (commands, messages): (Vec<String>, Vec<String>) = leftover.into_iter().partition(|t| t.starts_with('/'));
         match result {
             Ok(TurnEnd::Done) => {}
             Ok(TurnEnd::Cancelled) => ui::info("Interrupted."),
             Err(e) => ui::error(&format!("{e:#}")),
         }
-        // Messages queued just as the run finished start the next one.
-        if !leftover.is_empty() {
-            pending = Some(leftover.join("\n\n"));
+        // Queued slash commands run now; messages queued just as the run
+        // finished start the next one.
+        pending.extend(commands);
+        if !messages.is_empty() {
+            pending.push_back(messages.join("\n\n"));
         }
     }
     drop(tui);
@@ -242,10 +261,48 @@ fn sandbox_label(policy: &sandbox::Policy) -> String {
     }
 }
 
+/// Switch provider and model, keeping the conversation.
+fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::ModelChoice) {
+    let effort = agent.provider.effort().map(str::to_string).filter(|e| choice.efforts.contains(e));
+    match models::build(home, choice, effort.clone()) {
+        Ok(provider) => {
+            agent.provider = provider;
+            agent.context_window = config::context_window_for(&choice.provider, choice.context_window);
+            if let Err(e) = models::save_last(home, choice, effort.as_deref()) {
+                ui::error(&format!("could not remember the model: {e:#}"));
+            }
+            ui::info(&format!("  Switched to {} · {}", choice.provider, choice.model));
+        }
+        Err(e) => ui::error(&format!("{e:#}")),
+    }
+}
+
+/// Shift+Tab: auto → each supported effort → auto.
+fn cycle_effort(home: &std::path::Path, agent: &mut Agent, current: Option<&models::ModelChoice>) {
+    let efforts: Vec<String> = match current {
+        Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => c.efforts.clone(),
+        _ if agent.provider.name() == "codex" => ["low", "medium", "high", "xhigh"].map(String::from).to_vec(),
+        _ => Vec::new(),
+    };
+    if efforts.is_empty() {
+        ui::info("  This model has no adjustable reasoning effort.");
+        return;
+    }
+    let next = match agent.provider.effort() {
+        None => Some(efforts[0].clone()),
+        Some(e) => efforts.iter().position(|x| x == e).and_then(|i| efforts.get(i + 1)).cloned(),
+    };
+    agent.provider.set_effort(next.clone());
+    if let Some(c) = current {
+        let _ = models::save_last(home, c, next.as_deref());
+    }
+}
+
 fn sync_footer(tui: &Tui, agent: &Agent) {
     let mut s = tui.screen();
     s.footer.provider = agent.provider.name().to_string();
     s.footer.model = agent.provider.model().to_string();
+    s.footer.effort = agent.provider.effort().map(str::to_string);
     s.footer.yolo = agent.yolo;
     s.footer.usage = agent.usage;
     s.footer.context_tokens = agent.context_tokens;
@@ -315,8 +372,6 @@ async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig, qu
 
 /// `!cmd`: run a command yourself (unsandboxed) and show its output.
 async fn shell(cmd: &str, cwd: &PathBuf, tui: &Tui) {
-    let started = std::time::Instant::now();
-    tui.screen().print_tool_call("bash", cmd);
     let out = tokio::process::Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).stdin(std::process::Stdio::null()).output().await;
     let output = match out {
         Ok(o) => {
@@ -330,7 +385,7 @@ async fn shell(cmd: &str, cwd: &PathBuf, tui: &Tui) {
         }
         Err(e) => tools::ToolOutput::err(e.to_string()),
     };
-    tui.screen().print_tool_output(&output, started);
+    tui.screen().print_tool("bash", cmd, Some(&output));
 }
 
 fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
