@@ -279,7 +279,7 @@ fn save(home: &Path, auth: &Value) -> Result<()> {
         let mut file = options.open(&temp)?;
         file.write_all(&serde_json::to_vec(auth)?)?;
         file.sync_all()?;
-        std::fs::rename(&temp, home.join("chatgpt-auth.json"))?;
+        crate::tools::safeio::rename_over(&temp, &home.join("chatgpt-auth.json"))?;
         Ok(())
     })();
     if result.is_err() {
@@ -291,33 +291,57 @@ fn save(home: &Path, auth: &Value) -> Result<()> {
 /// Open the system browser; launch failures are intentionally ignored.
 #[allow(dead_code)]
 pub fn open_browser(url: &str) {
-    let mut command;
     #[cfg(target_os = "windows")]
     {
-        command = std::process::Command::new("cmd");
-        command.args(["/c", "start", "", url]);
+        // `cmd /c start` splits on `&`, which OAuth URLs contain.
+        open_browser_windows(url);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
-        command = std::process::Command::new("open");
-        command.arg(url);
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        command = std::process::Command::new("xdg-open");
-        command.arg(url);
-    }
-    if let Ok(mut child) = command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        let _ = std::thread::Builder::new()
-            .name("browser-launch".into())
-            .spawn(move || {
+        let mut command;
+        #[cfg(target_os = "macos")]
+        {
+            command = std::process::Command::new("open");
+            command.arg(url);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            command = std::process::Command::new("xdg-open");
+            command.arg(url);
+        }
+        if let Ok(mut child) = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            let _ = std::thread::Builder::new().name("browser-launch".into()).spawn(move || {
                 let _ = child.wait();
             });
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_browser_windows(url: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    let file: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(Some(0)).collect();
+    let op: Vec<u16> = std::ffi::OsStr::new("open").encode_wide().chain(Some(0)).collect();
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut std::ffi::c_void,
+            operation: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    // SAFETY: both strings are NUL-terminated UTF-16. A result ≤ 32 is a
+    // launch failure, which is ignored the same way a missing `open` is.
+    unsafe {
+        ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
     }
 }
 

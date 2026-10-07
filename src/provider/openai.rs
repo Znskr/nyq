@@ -200,6 +200,7 @@ impl Provider for OpenAiProvider {
                 ("reasoning_content", true),
                 ("reasoning", true),
                 ("content", false),
+                ("refusal", false),
             ] {
                 if let Some(text) = delta[key].as_str().filter(|s| !s.is_empty()) {
                     on_event(if reasoning {
@@ -250,6 +251,29 @@ impl Provider for OpenAiProvider {
                         });
                         call.started = true;
                     }
+                }
+            }
+            if let Some(function) = delta.get("function_call").filter(|v| !v.is_null()) {
+                // Legacy completions put the call here instead of `tool_calls`.
+                // `u64::MAX` does not collide with a `tool_calls` index.
+                let call = calls.entry(u64::MAX).or_insert_with(|| {
+                    let position = response.items.len();
+                    response.items.push(Item::ToolCall {
+                        id: "legacy-0".into(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                    Call { id: "legacy-0".into(), position, ..Call::default() }
+                });
+                if let Some(name) = function["name"].as_str() {
+                    call.name.push_str(name);
+                }
+                if let Some(args) = function["arguments"].as_str() {
+                    call.arguments.push_str(args);
+                }
+                if !call.started && !call.name.is_empty() {
+                    on_event(StreamEvent::ToolCallStart { id: call.id.clone(), name: call.name.clone() });
+                    call.started = true;
                 }
             }
         }
@@ -473,5 +497,21 @@ mod tests {
                 assert!(err.contains(reason), "{err}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_function_call_and_refusal_are_kept() {
+        let body = events(&[
+            json!({"choices":[{"index":0,"delta":{"function_call":{"name":"get_weather","arguments":"{\"city\":"}},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{"function_call":{"arguments":"\"Paris\"}"}},"finish_reason":"function_call"}]}),
+        ]);
+        let response = one_stream(body).await.unwrap();
+        assert_eq!(
+            response.items,
+            vec![Item::ToolCall { id: "legacy-0".into(), name: "get_weather".into(), arguments: "{\"city\":\"Paris\"}".into() }]
+        );
+        let body = events(&[json!({"choices":[{"index":0,"delta":{"refusal":"I can't help with that."},"finish_reason":"stop"}]})]);
+        let response = one_stream(body).await.unwrap();
+        assert_eq!(response.items, vec![Item::Assistant { text: "I can't help with that.".into() }]);
     }
 }

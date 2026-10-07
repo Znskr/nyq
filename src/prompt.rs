@@ -19,7 +19,13 @@ const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".nyq/instruction
 
 fn sandbox_guidance(policy: &crate::sandbox::Policy) -> String {
     let described = crate::sandbox::describe(policy);
-    let net = if policy.network { "" } else { ", and cannot open TCP connections" };
+    let net = if policy.network {
+        ""
+    } else if cfg!(target_os = "linux") {
+        ". TCP is blocked; UDP and Unix-domain sockets stay unrestricted"
+    } else {
+        ", and cannot open network connections"
+    };
     match policy.mode {
         crate::sandbox::Mode::Off => format!("{described}. Avoid destructive commands unless asked."),
         crate::sandbox::Mode::ReadOnly => format!(
@@ -44,7 +50,8 @@ pub fn system(cwd: &Path, sandbox: &crate::sandbox::Policy) -> String {
         s.push_str("\n- The workspace is a git repository.");
     }
     for name in INSTRUCTION_FILES {
-        if let Ok(text) = std::fs::read_to_string(cwd.join(name)) {
+        let path = cwd.join(name);
+        if let Ok(text) = crate::tools::read_rooted_text(cwd, &path) {
             let text = text.trim();
             if !text.is_empty() {
                 s.push_str(&format!("\n\n# Project instructions ({name})\n\n{text}"));
@@ -77,5 +84,29 @@ mod tests {
         assert!(ww.contains("workspace-write"), "{ww}");
         assert!(ww.contains("only inside the workspace"));
         assert!(!ww.contains("without a sandbox"));
+    }
+
+    #[test]
+    fn project_instructions_are_regular_files_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Use tabs.\n").unwrap();
+        let text = system(dir.path(), &Policy::default());
+        assert!(text.contains("Use tabs."), "{text}");
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret"), "SECRET_TOKEN_9f3a").unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secret"), linked.path().join("AGENTS.md")).unwrap();
+            let text = system(linked.path(), &Policy::default());
+            assert!(!text.contains("SECRET_TOKEN_9f3a"), "{text}");
+            if std::path::Path::new("/dev/zero").exists() {
+                let zero = tempfile::tempdir().unwrap();
+                std::os::unix::fs::symlink("/dev/zero", zero.path().join("CLAUDE.md")).unwrap();
+                let text = system(zero.path(), &Policy::default());
+                assert!(!text.contains("Project instructions (CLAUDE.md)"), "{text}");
+            }
+        }
     }
 }
