@@ -131,6 +131,9 @@ struct Call {
 
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
+    fn fork(&self) -> Box<dyn Provider> {
+        Box::new(Self::with_label(self.label.clone(), self.base_url.clone(), self.api_key.clone(), self.model.clone()))
+    }
     fn name(&self) -> &str {
         &self.label
     }

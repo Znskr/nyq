@@ -62,6 +62,43 @@ pub trait Ui: Send {
     fn take_follow_up(&mut self) -> Option<Item> {
         None
     }
+    /// Put a question to the user; None if they skipped it or can't be asked.
+    async fn ask(&mut self, _question: &str, _options: &[String]) -> Option<String> {
+        None
+    }
+}
+
+/// `ask_user_question`: the loop answers it through `Ui::ask` instead of
+/// running it, so it is only offered when a person is at the terminal.
+pub struct AskUserTool;
+
+pub const ASK_USER: &str = "ask_user_question";
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for AskUserTool {
+    fn spec(&self) -> crate::types::ToolSpec {
+        crate::types::ToolSpec {
+            name: ASK_USER.into(),
+            description: "Ask the user a multiple-choice question when you need a decision or missing \
+                information that you cannot reasonably infer. Offer 2-5 short, distinct options; the user \
+                may also type their own answer or skip. Do not use it for confirmation of routine steps."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question, one or two sentences."},
+                    "options": {"type": "array", "items": {"type": "string"}, "description": "2-5 answer choices."}
+                },
+                "required": ["question", "options"]
+            }),
+        }
+    }
+    fn summary(&self, args: &Value) -> String {
+        args["question"].as_str().unwrap_or("").to_string()
+    }
+    async fn run(&self, _args: Value, _ctx: &ToolCtx) -> ToolOutput {
+        ToolOutput::err("ask_user_question is answered by the user interface")
+    }
 }
 
 pub enum TurnEnd {
@@ -86,10 +123,12 @@ pub struct Agent {
     /// Latest context size (input plus output), or an estimate after compaction.
     pub context_tokens: u64,
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
+    /// File contents before each write/edit, for `/undo`.
+    pub undo: crate::undo::UndoLog,
 }
 
 impl Agent {
-    fn push(&mut self, item: Item) {
+    pub fn push(&mut self, item: Item) {
         if let Some(s) = &mut self.session {
             if let Err(e) = s.append(&item) {
                 eprintln!("warning: could not save session: {e}");
@@ -228,6 +267,22 @@ impl Agent {
         let Some(tool) = self.tools.get(name) else {
             return ToolOutput::err(format!("Unknown tool `{name}`."));
         };
+        if name == ASK_USER {
+            let args: Value = serde_json::from_str(arguments).unwrap_or_default();
+            let question = args["question"].as_str().unwrap_or("").to_string();
+            let options: Vec<String> = args["options"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|o| o.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let answer = tokio::select! {
+                a = ui.ask(&question, &options) => a,
+                _ = cancel.cancelled() => None,
+            };
+            return match answer {
+                Some(a) => ToolOutput::ok(format!("The user answered: {a}")),
+                None => ToolOutput::ok("The user skipped the question. Use your best judgment or ask in your reply."),
+            };
+        }
         let args: Value = match serde_json::from_str(if arguments.trim().is_empty() {
             "{}"
         } else {
@@ -240,6 +295,7 @@ impl Agent {
             cwd: self.cwd.clone(),
             cancel: cancel.clone(),
             sandbox: self.sandbox.clone(),
+            provider: Some(std::sync::Arc::from(self.provider.fork())),
         };
         let summary = tool.summary(&args);
 
@@ -266,10 +322,15 @@ impl Agent {
         }
 
         ui.tool_start(name, &summary);
+        let before = self.undo.len();
+        self.undo.snapshot(&self.cwd, name, &args);
         let out = tokio::select! {
             out = tool.run(args, &ctx) => out,
             _ = cancel.cancelled() => ToolOutput::err("Cancelled by user."),
         };
+        if out.is_error && self.undo.len() > before {
+            self.undo.discard_last();
+        }
         ui.tool_end(name, &out);
         out
     }
@@ -384,6 +445,9 @@ mod tests {
             "fake"
         }
         fn set_model(&mut self, _: String) {}
+        fn fork(&self) -> Box<dyn Provider> {
+            unimplemented!()
+        }
         async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> Result<Response> {
             assert!(req.tools.is_empty());
             assert_eq!(req.items.last(), Some(&Item::user(COMPACT_PROMPT)));
@@ -408,6 +472,7 @@ mod tests {
             context_window: 1000,
             context_tokens: 900,
             sandbox: Default::default(),
+            undo: Default::default(),
         }
     }
 

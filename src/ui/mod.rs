@@ -112,6 +112,14 @@ pub fn banner(version: &str) {
     info(&text);
 }
 
+/// A listing whose rows are cut to the terminal width.
+pub fn list(lines: &[String]) {
+    match tui::active() {
+        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_list(lines),
+        None => lines.iter().for_each(|l| eprintln!("{l}")),
+    }
+}
+
 pub fn info(msg: &str) {
     match tui::active() {
         Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_info(msg, Style::new()),

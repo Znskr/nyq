@@ -6,8 +6,10 @@ mod prompt;
 mod provider;
 mod sandbox;
 mod session;
+mod skills;
 mod tools;
 mod types;
+mod undo;
 mod ui;
 
 use std::collections::HashSet;
@@ -70,7 +72,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "list saved conversations"),
     ("/model", "switch model or provider (ctrl+l); /model NAME sets the model id"),
     ("/compact", "summarize the conversation to free up context"),
+    ("/copy", "copy the last answer to the clipboard"),
+    ("/undo", "revert the last file change nyq made"),
     ("/tools", "list available tools"),
+    ("/skills", "list available skills"),
     ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
     ("/yolo", "toggle auto-approval of tool calls"),
     ("/usage", "token usage for this conversation"),
@@ -115,8 +120,14 @@ async fn run() -> Result<()> {
         context_window: 0,
         context_tokens: 0,
         sandbox: std::sync::Arc::new(sandbox_policy(&cli)?),
+        undo: Default::default(),
     };
     agent.context_window = config::context_window_for(agent.provider.name(), None);
+    let skills = skills::discover(&home, &cwd);
+    if !skills.is_empty() {
+        agent.system.push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
+        agent.tools.add(skills::tool(skills.clone()));
+    }
 
     let resume = cli.resume.clone().or_else(|| cli.continue_last.then(|| "last".to_string()));
     let mut resumed = None;
@@ -163,6 +174,7 @@ async fn run() -> Result<()> {
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     }
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
+    agent.tools.add(Box::new(agent::AskUserTool));
     let mut pending: std::collections::VecDeque<String> = (!text.trim().is_empty()).then_some(text).into_iter().collect();
     // The model's catalog entry, once picked in the switcher (for its efforts).
     let mut current: Option<models::ModelChoice> = None;
@@ -198,7 +210,7 @@ async fn run() -> Result<()> {
                 tui.open_models();
                 continue;
             }
-            match slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir, &tui).await {
+            match slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir, &tui, &skills).await {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
@@ -414,6 +426,7 @@ async fn slash(
     servers: &[ServerConfig],
     sessions_dir: &std::path::Path,
     tui: &Tui,
+    skills: &[skills::Skill],
 ) -> Result<bool> {
     let mut parts = line.split_whitespace();
     let cmd = parts.next().unwrap_or("");
@@ -430,7 +443,30 @@ async fn slash(
             agent.reset(Some(Session::create(sessions_dir, &agent.cwd, agent.provider.model())?));
             ui::info("Started a new conversation.");
         }
-        "/sessions" => ui::info(&session_lines(sessions_dir)?.join("\n")),
+        "/sessions" => ui::list(&session_lines(sessions_dir)?),
+        "/skills" => ui::list(&skills::list_lines(skills)),
+        "/undo" if agent.undo.is_empty() => ui::info("  Nothing to undo."),
+        "/undo" => match agent.undo.undo() {
+            Ok(msg) => {
+                ui::info(&format!("  {msg}"));
+                // Tell the model, so it doesn't assume its edit is still there.
+                agent.push(types::Item::user(format!("[The user undid your last file change: {msg}]")));
+            }
+            Err(e) => ui::info(&format!("  {e}")),
+        },
+        "/copy" => {
+            let last = agent.items.iter().rev().find_map(|i| match i {
+                types::Item::Assistant { text } if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            });
+            match last {
+                Some(text) => {
+                    let via = tui.screen().copy(&text);
+                    ui::info(&format!("  Copied the last answer ({} chars) via {via}.", text.chars().count()));
+                }
+                None => ui::info("  Nothing to copy yet."),
+            }
+        }
         "/compact" => {
             let cancel = CancellationToken::new();
             tui.screen().set_busy(Some("Compacting"), Some(cancel.clone()));
@@ -456,10 +492,13 @@ async fn slash(
             None => ui::info(&format!("{} · {}", agent.provider.name(), agent.provider.model())),
         },
         "/tools" => {
-            for spec in agent.tools.specs() {
-                let first = spec.description.lines().next().unwrap_or("");
-                ui::info(&format!("  {:<28} {first}", spec.name));
-            }
+            let lines: Vec<String> = agent
+                .tools
+                .specs()
+                .iter()
+                .map(|t| format!("{:<24} {}", t.name, t.description.lines().next().unwrap_or("")))
+                .collect();
+            ui::list(&lines);
         }
         "/mcp" => match (arg.first().copied(), arg.get(1).copied()) {
             (Some("connect"), Some(name)) => {

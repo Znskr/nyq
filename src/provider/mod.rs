@@ -20,6 +20,8 @@ pub trait Provider: Send + Sync {
         None
     }
     fn set_effort(&mut self, _effort: Option<String>) {}
+    /// A fresh provider with the same settings (for subagents).
+    fn fork(&self) -> Box<dyn Provider>;
     /// Stream one response. Cancellation is done by dropping the future.
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> anyhow::Result<Response>;
 }

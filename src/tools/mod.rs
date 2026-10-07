@@ -5,6 +5,8 @@ mod bash;
 mod fs;
 pub mod image;
 mod search;
+pub mod web;
+pub mod subagent;
 
 use std::path::PathBuf;
 
@@ -27,6 +29,9 @@ pub struct ToolCtx {
     pub cancel: CancellationToken,
     /// How shell commands are confined.
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
+    /// A copy of the session's model provider, for tools that run their own
+    /// model calls (subagents). None in tests.
+    pub provider: Option<std::sync::Arc<dyn crate::provider::Provider>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -74,13 +79,15 @@ pub struct Registry {
 
 impl Registry {
     /// The built-in workspace tools: read_file, write_file, edit_file, bash,
-    /// glob, grep, list_dir, view_image.
+    /// glob, grep, list_dir, view_image, web_fetch, web_search, subagent.
     pub fn builtin() -> Self {
         let mut r = Self::default();
         fs::register(&mut r);
         search::register(&mut r);
         bash::register(&mut r);
         image::register(&mut r);
+        web::register(&mut r);
+        subagent::register(&mut r);
         r
     }
 
