@@ -1241,6 +1241,7 @@ dependencies = [
  "globset",
  "ignore",
  "landlock",
+ "libc",
  "nu-ansi-term",
  "reedline",
  "regex",

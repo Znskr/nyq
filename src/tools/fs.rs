@@ -20,8 +20,8 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
 fn display_path(path: &Path) -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
     path.strip_prefix(&cwd)
-        .map(|r| if r.as_os_str().is_empty() { ".".into() } else { r.display().to_string() })
-        .unwrap_or_else(|_| path.display().to_string())
+        .map(|r| if r.as_os_str().is_empty() { ".".into() } else { super::slash_path(r) })
+        .unwrap_or_else(|_| super::slash_path(path))
 }
 
 /// Path argument resolved against the process cwd (for `summary`, which has no ctx).
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(ReadFile.summary(&args), "src/main.rs");
         assert_eq!(EditFile.summary(&args), "src/main.rs");
         let args = json!({"path": "/definitely/outside.rs"});
-        assert!(ReadFile.summary(&args).starts_with("/definitely/outside.rs"));
+        assert!(ReadFile.summary(&args).ends_with("/definitely/outside.rs"));
 
         let spec = ReadFile.spec();
         assert_eq!(spec.name, "read_file");
