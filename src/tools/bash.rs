@@ -53,6 +53,10 @@ impl Tool for Bash {
         cmd.lines().next().unwrap_or("").chars().take(120).collect()
     }
 
+    fn handles_cancel(&self) -> bool {
+        true
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(command) = args.get("command").and_then(Value::as_str).filter(|c| !c.is_empty()) else {
             return ToolOutput::err("bash: missing required argument `command`.");
@@ -69,6 +73,7 @@ impl Tool for Bash {
             Err(e) => return ToolOutput::err(format!("bash: {e}")),
         };
         let pid = child.id().unwrap_or(0);
+        let job = assign_job(&child);
 
         // Pump both pipes into one channel so output is merged in arrival order.
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -97,10 +102,10 @@ impl Tool for Bash {
         let (status, timed_out) = match outcome {
             Outcome::Exit(status) => (Some(status), false),
             Outcome::Cancelled => {
-                terminate(&mut child, pid).await;
+                terminate(&mut child, pid, job.as_ref()).await;
                 return ToolOutput::err("Cancelled by user.");
             }
-            Outcome::TimedOut => (terminate(&mut child, pid).await, true),
+            Outcome::TimedOut => (terminate(&mut child, pid, job.as_ref()).await, true),
         };
 
         let output = drain(&mut rx, GRACE).await;
@@ -121,7 +126,7 @@ impl Tool for Bash {
         if is_error && ctx.sandbox.mode != crate::sandbox::Mode::Off && denied.iter().any(|d| content.contains(d)) {
             push_line(&mut content, "(The sandbox blocks writes outside the workspace and, unless allowed, network access. If this command needs that, ask the user to rerun nyq with --sandbox off or --allow-network.)");
         }
-        ToolOutput { content, is_error, display: None, images: Vec::new() }
+        ToolOutput { content, is_error, display: None, images: Vec::new(), changed: false }
     }
 }
 
@@ -148,27 +153,149 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(mut r: R, tx: mpsc::UnboundedSend
 }
 
 /// SIGTERM (then SIGKILL) the whole process group and reap the child.
-async fn terminate(child: &mut Child, pid: u32) -> Option<std::process::ExitStatus> {
-    kill_group(pid, "TERM");
+/// On Windows the job object kills every process assigned to it.
+async fn terminate(child: &mut Child, pid: u32, job: Option<&WinJob>) -> Option<std::process::ExitStatus> {
+    kill_group(pid, "TERM", job);
     if let Ok(status) = tokio::time::timeout(GRACE, child.wait()).await {
         return status.ok();
     }
-    kill_group(pid, "KILL");
+    kill_group(pid, "KILL", job);
     let _ = child.kill().await;
     child.wait().await.ok()
 }
 
-fn kill_group(pid: u32, signal: &str) {
+fn kill_group(pid: u32, signal: &str, job: Option<&WinJob>) {
     #[cfg(unix)]
-    if let Ok(pgid) = i32::try_from(pid) {
-        if pgid > 0 {
-            let sig = if signal == "KILL" { libc::SIGKILL } else { libc::SIGTERM };
-            // SAFETY: plain syscall; a negative pid addresses the process group.
-            unsafe { libc::kill(-pgid, sig) };
+    {
+        let _ = job;
+        if let Ok(pgid) = i32::try_from(pid) {
+            if pgid > 0 {
+                let sig = if signal == "KILL" { libc::SIGKILL } else { libc::SIGTERM };
+                // SAFETY: plain syscall; a negative pid addresses the process group.
+                unsafe { libc::kill(-pgid, sig) };
+            }
         }
     }
-    #[cfg(not(unix))]
-    let _ = (pid, signal);
+    #[cfg(windows)]
+    {
+        let _ = (pid, signal);
+        if let Some(job) = job {
+            // SAFETY: `job.handle` is a live job object we own.
+            unsafe { TerminateJobObject(job.handle, 1) };
+        }
+    }
+}
+
+/// Windows job that kills the whole process tree when closed or terminated.
+/// On other platforms this is an empty placeholder.
+#[cfg(windows)]
+struct WinJob {
+    handle: *mut std::ffi::c_void,
+}
+
+#[cfg(not(windows))]
+struct WinJob;
+
+#[cfg(windows)]
+unsafe impl Send for WinJob {}
+#[cfg(windows)]
+unsafe impl Sync for WinJob {}
+
+impl Drop for WinJob {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+fn assign_job(child: &Child) -> Option<WinJob> {
+    #[cfg(windows)]
+    let job = assign_job_windows(child);
+    #[cfg(not(windows))]
+    let job = {
+        let _ = child;
+        None
+    };
+    job
+}
+
+#[cfg(windows)]
+fn assign_job_windows(child: &Child) -> Option<WinJob> {
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    #[repr(C)]
+    struct BasicLimit {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+    #[repr(C)]
+    struct ExtendedLimit {
+        basic: BasicLimit,
+        io_counters: [u64; 6],
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attrs: *mut std::ffi::c_void, name: *const u16) -> *mut std::ffi::c_void;
+        fn SetInformationJobObject(job: *mut std::ffi::c_void, class: i32, info: *const std::ffi::c_void, len: u32) -> i32;
+        fn AssignProcessToJobObject(job: *mut std::ffi::c_void, process: *mut std::ffi::c_void) -> i32;
+    }
+    let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+    if job.is_null() {
+        return None;
+    }
+    let mut info = ExtendedLimit {
+        basic: BasicLimit {
+            per_process_user_time_limit: 0,
+            per_job_user_time_limit: 0,
+            limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            minimum_working_set_size: 0,
+            maximum_working_set_size: 0,
+            active_process_limit: 0,
+            affinity: 0,
+            priority_class: 0,
+            scheduling_class: 0,
+        },
+        io_counters: [0; 6],
+        process_memory_limit: 0,
+        job_memory_limit: 0,
+        peak_process_memory_used: 0,
+        peak_job_memory_used: 0,
+    };
+    let set = unsafe {
+        SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            (&mut info as *mut ExtendedLimit).cast(),
+            std::mem::size_of::<ExtendedLimit>() as u32,
+        )
+    };
+    let assigned = set != 0
+        && child.raw_handle().is_some_and(|h| unsafe { AssignProcessToJobObject(job, h.cast()) } != 0);
+    if !assigned {
+        unsafe { CloseHandle(job) };
+        return None;
+    }
+    Some(WinJob { handle: job })
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
 }
 
 /// Collect remaining output; pipes still open after `grace` are abandoned.

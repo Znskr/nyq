@@ -133,12 +133,25 @@ pub fn shell_command(policy: &Policy, cwd: &Path, script: &str) -> anyhow::Resul
     Ok(c)
 }
 
+/// `NYQ_SANDBOX_HELPER` may name this same binary (a path alias). Any other
+/// path is refused so a helper cannot skip Landlock and run the command raw.
+#[cfg(any(target_os = "linux", test))]
+fn trusted_helper(current: &Path, override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(over) = override_path {
+        let current_real = std::fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+        let over_real = std::fs::canonicalize(over).unwrap_or_else(|_| over.to_path_buf());
+        if current_real != over_real {
+            anyhow::bail!("NYQ_SANDBOX_HELPER ({}) is not this nyq binary", over.display());
+        }
+    }
+    Ok(current.to_path_buf())
+}
+
 #[cfg(target_os = "linux")]
 fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<String>> {
-    let exe = match std::env::var_os("NYQ_SANDBOX_HELPER") {
-        Some(p) => PathBuf::from(p),
-        None => std::env::current_exe()?,
-    };
+    let current = std::env::current_exe()?;
+    let over = std::env::var_os("NYQ_SANDBOX_HELPER").map(PathBuf::from);
+    let exe = trusted_helper(&current, over.as_deref())?;
     Ok(linux::helper_args(&exe, &writable_roots(policy, cwd), policy.network, argv))
 }
 
@@ -384,6 +397,16 @@ mod tests {
         if p.contains("landlock") {
             assert!(p.contains("unix sockets not restricted"), "{p}");
         }
+    }
+
+    #[test]
+    fn helper_override_must_be_this_binary() {
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(trusted_helper(&exe, None).unwrap(), exe);
+        assert_eq!(trusted_helper(&exe, Some(exe.as_path())).unwrap(), exe);
+        let other = std::env::temp_dir().join(format!("nyq-not-the-binary-{}", std::process::id()));
+        let err = trusted_helper(&exe, Some(&other)).unwrap_err();
+        assert!(err.to_string().contains("NYQ_SANDBOX_HELPER"), "{err}");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 mod bash;
 mod fs;
 pub mod image;
+mod safeio;
 mod search;
 pub mod web;
 pub mod subagent;
@@ -49,6 +50,9 @@ pub struct ToolOutput {
     pub display: Option<String>,
     /// Images for the model (sent in a follow-up user message).
     pub images: Vec<crate::types::Image>,
+    /// The tool already changed the workspace, so a failed result must keep
+    /// its undo snapshot.
+    pub changed: bool,
 }
 
 impl ToolOutput {
@@ -75,6 +79,12 @@ pub trait Tool: Send + Sync {
         None
     }
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput;
+    /// When true, [`crate::agent::Agent::call_tool`] waits for `run` after
+    /// cancellation so the tool can kill children and notify peers. Tools
+    /// that only need the request dropped leave this false.
+    fn handles_cancel(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -97,8 +107,24 @@ impl Registry {
     }
 
     pub fn add(&mut self, tool: Box<dyn Tool>) {
-        self.tools.retain(|t| t.spec().name != tool.spec().name);
+        self.try_insert(tool).expect("duplicate tool name");
+    }
+
+    /// Insert `tool`, refusing to replace an existing name.
+    pub fn try_insert(&mut self, tool: Box<dyn Tool>) -> Result<(), String> {
+        let name = tool.spec().name.clone();
+        if self.tools.iter().any(|t| t.spec().name == name) {
+            return Err(format!("tool `{name}` collides with an existing tool"));
+        }
         self.tools.push(tool);
+        Ok(())
+    }
+
+    pub fn remove_names(&mut self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        self.tools.retain(|t| !names.iter().any(|n| n == &t.spec().name));
     }
 
     pub fn remove_prefix(&mut self, prefix: &str) {

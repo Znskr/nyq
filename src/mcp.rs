@@ -210,23 +210,39 @@ fn expand_env(s: &str) -> Result<String> {
 struct Server {
     service: RunningService<RoleClient, ()>,
     tools: usize,
+    names: Vec<String>,
 }
 
 pub struct McpManager {
     servers: BTreeMap<String, Server>,
     /// Profile directory; OAuth credentials live in `<home>/nyq/mcp-auth/`.
     home: PathBuf,
+    /// Credential file → `name\nendpoint`, so two identities cannot share one.
+    cred_owners: HashMap<PathBuf, String>,
 }
 
 impl McpManager {
     pub fn new(home: PathBuf) -> Self {
-        Self { servers: BTreeMap::new(), home }
+        Self { servers: BTreeMap::new(), home, cred_owners: HashMap::new() }
     }
 
-    fn credentials(&self, name: &str) -> FileCredentialStore {
-        let file: String =
-            name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-        FileCredentialStore::new(self.home.join("nyq").join("mcp-auth").join(format!("{file}.json")))
+    /// Tool names currently registered for `name` (empty when it is not connected).
+    pub fn registered_names(&self, name: &str) -> Vec<String> {
+        self.servers.get(name).map(|s| s.names.clone()).unwrap_or_default()
+    }
+
+    fn claim_store(&mut self, name: &str, endpoint: &str) -> Result<FileCredentialStore> {
+        let path = credential_path(&self.home, name, endpoint)?;
+        let key = format!("{name}\n{endpoint}");
+        if let Some(owner) = self.cred_owners.get(&path) {
+            if owner != &key {
+                bail!("MCP server '{name}' would share a credential file with another server");
+            }
+        } else if self.cred_owners.values().any(|owner| owner == &key) {
+            bail!("MCP server '{name}' is already stored under another credential file");
+        }
+        self.cred_owners.insert(path.clone(), key);
+        Ok(FileCredentialStore::new(path))
     }
 
     /// Start (or reconnect to) the server and return its tools.
@@ -253,14 +269,15 @@ impl McpManager {
     }
 
     async fn connect_http(
-        &self,
+        &mut self,
         name: &str,
         url: &str,
         headers: &BTreeMap<String, String>,
     ) -> Result<RunningService<RoleClient, ()>> {
         let config = http_config(url, headers)?;
         let explicit = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
-        let store = self.credentials(name);
+        let endpoint = reqwest::Url::parse(url).with_context(|| format!("MCP server '{name}': invalid url"))?.to_string();
+        let store = self.claim_store(name, &endpoint)?;
         let result = if !explicit && store.path.exists() {
             let mut manager = AuthorizationManager::new(url).await?;
             manager.set_credential_store(store);
@@ -293,23 +310,28 @@ impl McpManager {
             }
         };
         let peer = service.peer().clone();
-        let tools: Vec<Box<dyn Tool>> = listed
-            .into_iter()
-            .map(|t| {
-                let mut schema = Value::Object(t.input_schema.as_ref().clone());
-                if let Value::Object(m) = &mut schema {
-                    m.entry("type").or_insert_with(|| "object".into());
-                }
-                Box::new(McpTool {
-                    name: tool_name(&cfg.name, &t.name),
-                    description: t.description.as_deref().unwrap_or_default().to_string(),
-                    schema,
-                    tool: t.name.to_string(),
-                    peer: peer.clone(),
-                }) as Box<dyn Tool>
-            })
-            .collect();
-        self.servers.insert(cfg.name.clone(), Server { service, tools: tools.len() });
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for t in listed {
+            let name = tool_name(&cfg.name, &t.name);
+            if let Some(other) = seen.insert(name.clone(), t.name.to_string()) {
+                let _ = service.cancel().await;
+                bail!("MCP server '{}': tools `{other}` and `{}` both map to `{name}`", cfg.name, t.name);
+            }
+            let mut schema = Value::Object(t.input_schema.as_ref().clone());
+            if let Value::Object(m) = &mut schema {
+                m.entry("type").or_insert_with(|| "object".into());
+            }
+            tools.push(Box::new(McpTool {
+                name,
+                description: t.description.as_deref().unwrap_or_default().to_string(),
+                schema,
+                tool: t.name.to_string(),
+                peer: peer.clone(),
+            }));
+        }
+        let names: Vec<String> = seen.into_keys().collect();
+        self.servers.insert(cfg.name.clone(), Server { service, tools: tools.len(), names });
         Ok(tools)
     }
 
@@ -335,7 +357,8 @@ impl McpManager {
         let port = listener.local_addr()?.port();
         let redirect = format!("http://127.0.0.1:{port}/callback");
         let mut manager = AuthorizationManager::new(url.as_str()).await?;
-        manager.set_credential_store(self.credentials(&cfg.name));
+        let endpoint = canonical_endpoint(&cfg.transport)?;
+        manager.set_credential_store(self.claim_store(&cfg.name, &endpoint)?);
         let metadata = manager
             .resolve_metadata_from_challenge(challenge.as_deref())
             .await
@@ -358,11 +381,13 @@ impl McpManager {
 
     /// Forget saved OAuth credentials (disconnecting first). Returns whether
     /// any were stored.
-    pub async fn logout(&mut self, name: &str) -> Result<bool> {
+    pub async fn logout(&mut self, name: &str, endpoint: &str) -> Result<bool> {
         if self.servers.contains_key(name) {
             self.disconnect(name).await?;
         }
-        let store = self.credentials(name);
+        let path = credential_path(&self.home, name, endpoint)?;
+        self.cred_owners.remove(&path);
+        let store = FileCredentialStore::new(path);
         let existed = store.path.exists();
         store.clear().await?;
         Ok(existed)
@@ -485,26 +510,8 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
-/// Atomically write `bytes` to `path` (file 0600, directory 0700 on unix).
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        builder.mode(0o700);
-        opts.mode(0o600);
-    }
-    builder.create(dir)?;
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    let mut f = opts.open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    crate::session::write_private(path, bytes)
 }
 
 /// Open `url` in the user's browser, ignoring failures (the URL is printed too).
@@ -600,13 +607,72 @@ async fn close(mut server: Server) {
     let _ = server.service.close_with_timeout(Duration::from_secs(3)).await;
 }
 
-/// `mcp__<server>__<tool>`, restricted to `[A-Za-z0-9_-]` and 64 chars.
+/// Sanitized `mcp__<server>__` prefix actually used on tool names.
+pub fn tool_prefix(server: &str) -> String {
+    sanitize(&format!("mcp__{server}__"))
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect()
+}
+
+/// `mcp__<server>__<tool>`, restricted to `[A-Za-z0-9_-]`. Names that would
+/// exceed 64 characters keep a stable hash of the full name so a shared
+/// prefix cannot collide.
 fn tool_name(server: &str, tool: &str) -> String {
-    format!("mcp__{server}__{tool}")
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .take(64)
-        .collect()
+    let raw = sanitize(&format!("mcp__{server}__{tool}"));
+    if raw.len() <= 64 {
+        return raw;
+    }
+    let hash = format!("{:08x}", fnv64(raw.as_bytes()) & 0xffff_ffff);
+    let keep = 64 - hash.len() - 1;
+    format!("{}_{hash}", &raw[..keep])
+}
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Canonical identity of a server's credential file. Stdio has no endpoint.
+pub fn canonical_endpoint(transport: &Transport) -> Result<String> {
+    match transport {
+        Transport::Http { url, .. } => {
+            Ok(reqwest::Url::parse(url).with_context(|| format!("invalid MCP url {url}"))?.to_string())
+        }
+        Transport::Stdio { .. } => Ok(String::new()),
+    }
+}
+
+/// Injective filename for `name` + newline + canonical endpoint. `_` is
+/// escaped, and names that would exceed 180 characters are rejected.
+pub fn credential_path(home: &Path, name: &str, endpoint: &str) -> Result<PathBuf> {
+    let file = encode_ident(&format!("{name}\n{endpoint}"))?;
+    Ok(home.join("nyq").join("mcp-auth").join(format!("{file}.json")))
+}
+
+fn encode_ident(key: &str) -> Result<String> {
+    let mut out = String::new();
+    for c in key.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            out.push(c);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                out.push('_');
+                out.push(char::from(b"0123456789abcdef"[(b >> 4) as usize]));
+                out.push(char::from(b"0123456789abcdef"[(b & 0xf) as usize]));
+            }
+        }
+    }
+    if out.len() > 180 {
+        bail!("MCP credential name is too long to store");
+    }
+    Ok(out)
 }
 
 struct McpTool {
@@ -625,6 +691,10 @@ impl Tool for McpTool {
     }
 
     fn needs_approval(&self, _args: &Value) -> bool {
+        true
+    }
+
+    fn handles_cancel(&self) -> bool {
         true
     }
 
@@ -697,7 +767,7 @@ fn convert(r: CallToolResult) -> ToolOutput {
             content.push_str(&s.to_string());
         }
     }
-    ToolOutput { content, is_error: r.is_error.unwrap_or(false), display: None, images: Vec::new() }
+    ToolOutput { content, is_error: r.is_error.unwrap_or(false), display: None, images: Vec::new(), changed: false }
 }
 
 #[cfg(test)]
@@ -769,6 +839,21 @@ mod tests {
     fn names_are_sanitized() {
         assert_eq!(tool_name("my server", "do.it"), "mcp__my_server__do_it");
         assert_eq!(tool_name("s", &"x".repeat(100)).len(), 64);
+        assert_eq!(tool_name("s", "a.b"), tool_name("s", "a/b"));
+        assert_ne!(tool_name("s", &"x".repeat(80)), tool_name("s", &format!("{}y", "x".repeat(79))));
+        assert_eq!(tool_prefix("my server"), "mcp__my_server__");
+    }
+
+    #[test]
+    fn credential_filenames_do_not_collide() {
+        let home = Path::new("/tmp/nyq-home");
+        let a = credential_path(home, "team/api", "https://example.com/mcp").unwrap();
+        let b = credential_path(home, "team_api", "https://example.com/mcp").unwrap();
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().contains("_2f"));
+        assert!(credential_path(home, &"n".repeat(300), "").is_err());
+        let url = reqwest::Url::parse("https://Example.com/mcp").unwrap().to_string();
+        assert_eq!(credential_path(home, "idp", &url).unwrap(), credential_path(home, "idp", "https://example.com/mcp").unwrap());
     }
 
     const FAKE_SERVER: &str = r#"
@@ -1062,7 +1147,8 @@ for line in sys.stdin:
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(page.lock().await.contains("You can close this tab"));
 
-        let file = home.path().join("nyq/mcp-auth/idp_server.json");
+        let endpoint = canonical_endpoint(&cfg.transport).unwrap();
+        let file = credential_path(home.path(), "idp server", &endpoint).unwrap();
         let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(saved["client_id"], "nyq-client");
         assert_eq!(saved["token_response"]["access_token"], "good-token");
@@ -1078,9 +1164,9 @@ for line in sys.stdin:
         let tools = mgr.connect(&cfg).await.unwrap();
         assert!(!tools[0].run(serde_json::json!({}), &ctx).await.is_error);
 
-        assert!(mgr.logout("idp server").await.unwrap());
+        assert!(mgr.logout("idp server", &endpoint).await.unwrap());
         assert!(mgr.connected().is_empty() && !file.exists());
-        assert!(!mgr.logout("idp server").await.unwrap());
+        assert!(!mgr.logout("idp server", &endpoint).await.unwrap());
         let err = mgr.connect(&cfg).await.err().unwrap();
         assert!(format!("{err:#}").contains("needs sign-in"), "{err:#}");
     }

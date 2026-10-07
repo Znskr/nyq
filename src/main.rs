@@ -133,6 +133,7 @@ async fn run() -> Result<()> {
         usage: Usage::default(),
         context_window: 0,
         context_tokens: 0,
+        context_estimated: false,
         suppress_auto_compact: false,
         sandbox,
         undo: Default::default(),
@@ -152,6 +153,7 @@ async fn run() -> Result<()> {
         let (s, meta, items) = session::load(&sessions_dir, which, &cwd)?;
         agent.session = Some(s);
         agent.items = items;
+        agent.adopt_transcript();
         resumed = Some(meta);
     }
 
@@ -175,7 +177,10 @@ async fn run() -> Result<()> {
         connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
         let mut plain = ui::PlainUi::new(cli.yolo);
         let cancel = cancel_on_ctrl_c();
-        let (item, _) = tools::image::user_message(&text, &cwd)?;
+        let (item, _, warning) = tools::image::user_turn(&text, &cwd);
+        if let Some(warning) = warning {
+            ui::error(&warning);
+        }
         let r = agent.turn(item, &mut plain, cancel).await;
         mcp.shutdown().await;
         return r.map(|_| ());
@@ -271,7 +276,8 @@ async fn run() -> Result<()> {
                 s.queue.drain(..).map(|(_, t)| t).collect::<Vec<_>>()
             }
         };
-        let (commands, messages): (Vec<String>, Vec<String>) = leftover.into_iter().partition(|t| t.starts_with('/'));
+        let (commands, messages): (Vec<String>, Vec<String>) =
+            leftover.into_iter().partition(|t| is_slash_command(t));
         match result {
             Ok(TurnEnd::Done) => {}
             Ok(TurnEnd::Cancelled) => ui::info("Interrupted."),
@@ -303,7 +309,7 @@ fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::Mode
     match models::build(home, choice, effort.clone()) {
         Ok(provider) => {
             agent.provider = provider;
-            agent.context_window = config::context_window_for(&choice.provider, choice.context_window);
+            agent.set_context_window(config::context_window_for(&choice.provider, choice.context_window));
             if let Err(e) = models::save_last(home, choice, effort.as_deref()) {
                 ui::error(&format!("could not remember the model: {e:#}"));
             }
@@ -392,14 +398,36 @@ async fn connect_profile_servers(mcp: &mut McpManager, agent: &mut Agent, server
     }
 }
 
+fn drop_server_tools(agent: &mut Agent, mcp: &McpManager, name: &str) {
+    let names = mcp.registered_names(name);
+    agent.tools.remove_names(&names);
+    agent.tools.remove_prefix(&mcp::tool_prefix(name));
+}
+
+fn install_mcp_tools(agent: &mut Agent, name: &str, tools: Vec<Box<dyn tools::Tool>>) -> Result<()> {
+    let mut added = Vec::new();
+    for tool in tools {
+        let n = tool.spec().name.clone();
+        if let Err(e) = agent.tools.try_insert(tool) {
+            agent.tools.remove_names(&added);
+            agent.tools.remove_prefix(&mcp::tool_prefix(name));
+            anyhow::bail!("MCP {name}: {e}");
+        }
+        added.push(n);
+    }
+    Ok(())
+}
+
 async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig, quiet: bool) {
+    drop_server_tools(agent, mcp, &cfg.name);
     match mcp.connect(cfg).await {
         Ok(tools) => {
-            if !quiet {
-                ui::info(&format!("MCP {}: {} tools", cfg.name, tools.len()));
-            }
-            for t in tools {
-                agent.tools.add(t);
+            let n = tools.len();
+            if let Err(e) = install_mcp_tools(agent, &cfg.name, tools) {
+                ui::error(&format!("{e:#}"));
+                let _ = mcp.disconnect(&cfg.name).await;
+            } else if !quiet {
+                ui::info(&format!("MCP {}: {n} tools", cfg.name));
             }
         }
         Err(e) => ui::error(&format!("MCP {}: {e:#}", cfg.name)),
@@ -438,7 +466,7 @@ fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
     }
     Ok(all
         .iter()
-        .map(|m| format!("{}  {}  {}  {}", &m.id[..8.min(m.id.len())], m.created.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"), m.cwd.display(), m.title))
+        .map(|m| format!("{}  {}  {}  {}", session_label(&m.id), m.created.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"), m.cwd.display(), m.title))
         .collect())
 }
 
@@ -448,6 +476,7 @@ fn resume_session(agent: &mut Agent, sessions_dir: &std::path::Path, which: &str
     agent.reset(Some(s));
     ui::replay(&items);
     agent.items = items;
+    agent.adopt_transcript();
     ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     Ok(())
 }
@@ -532,6 +561,7 @@ async fn slash(
         "/model" => match arg.first() {
             Some(m) => {
                 agent.provider.set_model(m.to_string());
+                agent.suppress_auto_compact = false;
                 ui::info(&format!("Model set to {m}."));
             }
             None => ui::info(&format!("{} · {}", agent.provider.name(), agent.provider.model())),
@@ -552,26 +582,27 @@ async fn slash(
             }
             (Some("login"), Some(name)) => {
                 let cfg = servers.iter().find(|s| s.name == name).with_context(|| format!("no MCP server named `{name}`"))?;
+                drop_server_tools(agent, mcp, name);
                 let tools = mcp
                     .login(cfg, |url| {
                         ui::info(&format!("Sign in to {name} in your browser (waiting up to 5 minutes):\n  {url}"));
                         mcp::open_browser(url);
                     })
                     .await?;
-                agent.tools.remove_prefix(&format!("mcp__{name}__"));
-                ui::info(&format!("MCP {name}: signed in · {} tools", tools.len()));
-                for t in tools {
-                    agent.tools.add(t);
-                }
+                let n = tools.len();
+                install_mcp_tools(agent, name, tools)?;
+                ui::info(&format!("MCP {name}: signed in · {n} tools"));
             }
             (Some("logout"), Some(name)) => {
-                let existed = mcp.logout(name).await?;
-                agent.tools.remove_prefix(&format!("mcp__{name}__"));
+                let cfg = servers.iter().find(|s| s.name == name).with_context(|| format!("no MCP server named `{name}`"))?;
+                let endpoint = mcp::canonical_endpoint(&cfg.transport)?;
+                drop_server_tools(agent, mcp, name);
+                let existed = mcp.logout(name, &endpoint).await?;
                 ui::info(&if existed { format!("Signed out of {name}.") } else { format!("No saved sign-in for {name}.") });
             }
             (Some("disconnect"), Some(name)) => {
+                drop_server_tools(agent, mcp, name);
                 mcp.disconnect(name).await?;
-                agent.tools.remove_prefix(&format!("mcp__{name}__"));
                 ui::info(&format!("Disconnected {name}."));
             }
             _ => {
@@ -602,6 +633,14 @@ async fn slash(
     Ok(true)
 }
 
+fn session_label(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn is_slash_command(text: &str) -> bool {
+    text.trim_start().starts_with('/')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +654,13 @@ mod tests {
         assert_eq!(parse(&["nyq", "--resume=abc", "hello"]).prompt, ["hello"]);
         assert_eq!(parse(&["nyq", "hi"]).resume, None);
         assert!(parse(&["nyq", "-c"]).continue_last);
+    }
+
+    #[test]
+    fn session_id_prefix_is_char_aligned() {
+        assert_eq!(session_label("ééééé"), "ééééé");
+        assert_eq!(session_label("ééééééééEXTRA").chars().count(), 8);
+        assert!(is_slash_command("  /model x"));
+        assert!(!is_slash_command("  model"));
     }
 }

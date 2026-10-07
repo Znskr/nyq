@@ -23,7 +23,67 @@ pub fn paint(color: bool, style: Style, s: &str) -> String {
 
 /// First line of `s`, trimmed and capped at `max` chars; appends `…` when
 /// anything was cut.
+/// Drop terminal controls from untrusted text. Newlines stay, tabs expand to
+/// stops of 8, and CSI / OSC sequences are consumed.
+pub fn sanitize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut col = 0usize;
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            '\t' => {
+                let n = 8 - (col % 8);
+                out.extend(std::iter::repeat_n(' ', n));
+                col += n;
+            }
+            '\u{1b}' => consume_escape(&mut chars),
+            c if c.is_control() => {}
+            c => {
+                out.push(c);
+                col += c.width().unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
+fn consume_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.peek().copied() {
+        Some('[') => {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        Some(']') => {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\u{7}' {
+                    break;
+                }
+                if c == '\u{1b}' {
+                    if chars.peek() == Some(&'\\') {
+                        chars.next();
+                    }
+                    break;
+                }
+            }
+        }
+        Some(c) if c.is_ascii() && !c.is_control() => {
+            chars.next();
+        }
+        _ => {}
+    }
+}
+
 pub fn one_line(s: &str, max: usize) -> String {
+    let s = sanitize_text(s);
     let s = s.trim();
     let first = s.lines().next().unwrap_or("").trim_end();
     let mut out: String = first.chars().take(max).collect();
@@ -405,6 +465,18 @@ mod tests {
         assert_eq!(one_line("  hello  ", 10), "hello");
         assert_eq!(one_line("abcdef", 3), "abc…");
         assert_eq!(one_line("a\nb", 10), "a…");
+    }
+
+    #[test]
+    fn sanitize_strips_terminal_controls() {
+        assert_eq!(sanitize_text("a\nb"), "a\nb");
+        assert_eq!(sanitize_text("a\tb"), format!("a{}b", " ".repeat(7)));
+        assert_eq!(sanitize_text("\u{1b}[2Jhi"), "hi");
+        assert_eq!(sanitize_text("\u{1b}]0;title\u{7}ok"), "ok");
+        assert_eq!(sanitize_text("\u{1b}]52;c;eA==\u{1b}\\z"), "z");
+        assert_eq!(sanitize_text("a\u{8}b\r"), "ab");
+        let once = sanitize_text("a\tb\u{1b}[0m");
+        assert_eq!(sanitize_text(&once), once);
     }
 
     fn lines(md: &str) -> Vec<String> {
