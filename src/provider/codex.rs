@@ -153,7 +153,8 @@ impl CodexProvider {
             Item::ToolCall { id, name, arguments } => json!({"type":"function_call","call_id":id,"name":name,"arguments":arguments}),
             Item::ToolResult { id, output, .. } => json!({"type":"function_call_output","call_id":id,"output":output}),
         })).collect();
-        let tools: Vec<_> = req.tools.iter().map(|t| json!({"type":"function","name":t.name,"description":t.description,"parameters":t.parameters,"strict":false})).collect();
+        // Codex has native web search; it replaces our DuckDuckGo function tool.
+        let tools: Vec<_> = req.tools.iter().map(|t| if t.name == "web_search" { json!({"type":"web_search"}) } else { json!({"type":"function","name":t.name,"description":t.description,"parameters":t.parameters,"strict":false}) }).collect();
         let mut body = json!({"model":self.model,"store":false,"stream":true,"instructions":req.system,"input":input,"tools":tools,"tool_choice":"auto","parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"text":{"verbosity":"low"}});
         if let Some(effort) = &self.effort {
             body["reasoning"] =
@@ -280,6 +281,9 @@ fn output_item(item: &Value) -> Option<Item> {
 
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
+    fn fork(&self) -> Box<dyn Provider> {
+        Box::new(Self::new(self.auth_path.clone(), self.model.clone(), self.effort.clone()))
+    }
     fn name(&self) -> &str {
         "codex"
     }
@@ -311,6 +315,7 @@ impl Provider for CodexProvider {
         let mut items = BTreeMap::new();
         let mut response = Response::default();
         let mut completed = false;
+        let mut searches = std::collections::HashSet::new();
         while let Some(event) = events.next().await {
             let event = event?;
             if event.data.trim() == "[DONE]" {
@@ -330,6 +335,18 @@ impl Provider for CodexProvider {
                         id: sse::string(&data["item"], "call_id"),
                         name: sse::string(&data["item"], "name"),
                     });
+                }
+                // Native web search runs server-side: show activity, but it
+                // is not a tool call for us to run (and is never replayed).
+                "response.output_item.added" | "response.output_item.done"
+                    if data["item"]["type"] == "web_search_call" =>
+                {
+                    let item = &data["item"];
+                    let id = sse::string(item, "id");
+                    let has_query = item["action"]["query"].as_str().is_some();
+                    if (kind == "response.output_item.added" || has_query) && searches.insert(id.clone()) {
+                        on_event(StreamEvent::ToolCallStart { id, name: "web_search".into() });
+                    }
                 }
                 "response.output_item.done" => {
                     if let Some(item) = output_item(&data["item"]) {
@@ -594,6 +611,43 @@ mod tests {
             assert!(request.contains(header));
         }
         assert!(request.contains(&format!("session_id: {}", provider.session_id)));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_web_search() {
+        let _lock = ENV.lock().unwrap();
+        let _env = Env;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = CodexProvider::new(auth_file(&dir, i64::MAX), "test".into(), None);
+        let tools = vec![
+            ToolSpec { name: "web_search".into(), description: "ddg".into(), parameters: json!({"type":"object"}) },
+            ToolSpec { name: "web_fetch".into(), description: "fetch".into(), parameters: json!({"type":"object"}) },
+        ];
+        let req = || Request { system: "", items: &[], tools: &tools };
+        let body = provider.body(req());
+        assert_eq!(body["tools"][0], json!({"type":"web_search"}));
+        assert_eq!(body["tools"][1]["name"], "web_fetch");
+
+        let events = events(&[
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}),
+            json!({"type":"response.web_search_call.searching","output_index":0,"item_id":"ws_1"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"rust","sources":[]},"extra":1}}),
+            // A search only reported on completion still shows activity once.
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"web_search_call","id":"ws_2","status":"completed","action":{"type":"search","query":"more"}}}),
+            json!({"type":"response.output_item.done","output_index":2,"item":{"type":"web_search_call","id":"ws_3","status":"completed","action":{"type":"open_page","url":"https://x.org"}}}),
+            json!({"type":"response.output_item.done","output_index":3,"item":{"type":"message","content":[{"type":"output_text","text":"found it"}]}}),
+            completed(),
+        ]);
+        let (url, mut requests, task) = server(vec![(200, events)]).await;
+        Env::set("NYQ_CODEX_URL", &url);
+        let mut received = Vec::new();
+        let response = provider.stream(req(), &mut |e| received.push(e)).await.unwrap();
+        assert_eq!(response.items, vec![Item::Assistant { text: "found it".into() }]);
+        let start = |id: &str| StreamEvent::ToolCallStart { id: id.into(), name: "web_search".into() };
+        assert_eq!(received, vec![start("ws_1"), start("ws_2")]);
+        let request = requests.recv().await.unwrap();
+        assert!(request.contains(r#"{"type":"web_search"}"#));
         task.await.unwrap();
     }
 

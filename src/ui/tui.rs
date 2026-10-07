@@ -96,6 +96,13 @@ struct PendingApproval {
     reply: oneshot::Sender<Approval>,
 }
 
+struct PendingQuestion {
+    question: String,
+    options: Vec<String>,
+    selected: usize,
+    reply: oneshot::Sender<Option<String>>,
+}
+
 struct MenuItem {
     label: String,
     detail: String,
@@ -143,6 +150,7 @@ pub struct Screen {
     pub editor: Editor,
     pub queue: Vec<(Queued, String)>,
     approval: Option<PendingApproval>,
+    question: Option<PendingQuestion>,
     tools: Vec<ToolRow>,
     menu: Option<ModelMenu>,
     slash_selected: usize,
@@ -364,6 +372,7 @@ impl Screen {
             editor,
             queue: Vec::new(),
             approval: None,
+            question: None,
             tools: Vec::new(),
             menu: None,
             slash_selected: 0,
@@ -511,7 +520,22 @@ impl Screen {
             }
             cursor_row = top + view.cursor_row;
             cursor_col = 2 + view.cursor_col;
-            if !self.menu_rows(&mut rows) {
+            if let Some(q) = &self.question {
+                rows.push(rule(w));
+                rows.push(paint(fg(BRIGHT).bold(), "Question"));
+                for l in wrap(&q.question, w.saturating_sub(2)) {
+                    rows.push(paint(fg(MID), &l));
+                }
+                rows.push(String::new());
+                for (i, o) in q.options.iter().enumerate() {
+                    let sel = i == q.selected;
+                    let lead = if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() };
+                    let text = truncate(&format!("{}. {o}", i + 1), w.saturating_sub(2));
+                    rows.push(format!("{lead}{}", if sel { paint(fg(BRIGHT).bold(), &text) } else { paint(fg(MID), &text) }));
+                }
+                rows.push(rule(w));
+                rows.push(hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("type", "Own answer"), ("Esc", "Skip")]));
+            } else if !self.menu_rows(&mut rows) {
                 rows.push(String::new());
                 rows.push(self.footer_line());
             }
@@ -671,6 +695,16 @@ impl Screen {
         let mut rows = self.begin(Block::Info);
         rows.extend(text.lines().map(|l| paint(style, l)));
         self.emit(&rows);
+    }
+
+    /// Rows that should each stay on one screen line (listings).
+    pub fn print_list(&mut self, lines: &[String]) {
+        let w = self.width;
+        let rows: Vec<String> = lines.iter().map(|l| paint(fg(MID), &truncate(&format!("  {l}"), w))).collect();
+        self.flush_all();
+        let mut out = self.begin(Block::Info);
+        out.extend(rows);
+        self.emit(&out);
     }
 
     pub fn print_error(&mut self, text: &str) {
@@ -862,6 +896,41 @@ impl Screen {
         self.editor.set_text(&parts.join("\n\n"));
     }
 
+    /// Copy text to the clipboard: a native tool when one is available, and
+    /// always the OSC 52 terminal escape (works over SSH in most terminals).
+    pub fn copy(&mut self, text: &str) -> &'static str {
+        use base64::Engine;
+        let osc = format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text));
+        let _ = self.out.write_all(osc.as_bytes());
+        let _ = self.out.flush();
+        let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+            &[("pbcopy", &[])]
+        } else if cfg!(windows) {
+            &[("clip.exe", &[])]
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
+        } else {
+            &[("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])]
+        };
+        for (cmd, args) in tools {
+            let child = std::process::Command::new(cmd)
+                .args(*args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let Ok(mut child) = child {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                if child.wait().is_ok_and(|s| s.success()) {
+                    return cmd;
+                }
+            }
+        }
+        "terminal (OSC 52)"
+    }
+
     /// Open the model switcher; `models` arrive later via `set_models`.
     pub fn open_models(&mut self) {
         self.menu = Some(ModelMenu { choices: Vec::new(), tabs: vec!["All".into()], tab: 0, filter: String::new(), selected: 0, loading: true, warnings: Vec::new() });
@@ -946,6 +1015,31 @@ impl Screen {
         }
         if self.menu.is_some() {
             return self.on_menu_key(key, commands);
+        }
+        if let Some(q) = &mut self.question {
+            let n = q.options.len().max(1);
+            match key.code {
+                KeyCode::Up if self.editor.is_empty() => q.selected = q.selected.checked_sub(1).unwrap_or(n - 1),
+                KeyCode::Down if self.editor.is_empty() => q.selected = (q.selected + 1) % n,
+                KeyCode::Char(d @ '1'..='9') if self.editor.is_empty() && (d as usize - '1' as usize) < q.options.len() => {
+                    q.selected = d as usize - '1' as usize;
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    let q = self.question.take().unwrap();
+                    let typed = self.editor.text();
+                    let answer = if typed.trim().is_empty() { q.options.get(q.selected).cloned() } else { Some(typed) };
+                    self.editor.set_text("");
+                    let _ = q.reply.send(answer);
+                }
+                KeyCode::Esc => {
+                    let q = self.question.take().unwrap();
+                    let _ = q.reply.send(None);
+                }
+                _ => {
+                    self.editor.handle_key(key, true);
+                }
+            }
+            return self.redraw();
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('l') {
@@ -1275,6 +1369,21 @@ impl Ui for TuiUi {
 
     fn notice(&mut self, msg: &str) {
         self.s().print_info(&format!("  {msg}"), fg(GRAY));
+    }
+
+    async fn ask(&mut self, question: &str, options: &[String]) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut s = self.s();
+            s.flush_all();
+            s.question = Some(PendingQuestion { question: question.to_string(), options: options.to_vec(), selected: 0, reply: tx });
+            s.redraw();
+        }
+        let answer = rx.await.ok().flatten();
+        let mut s = self.s();
+        let shown = answer.clone().unwrap_or_else(|| "(skipped)".into());
+        s.print_info(&format!("{} {}\n  {}", paint(fg(BRIGHT), "?"), paint(fg(MID), question), paint(fg(GRAY), &shown)), Style::new());
+        answer
     }
 
     fn take_steering(&mut self) -> Vec<Item> {

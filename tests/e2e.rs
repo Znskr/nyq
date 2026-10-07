@@ -78,7 +78,7 @@ fn print_mode_runs_tools_and_answers() {
     let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
         .args(["--print", "--yolo", "--sandbox", "off", "copy the notes"])
         .current_dir(work.path())
-        .env("NYQ_HOME", home.path())
+        .env("NYQ_HOME", home.path()).env("HOME", home.path())
         .env("NYQ_BASE_URL", &url)
         .env("NYQ_MODEL", "fake-model")
         .env_remove("NYQ_API_KEY")
@@ -108,7 +108,7 @@ fn print_mode_runs_tools_and_answers() {
     // The conversation was saved and is listed.
     let list = Command::new(env!("CARGO_BIN_EXE_nyq"))
         .arg("sessions")
-        .env("NYQ_HOME", home.path())
+        .env("NYQ_HOME", home.path()).env("HOME", home.path())
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&list.stdout).contains("copy the notes"));
@@ -130,7 +130,7 @@ fn print_mode_denies_mutations_without_yolo() {
     let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
         .args(["-p", "--sandbox", "off", "write x"])
         .current_dir(work.path())
-        .env("NYQ_HOME", home.path())
+        .env("NYQ_HOME", home.path()).env("HOME", home.path())
         .env("NYQ_BASE_URL", &url)
         .env("NYQ_MODEL", "fake-model")
         .output()
@@ -157,7 +157,7 @@ fn print_command(work: &std::path::Path, home: &std::path::Path, url: &str) -> C
         "openai",
     ])
     .current_dir(work)
-    .env("NYQ_HOME", home)
+    .env("NYQ_HOME", home).env("HOME", home)
     .env("NYQ_BASE_URL", url)
     .env("NYQ_MODEL", "fake-model")
     .env("NYQ_CONTEXT_WINDOW", "1000")

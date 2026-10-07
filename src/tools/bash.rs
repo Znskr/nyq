@@ -233,7 +233,7 @@ mod tests {
         // Sandbox enforcement is covered by tests/sandbox.rs, which can
         // re-exec the real binary; here the test harness is current_exe().
         let sandbox = std::sync::Arc::new(crate::sandbox::Policy { mode: crate::sandbox::Mode::Off, ..Default::default() });
-        ToolCtx { cwd: dir.to_path_buf(), cancel: cancel.clone(), sandbox }
+        ToolCtx { cwd: dir.to_path_buf(), cancel: cancel.clone(), sandbox, ..Default::default() }
     }
 
     async fn run(args: Value) -> ToolOutput {
