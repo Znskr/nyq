@@ -181,8 +181,11 @@ impl CodexProvider {
             !auth.read_only,
             "the codex CLI login has expired; run `codex` once to refresh it"
         );
-        let url = std::env::var("NYQ_CODEX_TOKEN_URL")
-            .unwrap_or_else(|_| "https://auth.openai.com/oauth/token".into());
+        let url = std::env::var("NYQ_CODEX_TOKEN_URL").unwrap_or_else(|_| {
+            let issuer = std::env::var("NYQ_CODEX_ISSUER")
+                .unwrap_or_else(|_| "https://auth.openai.com".into());
+            format!("{}/oauth/token", issuer.trim_end_matches('/'))
+        });
         let result: Value = sse::checked(self.client.post(url).json(&json!({"client_id":"app_EMoamEEZ73f0CkXaXp7hrann","grant_type":"refresh_token","refresh_token":auth.refresh_token})).send().await?).await?.json().await?;
         let mut refreshed = auth.clone();
         refreshed.access_token = result["access_token"]

@@ -2,9 +2,11 @@
 //! takes a `color` flag; with `color == false` the input text is preserved.
 
 use nu_ansi_term::{Color, Style};
+use unicode_width::UnicodeWidthChar;
 
 const CODE_BLOCK: Color = Color::Rgb(208, 208, 208);
 const INLINE_CODE: Color = Color::Rgb(138, 138, 138);
+const TABLE_LINE: Color = Color::Rgb(88, 88, 88);
 
 pub fn dim() -> Style {
     Style::new().dimmed()
@@ -108,6 +110,154 @@ pub fn inline(s: &str, color: bool) -> String {
         }
     }
     out.push_str(&s[lit..]);
+    out
+}
+
+/// Display width of text that may contain ANSI escapes.
+pub fn visible_width(s: &str) -> usize {
+    let mut w = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            w += c.width().unwrap_or(0);
+        }
+    }
+    w
+}
+
+/// Cut plain text to at most `width` columns, marking the cut with `…`.
+pub fn truncate(s: &str, width: usize) -> String {
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw + 1 > width {
+            break;
+        }
+        w += cw;
+        out.push(c);
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
+}
+
+/// Cells of a markdown table row: outer pipes dropped, `\|` unescaped.
+pub fn table_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = if t.ends_with('|') && !t.ends_with("\\|") { &t[..t.len() - 1] } else { t };
+    let mut cells = vec![String::new()];
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => cells.last_mut().unwrap().push(chars.next().unwrap()),
+            '|' => cells.push(String::new()),
+            c => cells.last_mut().unwrap().push(c),
+        }
+    }
+    cells.iter().map(|c| c.trim().to_string()).collect()
+}
+
+/// A table's header separator row, like `|---|:--:|`.
+pub fn is_table_sep(line: &str) -> bool {
+    line.contains('-')
+        && table_cells(line).iter().all(|c| {
+            let d = c.strip_prefix(':').unwrap_or(c);
+            let d = d.strip_suffix(':').unwrap_or(d);
+            !d.is_empty() && d.chars().all(|ch| ch == '-')
+        })
+}
+
+/// Column widths for `natural` widths and `sep`-wide gaps within `width`:
+/// the widest columns give way first, down to 3 columns each.
+fn fit_columns(natural: &[usize], sep: usize, width: usize) -> Vec<usize> {
+    let mut w = natural.to_vec();
+    let budget = width.saturating_sub(sep * w.len().saturating_sub(1));
+    while w.iter().sum::<usize>() > budget {
+        let (i, &max) = w.iter().enumerate().max_by_key(|(i, &c)| (c, std::cmp::Reverse(*i))).unwrap();
+        if max <= 3 {
+            break;
+        }
+        w[i] -= 1;
+    }
+    w
+}
+
+/// Lay out a markdown table (header, separator and body lines) in `width`
+/// columns with light box-drawing separators.
+pub fn table(lines: &[String], width: usize, color: bool) -> Vec<String> {
+    let line_style = Style::new().fg(TABLE_LINE);
+    let header_style = Style::new().fg(Color::Rgb(238, 238, 238)).bold();
+    let aligns: Vec<(bool, bool)> = lines.get(1).map(|l| table_cells(l)).unwrap_or_default().iter().map(|c| (c.starts_with(':'), c.ends_with(':'))).collect();
+    let n = aligns.len().max(1);
+    let rows: Vec<Vec<String>> = lines
+        .iter()
+        .take(1)
+        .chain(lines.iter().skip(2))
+        .map(|l| {
+            let mut cells: Vec<String> = table_cells(l).into_iter().map(|c| inline(&c, color)).collect();
+            cells.resize(n, String::new());
+            cells
+        })
+        .collect();
+    let natural: Vec<usize> = (0..n).map(|c| rows.iter().map(|r| visible_width(&r[c])).max().unwrap_or(0).max(1)).collect();
+    let widths = fit_columns(&natural, 3, width);
+    let mut out = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .enumerate()
+            .map(|(c, (cell, &w))| {
+                let text = if visible_width(cell) > w { truncate(&strip_ansi(cell), w) } else { cell.clone() };
+                let pad = w.saturating_sub(visible_width(&text));
+                let (left, right) = match aligns.get(c).copied().unwrap_or_default() {
+                    (true, true) => (pad / 2, pad - pad / 2),
+                    (false, true) => (pad, 0),
+                    _ if c + 1 == n => (0, 0),
+                    _ => (0, pad),
+                };
+                // The header is uniformly bright and bold (inline styles dropped).
+                let text = if r == 0 { paint(color, header_style, &strip_ansi(&text)) } else { text };
+                format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
+            })
+            .collect();
+        out.push(cells.join(&paint(color, line_style, " │ ")).trim_end().to_string());
+        if r == 0 {
+            let rule: Vec<String> = widths.iter().map(|&w| "─".repeat(w)).collect();
+            out.push(paint(color, line_style, &rule.join("─┼─")));
+        }
+    }
+    out
+}
+
+/// `s` without ANSI escape sequences.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
     out
 }
 
@@ -235,5 +385,56 @@ mod tests {
         assert_eq!(one_line("  hello  ", 10), "hello");
         assert_eq!(one_line("abcdef", 3), "abc…");
         assert_eq!(one_line("a\nb", 10), "a…");
+    }
+
+    fn lines(md: &str) -> Vec<String> {
+        md.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn table_cells_and_separators() {
+        assert_eq!(table_cells("| a | b |"), vec!["a", "b"]);
+        assert_eq!(table_cells("a|b"), vec!["a", "b"]);
+        assert_eq!(table_cells(r"| x \| y | |"), vec!["x | y", ""]);
+        assert!(is_table_sep("|---|:--:|---:|"));
+        assert!(is_table_sep("--- | ---"));
+        assert!(!is_table_sep("| a | b |"));
+        assert!(!is_table_sep("|   |   |"));
+        assert!(!is_table_sep(""));
+    }
+
+    #[test]
+    fn table_aligns_columns() {
+        let t = lines("| Name | Size |\n|------|-----:|\n| main.rs | 12 |\n| a | 1234 |");
+        assert_eq!(
+            table(&t, 80, false),
+            vec!["Name    │ Size", "────────┼─────", "main.rs │   12", "a       │ 1234"]
+        );
+        // Centered columns, missing and extra cells.
+        let t = lines("|a|b|c|\n|:-:|---|---|\n|x|\n|1|2|3|4|");
+        assert_eq!(table(&t, 80, false), vec!["a │ b │ c", "──┼───┼──", "x │   │", "1 │ 2 │ 3"]);
+    }
+
+    #[test]
+    fn wide_tables_shrink_the_widest_columns() {
+        let t = lines("| id | description |\n|---|---|\n| 1 | a very long description that does not fit |");
+        let out = table(&t, 24, false);
+        assert!(out.iter().all(|l| visible_width(l) <= 24), "{out:?}");
+        assert_eq!(out[0], "id │ description");
+        assert_eq!(out[2], "1  │ a very long descri…");
+        // Columns never shrink below three cells; then the row just overflows.
+        let t = lines("|aaaaaa|bbbbbb|\n|-|-|\n|x|y|");
+        assert_eq!(table(&t, 4, false)[0], "aa… │ bb…");
+        assert_eq!(fit_columns(&[10, 4, 10], 3, 20), vec![5, 4, 5]);
+        assert_eq!(fit_columns(&[2, 3], 3, 80), vec![2, 3]);
+    }
+
+    #[test]
+    fn table_with_color_keeps_widths() {
+        let t = lines("| k | v |\n|---|---|\n| `code` | **bold** |");
+        let out = table(&t, 80, true);
+        assert_eq!(visible_width(&out[2]), "code │ bold".chars().count());
+        assert!(!strip_ansi(&out[2]).contains('`'));
+        assert_eq!(strip_ansi(&out[0]), "k    │ v");
     }
 }

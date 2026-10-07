@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod login;
 mod mcp;
 mod models;
 mod prompt;
@@ -52,8 +53,8 @@ struct Cli {
     /// Continue the most recent conversation in this directory.
     #[arg(short = 'c', long = "continue")]
     continue_last: bool,
-    /// Resume a saved conversation by id (or id prefix).
-    #[arg(short, long, value_name = "ID")]
+    /// Resume a saved conversation by id (or id prefix); without an id, pick one.
+    #[arg(short, long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -63,12 +64,14 @@ struct Cli {
 enum Command {
     /// List saved conversations.
     Sessions,
+    /// Sign in with your ChatGPT subscription (Codex models).
+    Login,
 }
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     ("/new", "start a fresh conversation"),
-    ("/resume", "resume a saved conversation: /resume [id]"),
+    ("/resume", "resume a saved conversation: pick one, or /resume ID|last"),
     ("/sessions", "list saved conversations"),
     ("/model", "switch model or provider (ctrl+l); /model NAME sets the model id"),
     ("/compact", "summarize the conversation to free up context"),
@@ -102,8 +105,18 @@ async fn run() -> Result<()> {
     let sessions_dir = home.join("nyq").join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
 
-    if let Some(Command::Sessions) = cli.command {
-        return list_sessions(&sessions_dir);
+    match cli.command {
+        Some(Command::Sessions) => return list_sessions(&sessions_dir),
+        Some(Command::Login) => {
+            let msg = login::login(&home, |url| {
+                eprintln!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}");
+                login::open_browser(url);
+            })
+            .await?;
+            println!("{msg}");
+            return Ok(());
+        }
+        None => {}
     }
 
     let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
@@ -130,8 +143,10 @@ async fn run() -> Result<()> {
     }
 
     let resume = cli.resume.clone().or_else(|| cli.continue_last.then(|| "last".to_string()));
+    // `-r` without an id opens the session picker once the TUI is up.
+    let pick = resume.as_deref() == Some("");
     let mut resumed = None;
-    if let Some(which) = &resume {
+    if let Some(which) = resume.as_ref().filter(|_| !pick) {
         let (s, meta, items) = session::load(&sessions_dir, which, &cwd)?;
         agent.session = Some(s);
         agent.items = items;
@@ -147,6 +162,7 @@ async fn run() -> Result<()> {
     let mut text = cli.prompt.join(" ");
     let interactive = !cli.print && std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&std::io::stdout());
     if !interactive {
+        anyhow::ensure!(!pick, "-r without an id needs a terminal to pick a session; pass -r ID or -c");
         if text.trim().is_empty() {
             use std::io::Read;
             std::io::stdin().read_to_string(&mut text)?;
@@ -175,6 +191,12 @@ async fn run() -> Result<()> {
     }
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
     agent.tools.add(Box::new(agent::AskUserTool));
+    if pick {
+        // A prompt given with `-r` waits in the editor until a session is picked.
+        tui.screen().editor.set_text(text.trim());
+        text.clear();
+        open_sessions(&tui, &sessions_dir, &agent)?;
+    }
     let mut pending: std::collections::VecDeque<String> = (!text.trim().is_empty()).then_some(text).into_iter().collect();
     // The model's catalog entry, once picked in the switcher (for its efforts).
     let mut current: Option<models::ModelChoice> = None;
@@ -188,6 +210,12 @@ async fn run() -> Result<()> {
                 Some(UiCommand::SetModel(choice)) => {
                     switch_model(&home, &mut agent, &choice);
                     current = Some(choice);
+                    continue;
+                }
+                Some(UiCommand::Resume(id)) => {
+                    if let Err(e) = resume_session(&mut agent, &sessions_dir, &id) {
+                        ui::error(&format!("{e:#}"));
+                    }
                     continue;
                 }
                 Some(UiCommand::CycleEffort) => {
@@ -411,6 +439,24 @@ fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Switch to a saved session (`id`, id prefix or `last`), replaying it.
+fn resume_session(agent: &mut Agent, sessions_dir: &std::path::Path, which: &str) -> Result<()> {
+    let (s, meta, items) = session::load(sessions_dir, which, &agent.cwd)?;
+    agent.reset(Some(s));
+    ui::replay(&items);
+    agent.items = items;
+    ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+    Ok(())
+}
+
+/// Open the session picker (this folder's sessions first).
+fn open_sessions(tui: &Tui, sessions_dir: &std::path::Path, agent: &Agent) -> Result<()> {
+    let all = session::list(sessions_dir)?;
+    let current = agent.session.as_ref().map(|s| s.id.as_str());
+    tui.screen().open_sessions(all, &agent.cwd, current);
+    Ok(())
+}
+
 fn list_sessions(dir: &std::path::Path) -> Result<()> {
     for l in session_lines(dir)? {
         println!("{l}");
@@ -476,14 +522,10 @@ async fn slash(
                 ui::info("Interrupted.");
             }
         }
-        "/resume" => {
-            let which = arg.first().copied().unwrap_or("last");
-            let (s, meta, items) = session::load(sessions_dir, which, &agent.cwd)?;
-            agent.reset(Some(s));
-            ui::replay(&items);
-            agent.items = items;
-            ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
-        }
+        "/resume" => match arg.first() {
+            Some(which) => resume_session(agent, sessions_dir, which)?,
+            None => open_sessions(tui, sessions_dir, agent)?,
+        },
         "/model" => match arg.first() {
             Some(m) => {
                 agent.provider.set_model(m.to_string());
@@ -555,4 +597,20 @@ async fn slash(
         other => ui::error(&format!("unknown command {other} (try /help)")),
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_flag_value_is_optional() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap();
+        assert_eq!(parse(&["nyq", "-r"]).resume.as_deref(), Some(""));
+        assert_eq!(parse(&["nyq", "--resume"]).resume.as_deref(), Some(""));
+        assert_eq!(parse(&["nyq", "-r", "abc"]).resume.as_deref(), Some("abc"));
+        assert_eq!(parse(&["nyq", "--resume=abc", "hello"]).prompt, ["hello"]);
+        assert_eq!(parse(&["nyq", "hi"]).resume, None);
+        assert!(parse(&["nyq", "-c"]).continue_last);
+    }
 }

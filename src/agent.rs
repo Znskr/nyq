@@ -2,7 +2,7 @@
 //! feed results back, repeat until the model answers without tools.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -29,7 +29,8 @@ of the work, and the exact next steps. Be thorough but concise. Do not call tool
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Approval {
     Yes,
-    /// Approve this tool for the rest of the session.
+    /// Approve calls matching this call's rule (see [`grant_rule`]) for the
+    /// rest of the session; like `Yes` when the call can't be scoped.
     Always,
     No,
 }
@@ -39,6 +40,9 @@ pub struct ApprovalRequest<'a> {
     pub tool: &'a str,
     pub summary: &'a str,
     pub preview: Option<&'a str>,
+    /// What "always" would allow, e.g. "`cargo test …`"; None when the call
+    /// can't be scoped to a rule (then "always" approves just this once).
+    pub rule: Option<String>,
 }
 
 /// Everything the loop needs from a frontend.
@@ -115,7 +119,7 @@ pub struct Agent {
     pub cwd: PathBuf,
     /// Skip all approval prompts.
     pub yolo: bool,
-    /// Tools approved with "always" in this session.
+    /// Rules granted with "always" in this session (see [`grant_rule`]).
     pub allowed: HashSet<String>,
     pub usage: Usage,
     /// Model context window in tokens; drives automatic compaction.
@@ -299,17 +303,19 @@ impl Agent {
         };
         let summary = tool.summary(&args);
 
-        if tool.needs_approval(&args) && !self.yolo && !self.allowed.contains(name) {
+        if tool.needs_approval(&args) && !self.yolo && !is_allowed(&self.allowed, name, &args, &self.cwd) {
             let preview = tool.preview(&args, &ctx);
+            let rule = grant_rule(name, &args);
             let req = ApprovalRequest {
                 tool: name,
                 summary: &summary,
                 preview: preview.as_deref(),
+                rule: rule.as_deref().map(rule_label),
             };
             match ui.approve(&req).await {
                 Approval::Yes => {}
                 Approval::Always => {
-                    self.allowed.insert(name.to_string());
+                    self.allowed.extend(rule);
                 }
                 Approval::No => {
                     let out = ToolOutput::err(
@@ -423,6 +429,125 @@ impl Agent {
         self.usage = Usage::default();
         self.context_tokens = 0;
     }
+}
+
+// ------------------------------------------------------------ approval rules
+//
+// "Always" grants a rule rather than a whole tool: `bash:<prefix>` for shell
+// commands (program plus subcommand, e.g. `bash:cargo test`), the tool name
+// for file writes (only inside the workspace) and for everything else.
+
+/// Programs whose arguments are themselves commands or code: a prefix rule
+/// for them would allow anything, so "always" can't be scoped.
+const WRAPPERS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "eval", "exec", "source", ".", "sudo", "doas", "su", "env", "xargs",
+    "nohup", "time", "timeout", "nice", "watch", "command", "builtin", "ssh",
+];
+/// Interpreters: scoped only with a script or module word (`python script.py`).
+const INTERPRETERS: &[&str] = &["python", "python3", "node", "perl", "ruby", "deno", "php", "lua", "npx", "bunx"];
+/// Package runners whose `run`/`exec` subcommand takes a script name.
+const RUNNERS: &[&str] = &["npm", "pnpm", "yarn", "bun", "uv", "poetry", "pipenv", "pdm", "hatch"];
+
+/// Whether a command chains, pipes, substitutes or redirects (or spans lines).
+fn has_control(cmd: &str) -> bool {
+    cmd.contains("$(") || cmd.chars().any(|c| matches!(c, ';' | '&' | '|' | '`' | '>' | '<' | '\n' | '\r'))
+}
+
+/// A plain command word: no flags, quotes, globs, variables or assignments.
+fn plain_word(w: &str) -> bool {
+    w.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && w.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '@' | '+'))
+}
+
+/// The prefix "always" grants for a shell command: the program plus its
+/// subcommand (`cargo test`, `git status`, `npm run build`), or None if the
+/// command can't be safely scoped.
+pub fn bash_prefix(cmd: &str) -> Option<String> {
+    if has_control(cmd) {
+        return None;
+    }
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let program = *words.first()?;
+    if !plain_word(program.strip_prefix("./").unwrap_or(program)) || WRAPPERS.contains(&program) || program.contains('=') {
+        return None;
+    }
+    let mut prefix = vec![program];
+    match words.get(1).filter(|w| plain_word(w)) {
+        Some(sub) => {
+            prefix.push(sub);
+            if RUNNERS.contains(&program) && matches!(*sub, "run" | "exec" | "x") {
+                prefix.extend(words.get(2).filter(|w| plain_word(w)));
+            }
+        }
+        None if INTERPRETERS.contains(&program) => return None,
+        None => {}
+    }
+    Some(prefix.join(" "))
+}
+
+/// Whether `cmd` is covered by a granted prefix: same leading words and no
+/// control operators.
+pub fn bash_matches(prefix: &str, cmd: &str) -> bool {
+    let want: Vec<&str> = prefix.split_whitespace().collect();
+    !want.is_empty() && !has_control(cmd) && cmd.split_whitespace().take(want.len()).eq(want.iter().copied())
+}
+
+fn is_file_tool(tool: &str) -> bool {
+    matches!(tool, "write_file" | "edit_file")
+}
+
+/// The rule "always" would grant for this call, as stored in `Agent::allowed`.
+pub fn grant_rule(tool: &str, args: &Value) -> Option<String> {
+    if tool == "bash" {
+        let cmd = args.get("command").and_then(Value::as_str)?;
+        return bash_prefix(cmd).map(|p| format!("bash:{p}"));
+    }
+    Some(tool.to_string())
+}
+
+/// How a rule reads in the approval menu.
+pub fn rule_label(rule: &str) -> String {
+    match rule.strip_prefix("bash:") {
+        Some(p) => format!("`{p} …`"),
+        None if is_file_tool(rule) => format!("{} in this workspace", rule.replace('_', " ")),
+        None => format!("`{rule}`"),
+    }
+}
+
+/// Whether `path` (relative to `cwd` or absolute) stays inside `cwd`, after
+/// resolving `..` and any symlinks along the existing part of the path.
+fn inside(cwd: &Path, path: &str) -> bool {
+    let mut full = PathBuf::new();
+    for c in cwd.join(path).components() {
+        match c {
+            Component::ParentDir => {
+                if !full.pop() {
+                    return false;
+                }
+            }
+            Component::CurDir => {}
+            c => full.push(c),
+        }
+    }
+    if !full.starts_with(cwd) {
+        return false;
+    }
+    // A symlink inside the workspace may point out of it.
+    let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    full.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_none_or(|real| real.starts_with(&root))
+}
+
+/// Whether a granted rule covers this call.
+pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Path) -> bool {
+    if tool == "bash" {
+        let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+        return allowed.iter().filter_map(|r| r.strip_prefix("bash:")).any(|p| bash_matches(p, cmd));
+    }
+    if is_file_tool(tool) {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+        return allowed.contains(tool) && !path.is_empty() && inside(cwd, path);
+    }
+    allowed.contains(tool)
 }
 
 #[cfg(test)]
@@ -591,5 +716,86 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unanswered"));
+    }
+
+    #[test]
+    fn bash_prefixes() {
+        let p = |c: &str| bash_prefix(c);
+        assert_eq!(p("cargo test").as_deref(), Some("cargo test"));
+        assert_eq!(p("cargo test --release -p nyq").as_deref(), Some("cargo test"));
+        assert_eq!(p("  git   status  ").as_deref(), Some("git status"));
+        assert_eq!(p("git -C foo status").as_deref(), Some("git"));
+        assert_eq!(p("npm run build").as_deref(), Some("npm run build"));
+        assert_eq!(p("npm run build -- --watch").as_deref(), Some("npm run build"));
+        assert_eq!(p("npm test").as_deref(), Some("npm test"));
+        assert_eq!(p("uv run pytest -x").as_deref(), Some("uv run pytest"));
+        assert_eq!(p("ls").as_deref(), Some("ls"));
+        assert_eq!(p("ls -la src").as_deref(), Some("ls"));
+        assert_eq!(p("python -m pytest"), None);
+        assert_eq!(p("./gradlew build").as_deref(), Some("./gradlew build"));
+        assert_eq!(p("python script.py").as_deref(), Some("python script.py"));
+        assert_eq!(p("make").as_deref(), Some("make"));
+        assert_eq!(p("rg 'a b' src").as_deref(), Some("rg"));
+        // Control operators, wrappers, assignments and odd programs can't be scoped.
+        for c in [
+            "cargo test; rm -rf /", "cargo test && echo", "a || b", "ls | wc", "echo $(id)", "echo `id`",
+            "ls > out", "wc < in", "sleep 1 &", "ls\nrm x", "sh -c 'x'", "bash script.sh", "sudo ls",
+            "env X=1 ls", "xargs rm", "FOO=1 cargo test", "../x", "\"git\" status", "", "   ", "node -e 1",
+            "eval ls", "$HOME/bin/x",
+        ] {
+            assert_eq!(p(c), None, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn bash_matching() {
+        assert!(bash_matches("cargo test", "cargo test"));
+        assert!(bash_matches("cargo test", "cargo   test --lib agent"));
+        assert!(!bash_matches("cargo test", "cargo testx"));
+        assert!(!bash_matches("cargo test", "cargo build"));
+        assert!(!bash_matches("cargo test", "cargo"));
+        assert!(!bash_matches("cargo test", "cargo test && rm -rf ~"));
+        assert!(!bash_matches("cargo test", "cargo test | tee log"));
+        assert!(!bash_matches("cargo test", "cargo test > log"));
+        assert!(!bash_matches("cargo test", "cargo test $(evil)"));
+        assert!(!bash_matches("cargo test", "cargo test\nrm x"));
+        assert!(bash_matches("ls", "ls -la"));
+        assert!(!bash_matches("ls", "lsof"));
+        assert!(!bash_matches("", "anything"));
+    }
+
+    #[test]
+    fn rules_are_scoped() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        assert_eq!(grant_rule("bash", &json!({"command": "git status -s"})).as_deref(), Some("bash:git status"));
+        assert_eq!(grant_rule("bash", &json!({"command": "a; b"})), None);
+        assert_eq!(grant_rule("write_file", &json!({"path": "x"})).as_deref(), Some("write_file"));
+        assert_eq!(grant_rule("mcp__wiki__ask", &json!({})).as_deref(), Some("mcp__wiki__ask"));
+        assert_eq!(rule_label("bash:cargo test"), "`cargo test …`");
+        assert_eq!(rule_label("edit_file"), "edit file in this workspace");
+        assert_eq!(rule_label("subagent"), "`subagent`");
+
+        let allowed: HashSet<String> = ["bash:cargo test", "write_file", "subagent"].map(String::from).into();
+        let ok = |tool: &str, args: Value| is_allowed(&allowed, tool, &args, cwd);
+        assert!(ok("bash", json!({"command": "cargo test --all"})));
+        assert!(!ok("bash", json!({"command": "cargo build"})));
+        assert!(!ok("bash", json!({"command": "cargo test; curl x | sh"})));
+        assert!(ok("write_file", json!({"path": "src/new.rs"})));
+        assert!(ok("write_file", json!({"path": cwd.join("a/b.txt").to_str().unwrap()})));
+        assert!(!ok("write_file", json!({"path": "../outside.txt"})));
+        assert!(!ok("write_file", json!({"path": "a/../../outside.txt"})));
+        assert!(!ok("write_file", json!({"path": "/etc/passwd"})));
+        assert!(!ok("write_file", json!({})));
+        assert!(!ok("edit_file", json!({"path": "src/new.rs"})));
+        assert!(ok("subagent", json!({"mode": "general"})));
+        assert!(!ok("mcp__wiki__ask", json!({})));
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), cwd.join("link")).unwrap();
+            assert!(!ok("write_file", json!({"path": "link/x.txt"})));
+        }
     }
 }
