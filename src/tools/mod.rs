@@ -13,6 +13,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::types::ToolSpec;
 
+/// A path as shown to the model and user: always with `/` separators.
+pub(crate) fn slash_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    if cfg!(windows) { s.replace('\\', "/") } else { s }
+}
+
 #[derive(Clone, Default)]
 pub struct ToolCtx {
     /// Workspace root; relative paths resolve against it.

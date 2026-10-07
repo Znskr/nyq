@@ -159,14 +159,16 @@ async fn terminate(child: &mut Child, pid: u32) -> Option<std::process::ExitStat
 }
 
 fn kill_group(pid: u32, signal: &str) {
-    if pid == 0 || cfg!(not(unix)) {
-        return;
+    #[cfg(unix)]
+    if let Ok(pgid) = i32::try_from(pid) {
+        if pgid > 0 {
+            let sig = if signal == "KILL" { libc::SIGKILL } else { libc::SIGTERM };
+            // SAFETY: plain syscall; a negative pid addresses the process group.
+            unsafe { libc::kill(-pgid, sig) };
+        }
     }
-    let _ = std::process::Command::new("kill")
-        .args([signal, "--", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    #[cfg(not(unix))]
+    let _ = (pid, signal);
 }
 
 /// Collect remaining output; pipes still open after `grace` are abandoned.

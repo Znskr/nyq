@@ -118,7 +118,7 @@ fn collect_glob(root: &Path, matcher: &globset::GlobMatcher) -> Vec<(SystemTime,
             continue;
         }
         let mtime = entry.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
-        found.push((mtime, rel.display().to_string()));
+        found.push((mtime, super::slash_path(rel)));
     }
     found
 }
@@ -233,13 +233,13 @@ fn collect_grep(
                 continue;
             }
             if files_only {
-                matches.push(rel.display().to_string());
+                matches.push(super::slash_path(rel));
             } else {
                 let mut snippet = line.trim().to_string();
                 if snippet.chars().count() > 300 {
                     snippet = snippet.chars().take(300).collect::<String>() + "…";
                 }
-                matches.push(format!("{}:{}: {}", rel.display(), i + 1, snippet));
+                matches.push(format!("{}:{}: {}", super::slash_path(rel), i + 1, snippet));
             }
             if matches.len() >= MAX_GREP {
                 return true;
