@@ -20,9 +20,10 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::{Action, Editor};
-use super::render::{diff, looks_like_diff, one_line, Markdown};
+use super::render::{diff, is_table_sep, looks_like_diff, one_line, table, table_cells, truncate, visible_width, Markdown};
 use crate::agent::{Approval, ApprovalRequest, Ui};
 use crate::models::ModelChoice;
+use crate::session::Meta;
 use crate::tools::ToolOutput;
 use crate::types::{Item, StreamEvent, Usage};
 
@@ -40,6 +41,8 @@ pub enum Command {
     Submit(String),
     /// A model picked in the switcher.
     SetModel(ModelChoice),
+    /// A session picked in the resume picker (its id).
+    Resume(String),
     /// Shift+Tab: next reasoning effort.
     CycleEffort,
     Exit,
@@ -93,6 +96,8 @@ struct ToolRow {
 struct PendingApproval {
     title: String,
     lines: Vec<String>,
+    /// What "always" grants; None when the call can't be scoped.
+    rule: Option<String>,
     reply: oneshot::Sender<Approval>,
 }
 
@@ -132,6 +137,44 @@ impl ModelMenu {
     }
 }
 
+/// The session picker (`/resume`, `nyq -r`).
+struct SessionMenu {
+    sessions: Vec<Meta>,
+    filter: String,
+    selected: usize,
+}
+
+impl SessionMenu {
+    fn visible(&self) -> Vec<&Meta> {
+        let f = self.filter.to_lowercase();
+        self.sessions
+            .iter()
+            .filter(|m| f.is_empty() || m.title.to_lowercase().contains(&f) || m.cwd.to_string_lossy().to_lowercase().contains(&f) || m.id.starts_with(&f))
+            .collect()
+    }
+}
+
+/// "5m ago"-style age of `then` at `now`.
+fn ago(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = (now - then).num_seconds().max(0);
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        86_400..=604_799 => format!("{}d ago", secs / 86_400),
+        604_800..=2_591_999 => format!("{}w ago", secs / 604_800),
+        _ => then.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string(),
+    }
+}
+
+/// Sessions for the picker: this folder's first, each group newest first,
+/// without the current one.
+fn order_sessions(mut all: Vec<Meta>, cwd: &std::path::Path, current: Option<&str>) -> Vec<Meta> {
+    all.retain(|m| Some(m.id.as_str()) != current);
+    all.sort_by_key(|m| (m.cwd != cwd, std::cmp::Reverse(m.created)));
+    all
+}
+
 pub struct Screen {
     out: Stdout,
     width: usize,
@@ -144,6 +187,9 @@ pub struct Screen {
     last_block: Block,
     md: Markdown,
     fence: Option<String>,
+    /// Markdown table lines held back until the table ends (column widths
+    /// depend on every row); a lone line with `|` is a candidate header.
+    table: Vec<String>,
     busy: Option<(String, Instant)>,
     thinking_since: Option<Instant>,
     frame: usize,
@@ -153,6 +199,7 @@ pub struct Screen {
     question: Option<PendingQuestion>,
     tools: Vec<ToolRow>,
     menu: Option<ModelMenu>,
+    sessions: Option<SessionMenu>,
     slash_selected: usize,
     pub footer: Footer,
     cancel: Option<CancellationToken>,
@@ -183,46 +230,6 @@ fn paint(style: Style, s: &str) -> String {
     } else {
         style.paint(s).to_string()
     }
-}
-
-/// Display width of text that may contain ANSI escapes.
-fn visible_width(s: &str) -> usize {
-    let mut w = 0;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            w += c.width().unwrap_or(0);
-        }
-    }
-    w
-}
-
-/// Cut plain text to at most `width` columns, marking the cut with `…`.
-fn truncate(s: &str, width: usize) -> String {
-    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
-    if total <= width {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(0);
-        if w + cw + 1 > width {
-            break;
-        }
-        w += cw;
-        out.push(c);
-    }
-    if width > 0 {
-        out.push('…');
-    }
-    out
 }
 
 /// Soft-wrap plain text into rows of at most `width` columns.
@@ -366,6 +373,7 @@ impl Screen {
             last_block: Block::None,
             md: Markdown::default(),
             fence: None,
+            table: Vec::new(),
             busy: None,
             thinking_since: None,
             frame: 0,
@@ -375,6 +383,7 @@ impl Screen {
             question: None,
             tools: Vec::new(),
             menu: None,
+            sessions: None,
             slash_selected: 0,
             footer,
             cancel: None,
@@ -457,8 +466,14 @@ impl Screen {
         let mut rows = Vec::new();
         match self.live_block {
             Block::Reasoning => {}
-            _ if !self.live.is_empty() => {
-                for r in wrap(&self.live, w.saturating_sub(2)) {
+            _ if !self.live.is_empty() || !self.table.is_empty() => {
+                // A table still streaming shows laid out at the current width.
+                match self.table.len() {
+                    0 => {}
+                    1 => rows.extend(wrap(&self.table[0], w.saturating_sub(2)).into_iter().map(|r| format!("  {r}"))),
+                    _ => rows.extend(self.table_rows(&self.table)),
+                }
+                for r in wrap(&self.live, w.saturating_sub(2)).into_iter().filter(|_| !self.live.is_empty()) {
                     rows.push(format!("  {r}"));
                 }
             }
@@ -510,8 +525,18 @@ impl Screen {
             rows.push(paint(fg(BRIGHT).bold(), "Approve"));
             rows.push(String::new());
             rows.extend(a.lines.iter().cloned());
+            if !a.lines.is_empty() {
+                rows.push(String::new());
+            }
+            let always = match &a.rule {
+                Some(r) => format!("Always allow {r}"),
+                None => "Always: can't be scoped to a rule (chained or wrapped command), approves once".into(),
+            };
+            for (key, text) in [("y", "Yes, once"), ("a", always.as_str()), ("n", "No, tell nyq what to do instead")] {
+                rows.push(format!("{}  {}", paint(fg(BRIGHT), key), paint(fg(MID), &truncate(text, w.saturating_sub(3)))));
+            }
             rows.push(rule(w));
-            rows.push(hints(&[("y", "Once"), ("a", "Always"), ("n", "Deny")]));
+            rows.push(hints(&[("y", "Once"), ("a", "Always"), ("n", "Deny"), ("Esc", "Deny")]));
         } else {
             let view = self.editor.render(w.saturating_sub(2).max(1));
             let top = rows.len();
@@ -603,6 +628,16 @@ impl Screen {
                 })
                 .collect();
             (header, items, m.selected, vec![("↑↓", "Navigate"), ("Tab", "Provider"), ("Enter", "Use"), ("Esc", "Close")])
+        } else if let Some(m) = &self.sessions {
+            let visible = m.visible();
+            let filter = if m.filter.is_empty() { paint(fg(FAINT), "Type to filter") } else { paint(fg(MID), &m.filter) };
+            let header = format!("{} {}  {}", paint(fg(BRIGHT).bold(), "Sessions"), paint(fg(GRAY), &visible.len().to_string()), filter);
+            let now = chrono::Utc::now();
+            let items = visible
+                .iter()
+                .map(|m| MenuItem { label: m.title.clone(), detail: String::new(), tag: format!("{} · {}", ago(m.created, now), tilde(&m.cwd.display().to_string())) })
+                .collect();
+            (header, items, m.selected, vec![("↑↓", "Navigate"), ("Enter", "Resume"), ("Esc", "Close")])
         } else {
             let s = self.editor.suggestions();
             if s.is_empty() || self.approval.is_some() {
@@ -625,15 +660,22 @@ impl Screen {
                 rows.push(paint(fg(YELLOW), &truncate(&format!("  {warn}"), w)));
             }
         }
+        if self.sessions.is_some() && items.is_empty() {
+            rows.push(paint(fg(GRAY), "  No saved sessions found."));
+        }
         let selected = selected.min(items.len().saturating_sub(1));
         let start = selected.saturating_sub(MENU_ROWS - 1);
         let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0).min(32) + 3;
         for (i, item) in items.iter().enumerate().skip(start).take(MENU_ROWS) {
             let sel = i == selected;
             let lead = if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() };
-            let label = format!("{:<label_w$}", truncate(&item.label, label_w - 1));
+            // Rows without a detail column give the label all the room left of the tag.
+            let tag_w = visible_width(&item.tag);
+            let label_w = if item.detail.is_empty() { w.saturating_sub(tag_w + 6).max(8) } else { label_w };
+            let label = truncate(&item.label, label_w - 1);
+            let label = if item.detail.is_empty() { label } else { format!("{label:<label_w$}") };
             let label = if sel { paint(fg(BRIGHT).bold(), &label) } else { paint(fg(MID), &label) };
-            let room = w.saturating_sub(label_w + 4 + item.tag.len());
+            let room = w.saturating_sub(label_w + 4 + tag_w);
             let left = format!("{lead}{label}{}", paint(fg(GRAY), &truncate(&item.detail, room)));
             rows.push(spread(&left, &paint(fg(GRAY), &item.tag), w));
         }
@@ -734,9 +776,11 @@ impl Screen {
         let mut rows = self.begin(Block::Text);
         self.md = Markdown::default();
         self.fence = None;
+        self.table.clear();
         for l in text.trim().lines() {
-            rows.push(self.render_line(l));
+            self.md_line(l, &mut rows);
         }
+        self.flush_table(&mut rows);
         self.emit(&rows);
     }
 
@@ -752,6 +796,39 @@ impl Screen {
                 }
             }
         }
+    }
+
+    /// Feed one finished markdown line into `out`; table lines are held back
+    /// until the table ends.
+    fn md_line(&mut self, line: &str, out: &mut Vec<String>) {
+        if self.fence.is_none() {
+            match self.table.len() {
+                1 if is_table_sep(line) && table_cells(line).len() == table_cells(&self.table[0]).len() => return self.table.push(line.into()),
+                n if n >= 2 && line.contains('|') => return self.table.push(line.into()),
+                _ => self.flush_table(out),
+            }
+            let t = line.trim_start();
+            if line.contains('|') && !t.starts_with("```") && !t.starts_with("~~~") {
+                return self.table.push(line.into());
+            }
+        }
+        out.push(self.render_line(line));
+    }
+
+    /// Emit held-back table lines: laid out if they form a table, else as text.
+    fn flush_table(&mut self, out: &mut Vec<String>) {
+        let lines = std::mem::take(&mut self.table);
+        if lines.len() >= 2 {
+            out.extend(self.table_rows(&lines));
+        } else {
+            for l in lines {
+                out.push(self.render_line(&l));
+            }
+        }
+    }
+
+    fn table_rows(&self, lines: &[String]) -> Vec<String> {
+        table(lines, self.width.saturating_sub(2), true).into_iter().map(|r| format!("  {r}")).collect()
     }
 
     /// Markdown line, indented, with fx-style frames around code blocks.
@@ -793,7 +870,7 @@ impl Screen {
             let done: String = self.live.drain(..=i).collect();
             let mut rows = self.begin(block);
             for line in done.trim_end_matches('\n').split('\n') {
-                rows.push(self.render_line(line));
+                self.md_line(line, &mut rows);
             }
             self.emit(&rows);
         } else {
@@ -804,7 +881,7 @@ impl Screen {
     fn flush_live(&mut self) {
         let block = self.live_block;
         self.live_block = Block::None;
-        if self.live.is_empty() {
+        if self.live.is_empty() && self.table.is_empty() {
             return;
         }
         let text = std::mem::take(&mut self.live);
@@ -813,7 +890,10 @@ impl Screen {
             let secs = self.thinking_since.take().map_or(0, |t| t.elapsed().as_secs());
             rows.push(paint(fg(GRAY).italic(), &thinking_summary(&text, secs, self.width)));
         } else {
-            rows.push(self.render_line(&text));
+            if !text.is_empty() {
+                self.md_line(&text, &mut rows);
+            }
+            self.flush_table(&mut rows);
         }
         self.emit(&rows);
     }
@@ -953,6 +1033,39 @@ impl Screen {
         self.redraw();
     }
 
+    /// Open the session picker over `all` (as from `session::list`).
+    pub fn open_sessions(&mut self, all: Vec<Meta>, cwd: &std::path::Path, current: Option<&str>) {
+        self.sessions = Some(SessionMenu { sessions: order_sessions(all, cwd, current), filter: String::new(), selected: 0 });
+        self.redraw();
+    }
+
+    fn on_sessions_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        let Some(m) = &mut self.sessions else { return };
+        let count = m.visible().len();
+        match key.code {
+            KeyCode::Esc => self.sessions = None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.sessions = None,
+            KeyCode::Up => m.selected = m.selected.checked_sub(1).unwrap_or(count.saturating_sub(1)),
+            KeyCode::Down => m.selected = if count == 0 { 0 } else { (m.selected + 1) % count },
+            KeyCode::Backspace => {
+                m.filter.pop();
+                m.selected = 0;
+            }
+            KeyCode::Enter => {
+                if let Some(id) = m.visible().get(m.selected).map(|m| m.id.clone()) {
+                    let _ = commands.send(Command::Resume(id));
+                    self.sessions = None;
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                m.filter.push(ch);
+                m.selected = 0;
+            }
+            _ => {}
+        }
+        self.redraw();
+    }
+
     fn remember(&mut self, text: &str) {
         self.editor.push_history(text);
         if self.history.last().map(String::as_str) != Some(text) {
@@ -1015,6 +1128,9 @@ impl Screen {
         }
         if self.menu.is_some() {
             return self.on_menu_key(key, commands);
+        }
+        if self.sessions.is_some() {
+            return self.on_sessions_key(key, commands);
         }
         if let Some(q) = &mut self.question {
             let n = q.options.len().max(1);
@@ -1179,7 +1295,7 @@ impl Tui {
                     match ev {
                         Event::Key(k) if k.kind != KeyEventKind::Release => s.on_key(k, &tx),
                         Event::Paste(text) => {
-                            if s.approval.is_none() && s.menu.is_none() {
+                            if s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() {
                                 s.editor.paste(&text);
                             }
                             s.redraw();
@@ -1347,7 +1463,7 @@ impl Ui for TuiUi {
                     lines.push(format!("  {}", paint(fg(MID), &truncate(l, w.saturating_sub(2)))));
                 }
             }
-            s.approval = Some(PendingApproval { title, lines, reply: tx });
+            s.approval = Some(PendingApproval { title, lines, rule: req.rule.clone(), reply: tx });
             s.redraw();
         }
         let answer = rx.await.unwrap_or(Approval::No);
@@ -1444,5 +1560,78 @@ mod tests {
     fn spread_aligns_right() {
         assert_eq!(spread("ab", "cd", 8), "ab    cd");
         assert_eq!(spread("abcdef", "cd", 8), "abcdef");
+    }
+
+    fn screen() -> Screen {
+        let mut s = Screen::new(Footer::default(), Editor::new(Vec::new(), Vec::new()), Vec::new(), PathBuf::new());
+        s.width = 40;
+        s
+    }
+
+    fn feed(s: &mut Screen, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for l in text.lines() {
+            s.md_line(l, &mut out);
+        }
+        s.flush_table(&mut out);
+        out.iter().map(|r| super::super::render::strip_ansi(r)).collect()
+    }
+
+    #[test]
+    fn tables_are_buffered_and_laid_out() {
+        let mut s = screen();
+        let out = feed(&mut s, "Intro\n| a | bb |\n|---|---|\n| 1 | 2 |\n\nafter");
+        assert_eq!(out, vec!["  Intro", "  a │ bb", "  ──┼───", "  1 │ 2", "  ", "  after"]);
+        // While streaming, rows wait until the table ends.
+        let mut out = Vec::new();
+        for l in ["| x | y |", "|---|---|", "| 1 | 2 |"] {
+            s.md_line(l, &mut out);
+        }
+        assert!(out.is_empty() && s.table.len() == 3);
+        s.md_line("done", &mut out);
+        assert_eq!(out.len(), 4);
+        assert!(s.table.is_empty());
+        // A line with a pipe that isn't a table header comes out unchanged.
+        assert_eq!(feed(&mut s, "a | b\nplain"), vec!["  a | b", "  plain"]);
+        assert_eq!(feed(&mut s, "x | y"), vec!["  x | y"]);
+        // Pipes inside code blocks are code.
+        assert_eq!(feed(&mut s, "```\n| a |\n|---|\n```").len(), 4);
+        assert!(s.table.is_empty());
+    }
+
+    fn meta(id: &str, cwd: &str, mins: i64) -> Meta {
+        Meta {
+            id: id.into(),
+            created: chrono::Utc::now() - chrono::Duration::minutes(mins),
+            cwd: cwd.into(),
+            model: String::new(),
+            title: format!("title {id}"),
+            path: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn session_picker_orders_and_filters() {
+        let all = vec![meta("a", "/other", 1), meta("b", "/here", 5), meta("cur", "/here", 0), meta("c", "/here", 2)];
+        let ordered = order_sessions(all, std::path::Path::new("/here"), Some("cur"));
+        let ids: Vec<&str> = ordered.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["c", "b", "a"]);
+        let mut m = SessionMenu { sessions: ordered, filter: "other".into(), selected: 0 };
+        assert_eq!(m.visible().len(), 1);
+        m.filter = "TITLE B".into();
+        assert_eq!(m.visible()[0].id, "b");
+    }
+
+    #[test]
+    fn relative_times() {
+        let now = chrono::Utc::now();
+        let ago_s = |s: i64| ago(now - chrono::Duration::seconds(s), now);
+        assert_eq!(ago_s(5), "just now");
+        assert_eq!(ago_s(-5), "just now");
+        assert_eq!(ago_s(120), "2m ago");
+        assert_eq!(ago_s(3 * 3600), "3h ago");
+        assert_eq!(ago_s(2 * 86_400), "2d ago");
+        assert_eq!(ago_s(15 * 86_400), "2w ago");
+        assert_eq!(ago_s(400 * 86_400).len(), 10);
     }
 }
