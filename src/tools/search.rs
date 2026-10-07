@@ -1,0 +1,430 @@
+//! Workspace search tools: glob (file patterns) and grep (content regex).
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use globset::Glob;
+use regex::RegexBuilder;
+use serde_json::{json, Value};
+
+use super::{Tool, ToolCtx, ToolOutput, Registry};
+use crate::types::ToolSpec;
+
+const MAX_GLOB: usize = 200;
+const MAX_GREP: usize = 300;
+
+/// Resolve a possibly relative path against `cwd`.
+fn resolve(cwd: &Path, p: &str) -> PathBuf {
+    let path = Path::new(p);
+    if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
+}
+
+/// Walk `root` respecting .gitignore (hidden files included) but never
+/// descending into `.git`.
+fn walk(root: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .require_git(false)
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
+        .build()
+}
+
+fn compile_glob(pattern: &str) -> Result<globset::GlobMatcher, ToolOutput> {
+    Glob::new(pattern)
+        .map(|g| g.compile_matcher())
+        .map_err(|e| ToolOutput::err(format!("invalid glob pattern {pattern:?}: {e}")))
+}
+
+fn check_root(tool: &str, root: &Path) -> Option<ToolOutput> {
+    if !root.exists() {
+        Some(ToolOutput::err(format!("{tool}: no such file or directory: {}", root.display())))
+    } else {
+        None
+    }
+}
+
+// ------------------------------------------------------------------------------- glob
+
+struct GlobFiles;
+
+#[async_trait::async_trait]
+impl Tool for GlobFiles {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "glob".into(),
+            description: "Find files matching a glob pattern (e.g. \"**/*.rs\", \"src/**/*.ts\"), \
+                respecting .gitignore. Returns paths relative to the search root, \
+                newest-modified first, at most 200 (a note is added when truncated)."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern, matched against paths relative to the search root."},
+                    "path": {"type": "string", "description": "Directory to search (default: the workspace root)."}
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    fn summary(&self, args: &Value) -> String {
+        args.get("pattern").and_then(Value::as_str).unwrap_or_default().to_string()
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
+        let Some(pattern) = args.get("pattern").and_then(Value::as_str).filter(|p| !p.is_empty()) else {
+            return ToolOutput::err("glob: missing required argument `pattern`.");
+        };
+        let matcher = match compile_glob(pattern) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let root = resolve(&ctx.cwd, args.get("path").and_then(Value::as_str).unwrap_or("."));
+        if let Some(e) = check_root("glob", &root) {
+            return e;
+        }
+
+        let found = tokio::select! {
+            r = tokio::task::spawn_blocking(move || collect_glob(&root, &matcher)) => r,
+            _ = ctx.cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
+        };
+        let mut found = match found {
+            Ok(f) => f,
+            Err(e) => return ToolOutput::err(format!("glob: {e}")),
+        };
+
+        if found.is_empty() {
+            return ToolOutput::ok("No files matched.");
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))); // newest first
+        let total = found.len();
+        let mut out: Vec<String> = found.into_iter().take(MAX_GLOB).map(|(_, p)| p).collect();
+        if total > MAX_GLOB {
+            out.push(format!("({} more matches)", total - MAX_GLOB));
+        }
+        ToolOutput::ok(out.join("\n"))
+    }
+}
+
+/// One entry per matching file: (modified time, path relative to the walk root).
+fn collect_glob(root: &Path, matcher: &globset::GlobMatcher) -> Vec<(SystemTime, String)> {
+    let mut found = Vec::new();
+    for entry in walk(root).flatten() {
+        if entry.file_type().is_some_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
+        if rel.as_os_str().is_empty() || !matcher.is_match(rel) {
+            continue;
+        }
+        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
+        found.push((mtime, rel.display().to_string()));
+    }
+    found
+}
+
+// ------------------------------------------------------------------------------- grep
+
+struct Grep;
+
+#[async_trait::async_trait]
+impl Tool for Grep {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "grep".into(),
+            description: "Search file contents with a regular expression, respecting .gitignore. \
+                Returns matching lines as \"path:line: text\" (at most 300, long lines truncated) \
+                or, with output=\"files\", just the paths of files containing matches. \
+                Use glob to restrict which files are searched."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression to search for."},
+                    "path": {"type": "string", "description": "File or directory to search (default: the workspace root)."},
+                    "glob": {"type": "string", "description": "Only search files matching this glob pattern (e.g. \"*.rs\")."},
+                    "case_insensitive": {"type": "boolean", "description": "Match without regard to case (default false)."},
+                    "output": {"type": "string", "enum": ["content", "files"], "description": "\"content\" returns matching lines (default); \"files\" returns the list of matching files."}
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    fn summary(&self, args: &Value) -> String {
+        args.get("pattern").and_then(Value::as_str).unwrap_or_default().to_string()
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
+        let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
+            return ToolOutput::err("grep: missing required argument `pattern`.");
+        };
+        let case_insensitive = args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false);
+        let re = match RegexBuilder::new(pattern).case_insensitive(case_insensitive).build() {
+            Ok(re) => re,
+            Err(e) => return ToolOutput::err(format!("grep: invalid regex {pattern:?}: {e}")),
+        };
+        let files_only = match args.get("output").and_then(Value::as_str).unwrap_or("content") {
+            "content" => false,
+            "files" => true,
+            other => {
+                return ToolOutput::err(format!("grep: output must be \"content\" or \"files\", got {other:?}."))
+            }
+        };
+        let filter = match args.get("glob").and_then(Value::as_str) {
+            Some(g) => match compile_glob(g) {
+                Ok(m) => Some(m),
+                Err(e) => return e,
+            },
+            None => None,
+        };
+        let root = resolve(&ctx.cwd, args.get("path").and_then(Value::as_str).unwrap_or("."));
+        if let Some(e) = check_root("grep", &root) {
+            return e;
+        }
+
+        let found = tokio::select! {
+            r = tokio::task::spawn_blocking(move || collect_grep(&root, &re, filter.as_ref(), files_only)) => r,
+            _ = ctx.cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
+        };
+        let (mut matches, truncated) = match found {
+            Ok(r) => r,
+            Err(e) => return ToolOutput::err(format!("grep: {e}")),
+        };
+
+        if matches.is_empty() {
+            return ToolOutput::ok("No matches found.");
+        }
+        if truncated {
+            matches.push(if files_only {
+                format!("(stopped after {MAX_GREP} files)")
+            } else {
+                format!("(stopped after {MAX_GREP} matches)")
+            });
+        }
+        ToolOutput::ok(matches.join("\n"))
+    }
+}
+
+/// Matching lines ("path:line: text") or file paths, plus whether the cap hit.
+fn collect_grep(
+    root: &Path,
+    re: &regex::Regex,
+    filter: Option<&globset::GlobMatcher>,
+    files_only: bool,
+) -> (Vec<String>, bool) {
+    let mut matches: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    // Search one file; returns true when the match cap was reached.
+    let mut check = |rel: &Path, abs: &Path| -> bool {
+        if let Some(f) = filter {
+            if !f.is_match(rel) {
+                return false;
+            }
+        }
+        let Ok(bytes) = std::fs::read(abs) else { return false };
+        if bytes.contains(&0) {
+            return false; // binary
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        for (i, line) in text.lines().enumerate() {
+            if !re.is_match(line) {
+                continue;
+            }
+            if files_only {
+                matches.push(rel.display().to_string());
+            } else {
+                let mut snippet = line.trim().to_string();
+                if snippet.chars().count() > 300 {
+                    snippet = snippet.chars().take(300).collect::<String>() + "…";
+                }
+                matches.push(format!("{}:{}: {}", rel.display(), i + 1, snippet));
+            }
+            if matches.len() >= MAX_GREP {
+                return true;
+            }
+            if files_only {
+                break; // one entry per file is enough
+            }
+        }
+        false
+    };
+
+    if root.is_file() {
+        let rel = Path::new(root.file_name().unwrap_or_default());
+        truncated = check(rel, root);
+    } else {
+        for entry in walk(root).flatten() {
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            if check(rel, entry.path()) {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    (matches, truncated)
+}
+
+// ------------------------------------------------------------------------------- misc
+
+pub fn register(r: &mut Registry) {
+    r.add(Box::new(GlobFiles));
+    r.add(Box::new(Grep));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn ctx(dir: &Path) -> ToolCtx {
+        ToolCtx { cwd: dir.to_path_buf(), cancel: CancellationToken::new(), ..Default::default() }
+    }
+
+    async fn run(tool: &dyn Tool, args: Value, dir: &Path) -> ToolOutput {
+        tool.run(args, &ctx(dir)).await
+    }
+
+    fn setup() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        std::fs::write(dir.path().join("src/old.rs"), "fn main() {}\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.path().join("src/new.rs"), "fn other() {}\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.path().join("src/nested/deep.rs"), "deep\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "todo: write tests\ntodo: sleep\n").unwrap();
+        std::fs::write(dir.path().join("src/ignored.rs"), "ignored\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "gitdir\n").unwrap();
+        std::fs::write(dir.path().join("blob.bin"), b"\0binary\n").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn glob_newest_first_gitignore_and_dot() {
+        let dir = setup();
+        let out = run(&GlobFiles, json!({"pattern": "*.rs"}), dir.path()).await;
+        assert!(!out.is_error, "{}", out.content);
+        let lines: Vec<&str> = out.content.lines().collect();
+        assert_eq!(lines[0], "src/nested/deep.rs"); // newest first
+        assert!(lines.contains(&"src/new.rs"));
+        assert!(lines.contains(&"src/old.rs"));
+        assert!(!lines.contains(&"src/ignored.rs")); // .gitignore respected
+        assert!(!lines.iter().any(|l| l.contains(".git/"))); // .git skipped
+        assert!(!lines.contains(&"notes.txt"));
+
+        let out = run(&GlobFiles, json!({"pattern": "**/*.rs", "path": "src"}), dir.path()).await;
+        let lines: Vec<&str> = out.content.lines().collect();
+        assert_eq!(lines[0], "nested/deep.rs");
+        assert!(lines.contains(&"new.rs") && lines.contains(&"old.rs"));
+        assert!(!lines.iter().any(|l| l.contains("ignored.rs")));
+
+        let out = run(&GlobFiles, json!({"pattern": "nope-*"}), dir.path()).await;
+        assert!(!out.is_error && out.content.contains("No files matched"));
+        assert!(run(&GlobFiles, json!({"pattern": "["}), dir.path()).await.is_error);
+        assert!(run(&GlobFiles, json!({}), dir.path()).await.is_error);
+        let out = run(&GlobFiles, json!({"pattern": "*.rs", "path": "missing"}), dir.path()).await;
+        assert!(out.is_error && out.content.contains("no such file"));
+        assert_eq!(GlobFiles.summary(&json!({"pattern": "*.rs"})), "*.rs");
+    }
+
+    #[tokio::test]
+    async fn glob_truncates_at_200() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..205 {
+            std::fs::write(dir.path().join(format!("f{i:03}.txt")), b"x").unwrap();
+        }
+        let out = run(&GlobFiles, json!({"pattern": "*.txt"}), dir.path()).await;
+        assert!(!out.is_error);
+        let lines: Vec<&str> = out.content.lines().collect();
+        assert_eq!(lines.len(), 201); // 200 + note
+        assert!(lines.last().unwrap().contains("(5 more matches)"));
+    }
+
+    #[tokio::test]
+    async fn grep_content_files_filters() {
+        let dir = setup();
+
+        let out = run(&Grep, json!({"pattern": "todo"}), dir.path()).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "notes.txt:1: todo: write tests\nnotes.txt:2: todo: sleep");
+
+        let out = run(&Grep, json!({"pattern": "TODO"}), dir.path()).await;
+        assert!(out.content.contains("No matches"));
+        let out = run(&Grep, json!({"pattern": "TODO", "case_insensitive": true}), dir.path()).await;
+        assert!(out.content.contains("notes.txt:1"));
+
+        let out = run(&Grep, json!({"pattern": "fn", "glob": "*.rs"}), dir.path()).await;
+        assert!(out.content.contains("src/old.rs:1: fn main() {}"));
+        assert!(out.content.contains("src/new.rs:1: fn other() {}"));
+        assert!(!out.content.contains("notes.txt"));
+
+        let out = run(&Grep, json!({"pattern": "todo", "output": "files"}), dir.path()).await;
+        assert_eq!(out.content, "notes.txt");
+
+        let out = run(&Grep, json!({"pattern": "deep", "path": "src/nested/deep.rs"}), dir.path()).await;
+        assert!(out.content.contains("deep.rs:1: deep"));
+
+        let out = run(&Grep, json!({"pattern": "binary"}), dir.path()).await;
+        assert!(out.content.contains("No matches")); // binary file skipped
+        let out = run(&Grep, json!({"pattern": "gitdir"}), dir.path()).await;
+        assert!(out.content.contains("No matches")); // .git skipped
+        assert!(run(&Grep, json!({"pattern": "("}), dir.path()).await.is_error);
+        assert!(run(&Grep, json!({"pattern": "x", "output": "bogus"}), dir.path()).await.is_error);
+        assert!(run(&Grep, json!({"pattern": "x", "glob": "["}), dir.path()).await.is_error);
+        assert!(run(&Grep, json!({}), dir.path()).await.is_error);
+        let out = run(&Grep, json!({"pattern": "x", "path": "missing"}), dir.path()).await;
+        assert!(out.is_error && out.content.contains("no such file"));
+        assert_eq!(Grep.summary(&json!({"pattern": "todo"})), "todo");
+    }
+
+    #[tokio::test]
+    async fn grep_caps_and_truncates_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=400).map(|i| format!("match {i}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        std::fs::write(dir.path().join("long.txt"), format!("match {}\n", "z".repeat(400))).unwrap();
+
+        let out = run(&Grep, json!({"pattern": "match"}), dir.path()).await;
+        assert!(!out.is_error);
+        let lines: Vec<&str> = out.content.lines().collect();
+        assert_eq!(lines.len(), MAX_GREP + 1); // 300 + note
+        assert!(lines.last().unwrap().contains("stopped after 300"));
+
+        let out = run(&Grep, json!({"pattern": "match", "glob": "long.txt"}), dir.path()).await;
+        let line = out.content.lines().next().unwrap();
+        assert_eq!(line.chars().count(), "long.txt:1: ".chars().count() + 300 + 1); // 300 + ellipsis
+    }
+
+    #[tokio::test]
+    async fn grep_files_mode_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..320 {
+            std::fs::write(dir.path().join(format!("m{i:03}.txt")), "match\n").unwrap();
+        }
+        let out = run(&Grep, json!({"pattern": "match", "output": "files"}), dir.path()).await;
+        assert!(!out.is_error);
+        let lines: Vec<&str> = out.content.lines().collect();
+        assert_eq!(lines.len(), MAX_GREP + 1);
+        assert!(lines.last().unwrap().contains("stopped after 300 files"));
+    }
+
+    #[tokio::test]
+    async fn specs_are_sane() {
+        let spec = GlobFiles.spec();
+        assert_eq!(spec.name, "glob");
+        assert_eq!(spec.parameters["required"], json!(["pattern"]));
+        let spec = Grep.spec();
+        assert_eq!(spec.name, "grep");
+        assert_eq!(spec.parameters["properties"]["output"]["enum"], json!(["content", "files"]));
+        assert!(!GlobFiles.needs_approval(&json!({})));
+        assert!(!Grep.needs_approval(&json!({})));
+    }
+}
