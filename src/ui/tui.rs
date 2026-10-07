@@ -20,7 +20,9 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::{Action, Editor};
-use super::render::{diff, is_table_sep, looks_like_diff, one_line, table, table_cells, truncate, visible_width, Markdown};
+use super::render::{
+    diff, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells, truncate, visible_width, Markdown,
+};
 use crate::agent::{Approval, ApprovalRequest, Ui};
 use crate::models::ModelChoice;
 use crate::session::Meta;
@@ -272,9 +274,13 @@ fn fit_header(prefix: String, filter: &str, placeholder: bool, width: usize) -> 
 }
 
 /// Steering texts, leaving slash commands in `queue` for the app loop.
+fn is_slash_command(text: &str) -> bool {
+    text.trim_start().starts_with('/')
+}
+
 fn take_steer_texts(queue: &mut Vec<(Queued, String)>) -> Vec<String> {
     let (steer, rest): (Vec<_>, Vec<_>) =
-        queue.drain(..).partition(|(k, t)| *k == Queued::Steer && !t.starts_with('/'));
+        queue.drain(..).partition(|(k, t)| *k == Queued::Steer && !is_slash_command(t));
     *queue = rest;
     steer.into_iter().map(|(_, t)| t).collect()
 }
@@ -794,6 +800,7 @@ impl Screen {
     // ------------------------------------------------------------ content
 
     pub fn print_info(&mut self, text: &str, style: Style) {
+        let text = sanitize_text(text);
         self.flush_all();
         let mut rows = self.begin(Block::Info);
         rows.extend(text.lines().map(|l| paint(style, l)));
@@ -811,6 +818,7 @@ impl Screen {
     }
 
     pub fn print_error(&mut self, text: &str) {
+        let text = sanitize_text(text);
         self.flush_all();
         let mut rows = self.begin(Block::Info);
         for (i, l) in text.lines().enumerate() {
@@ -821,6 +829,7 @@ impl Screen {
     }
 
     pub fn print_user(&mut self, text: &str) {
+        let text = sanitize_text(text);
         self.flush_all();
         let w = self.width;
         let mut rows = self.begin(Block::User);
@@ -833,6 +842,7 @@ impl Screen {
     }
 
     pub fn print_markdown(&mut self, text: &str) {
+        let text = sanitize_text(text);
         self.flush_all();
         let mut rows = self.begin(Block::Text);
         self.md = Markdown::default();
@@ -911,6 +921,7 @@ impl Screen {
     }
 
     fn stream(&mut self, block: Block, text: &str) {
+        let text = sanitize_text(text);
         if self.live_block != block {
             self.flush_live();
             self.flush_tools();
@@ -922,7 +933,7 @@ impl Screen {
                 self.set_label("Working");
             }
         }
-        self.live.push_str(text);
+        self.live.push_str(&text);
         if block == Block::Reasoning {
             self.redraw();
             return;
@@ -991,13 +1002,13 @@ impl Screen {
         }
         let lines: Vec<&str> = output.content.trim_end().lines().filter(|l| !l.trim().is_empty()).collect();
         if output.is_error {
-            t.detail = lines.iter().take(3).map(|l| l.to_string()).collect();
+            t.detail = lines.iter().take(3).map(|l| sanitize_text(l)).collect();
         } else if t.tool == "bash" && !lines.is_empty() {
             let skip = lines.len().saturating_sub(3);
             if skip > 0 {
                 t.detail.push(format!("… {skip} lines more"));
             }
-            t.detail.extend(lines[skip..].iter().map(|l| l.to_string()));
+            t.detail.extend(lines[skip..].iter().map(|l| sanitize_text(l)));
         }
         self.set_label("Working");
         self.redraw();
@@ -1014,6 +1025,8 @@ impl Screen {
     pub fn set_busy(&mut self, label: Option<&str>, cancel: Option<CancellationToken>) {
         if label.is_none() {
             self.flush_all();
+            self.approval.take();
+            self.question.take();
         }
         self.busy = label.map(|l| (l.to_string(), Instant::now()));
         self.cancel = cancel;
@@ -1205,6 +1218,23 @@ impl Screen {
         if self.sessions.is_some() {
             return self.on_sessions_key(key, commands);
         }
+        if self.question.is_some() {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let interrupt = key.code == KeyCode::Esc
+                || (ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')));
+            if interrupt {
+                if let Some(q) = self.question.take() {
+                    let _ = q.reply.send(None);
+                }
+                if let Some(c) = &self.cancel {
+                    c.cancel();
+                }
+                if ctrl && key.code == KeyCode::Char('d') {
+                    let _ = commands.send(Command::Exit);
+                }
+                return self.redraw();
+            }
+        }
         if let Some(q) = &mut self.question {
             let n = q.options.len().max(1);
             match key.code {
@@ -1219,10 +1249,6 @@ impl Screen {
                     let answer = if typed.trim().is_empty() { q.options.get(q.selected).cloned() } else { Some(typed) };
                     self.editor.set_text("");
                     let _ = q.reply.send(answer);
-                }
-                KeyCode::Esc => {
-                    let q = self.question.take().unwrap();
-                    let _ = q.reply.send(None);
                 }
                 _ => {
                     self.editor.handle_key(key, true);
@@ -1344,11 +1370,14 @@ impl Tui {
             .unwrap_or_default();
         let screen = Arc::new(Mutex::new(Screen::new(footer, Editor::new(history.clone(), commands), history, home)));
         terminal::enable_raw_mode()?;
+        let mut setup = TerminalSetup::arm();
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
         let mut out = io::stdout();
         execute!(out, crossterm::event::EnableBracketedPaste)?;
+        setup.bracketed = true;
         if enhanced {
             execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+            setup.enhanced = true;
         }
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -1398,6 +1427,7 @@ impl Tui {
                 }
             })
         };
+        setup.disarm();
         Ok(Tui { screen, commands: rx, tasks: vec![input, ticker], enhanced, history_path })
     }
 
@@ -1437,16 +1467,47 @@ impl Drop for Tui {
             let _ = s.out.flush();
             let skip = s.history.len().saturating_sub(1000);
             let history: Vec<String> = s.history[skip..].iter().map(|h| serde_json::to_string(h).unwrap_or_default()).collect();
-            if let Some(dir) = self.history_path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&self.history_path, history.join("\n") + "\n");
+            let _ = crate::session::write_private(&self.history_path, (history.join("\n") + "\n").as_bytes());
         }
         *SCREEN.lock().unwrap() = None;
         if self.enhanced {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         }
         restore_terminal();
+    }
+}
+
+/// Restores the terminal if `start` fails after raw mode is on. Disarmed once
+/// `Tui` exists, so `Drop` is the only restorer for a live session.
+struct TerminalSetup {
+    armed: bool,
+    bracketed: bool,
+    enhanced: bool,
+}
+
+impl TerminalSetup {
+    fn arm() -> Self {
+        Self { armed: true, bracketed: false, enhanced: false }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalSetup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.enhanced {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        if self.bracketed {
+            let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+        }
+        let _ = execute!(io::stdout(), cursor::Show);
+        let _ = terminal::disable_raw_mode();
     }
 }
 
@@ -1482,8 +1543,9 @@ pub async fn approve_active(tool: &str, summary: &str, preview: Option<&str>, ru
         let title = format!("{} {}", paint(fg(BRIGHT), &verb), paint(fg(GRAY), &truncate(&target, w.saturating_sub(verb.len() + 3))));
         let mut lines = Vec::new();
         if let Some(p) = preview {
-            let body: Vec<String> = if looks_like_diff(p) {
-                diff(p, true, usize::MAX, w, "  ").lines().map(str::to_string).collect()
+            let p = sanitize_text(p);
+            let body: Vec<String> = if looks_like_diff(&p) {
+                diff(&p, true, usize::MAX, w, "  ").lines().map(str::to_string).collect()
             } else {
                 p.lines().map(|l| paint(fg(GRAY), &format!("  {}", truncate(l, w.saturating_sub(2))))).collect()
             };
@@ -1493,6 +1555,7 @@ pub async fn approve_active(tool: &str, summary: &str, preview: Option<&str>, ru
                 lines.push(paint(fg(GRAY), &format!("  … {more} lines more")));
             }
         } else if tool == "bash" {
+            let summary = sanitize_text(summary);
             for l in summary.lines().take(MAX_PREVIEW) {
                 lines.push(format!("  {}", paint(fg(MID), &truncate(l, w.saturating_sub(2)))));
             }
@@ -1500,7 +1563,22 @@ pub async fn approve_active(tool: &str, summary: &str, preview: Option<&str>, ru
         s.approval = Some(PendingApproval { title, lines, rule, reply: tx });
         s.redraw();
     }
-    Some(rx.await.unwrap_or(Approval::No))
+    let guard = ClearApproval(Arc::clone(&screen));
+    let answer = rx.await.unwrap_or(Approval::No);
+    drop(guard);
+    Some(answer)
+}
+
+/// Clears a pending approval if the prompt is dropped before the user answers.
+struct ClearApproval(Arc<Mutex<Screen>>);
+
+impl Drop for ClearApproval {
+    fn drop(&mut self) {
+        let mut s = lock(&self.0);
+        if s.approval.take().is_some() {
+            s.redraw();
+        }
+    }
 }
 
 pub struct TuiUi {
@@ -1611,7 +1689,7 @@ impl Ui for TuiUi {
         let text = {
             let mut s = self.s();
             // Slash commands queued while busy are run by the app loop.
-            let i = s.queue.iter().position(|(k, t)| *k == Queued::FollowUp && !t.starts_with('/'))?;
+            let i = s.queue.iter().position(|(k, t)| *k == Queued::FollowUp && !is_slash_command(t))?;
             s.queue.remove(i).1
         };
         Some(self.deliver(text))
@@ -1738,6 +1816,7 @@ mod tests {
             (Queued::Steer, "look at main".into()),
             (Queued::FollowUp, "later".into()),
             (Queued::Steer, "/model gpt".into()),
+            (Queued::Steer, "  /model x".into()),
         ];
         assert_eq!(take_steer_texts(&mut queue), vec!["look at main".to_string()]);
         assert_eq!(
@@ -1746,6 +1825,7 @@ mod tests {
                 (Queued::Steer, "/compact now".into()),
                 (Queued::FollowUp, "later".into()),
                 (Queued::Steer, "/model gpt".into()),
+                (Queued::Steer, "  /model x".into()),
             ]
         );
     }
@@ -1830,5 +1910,61 @@ mod tests {
         assert!(lock(&screen).question.is_some());
         drop(fut);
         assert!(lock(&screen).question.is_none());
+    }
+
+    #[test]
+    fn question_interrupt_cancels_and_ctrl_d_exits() {
+        let mut s = screen();
+        let cancel = CancellationToken::new();
+        s.cancel = Some(cancel.clone());
+        let (tx, mut rx) = oneshot::channel();
+        s.question = Some(PendingQuestion {
+            question: "q".into(),
+            options: vec!["a".into()],
+            selected: 0,
+            reply: tx,
+        });
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &cmd_tx);
+        assert!(rx.try_recv().unwrap().is_none());
+        assert!(cancel.is_cancelled());
+        assert!(s.question.is_none());
+        assert!(cmd_rx.try_recv().is_err());
+
+        let cancel = CancellationToken::new();
+        s.cancel = Some(cancel.clone());
+        let (tx, mut rx) = oneshot::channel();
+        s.question = Some(PendingQuestion {
+            question: "q".into(),
+            options: vec!["a".into()],
+            selected: 0,
+            reply: tx,
+        });
+        s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &cmd_tx);
+        assert!(rx.try_recv().unwrap().is_none());
+        assert!(cancel.is_cancelled());
+        assert!(cmd_rx.try_recv().is_err());
+
+        let (tx, _rx) = oneshot::channel();
+        s.question = Some(PendingQuestion {
+            question: "q".into(),
+            options: vec!["a".into()],
+            selected: 0,
+            reply: tx,
+        });
+        s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &cmd_tx);
+        assert!(matches!(cmd_rx.try_recv().unwrap(), Command::Exit));
+    }
+
+    #[test]
+    fn dropping_approval_clears_the_pane() {
+        let screen = Arc::new(Mutex::new(screen()));
+        {
+            let mut s = lock(&screen);
+            let (tx, _rx) = oneshot::channel();
+            s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), rule: None, reply: tx });
+        }
+        drop(ClearApproval(Arc::clone(&screen)));
+        assert!(lock(&screen).approval.is_none());
     }
 }

@@ -161,9 +161,11 @@ impl Provider for OpenAiProvider {
             .eventsource();
         let mut response = Response::default();
         let mut calls = BTreeMap::<u64, Call>::new();
+        let mut completed = false;
         while let Some(event) = events.next().await {
             let event = event?;
             if event.data.trim() == "[DONE]" {
+                completed = true;
                 break;
             }
             let data: Value = serde_json::from_str(&event.data)?;
@@ -186,6 +188,9 @@ impl Provider for OpenAiProvider {
             else {
                 continue;
             };
+            if choice.get("finish_reason").is_some_and(|v| !v.is_null()) {
+                completed = true;
+            }
             let delta = &choice["delta"];
             for (key, reasoning) in [
                 ("reasoning_content", true),
@@ -251,6 +256,7 @@ impl Provider for OpenAiProvider {
                 arguments: call.arguments,
             };
         }
+        anyhow::ensure!(completed, "OpenAI stream ended before completion");
         Ok(response)
     }
 }
@@ -427,5 +433,27 @@ mod tests {
             .to_string();
         assert!(error.contains("429") && error.contains("usage limit reached"));
         task.await.unwrap();
+    }
+
+    async fn one_stream(body: String) -> anyhow::Result<Response> {
+        let (url, _requests, task) = server(vec![(200, body)]).await;
+        let provider = OpenAiProvider::new(url, None, "test".into());
+        let result = provider.stream(Request { system: "", items: &[], tools: &[] }, &mut |_| {}).await;
+        task.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn stream_without_completion_is_an_error() {
+        let body = events(&[json!({"choices":[{"index":0,"delta":{"content":"hi"}}]})]);
+        let err = one_stream(body).await.unwrap_err();
+        assert!(err.to_string().contains("before completion"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn finish_reason_completes_without_done() {
+        let body = events(&[json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]})]);
+        let response = one_stream(body).await.unwrap();
+        assert_eq!(response.items, vec![Item::Assistant { text: "hi".into() }]);
     }
 }

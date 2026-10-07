@@ -51,6 +51,39 @@ fn int_arg(args: &Value, name: &str) -> Option<i64> {
     args.get(name).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
 }
 
+/// Stop reading once this many bytes have been seen. Larger files are paged
+/// from the prefix instead of being loaded whole.
+const MAX_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Read at most `max + 1` bytes, rejecting directories and other non-files
+/// before any byte is copied (so `/dev/zero` cannot grow without bound).
+fn read_regular(path: &Path, max: u64) -> Result<Vec<u8>, ToolOutput> {
+    use std::io::Read;
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ToolOutput::err(format!("read_file: file not found: {}", display_path(path))));
+        }
+        Err(e) => return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path)))),
+    };
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path)))),
+    };
+    if meta.is_dir() {
+        return Err(ToolOutput::err(format!("read_file: {} is a directory (use list_dir).", display_path(path))));
+    }
+    if !meta.is_file() {
+        return Err(ToolOutput::err(format!("read_file: {} is not a regular file.", display_path(path))));
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = file.take(max.saturating_add(1)).read_to_end(&mut bytes) {
+        return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path))));
+    }
+    Ok(bytes)
+}
+
 // --------------------------------------------------------------------------- read_file
 
 struct ReadFile;
@@ -95,16 +128,25 @@ impl Tool for ReadFile {
         if limit < 1 {
             return ToolOutput::err(format!("read_file: limit must be at least 1, got {limit}."));
         }
-        if path.is_dir() {
-            return ToolOutput::err(format!("read_file: {} is a directory (use list_dir).", display_path(&path)));
-        }
-        let bytes = match fs::read(&path) {
+        let mut bytes = match read_regular(&path, MAX_SCAN_BYTES) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return ToolOutput::err(format!("read_file: file not found: {}", display_path(&path)))
-            }
-            Err(e) => return ToolOutput::err(format!("read_file: {e}: {}", display_path(&path))),
+            Err(e) => return e,
         };
+        let truncated = bytes.len() as u64 > MAX_SCAN_BYTES;
+        if truncated {
+            match bytes[..MAX_SCAN_BYTES as usize].iter().rposition(|b| *b == b'\n') {
+                Some(i) => bytes.truncate(i),
+                None => {
+                    return ToolOutput::err(format!(
+                        "read_file: {} has no complete line within the first 8 MiB.",
+                        display_path(&path)
+                    ))
+                }
+            }
+        }
+        if bytes.split(|b| *b == b'\n').any(|line| line.len() > MAX_LINE_BYTES) {
+            return ToolOutput::err(format!("read_file: a line in {} exceeds 1 MiB.", display_path(&path)));
+        }
         if bytes.contains(&0) {
             return ToolOutput::err(format!("read_file: {} is a binary file.", display_path(&path)));
         }
@@ -115,15 +157,22 @@ impl Tool for ReadFile {
 
         let lines: Vec<&str> = text.lines().collect();
         let total = lines.len();
-        if total == 0 {
+        if total == 0 && !truncated {
             return ToolOutput::ok(format!("read_file: {} is empty.", display_path(&path)));
         }
         let start = offset as usize - 1;
         if start >= total {
-            return ToolOutput::err(format!(
-                "read_file: offset {offset} is past the end of {} ({total} lines).",
-                display_path(&path)
-            ));
+            return if truncated {
+                ToolOutput::err(format!(
+                    "read_file: offset {offset} is past the first 8 MiB of {}.",
+                    display_path(&path)
+                ))
+            } else {
+                ToolOutput::err(format!(
+                    "read_file: offset {offset} is past the end of {} ({total} lines).",
+                    display_path(&path)
+                ))
+            };
         }
         let end = (start + limit as usize).min(total);
         let mut out = String::new();
@@ -135,8 +184,12 @@ impl Tool for ReadFile {
                 out.push_str(&format!("{n:>6}\t{line}\n"));
             }
         }
-        if end < total {
-            out.push_str(&format!("({} more lines below — use offset {} to read on)\n", total - end, end + 1));
+        if end < total || truncated {
+            if truncated {
+                out.push_str(&format!("(more lines below — use offset {})\n", end + 1));
+            } else {
+                out.push_str(&format!("({} more lines below — use offset {} to read on)\n", total - end, end + 1));
+            }
         }
         ToolOutput::ok(out)
     }
@@ -203,8 +256,14 @@ impl Tool for ListDir {
 
 /// Diff / new-file text for writing `content` to `path`. No side effects.
 fn write_preview(path: &Path, content: &str) -> String {
-    match fs::read(path) {
-        Err(_) => format!("new file: {}\n{}", display_path(path), head(content, 30)),
+    match super::safeio::read_capped(path, MAX_SCAN_BYTES) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("new file: {}\n{}", display_path(path), head(content, 30))
+        }
+        Err(_) => format!("cannot preview {}", display_path(path)),
+        Ok(bytes) if bytes.len() as u64 > MAX_SCAN_BYTES => {
+            format!("replaces a file larger than 8 MiB: {}", display_path(path))
+        }
         Ok(bytes) => {
             let len = bytes.len();
             match String::from_utf8(bytes) {
@@ -262,22 +321,13 @@ impl Tool for WriteFile {
             return ToolOutput::err(msg);
         }
         let preview = write_preview(&path, content);
-
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return ToolOutput::err(format!("write_file: {e}: {}", display_path(parent)));
-                }
-            }
-        }
-        if let Err(e) = fs::write(&path, content) {
+        if let Err(e) = commit_bytes(ctx, p, &path, content.as_bytes()) {
             return ToolOutput::err(format!("write_file: {e}: {}", display_path(&path)));
         }
         ToolOutput {
             content: format!("Wrote {} lines to {}.", content.lines().count(), display_path(&path)),
-            is_error: false,
             display: (!preview.is_empty()).then_some(preview),
-            images: Vec::new(),
+            ..ToolOutput::default()
         }
     }
 }
@@ -320,7 +370,7 @@ impl Tool for EditFile {
     fn preview(&self, args: &Value, ctx: &ToolCtx) -> Option<String> {
         let p = args.get("path")?.as_str()?;
         let path = resolve(&ctx.cwd, p);
-        let (old, new) = apply_edit(&path, args).ok()?;
+        let (old, new) = apply_edit(ctx, p, &path, args).ok()?;
         Some(unified_diff(&path, &old, &new))
     }
 
@@ -338,19 +388,18 @@ impl Tool for EditFile {
         if let Some(msg) = sandbox_denied(ctx, p, &path, "edit_file") {
             return ToolOutput::err(msg);
         }
-        let (old, new) = match apply_edit(&path, &args) {
+        let (old, new) = match apply_edit(ctx, p, &path, &args) {
             Ok(v) => v,
             Err(e) => return e,
         };
         let diff = unified_diff(&path, &old, &new);
-        if let Err(e) = fs::write(&path, &new) {
+        if let Err(e) = commit_bytes(ctx, p, &path, new.as_bytes()) {
             return ToolOutput::err(format!("edit_file: {e}: {}", display_path(&path)));
         }
         ToolOutput {
             content: format!("Edited {}.", display_path(&path)),
-            is_error: false,
             display: (!diff.is_empty()).then_some(diff),
-            images: Vec::new(),
+            ..ToolOutput::default()
         }
     }
 }
@@ -380,8 +429,63 @@ fn sandbox_denied(ctx: &ToolCtx, user_path: &str, path: &Path, tool: &str) -> Op
     })
 }
 
+/// Root a sandboxed write must stay under, when one applies.
+fn write_root<'a>(ctx: &'a ToolCtx, user_path: &str, path: &Path) -> Option<&'a Path> {
+    if crate::agent::inside(&ctx.cwd, user_path) {
+        return Some(ctx.cwd.as_path());
+    }
+    let shown = path.to_str().unwrap_or("");
+    ctx.sandbox
+        .writable
+        .iter()
+        .find(|root| crate::agent::inside(root, user_path) || crate::agent::inside(root, shown))
+        .map(std::path::PathBuf::as_path)
+}
+
+fn relative_in(root: &Path, user_path: &str, path: &Path) -> std::io::Result<std::path::PathBuf> {
+    super::safeio::relative_under(root, user_path)
+        .or_else(|| path.to_str().and_then(|p| super::safeio::relative_under(root, p)))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path escapes the sandbox root"))
+}
+
+/// Replace `path`. Unsandboxed writes may follow a final symlink and then
+/// replace that target atomically. Sandboxed writes never follow.
+fn commit_bytes(ctx: &ToolCtx, user_path: &str, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if ctx.sandbox.mode == crate::sandbox::Mode::Off {
+        return super::safeio::write_atomic(path, bytes);
+    }
+    let root = write_root(ctx, user_path, path).unwrap_or(ctx.cwd.as_path());
+    let rel = relative_in(root, user_path, path)?;
+    super::safeio::write_beneath(root, &rel, bytes)
+}
+
+fn load_edit_bytes(ctx: &ToolCtx, user_path: &str, path: &Path) -> Result<Vec<u8>, ToolOutput> {
+    if path.is_dir() {
+        return Err(ToolOutput::err(format!("edit_file: {} is a directory.", display_path(path))));
+    }
+    let loaded = if ctx.sandbox.mode == crate::sandbox::Mode::Off {
+        super::safeio::read_capped(path, MAX_SCAN_BYTES)
+    } else {
+        let root = write_root(ctx, user_path, path).unwrap_or(ctx.cwd.as_path());
+        match relative_in(root, user_path, path) {
+            Ok(rel) => super::safeio::read_beneath(root, &rel, MAX_SCAN_BYTES),
+            Err(e) => Err(e),
+        }
+    };
+    match loaded {
+        Ok(bytes) if bytes.len() as u64 > MAX_SCAN_BYTES => {
+            Err(ToolOutput::err(format!("edit_file: {} is larger than 8 MiB.", display_path(path))))
+        }
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(ToolOutput::err(format!("edit_file: file not found: {}", display_path(path))))
+        }
+        Err(e) => Err(ToolOutput::err(format!("edit_file: {e}: {}", display_path(path)))),
+    }
+}
+
 /// Pure version of an edit: (old content, new content). `Err` is the user-facing error.
-fn apply_edit(path: &Path, args: &Value) -> Result<(String, String), ToolOutput> {
+fn apply_edit(ctx: &ToolCtx, user_path: &str, path: &Path, args: &Value) -> Result<(String, String), ToolOutput> {
     let old_string = args.get("old_string").and_then(Value::as_str).unwrap_or_default();
     let new_string = args.get("new_string").and_then(Value::as_str).unwrap_or_default();
     let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
@@ -391,16 +495,7 @@ fn apply_edit(path: &Path, args: &Value) -> Result<(String, String), ToolOutput>
     if old_string == new_string {
         return Err(ToolOutput::err("edit_file: old_string and new_string are identical."));
     }
-    if path.is_dir() {
-        return Err(ToolOutput::err(format!("edit_file: {} is a directory.", display_path(path))));
-    }
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolOutput::err(format!("edit_file: file not found: {}", display_path(path))))
-        }
-        Err(e) => return Err(ToolOutput::err(format!("edit_file: {e}: {}", display_path(path)))),
-    };
+    let bytes = load_edit_bytes(ctx, user_path, path)?;
     if bytes.contains(&0) {
         return Err(ToolOutput::err(format!("edit_file: {} is a binary file.", display_path(path))));
     }
@@ -496,6 +591,12 @@ mod tests {
         assert!(out.is_error && out.content.contains("directory"));
         let out = run(&ReadFile, json!({"path": "empty"}), dir.path());
         assert!(!out.is_error && out.content.contains("empty"));
+
+        #[cfg(unix)]
+        if std::path::Path::new("/dev/zero").exists() {
+            let out = run(&ReadFile, json!({"path": "/dev/zero"}), dir.path());
+            assert!(out.is_error && out.content.contains("regular"), "{}", out.content);
+        }
     }
 
     #[test]
@@ -718,5 +819,46 @@ mod tests {
             assert!(!outside.path().join("via-symlink.txt").exists());
         }
         let _ = std::fs::remove_file(&escape);
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("real.txt");
+            std::fs::write(&target, "real").unwrap();
+            let link = dir.path().join("alias");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let out = futures::executor::block_on(
+                WriteFile.run(json!({"path": "alias", "content": "pwned"}), &ww),
+            );
+            assert!(out.is_error && out.content.contains("symlink"), "{}", out.content);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "real");
+
+            let out = futures::executor::block_on(
+                WriteFile.run(json!({"path": "alias", "content": "followed"}), &off),
+            );
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "followed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_write_keeps_the_original_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("keep.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+        let out = run(&WriteFile, json!({"path": "keep.txt", "content": "new"}), dir.path());
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(!out.changed);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
     }
 }

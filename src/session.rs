@@ -44,6 +44,8 @@ pub struct Session {
     pub path: PathBuf,
     /// Header line still to be written (new sessions, before the first append).
     pending_header: Option<String>,
+    /// Items accepted by `append` whose write has not landed yet.
+    queued: Vec<String>,
     file: Option<File>,
 }
 
@@ -57,34 +59,113 @@ impl Session {
             path: dir.join(format!("{id}.jsonl")),
             id,
             pending_header: Some(serde_json::to_string(&header)?),
+            queued: Vec::new(),
             file: None,
         })
     }
 
     pub fn append(&mut self, item: &Item) -> Result<()> {
-        let mut line = String::new();
-        if self.file.is_none() {
-            if let Some(dir) = self.path.parent() {
+        let line = serde_json::to_string(item).with_context(|| format!("encoding a session item for {}", self.id))?;
+        self.queued.push(line);
+        self.flush_queue()
+    }
+
+    /// Write the header (once) and every queued item. A failed write is rolled
+    /// back and the items stay queued for the next attempt.
+    fn flush_queue(&mut self) -> Result<()> {
+        if self.queued.is_empty() {
+            return Ok(());
+        }
+        self.ensure_file()?;
+        let file = self.file.as_mut().expect("file opened above");
+        let start = file.seek(SeekFrom::End(0)).with_context(|| format!("saving session {}", self.id))?;
+        let mut payload = String::new();
+        if let Some(header) = &self.pending_header {
+            payload.push_str(header);
+            payload.push('\n');
+        }
+        for line in &self.queued {
+            payload.push_str(line);
+            payload.push('\n');
+        }
+        if let Err(e) = file.write_all(payload.as_bytes()).and_then(|_| file.flush()) {
+            let _ = rollback(file, start);
+            return Err(e).with_context(|| format!("saving session {}", self.id));
+        }
+        self.pending_header = None;
+        self.queued.clear();
+        Ok(())
+    }
+
+    fn ensure_file(&mut self) -> Result<()> {
+        if self.file.is_some() {
+            return Ok(());
+        }
+        if let Some(dir) = self.path.parent() {
+            if !dir.as_os_str().is_empty() {
                 fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-            }
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .with_context(|| format!("opening {}", self.path.display()))?;
-            self.file = Some(file);
-            if let Some(h) = self.pending_header.take() {
-                line.push_str(&h);
-                line.push('\n');
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                        .with_context(|| format!("securing {}", dir.display()))?;
+                }
             }
         }
-        line.push_str(&serde_json::to_string(item)?);
-        line.push('\n');
-        let file = self.file.as_mut().expect("file opened above");
-        file.write_all(line.as_bytes())
-            .and_then(|_| file.flush())
-            .with_context(|| format!("saving session {}", self.id))
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("securing {}", self.path.display()))?;
+        }
+        self.file = Some(file);
+        Ok(())
     }
+}
+
+fn rollback(file: &mut File, start: u64) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(start))?;
+    file.set_len(start)
+}
+
+/// Atomically replace `path` (file 0600, parent directory 0700 on Unix).
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        builder.mode(0o700);
+        opts.mode(0o600);
+    }
+    builder.create(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let mut f = opts.open(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// All sessions, newest first.
@@ -164,7 +245,13 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
             f.write_all(b"\n")?;
         }
     }
-    let mut session = Session { id: meta.id.clone(), path: meta.path.clone(), pending_header: None, file: None };
+    let mut session = Session {
+        id: meta.id.clone(),
+        path: meta.path.clone(),
+        pending_header: None,
+        queued: Vec::new(),
+        file: None,
+    };
     for item in repairs(&items) {
         session.append(&item)?;
         items.push(item);
@@ -326,5 +413,50 @@ mod tests {
         assert_eq!(items, vec![user("hi")]);
         s.append(&user("again")).unwrap();
         assert_eq!(load(tmp.path(), "abc", Path::new("/w")).unwrap().2.len(), 2);
+    }
+
+    #[test]
+    fn failed_append_keeps_the_header_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("sessions");
+        fs::write(&blocker, "x").unwrap();
+        let mut s = Session::create(&blocker, Path::new("/w"), "m").unwrap();
+        assert!(s.append(&user("one")).is_err());
+        fs::remove_file(&blocker).unwrap();
+        s.append(&user("two")).unwrap();
+        let (_, _, items) = load(&blocker, "last", Path::new("/w")).unwrap();
+        assert_eq!(items, vec![user("one"), user("two")]);
+    }
+
+    #[test]
+    fn partial_record_is_rolled_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).unwrap();
+        f.write_all(b"header\n").unwrap();
+        let start = f.stream_position().unwrap();
+        f.write_all(b"PARTIAL").unwrap();
+        rollback(&mut f, start).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"header\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = Session::create(&dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("hi")).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&s.path).unwrap().permissions().mode() & 0o777, 0o600);
+        drop(s);
+        let path = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&path, perms).unwrap();
+        let (mut s, _, _) = load(&dir, "last", Path::new("/w")).unwrap();
+        s.append(&user("again")).unwrap();
+        assert_eq!(fs::metadata(&s.path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

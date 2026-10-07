@@ -28,11 +28,10 @@ fn media_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 pub fn load(path: &Path) -> Result<Image> {
-    let size = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?.len();
-    if size > MAX_BYTES {
-        bail!("{} is {} MB; images are limited to 20 MB", path.display(), size / (1024 * 1024));
+    let bytes = super::safeio::read_capped(path, MAX_BYTES).with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() as u64 > MAX_BYTES {
+        bail!("{} is {} MB; images are limited to 20 MB", path.display(), (bytes.len() as u64) / (1024 * 1024));
     }
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let Some(media_type) = media_type(&bytes) else {
         bail!("{} is not a PNG, JPEG, GIF or WebP image", path.display());
     };
@@ -148,6 +147,11 @@ mod tests {
         assert_eq!(text, "long note @nope.png");
         assert!(images.is_empty() && attached.is_empty());
         assert!(warning.unwrap().contains("nope.png"));
+        #[cfg(unix)]
+        if Path::new("/dev/zero").exists() {
+            let err = load(Path::new("/dev/zero")).unwrap_err();
+            assert!(format!("{err:#}").contains("regular"), "{err:#}");
+        }
     }
 
     #[tokio::test]

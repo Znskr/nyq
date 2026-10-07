@@ -11,6 +11,8 @@ use crate::types::{Item, StreamEvent, ToolSpec, Usage};
 
 const NAME: &str = "subagent";
 const TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long a timed-out subagent gets to kill its tools before we drop it.
+const CLEANUP: Duration = Duration::from_secs(5);
 const MAX_REPORT: usize = 20_000;
 /// Tools an explore subagent may use (those present in the builtins).
 const READ_ONLY: &[&str] = &[
@@ -94,6 +96,10 @@ impl Tool for Subagent {
         if is_general(args) { format!("{label} (general)") } else { label.to_string() }
     }
 
+    fn handles_cancel(&self) -> bool {
+        true
+    }
+
     fn preview(&self, args: &Value, _: &ToolCtx) -> Option<String> {
         let task = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty())?;
         let mode = if is_general(args) { "general" } else { "explore" };
@@ -124,20 +130,23 @@ impl Tool for Subagent {
             usage: Usage::default(),
             context_window,
             context_tokens: 0,
+            context_estimated: false,
             suppress_auto_compact: false,
             sandbox: ctx.sandbox.clone(),
             undo: Default::default(),
         };
         let mut ui = Collector::default();
         let cancel = ctx.cancel.child_token();
-        let result = tokio::time::timeout(TIMEOUT, agent.turn(Item::user(task), &mut ui, cancel)).await;
+        let result = drive_turn(agent.turn(Item::user(task), &mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await;
         let display = Some(ui.display());
         let fail = |msg: String| ToolOutput { display: display.clone(), ..ToolOutput::err(msg) };
         match result {
-            Err(_) => return fail(format!("Subagent timed out after {} minutes.", TIMEOUT.as_secs() / 60)),
-            Ok(Err(e)) => return fail(format!("Subagent failed: {e:#}")),
-            Ok(Ok(TurnEnd::Cancelled)) => return fail("Subagent cancelled.".into()),
-            Ok(Ok(TurnEnd::Done)) => {}
+            Err(e) if e.to_string().contains("timed out") => {
+                return fail(format!("Subagent timed out after {} minutes.", TIMEOUT.as_secs() / 60));
+            }
+            Err(e) => return fail(format!("Subagent failed: {e:#}")),
+            Ok(TurnEnd::Cancelled) => return fail("Subagent cancelled.".into()),
+            Ok(TurnEnd::Done) => {}
         }
         let report = agent
             .items
@@ -156,6 +165,25 @@ impl Tool for Subagent {
             agent.usage.output_tokens
         ));
         ToolOutput { display, ..ToolOutput::ok(content) }
+    }
+}
+
+async fn drive_turn(
+    turn: impl std::future::Future<Output = anyhow::Result<TurnEnd>>,
+    timeout: Duration,
+    cleanup: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<TurnEnd> {
+    tokio::pin!(turn);
+    tokio::select! {
+        r = &mut turn => r,
+        _ = tokio::time::sleep(timeout) => {
+            cancel.cancel();
+            match tokio::time::timeout(cleanup, turn).await {
+                Ok(Ok(TurnEnd::Cancelled)) | Err(_) => anyhow::bail!("timed out"),
+                Ok(other) => other,
+            }
+        }
     }
 }
 
@@ -367,5 +395,20 @@ mod tests {
             .await
             .expect("subagent did not stop on cancel");
         assert!(out.is_error && out.content.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn timeout_cancels_the_child_before_reporting() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let token = cancel.clone();
+        let turn = async move {
+            token.cancelled().await;
+            Ok(TurnEnd::Cancelled)
+        };
+        let err = match drive_turn(turn, Duration::from_millis(30), Duration::from_secs(2), cancel).await {
+            Err(err) => err,
+            Ok(_) => panic!("expected a timeout"),
+        };
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 }

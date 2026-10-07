@@ -12,6 +12,7 @@ use crate::types::ToolSpec;
 
 const MAX_GLOB: usize = 200;
 const MAX_GREP: usize = 300;
+const MAX_GREP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Resolve a possibly relative path against `cwd`.
 fn resolve(cwd: &Path, p: &str) -> PathBuf {
@@ -71,6 +72,10 @@ impl Tool for GlobFiles {
         args.get("pattern").and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
+    fn handles_cancel(&self) -> bool {
+        true
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(pattern) = args.get("pattern").and_then(Value::as_str).filter(|p| !p.is_empty()) else {
             return ToolOutput::err("glob: missing required argument `pattern`.");
@@ -84,12 +89,11 @@ impl Tool for GlobFiles {
             return e;
         }
 
-        let found = tokio::select! {
-            r = tokio::task::spawn_blocking(move || collect_glob(&root, &matcher)) => r,
-            _ = ctx.cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
-        };
+        let cancel = ctx.cancel.clone();
+        let found = tokio::task::spawn_blocking(move || collect_glob(&root, &matcher, &cancel)).await;
         let mut found = match found {
-            Ok(f) => f,
+            Ok(Ok(f)) => f,
+            Ok(Err(msg)) => return ToolOutput::err(msg),
             Err(e) => return ToolOutput::err(format!("glob: {e}")),
         };
 
@@ -107,9 +111,16 @@ impl Tool for GlobFiles {
 }
 
 /// One entry per matching file: (modified time, path relative to the walk root).
-fn collect_glob(root: &Path, matcher: &globset::GlobMatcher) -> Vec<(SystemTime, String)> {
+fn collect_glob(
+    root: &Path,
+    matcher: &globset::GlobMatcher,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<(SystemTime, String)>, String> {
     let mut found = Vec::new();
     for entry in walk(root).flatten() {
+        if cancel.is_cancelled() {
+            return Err("Cancelled by user.".into());
+        }
         if entry.file_type().is_some_and(|t| t.is_dir()) {
             continue;
         }
@@ -120,7 +131,7 @@ fn collect_glob(root: &Path, matcher: &globset::GlobMatcher) -> Vec<(SystemTime,
         let mtime = entry.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
         found.push((mtime, super::slash_path(rel)));
     }
-    found
+    Ok(found)
 }
 
 // ------------------------------------------------------------------------------- grep
@@ -155,6 +166,10 @@ impl Tool for Grep {
         args.get("pattern").and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
+    fn handles_cancel(&self) -> bool {
+        true
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
             return ToolOutput::err("grep: missing required argument `pattern`.");
@@ -183,12 +198,11 @@ impl Tool for Grep {
             return e;
         }
 
-        let found = tokio::select! {
-            r = tokio::task::spawn_blocking(move || collect_grep(&root, &re, filter.as_ref(), files_only)) => r,
-            _ = ctx.cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
-        };
+        let cancel = ctx.cancel.clone();
+        let found = tokio::task::spawn_blocking(move || collect_grep(&root, &re, filter.as_ref(), files_only, &cancel)).await;
         let (mut matches, truncated) = match found {
-            Ok(r) => r,
+            Ok(Ok(r)) => r,
+            Ok(Err(msg)) => return ToolOutput::err(msg),
             Err(e) => return ToolOutput::err(format!("grep: {e}")),
         };
 
@@ -212,21 +226,22 @@ fn collect_grep(
     re: &regex::Regex,
     filter: Option<&globset::GlobMatcher>,
     files_only: bool,
-) -> (Vec<String>, bool) {
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(Vec<String>, bool), String> {
     let mut matches: Vec<String> = Vec::new();
     let mut truncated = false;
 
     // Search one file; returns true when the match cap was reached.
     let mut check = |rel: &Path, abs: &Path| -> bool {
+        if cancel.is_cancelled() {
+            return true;
+        }
         if let Some(f) = filter {
             if !f.is_match(rel) {
                 return false;
             }
         }
-        let Ok(bytes) = std::fs::read(abs) else { return false };
-        if bytes.contains(&0) {
-            return false; // binary
-        }
+        let Some(bytes) = read_grep_file(abs, cancel) else { return false };
         let text = String::from_utf8_lossy(&bytes);
         for (i, line) in text.lines().enumerate() {
             if !re.is_match(line) {
@@ -252,21 +267,58 @@ fn collect_grep(
     };
 
     if root.is_file() {
+        if cancel.is_cancelled() {
+            return Err("Cancelled by user.".into());
+        }
         let rel = Path::new(root.file_name().unwrap_or_default());
         truncated = check(rel, root);
     } else {
         for entry in walk(root).flatten() {
+            if cancel.is_cancelled() {
+                return Err("Cancelled by user.".into());
+            }
             if entry.file_type().is_some_and(|t| t.is_dir()) {
                 continue;
             }
             let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
             if check(rel, entry.path()) {
+                if cancel.is_cancelled() {
+                    return Err("Cancelled by user.".into());
+                }
                 truncated = true;
                 break;
             }
         }
     }
-    (matches, truncated)
+    if cancel.is_cancelled() {
+        return Err("Cancelled by user.".into());
+    }
+    Ok((matches, truncated))
+}
+
+/// Read at most [`MAX_GREP_BYTES`] of a regular file, skipping binaries and
+/// devices. `None` means "skip this file".
+fn read_grep_file(path: &Path, cancel: &tokio_util::sync::CancellationToken) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut file = file.take(MAX_GREP_BYTES);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) if chunk[..n].contains(&0) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(buf)
 }
 
 // ------------------------------------------------------------------------------- misc
@@ -426,5 +478,19 @@ mod tests {
         assert_eq!(spec.parameters["properties"]["output"]["enum"], json!(["content", "files"]));
         assert!(!GlobFiles.needs_approval(&json!({})));
         assert!(!Grep.needs_approval(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_returns_without_finishing() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..40 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "match\n").unwrap();
+        }
+        let ctx = ToolCtx { cwd: dir.path().into(), cancel: CancellationToken::new(), ..Default::default() };
+        ctx.cancel.cancel();
+        let out = GlobFiles.run(json!({"pattern": "*.txt"}), &ctx).await;
+        assert!(out.is_error && out.content.contains("Cancelled"), "{}", out.content);
+        let out = Grep.run(json!({"pattern": "match"}), &ctx).await;
+        assert!(out.is_error && out.content.contains("Cancelled"), "{}", out.content);
     }
 }

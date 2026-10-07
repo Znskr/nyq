@@ -126,6 +126,9 @@ pub struct Agent {
     pub context_window: u64,
     /// Latest context size (input plus output), or an estimate after compaction.
     pub context_tokens: u64,
+    /// `context_tokens` is a chars/4 estimate, refreshed from the transcript
+    /// until a provider reports usage.
+    pub context_estimated: bool,
     /// Set when compaction cannot get under the limit, so later turns don't retry.
     pub(crate) suppress_auto_compact: bool,
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
@@ -150,8 +153,9 @@ impl Agent {
         ui: &mut dyn Ui,
         cancel: CancellationToken,
     ) -> Result<TurnEnd> {
-        self.push(input);
+        self.push_counted(input);
         for _ in 0..MAX_STEPS {
+            self.sync_estimate();
             if !self.suppress_auto_compact
                 && self.context_window > 0
                 && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT
@@ -190,7 +194,10 @@ impl Agent {
                 self.usage.output_tokens += u.output_tokens;
                 self.usage.cached_tokens += u.cached_tokens;
                 self.context_tokens = u.input_tokens + u.output_tokens;
+                self.context_estimated = false;
                 ui.usage(&u);
+            } else {
+                self.context_estimated = true;
             }
 
             let calls: Vec<(String, String, String)> = response
@@ -216,10 +223,11 @@ impl Agent {
                     queued.extend(ui.take_follow_up());
                 }
                 if queued.is_empty() {
+                    self.sync_estimate();
                     return Ok(TurnEnd::Done);
                 }
                 for item in queued {
-                    self.push(item);
+                    self.push_counted(item);
                 }
                 continue;
             }
@@ -240,9 +248,12 @@ impl Agent {
                 let out = self.call_tool(name, arguments, ui, &cancel).await;
                 // Usage precedes tool execution, so account for the new text
                 // before deciding whether the next step needs compaction.
-                self.context_tokens = self
-                    .context_tokens
-                    .saturating_add((out.content.len() as u64).div_ceil(4));
+                // An estimate is replaced wholesale on the next sync.
+                if !self.context_estimated {
+                    self.context_tokens = self
+                        .context_tokens
+                        .saturating_add((out.content.len() as u64).div_ceil(4));
+                }
                 images.extend(out.images);
                 self.push(Item::ToolResult {
                     id: id.clone(),
@@ -257,10 +268,10 @@ impl Agent {
                     "[{} image(s) returned by the tool calls above]",
                     images.len()
                 );
-                self.push(Item::User { text, images });
+                self.push_counted(Item::User { text, images });
             }
             for item in ui.take_steering() {
-                self.push(item);
+                self.push_counted(item);
             }
         }
         anyhow::bail!("stopped after {MAX_STEPS} steps without a final answer")
@@ -337,11 +348,15 @@ impl Agent {
         ui.tool_start(name, &summary);
         let before = self.undo.len();
         self.undo.snapshot(&self.cwd, name, &args);
-        let out = tokio::select! {
-            out = tool.run(args, &ctx) => out,
-            _ = cancel.cancelled() => ToolOutput::err("Cancelled by user."),
+        let out = if tool.handles_cancel() {
+            tool.run(args, &ctx).await
+        } else {
+            tokio::select! {
+                out = tool.run(args, &ctx) => out,
+                _ = cancel.cancelled() => ToolOutput::err("Cancelled by user."),
+            }
         };
-        if out.is_error && self.undo.len() > before {
+        if out.is_error && !out.changed && self.undo.len() > before {
             self.undo.discard_last();
         }
         ui.tool_end(name, &out);
@@ -416,6 +431,9 @@ impl Agent {
             + response.usage.map_or(estimate(&summary), |u| {
                 u.output_tokens.max(estimate(&summary))
             });
+        self.context_estimated = false;
+        self.suppress_auto_compact = self.context_window > 0
+            && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT;
         if let Some(u) = response.usage {
             self.usage.input_tokens += u.input_tokens;
             self.usage.output_tokens += u.output_tokens;
@@ -435,8 +453,58 @@ impl Agent {
         self.session = session;
         self.usage = Usage::default();
         self.context_tokens = 0;
+        self.context_estimated = false;
+        self.suppress_auto_compact = false;
         self.undo = Default::default();
     }
+
+    /// Replace the context-window size and allow automatic compaction again.
+    pub fn set_context_window(&mut self, window: u64) {
+        self.context_window = window;
+        self.suppress_auto_compact = false;
+    }
+
+    /// After loading a transcript, estimate its size until the provider reports usage.
+    pub(crate) fn adopt_transcript(&mut self) {
+        self.context_estimated = true;
+        self.context_tokens = estimate_context(&self.system, &self.items);
+    }
+
+    fn push_counted(&mut self, item: Item) {
+        if !self.context_estimated {
+            self.context_tokens = self.context_tokens.saturating_add(item_tokens(&item));
+        }
+        self.push(item);
+    }
+
+    fn sync_estimate(&mut self) {
+        if self.context_estimated {
+            self.context_tokens = estimate_context(&self.system, &self.items);
+        }
+    }
+}
+
+fn text_tokens(text: &str) -> u64 {
+    (text.len() as u64).div_ceil(4)
+}
+
+fn item_tokens(item: &Item) -> u64 {
+    match item {
+        Item::User { text, images } => {
+            text_tokens(text) + images.iter().map(|image| text_tokens(&image.data)).sum::<u64>()
+        }
+        Item::Assistant { text } => text_tokens(text),
+        Item::Reasoning { summary, encrypted, .. } => {
+            text_tokens(summary) + encrypted.as_deref().map(text_tokens).unwrap_or(0)
+        }
+        Item::ToolCall { id, name, arguments } => text_tokens(id) + text_tokens(name) + text_tokens(arguments),
+        Item::ToolResult { id, output, .. } => text_tokens(id) + text_tokens(output),
+        Item::Compaction { summary } => text_tokens(&crate::types::compaction_text(summary)),
+    }
+}
+
+fn estimate_context(system: &str, items: &[Item]) -> u64 {
+    text_tokens(system) + items.iter().map(item_tokens).sum::<u64>()
 }
 
 // ------------------------------------------------------------ approval rules
@@ -477,9 +545,32 @@ fn program_base(program: &str) -> &str {
     program.rsplit(['/', '\\']).next().unwrap_or(program)
 }
 
-/// The prefix "always" grants for a shell command: the program, any leading
-/// flags (`rm -rf`, `git -C`), and a subcommand when there is no leading flag
-/// (`cargo test`, `npm run build`). None when the command can't be safely
+/// `Some(true)`: the next plain word is an operand and belongs in the grant.
+/// `Some(false)`: a boolean flag, or a self-contained `--name=value`.
+/// `None`: the option cannot be scoped (the grant would be once-only).
+fn flag_operand(program: &str, flag: &str) -> Option<bool> {
+    if let Some((name, value)) = flag.split_once('=') {
+        if name.starts_with("--") && name.len() > 2 && plain_word(value) {
+            return Some(false);
+        }
+        return None;
+    }
+    let valued = |flags: &[&str]| flags.contains(&flag).then_some(true);
+    let boolean = |flags: &[&str]| flags.contains(&flag).then_some(false);
+    match program_base(program) {
+        "git" => valued(&["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"])
+            .or_else(|| boolean(&["--bare", "--no-pager", "--paginate", "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs"])),
+        "cargo" => valued(&["--manifest-path", "-p", "--package", "--target", "--target-dir", "--features", "--jobs", "-j", "--color", "--config", "--profile", "--message-format", "--out-dir", "--artifact-dir", "-Z"])
+            .or_else(|| boolean(&["--release", "--offline", "--locked", "--frozen", "--all-features", "--no-default-features", "--workspace", "--all", "--lib", "--bins", "--tests", "--examples", "--benches", "--doc", "--quiet", "-q", "--verbose", "-v"])),
+        "curl" => valued(&["-o", "-d", "-H", "-X", "-u", "--url", "--output", "--data", "--header", "--request", "--user", "-A", "--user-agent", "-e", "--referer", "-b", "--cookie", "-F", "--form", "-T", "--upload-file", "--data-binary", "--data-raw", "-m", "--max-time", "--connect-timeout", "-w", "--write-out", "--proxy", "-x", "--cacert", "--cert", "--key"])
+            .or_else(|| boolean(&["-s", "-S", "-L", "-f", "-k", "-I", "-v", "-i", "-G", "--silent", "--show-error", "--location", "--fail", "--insecure", "--head", "--verbose", "--include", "--get", "--compressed"])),
+        _ => None,
+    }
+}
+
+/// The prefix "always" grants for a shell command: the program, known leading
+/// options together with their operands (`git -C foo`, `curl -o file`), and
+/// the following subcommand (`git -C foo status`). Unknown options are not
 /// scoped. Wrappers and interpreters are matched on the program name with any
 /// directory stripped (`./sh`, `bin/bash`, `./python`).
 pub fn bash_prefix(cmd: &str) -> Option<String> {
@@ -492,27 +583,40 @@ pub fn bash_prefix(cmd: &str) -> Option<String> {
     if !plain_word(program.strip_prefix("./").unwrap_or(program)) || WRAPPERS.contains(&base) || program.contains('=') {
         return None;
     }
+    if INTERPRETERS.contains(&base) && words.get(1).is_some_and(|w| is_flag(w)) {
+        return None;
+    }
     let mut prefix = vec![program];
     let mut i = 1;
+    let mut saw_flag = false;
     while words.get(i).is_some_and(|w| is_flag(w)) {
-        prefix.push(words[i]);
-        i += 1;
-    }
-    let flags = i > 1;
-    if INTERPRETERS.contains(&base) {
-        // `-c` / `-m` / `-e` would scope the interpreter to anything.
-        if flags {
-            return None;
+        saw_flag = true;
+        match flag_operand(program, words[i]) {
+            Some(true) => {
+                let operand = words.get(i + 1).copied().filter(|w| plain_word(w))?;
+                prefix.push(words[i]);
+                prefix.push(operand);
+                i += 2;
+            }
+            Some(false) => {
+                prefix.push(words[i]);
+                i += 1;
+            }
+            None => return None,
         }
+    }
+    if INTERPRETERS.contains(&base) {
         prefix.push(words.get(i).filter(|w| plain_word(w))?);
         return Some(prefix.join(" "));
     }
-    if !flags {
-        if let Some(sub) = words.get(i).filter(|w| plain_word(w)) {
+    if let Some(sub) = words.get(i) {
+        if plain_word(sub) {
             prefix.push(sub);
             if RUNNERS.contains(&base) && matches!(*sub, "run" | "exec" | "x") {
                 prefix.extend(words.get(i + 1).filter(|w| plain_word(w)));
             }
+        } else if saw_flag {
+            return None;
         }
     }
     Some(prefix.join(" "))
@@ -599,6 +703,27 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
 }
 
 #[cfg(test)]
+struct ScriptedTurns {
+    left: std::sync::Arc<std::sync::Mutex<Vec<crate::types::Response>>>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Provider for ScriptedTurns {
+    fn name(&self) -> &str { "fake" }
+    fn model(&self) -> &str { "fake" }
+    fn set_model(&mut self, _: String) {}
+    fn fork(&self) -> Box<dyn Provider> {
+        Box::new(ScriptedTurns { left: std::sync::Arc::clone(&self.left) })
+    }
+    async fn stream(&self, _: Request<'_>, _: crate::provider::EventSink<'_>) -> Result<crate::types::Response> {
+        let mut left = self.left.lock().unwrap();
+        anyhow::ensure!(!left.is_empty(), "script exhausted");
+        Ok(left.remove(0))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::EventSink;
@@ -644,6 +769,7 @@ mod tests {
             usage: Usage::default(),
             context_window: 1000,
             context_tokens: 900,
+            context_estimated: false,
             suppress_auto_compact: false,
             sandbox: Default::default(),
             undo: Default::default(),
@@ -713,10 +839,12 @@ mod tests {
             },
             None,
         );
+        agent.suppress_auto_compact = true;
         assert!(agent
             .compact(&mut QuietUi, &CancellationToken::new())
             .await
             .unwrap());
+        assert!(!agent.suppress_auto_compact);
         assert_eq!(agent.usage, usage);
         assert_eq!(
             agent.context_tokens,
@@ -773,15 +901,23 @@ mod tests {
         assert_eq!(p("cargo test").as_deref(), Some("cargo test"));
         assert_eq!(p("cargo test --release -p nyq").as_deref(), Some("cargo test"));
         assert_eq!(p("  git   status  ").as_deref(), Some("git status"));
-        assert_eq!(p("git -C foo status").as_deref(), Some("git -C"));
+        assert_eq!(p("git -C foo status").as_deref(), Some("git -C foo status"));
         assert_eq!(p("npm run build").as_deref(), Some("npm run build"));
         assert_eq!(p("npm run build -- --watch").as_deref(), Some("npm run build"));
         assert_eq!(p("npm test").as_deref(), Some("npm test"));
         assert_eq!(p("uv run pytest -x").as_deref(), Some("uv run pytest"));
         assert_eq!(p("ls").as_deref(), Some("ls"));
-        assert_eq!(p("ls -la src").as_deref(), Some("ls -la"));
-        assert_eq!(p("rm -rf target/debug").as_deref(), Some("rm -rf"));
-        assert_eq!(p("chmod -R 755 .").as_deref(), Some("chmod -R"));
+        assert_eq!(p("ls -la src"), None);
+        assert_eq!(p("rm -rf target/debug"), None);
+        assert_eq!(p("chmod -R 755 ."), None);
+        assert_eq!(
+            p("curl -o approved-file https://example.com/a").as_deref(),
+            Some("curl -o approved-file https://example.com/a")
+        );
+        assert_eq!(
+            p("cargo --manifest-path safe/Cargo.toml test").as_deref(),
+            Some("cargo --manifest-path safe/Cargo.toml test")
+        );
         assert_eq!(p("./python script.py").as_deref(), Some("./python script.py"));
         assert_eq!(p("python -m pytest"), None);
         assert_eq!(p("./gradlew build").as_deref(), Some("./gradlew build"));
@@ -819,6 +955,7 @@ mod tests {
         assert!(!bash_matches("ls -la", "ls src"));
         assert!(!bash_matches("git -C", "git status"));
         assert!(bash_matches("git -C", "git -C elsewhere reset --hard"));
+        assert!(!bash_matches("git -C safe status", "git -C elsewhere reset --hard"));
         assert!(!bash_matches("", "anything"));
     }
 
@@ -873,8 +1010,23 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "a").unwrap();
         agent.undo.snapshot(&agent.cwd, "edit_file", &json!({"path": "f.txt"}));
         assert_eq!(agent.undo.len(), 1);
+        agent.suppress_auto_compact = true;
+        agent.context_estimated = true;
+        agent.context_tokens = 40;
         agent.reset(None);
         assert!(agent.undo.is_empty());
+        assert!(!agent.suppress_auto_compact);
+        assert!(!agent.context_estimated);
+        assert_eq!(agent.context_tokens, 0);
+
+        agent.system = "abcd".into();
+        agent.items = vec![Item::user("abcd")];
+        agent.adopt_transcript();
+        assert!(agent.context_estimated);
+        assert_eq!(agent.context_tokens, 2);
+        agent.set_context_window(1000);
+        assert_eq!(agent.context_window, 1000);
+        assert!(!agent.suppress_auto_compact);
     }
 
     #[test]
@@ -952,5 +1104,60 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(matches!(agent.turn(Item::user("again"), &mut ui, CancellationToken::new()).await.unwrap(), TurnEnd::Done));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_write_keeps_undo_only_when_it_changed_the_file() {
+        struct MutTool {
+            changed: bool,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for MutTool {
+            fn spec(&self) -> crate::types::ToolSpec {
+                crate::types::ToolSpec {
+                    name: "write_file".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                }
+            }
+            fn summary(&self, _: &Value) -> String {
+                "f.txt".into()
+            }
+            async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
+                ToolOutput { content: "nope".into(), is_error: true, changed: self.changed, ..ToolOutput::default() }
+            }
+        }
+
+        let script = |changed: bool| {
+            let mut agent = agent(Response::default(), None);
+            agent.context_window = 0;
+            agent.context_tokens = 0;
+            agent.tools.add(Box::new(MutTool { changed }));
+            agent.provider = Box::new(ScriptedTurns {
+                left: std::sync::Arc::new(std::sync::Mutex::new(vec![
+                    Response {
+                        items: vec![Item::ToolCall {
+                            id: "1".into(),
+                            name: "write_file".into(),
+                            arguments: r#"{"path":"f.txt"}"#.into(),
+                        }],
+                        usage: Some(Usage { input_tokens: 1, output_tokens: 1, cached_tokens: 0 }),
+                    },
+                    Response {
+                        items: vec![Item::Assistant { text: "done".into() }],
+                        usage: Some(Usage { input_tokens: 2, output_tokens: 1, cached_tokens: 0 }),
+                    },
+                ])),
+            });
+            agent
+        };
+
+        let mut kept = script(true);
+        kept.turn(Item::user("go"), &mut QuietUi, CancellationToken::new()).await.unwrap();
+        assert_eq!(kept.undo.len(), 1);
+
+        let mut dropped = script(false);
+        dropped.turn(Item::user("go"), &mut QuietUi, CancellationToken::new()).await.unwrap();
+        assert_eq!(dropped.undo.len(), 0);
     }
 }
