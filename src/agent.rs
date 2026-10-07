@@ -41,18 +41,27 @@ pub struct ApprovalRequest<'a> {
     pub preview: Option<&'a str>,
 }
 
-/// Everything the loop needs from a frontend. Implementations may block
-/// (e.g. reading a key for `approve`).
+/// Everything the loop needs from a frontend.
+#[async_trait::async_trait]
 pub trait Ui: Send {
     fn stream(&mut self, event: &StreamEvent);
     /// Called once the model response is complete (flush partial lines).
     fn end_message(&mut self);
     fn tool_start(&mut self, tool: &str, summary: &str);
     fn tool_end(&mut self, tool: &str, output: &ToolOutput);
-    fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval;
+    async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval;
     fn usage(&mut self, _usage: &Usage) {}
     /// A short status message from the loop (e.g. "Compacting…").
     fn notice(&mut self, _msg: &str) {}
+    /// Messages the user typed while the agent was working, delivered before
+    /// the next model request ("steering").
+    fn take_steering(&mut self) -> Vec<Item> {
+        Vec::new()
+    }
+    /// A message queued to run once the agent would otherwise stop.
+    fn take_follow_up(&mut self) -> Option<Item> {
+        None
+    }
 }
 
 pub enum TurnEnd {
@@ -152,7 +161,19 @@ impl Agent {
                 self.push(item);
             }
             if calls.is_empty() {
-                return Ok(TurnEnd::Done);
+                // Queued input keeps the run going: steering first, then one
+                // follow-up at a time.
+                let mut queued = ui.take_steering();
+                if queued.is_empty() {
+                    queued.extend(ui.take_follow_up());
+                }
+                if queued.is_empty() {
+                    return Ok(TurnEnd::Done);
+                }
+                for item in queued {
+                    self.push(item);
+                }
+                continue;
             }
 
             let mut images = Vec::new();
@@ -190,6 +211,9 @@ impl Agent {
                 );
                 self.push(Item::User { text, images });
             }
+            for item in ui.take_steering() {
+                self.push(item);
+            }
         }
         anyhow::bail!("stopped after {MAX_STEPS} steps without a final answer")
     }
@@ -226,7 +250,7 @@ impl Agent {
                 summary: &summary,
                 preview: preview.as_deref(),
             };
-            match ui.approve(&req) {
+            match ui.approve(&req).await {
                 Approval::Yes => {}
                 Approval::Always => {
                     self.allowed.insert(name.to_string());
@@ -388,12 +412,13 @@ mod tests {
     }
 
     struct QuietUi;
+    #[async_trait::async_trait]
     impl Ui for QuietUi {
         fn stream(&mut self, _: &StreamEvent) {}
         fn end_message(&mut self) {}
         fn tool_start(&mut self, _: &str, _: &str) {}
         fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
-        fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval {
+        async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval {
             Approval::Yes
         }
     }

@@ -21,7 +21,7 @@ use mcp::{McpManager, Scope, ServerConfig};
 use session::Session;
 use tools::Registry;
 use types::Usage;
-use ui::Input;
+use ui::tui::{Command as UiCommand, Footer, Tui};
 
 #[derive(Parser)]
 #[command(name = "nyq", version, about = "A small, friendly coding agent for your terminal")]
@@ -118,14 +118,12 @@ async fn run() -> Result<()> {
     agent.context_window = config::context_window(agent.provider.name());
 
     let resume = cli.resume.clone().or_else(|| cli.continue_last.then(|| "last".to_string()));
+    let mut resumed = None;
     if let Some(which) = &resume {
         let (s, meta, items) = session::load(&sessions_dir, which, &cwd)?;
-        ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
-        if !cli.print {
-            ui::replay(&items);
-        }
         agent.session = Some(s);
         agent.items = items;
+        resumed = Some(meta);
     }
 
     let mut mcp = McpManager::new(home.clone());
@@ -135,13 +133,17 @@ async fn run() -> Result<()> {
     }
 
     let mut text = cli.prompt.join(" ");
-    if cli.print {
+    let interactive = !cli.print && std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    if !interactive {
         if text.trim().is_empty() {
             use std::io::Read;
             std::io::stdin().read_to_string(&mut text)?;
         }
+        if let Some(meta) = &resumed {
+            ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+        }
         connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
-        let mut plain = ui::PlainUi { yolo: cli.yolo };
+        let mut plain = ui::PlainUi::new(cli.yolo);
         let cancel = cancel_on_ctrl_c();
         let (item, _) = tools::image::user_message(&text, &cwd)?;
         let r = agent.turn(item, &mut plain, cancel).await;
@@ -149,20 +151,26 @@ async fn run() -> Result<()> {
         return r.map(|_| ());
     }
 
-    ui::banner(agent.provider.name(), agent.provider.model(), &cwd.display().to_string());
-    ui::info(&format!("  {}", sandbox::describe(&agent.sandbox)));
+    let footer = Footer { cwd: cwd.display().to_string(), sandbox: sandbox_label(&agent.sandbox), ..Footer::default() };
+    let commands = COMMANDS.iter().map(|(c, d)| (c.to_string(), d.to_string())).collect();
+    let mut tui = Tui::start(footer, home.join("nyq").join("history"), commands)?;
+    sync_footer(&tui, &agent);
+    ui::banner(env!("CARGO_PKG_VERSION"));
+    ui::info(&sandbox::describe(&agent.sandbox));
+    if let Some(meta) = &resumed {
+        ui::replay(&agent.items);
+        ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+    }
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
-    let mut term = ui::TermUi::new();
-    let mut input = ui::Prompt::new(home.join("nyq").join("history"), COMMANDS.iter().map(|c| c.0.to_string()).collect())?;
     let mut pending = (!text.trim().is_empty()).then_some(text);
 
     loop {
+        sync_footer(&tui, &agent);
         let line = match pending.take() {
             Some(t) => t,
-            None => match input.read(&status(&agent))? {
-                Input::Line(l) => l,
-                Input::Interrupt => continue,
-                Input::Eof => break,
+            None => match tui.commands.recv().await {
+                Some(UiCommand::Submit(t)) => t,
+                Some(UiCommand::Exit) | None => break,
             },
         };
         let line = line.trim().to_string();
@@ -170,11 +178,11 @@ async fn run() -> Result<()> {
             continue;
         }
         if let Some(cmd) = line.strip_prefix('!') {
-            shell(cmd, &cwd).await;
+            shell(cmd, &cwd, &tui).await;
             continue;
         }
         if line.starts_with('/') {
-            match slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir).await {
+            match slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir, &tui).await {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
@@ -185,6 +193,7 @@ async fn run() -> Result<()> {
         }
         let item = match tools::image::user_message(&line, &cwd) {
             Ok((item, attached)) => {
+                tui.screen().print_user(&line);
                 if !attached.is_empty() {
                     ui::info(&format!("Attached {}", attached.join(", ")));
                 }
@@ -195,16 +204,53 @@ async fn run() -> Result<()> {
                 continue;
             }
         };
-        let cancel = cancel_on_ctrl_c();
-        match agent.turn(item, &mut term, cancel.clone()).await {
+        let cancel = CancellationToken::new();
+        tui.screen().set_busy(Some("Working"), Some(cancel.clone()));
+        let result = agent.turn(item, &mut tui.ui(cwd.clone()), cancel.clone()).await;
+        let leftover = {
+            let mut s = tui.screen();
+            s.set_busy(None, None);
+            if !matches!(result, Ok(TurnEnd::Done)) {
+                // Interrupted or failed: give queued messages back for editing.
+                s.dequeue();
+                s.redraw();
+                Vec::new()
+            } else {
+                s.queue.drain(..).map(|(_, t)| t).collect::<Vec<_>>()
+            }
+        };
+        match result {
             Ok(TurnEnd::Done) => {}
             Ok(TurnEnd::Cancelled) => ui::info("Interrupted."),
             Err(e) => ui::error(&format!("{e:#}")),
         }
-        cancel.cancel(); // stop this turn's Ctrl-C listener
+        // Messages queued just as the run finished start the next one.
+        if !leftover.is_empty() {
+            pending = Some(leftover.join("\n\n"));
+        }
     }
+    drop(tui);
     mcp.shutdown().await;
     Ok(())
+}
+
+fn sandbox_label(policy: &sandbox::Policy) -> String {
+    match policy.mode {
+        sandbox::Mode::Off => "no sandbox".into(),
+        sandbox::Mode::ReadOnly => format!("read-only{}", if policy.network { " + net" } else { "" }),
+        sandbox::Mode::WorkspaceWrite => format!("sandboxed{}", if policy.network { " + net" } else { "" }),
+    }
+}
+
+fn sync_footer(tui: &Tui, agent: &Agent) {
+    let mut s = tui.screen();
+    s.footer.provider = agent.provider.name().to_string();
+    s.footer.model = agent.provider.model().to_string();
+    s.footer.yolo = agent.yolo;
+    s.footer.usage = agent.usage;
+    s.footer.context_tokens = agent.context_tokens;
+    s.footer.context_window = agent.context_window;
+    s.redraw();
 }
 
 /// The requested sandbox, or by default workspace-write when this system
@@ -223,18 +269,6 @@ fn sandbox_policy(cli: &Cli) -> Result<sandbox::Policy> {
         policy.mode = sandbox::Mode::Off;
     }
     Ok(policy)
-}
-
-fn status(agent: &Agent) -> String {
-    let mut s = agent.provider.model().to_string();
-    if agent.yolo {
-        s.push_str(" · yolo");
-    }
-    let total = agent.usage.input_tokens + agent.usage.output_tokens;
-    if total > 0 {
-        s.push_str(&format!(" · {}k tok", total / 1000));
-    }
-    s
 }
 
 /// A token that fires on the next Ctrl-C. Cancel it yourself to stop listening.
@@ -279,20 +313,40 @@ async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig, qu
     }
 }
 
-async fn shell(cmd: &str, cwd: &PathBuf) {
-    let status = tokio::process::Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).status().await;
-    if let Err(e) = status {
-        ui::error(&format!("{e}"));
+/// `!cmd`: run a command yourself (unsandboxed) and show its output.
+async fn shell(cmd: &str, cwd: &PathBuf, tui: &Tui) {
+    let started = std::time::Instant::now();
+    tui.screen().print_tool_call("bash", cmd);
+    let out = tokio::process::Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).stdin(std::process::Stdio::null()).output().await;
+    let output = match out {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            let ok = o.status.success();
+            if !ok {
+                text.push_str(&format!("\nexit code {}", o.status.code().unwrap_or(-1)));
+            }
+            tools::ToolOutput { content: if text.trim().is_empty() { "(no output)".into() } else { text }, is_error: !ok, ..Default::default() }
+        }
+        Err(e) => tools::ToolOutput::err(e.to_string()),
+    };
+    tui.screen().print_tool_output(&output, started);
+}
+
+fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
+    let all = session::list(dir)?;
+    if all.is_empty() {
+        return Ok(vec!["No saved conversations.".into()]);
     }
+    Ok(all
+        .iter()
+        .map(|m| format!("{}  {}  {}  {}", &m.id[..8.min(m.id.len())], m.created.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"), m.cwd.display(), m.title))
+        .collect())
 }
 
 fn list_sessions(dir: &std::path::Path) -> Result<()> {
-    let all = session::list(dir)?;
-    if all.is_empty() {
-        println!("No saved conversations.");
-    }
-    for m in all {
-        println!("{}  {}  {}  {}", &m.id[..8.min(m.id.len())], m.created.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"), m.cwd.display(), m.title);
+    for l in session_lines(dir)? {
+        println!("{l}");
     }
     Ok(())
 }
@@ -304,6 +358,7 @@ async fn slash(
     mcp: &mut McpManager,
     servers: &[ServerConfig],
     sessions_dir: &std::path::Path,
+    tui: &Tui,
 ) -> Result<bool> {
     let mut parts = line.split_whitespace();
     let cmd = parts.next().unwrap_or("");
@@ -314,21 +369,21 @@ async fn slash(
             for (c, d) in COMMANDS {
                 ui::info(&format!("  {c:<10} {d}"));
             }
-            ui::info("  !CMD       run a shell command yourself\n  Ctrl-C     interrupt the current turn");
+            ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts");
         }
         "/new" | "/clear" => {
             agent.reset(Some(Session::create(sessions_dir, &agent.cwd, agent.provider.model())?));
             ui::info("Started a new conversation.");
         }
-        "/sessions" => list_sessions(sessions_dir)?,
+        "/sessions" => ui::info(&session_lines(sessions_dir)?.join("\n")),
         "/compact" => {
-            let cancel = cancel_on_ctrl_c();
-            let mut term = ui::TermUi::new();
-            ui::info("Compacting…");
-            if !agent.compact(&mut term, &cancel).await? {
+            let cancel = CancellationToken::new();
+            tui.screen().set_busy(Some("Compacting"), Some(cancel.clone()));
+            let result = agent.compact(&mut tui.ui(agent.cwd.clone()), &cancel).await;
+            tui.screen().set_busy(None, None);
+            if !result? {
                 ui::info("Interrupted.");
             }
-            cancel.cancel();
         }
         "/resume" => {
             let which = arg.first().copied().unwrap_or("last");
@@ -360,7 +415,7 @@ async fn slash(
                 let cfg = servers.iter().find(|s| s.name == name).with_context(|| format!("no MCP server named `{name}`"))?;
                 let tools = mcp
                     .login(cfg, |url| {
-                        ui::info(&format!("Sign in to {name} in your browser (waiting up to 5 minutes, Ctrl-C to cancel):\n  {url}"));
+                        ui::info(&format!("Sign in to {name} in your browser (waiting up to 5 minutes):\n  {url}"));
                         mcp::open_browser(url);
                     })
                     .await?;
