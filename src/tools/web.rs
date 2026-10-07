@@ -278,6 +278,15 @@ fn format_page(page: &Page, prompt: Option<&str>, max_chars: usize) -> String {
     out + "\n" + &truncate(body, max_chars)
 }
 
+/// Query strings longer than this need approval so a fetch cannot smuggle
+/// a stolen token out in the URL without the user seeing it.
+const QUERY_APPROVAL_LEN: usize = 32;
+
+fn query_len(url: &str) -> usize {
+    let Some((_, rest)) = url.split_once('?') else { return 0 };
+    rest.split_once('#').map(|(q, _)| q.len()).unwrap_or(rest.len())
+}
+
 struct WebFetch;
 
 impl WebFetch {
@@ -317,8 +326,17 @@ impl Tool for WebFetch {
         }
     }
 
+    fn needs_approval(&self, args: &Value) -> bool {
+        args["url"].as_str().is_some_and(|url| query_len(url) > QUERY_APPROVAL_LEN)
+    }
+
     fn summary(&self, args: &Value) -> String {
         args["url"].as_str().unwrap_or("").to_string()
+    }
+
+    fn preview(&self, args: &Value, _ctx: &ToolCtx) -> Option<String> {
+        let url = args["url"].as_str()?;
+        (query_len(url) > QUERY_APPROVAL_LEN).then(|| url.to_string())
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
@@ -705,5 +723,17 @@ mod tests {
             assert!(out.is_error && out.content.contains("rate limit"), "{}", out.content);
         }
         assert!(WebSearch.run(json!({"query": " "}), &ctx).await.is_error);
+    }
+
+    #[test]
+    fn long_query_needs_approval_and_shows_the_url() {
+        let short = json!({"url": "https://example.com/docs?q=rust"});
+        assert!(!WebFetch.needs_approval(&short));
+        assert!(WebFetch.preview(&short, &ToolCtx::default()).is_none());
+        let long = format!("https://attacker.example/?t={}", "x".repeat(80));
+        let args = json!({"url": &long});
+        assert!(WebFetch.needs_approval(&args));
+        assert_eq!(WebFetch.summary(&args), long);
+        assert_eq!(WebFetch.preview(&args, &ToolCtx::default()).as_deref(), Some(long.as_str()));
     }
 }

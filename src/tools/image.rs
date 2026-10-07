@@ -107,7 +107,11 @@ impl Tool for ViewImage {
         let Some(raw) = args["path"].as_str() else {
             return ToolOutput::err("view_image: missing `path`");
         };
-        match load(&resolve(&ctx.cwd, raw)) {
+        let path = resolve(&ctx.cwd, raw);
+        if let Some(msg) = super::SecretRoots::load().reject(raw, &path) {
+            return ToolOutput::err(format!("view_image: {msg}"));
+        }
+        match load(&path) {
             Ok(image) => ToolOutput { images: vec![image], ..ToolOutput::ok(format!("Loaded {raw}; the image follows.")) },
             Err(e) => ToolOutput::err(format!("view_image: {e:#}")),
         }
@@ -163,5 +167,22 @@ mod tests {
         assert!(!out.is_error);
         assert_eq!(out.images.len(), 1);
         assert!(ViewImage.run(json!({"path": "b.png"}), &ctx).await.is_error);
+    }
+
+    #[test]
+    fn view_image_refuses_credential_files() {
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("NYQ_HOME");
+        let old_auth = std::env::var_os("NYQ_CODEX_AUTH");
+        std::env::set_var("NYQ_HOME", home.path());
+        std::env::remove_var("NYQ_CODEX_AUTH");
+        std::fs::write(home.path().join("shot.png"), PNG).unwrap();
+        let ctx = ToolCtx { cwd: home.path().into(), ..Default::default() };
+        let out = futures::executor::block_on(ViewImage.run(json!({"path": "shot.png"}), &ctx));
+        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        assert!(out.images.is_empty());
+        if let Some(v) = old_home { std::env::set_var("NYQ_HOME", v); } else { std::env::remove_var("NYQ_HOME"); }
+        if let Some(v) = old_auth { std::env::set_var("NYQ_CODEX_AUTH", v); } else { std::env::remove_var("NYQ_CODEX_AUTH"); }
     }
 }

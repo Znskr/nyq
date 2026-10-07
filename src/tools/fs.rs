@@ -120,6 +120,9 @@ impl Tool for ReadFile {
             return ToolOutput::err("read_file: missing required argument `path`.");
         };
         let path = resolve(&ctx.cwd, p);
+        if let Some(msg) = super::SecretRoots::load().reject(p, &path) {
+            return ToolOutput::err(format!("read_file: {msg}"));
+        }
         let offset = int_arg(&args, "offset").unwrap_or(1);
         let limit = int_arg(&args, "limit").unwrap_or(2000);
         if offset < 1 {
@@ -143,9 +146,6 @@ impl Tool for ReadFile {
                     ))
                 }
             }
-        }
-        if bytes.split(|b| *b == b'\n').any(|line| line.len() > MAX_LINE_BYTES) {
-            return ToolOutput::err(format!("read_file: a line in {} exceeds 1 MiB.", display_path(&path)));
         }
         if bytes.contains(&0) {
             return ToolOutput::err(format!("read_file: {} is a binary file.", display_path(&path)));
@@ -179,7 +179,8 @@ impl Tool for ReadFile {
         for (i, line) in lines[start..end].iter().enumerate() {
             let n = start + i + 1;
             if line.chars().count() > 2000 {
-                out.push_str(&format!("{n:>6}\t{}…\n", line.chars().take(2000).collect::<String>()));
+                let note = if line.len() > MAX_LINE_BYTES { " [line exceeds 1 MiB]" } else { "" };
+                out.push_str(&format!("{n:>6}\t{}…{note}\n", line.chars().take(2000).collect::<String>()));
             } else {
                 out.push_str(&format!("{n:>6}\t{line}\n"));
             }
@@ -221,7 +222,11 @@ impl Tool for ListDir {
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
-        let path = resolve(&ctx.cwd, args.get("path").and_then(Value::as_str).unwrap_or("."));
+        let user = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let path = resolve(&ctx.cwd, user);
+        if let Some(msg) = super::SecretRoots::load().reject(user, &path) {
+            return ToolOutput::err(format!("list_dir: {msg}"));
+        }
         if !path.is_dir() {
             if !path.exists() {
                 return ToolOutput::err(format!("list_dir: no such directory: {}", display_path(&path)));
@@ -829,8 +834,23 @@ mod tests {
             let out = futures::executor::block_on(
                 WriteFile.run(json!({"path": "alias", "content": "pwned"}), &ww),
             );
-            assert!(out.is_error && out.content.contains("symlink"), "{}", out.content);
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "real");
+            #[cfg(target_os = "linux")]
+            {
+                assert!(!out.is_error, "{}", out.content);
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "pwned");
+                assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+                let out = futures::executor::block_on(EditFile.run(
+                    json!({"path": "alias", "old_string": "pwned", "new_string": "edited"}),
+                    &ww,
+                ));
+                assert!(!out.is_error, "{}", out.content);
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "edited");
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                assert!(out.is_error && out.content.contains("symlink"), "{}", out.content);
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "real");
+            }
 
             let out = futures::executor::block_on(
                 WriteFile.run(json!({"path": "alias", "content": "followed"}), &off),
@@ -860,5 +880,53 @@ mod tests {
         assert!(out.is_error, "{}", out.content);
         assert!(!out.changed);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+    }
+
+    #[test]
+    fn read_pages_a_line_longer_than_one_mebibyte() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = "x".repeat(MAX_LINE_BYTES + 8);
+        big.push('\n');
+        big.push_str("after\n");
+        std::fs::write(dir.path().join("app.min.js"), &big).unwrap();
+        let out = run(&ReadFile, json!({"path": "app.min.js", "limit": 1}), dir.path());
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("[line exceeds 1 MiB]"), "{}", out.content);
+        assert!(out.content.contains('…'));
+        let out = run(&ReadFile, json!({"path": "app.min.js", "offset": 2, "limit": 1}), dir.path());
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("after"), "{}", out.content);
+    }
+
+    #[test]
+    fn reads_refuse_credential_files() {
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("NYQ_HOME");
+        let old_auth = std::env::var_os("NYQ_CODEX_AUTH");
+        std::env::set_var("NYQ_HOME", home.path());
+        std::env::remove_var("NYQ_CODEX_AUTH");
+        std::fs::write(home.path().join("chatgpt-auth.json"), "refresh-token").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("ok.txt"), "hello\n").unwrap();
+        let secret = home.path().join("chatgpt-auth.json");
+        let out = run(&ReadFile, json!({"path": secret.to_str().unwrap()}), ws.path());
+        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        assert!(!out.content.contains("refresh-token"));
+        let out = run(&ListDir, json!({"path": home.path().to_str().unwrap()}), ws.path());
+        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        let out = run(&ReadFile, json!({"path": "ok.txt"}), ws.path());
+        assert!(!out.is_error && out.content.contains("hello"), "{}", out.content);
+        let out = run(&ReadFile, json!({"path": "~/.ssh/id_rsa"}), ws.path());
+        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, ws.path().join("leak")).unwrap();
+            let out = run(&ReadFile, json!({"path": "leak"}), ws.path());
+            assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+            assert!(!out.content.contains("refresh-token"));
+        }
+        if let Some(v) = old_home { std::env::set_var("NYQ_HOME", v); } else { std::env::remove_var("NYQ_HOME"); }
+        if let Some(v) = old_auth { std::env::set_var("NYQ_CODEX_AUTH", v); } else { std::env::remove_var("NYQ_CODEX_AUTH"); }
     }
 }

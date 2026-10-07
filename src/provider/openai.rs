@@ -188,8 +188,12 @@ impl Provider for OpenAiProvider {
             else {
                 continue;
             };
-            if choice.get("finish_reason").is_some_and(|v| !v.is_null()) {
-                completed = true;
+            if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
+                match reason.as_str() {
+                    Some("stop" | "tool_calls" | "function_call") => completed = true,
+                    Some(other) => anyhow::bail!("OpenAI stream stopped early: finish_reason {other}"),
+                    None => anyhow::bail!("OpenAI stream stopped early: finish_reason {reason}"),
+                }
             }
             let delta = &choice["delta"];
             for (key, reasoning) in [
@@ -455,5 +459,19 @@ mod tests {
         let body = events(&[json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]})]);
         let response = one_stream(body).await.unwrap();
         assert_eq!(response.items, vec![Item::Assistant { text: "hi".into() }]);
+    }
+
+    #[tokio::test]
+    async fn incomplete_finish_reasons_are_errors() {
+        for reason in ["length", "content_filter", "tool_calls", "function_call"] {
+            let body = events(&[json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason": reason}]})]);
+            let result = one_stream(body).await;
+            if reason == "tool_calls" || reason == "function_call" {
+                assert!(result.is_ok(), "{reason}: {result:?}");
+            } else {
+                let err = result.unwrap_err().to_string();
+                assert!(err.contains(reason), "{err}");
+            }
+        }
     }
 }

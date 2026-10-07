@@ -22,11 +22,12 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
 
 /// Walk `root` respecting .gitignore (hidden files included) but never
 /// descending into `.git`.
-fn walk(root: &Path) -> ignore::Walk {
+fn walk(root: &Path, secrets: &super::SecretRoots) -> ignore::Walk {
+    let secrets = secrets.clone();
     ignore::WalkBuilder::new(root)
         .hidden(false)
         .require_git(false)
-        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
+        .filter_entry(move |e| e.file_name() != std::ffi::OsStr::new(".git") && !secrets.blocks_path(e.path()))
         .build()
 }
 
@@ -84,13 +85,18 @@ impl Tool for GlobFiles {
             Ok(m) => m,
             Err(e) => return e,
         };
-        let root = resolve(&ctx.cwd, args.get("path").and_then(Value::as_str).unwrap_or("."));
+        let user = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let root = resolve(&ctx.cwd, user);
+        let secrets = super::SecretRoots::load();
+        if let Some(msg) = secrets.reject(user, &root) {
+            return ToolOutput::err(format!("glob: {msg}"));
+        }
         if let Some(e) = check_root("glob", &root) {
             return e;
         }
 
         let cancel = ctx.cancel.clone();
-        let found = tokio::task::spawn_blocking(move || collect_glob(&root, &matcher, &cancel)).await;
+        let found = tokio::task::spawn_blocking(move || collect_glob(&root, &matcher, &cancel, &secrets)).await;
         let mut found = match found {
             Ok(Ok(f)) => f,
             Ok(Err(msg)) => return ToolOutput::err(msg),
@@ -115,9 +121,10 @@ fn collect_glob(
     root: &Path,
     matcher: &globset::GlobMatcher,
     cancel: &tokio_util::sync::CancellationToken,
+    secrets: &super::SecretRoots,
 ) -> Result<Vec<(SystemTime, String)>, String> {
     let mut found = Vec::new();
-    for entry in walk(root).flatten() {
+    for entry in walk(root, secrets).flatten() {
         if cancel.is_cancelled() {
             return Err("Cancelled by user.".into());
         }
@@ -193,13 +200,18 @@ impl Tool for Grep {
             },
             None => None,
         };
-        let root = resolve(&ctx.cwd, args.get("path").and_then(Value::as_str).unwrap_or("."));
+        let user = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let root = resolve(&ctx.cwd, user);
+        let secrets = super::SecretRoots::load();
+        if let Some(msg) = secrets.reject(user, &root) {
+            return ToolOutput::err(format!("grep: {msg}"));
+        }
         if let Some(e) = check_root("grep", &root) {
             return e;
         }
 
         let cancel = ctx.cancel.clone();
-        let found = tokio::task::spawn_blocking(move || collect_grep(&root, &re, filter.as_ref(), files_only, &cancel)).await;
+        let found = tokio::task::spawn_blocking(move || collect_grep(&root, &re, filter.as_ref(), files_only, &cancel, &secrets)).await;
         let (mut matches, truncated) = match found {
             Ok(Ok(r)) => r,
             Ok(Err(msg)) => return ToolOutput::err(msg),
@@ -227,9 +239,11 @@ fn collect_grep(
     filter: Option<&globset::GlobMatcher>,
     files_only: bool,
     cancel: &tokio_util::sync::CancellationToken,
+    secrets: &super::SecretRoots,
 ) -> Result<(Vec<String>, bool), String> {
     let mut matches: Vec<String> = Vec::new();
     let mut truncated = false;
+    let owned = secrets.clone();
 
     // Search one file; returns true when the match cap was reached.
     let mut check = |rel: &Path, abs: &Path| -> bool {
@@ -240,6 +254,9 @@ fn collect_grep(
             if !f.is_match(rel) {
                 return false;
             }
+        }
+        if owned.blocks_path(abs) {
+            return false;
         }
         let Some(bytes) = read_grep_file(abs, cancel) else { return false };
         let text = String::from_utf8_lossy(&bytes);
@@ -273,7 +290,7 @@ fn collect_grep(
         let rel = Path::new(root.file_name().unwrap_or_default());
         truncated = check(rel, root);
     } else {
-        for entry in walk(root).flatten() {
+        for entry in walk(root, secrets).flatten() {
             if cancel.is_cancelled() {
                 return Err("Cancelled by user.".into());
             }
@@ -492,5 +509,34 @@ mod tests {
         assert!(out.is_error && out.content.contains("Cancelled"), "{}", out.content);
         let out = Grep.run(json!({"pattern": "match"}), &ctx).await;
         assert!(out.is_error && out.content.contains("Cancelled"), "{}", out.content);
+    }
+
+    #[test]
+    fn search_refuses_credential_files() {
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("NYQ_HOME");
+        let old_auth = std::env::var_os("NYQ_CODEX_AUTH");
+        std::env::set_var("NYQ_HOME", home.path());
+        std::env::remove_var("NYQ_CODEX_AUTH");
+        std::fs::write(home.path().join("chatgpt-auth.json"), "refresh-token\n").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("ok.txt"), "hello refresh-token\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(home.path().join("chatgpt-auth.json"), ws.path().join("leak")).unwrap();
+        let secret = home.path().to_str().unwrap().to_string();
+        let ws_path = ws.path().to_path_buf();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = rt.block_on(GlobFiles.run(json!({"pattern": "**/*", "path": secret}), &ctx(&ws_path)));
+        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        let out = rt.block_on(Grep.run(json!({"pattern": "refresh-token", "path": secret}), &ctx(&ws_path)));
+        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        let out = rt.block_on(Grep.run(json!({"pattern": "refresh-token"}), &ctx(&ws_path)));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("ok.txt"), "{}", out.content);
+        #[cfg(unix)]
+        assert!(!out.content.contains("leak"), "{}", out.content);
+        if let Some(v) = old_home { std::env::set_var("NYQ_HOME", v); } else { std::env::remove_var("NYQ_HOME"); }
+        if let Some(v) = old_auth { std::env::set_var("NYQ_CODEX_AUTH", v); } else { std::env::remove_var("NYQ_CODEX_AUTH"); }
     }
 }

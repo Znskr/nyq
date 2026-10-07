@@ -263,7 +263,18 @@ fn clip_width(s: &str, width: usize) -> String {
         out.push(c);
     }
     out.push('…');
+    // A cut can land inside a styled span and drop its reset, so later rows
+    // keep the last color. Put the reset back when the source used escapes.
+    if s.contains('\x1b') {
+        out.push_str("\x1b[0m");
+    }
     out
+}
+
+/// One listing row, with terminal controls removed before it is painted.
+fn list_row(line: &str, width: usize) -> String {
+    let line = sanitize_text(line);
+    paint(fg(MID), &truncate(&format!("  {line}"), width))
 }
 
 /// Header plus a filter that cannot grow past the terminal width.
@@ -638,7 +649,11 @@ impl Screen {
     fn footer_line(&self) -> String {
         let f = &self.footer;
         let effort = f.effort.as_deref().unwrap_or("auto");
-        let left = format!("{} {} {}", paint(fg(MID), effort), paint(fg(GRAY), "·"), paint(fg(GRAY), &f.model));
+        let model = sanitize_text(&f.model);
+        let left = format!("{} {} {}", paint(fg(MID), effort), paint(fg(GRAY), "·"), paint(fg(GRAY), &model));
+        if visible_width(&left) > self.width {
+            return clip_width(&left, self.width);
+        }
         let mut right = vec![f.provider.clone()];
         if f.context_window > 0 && f.context_tokens > 0 {
             right.push(format!("{:.0}% of {}", f.context_tokens as f64 * 100.0 / f.context_window as f64, tokens(f.context_window)));
@@ -680,7 +695,7 @@ impl Screen {
             let items = visible
                 .iter()
                 .map(|c| MenuItem {
-                    label: c.model.clone(),
+                    label: sanitize_text(&c.model),
                     detail: [
                         if (c.provider.as_str(), c.model.as_str()) == current { "current".to_string() } else { String::new() },
                         c.context_window.map(|n| format!("{} ctx", tokens(n))).unwrap_or_default(),
@@ -810,7 +825,7 @@ impl Screen {
     /// Rows that should each stay on one screen line (listings).
     pub fn print_list(&mut self, lines: &[String]) {
         let w = self.width;
-        let rows: Vec<String> = lines.iter().map(|l| paint(fg(MID), &truncate(&format!("  {l}"), w))).collect();
+        let rows: Vec<String> = lines.iter().map(|l| list_row(l, w)).collect();
         self.flush_all();
         let mut out = self.begin(Block::Info);
         out.extend(rows);
@@ -1554,7 +1569,7 @@ pub async fn approve_active(tool: &str, summary: &str, preview: Option<&str>, ru
             if more > 0 {
                 lines.push(paint(fg(GRAY), &format!("  … {more} lines more")));
             }
-        } else if tool == "bash" {
+        } else if tool == "bash" || tool == "web_fetch" {
             let summary = sanitize_text(summary);
             for l in summary.lines().take(MAX_PREVIEW) {
                 lines.push(format!("  {}", paint(fg(MID), &truncate(l, w.saturating_sub(2)))));
@@ -1966,5 +1981,62 @@ mod tests {
         }
         drop(ClearApproval(Arc::clone(&screen)));
         assert!(lock(&screen).approval.is_none());
+    }
+
+    #[test]
+    fn clip_width_restores_sgr_reset() {
+        let painted = format!("\x1b[38;2;138;138;138m{}\x1b[0m", "m".repeat(40));
+        let clipped = clip_width(&painted, 12);
+        assert!(clipped.contains("\x1b[0m"), "{clipped:?}");
+        assert!(visible_width(&clipped) <= 12, "{}", visible_width(&clipped));
+        assert_eq!(clip_width("plain", 10), "plain");
+    }
+
+    #[test]
+    fn list_rows_drop_terminal_controls() {
+        let row = list_row("helper\u{1b}]52;c;eA==\u{7}ok", 80);
+        assert!(!row.contains("52;c"), "{row}");
+        let plain = super::super::render::strip_ansi(&row);
+        assert!(plain.contains("helper") && plain.contains("ok"), "{plain}");
+    }
+
+    #[test]
+    fn narrow_footer_stays_in_width_and_resets() {
+        let mut s = screen();
+        s.width = 20;
+        s.footer.model = "gpt-5.6-sol-high\u{1b}[31m".into();
+        s.footer.effort = Some("medium".into());
+        s.footer.provider = "codex".into();
+        s.footer.sandbox = "workspace-write".into();
+        s.footer.cwd = "/home/someone/very/long".into();
+        let line = s.footer_line();
+        assert!(visible_width(&line) <= 20, "{} {line:?}", visible_width(&line));
+        assert!(line.contains("\x1b[0m"), "{line:?}");
+        assert!(!line.contains("[31m"), "{line:?}");
+    }
+
+    #[test]
+    fn model_menu_labels_are_sanitized() {
+        let mut s = screen();
+        s.width = 60;
+        s.height = 40;
+        s.menu = Some(ModelMenu {
+            choices: vec![ModelChoice {
+                provider: "openai".into(),
+                model: "evil\u{1b}]52;c;eA==\u{7}model".into(),
+                context_window: None,
+                efforts: Vec::new(),
+            }],
+            tabs: vec!["All".into()],
+            tab: 0,
+            filter: String::new(),
+            selected: 0,
+            loading: false,
+            warnings: Vec::new(),
+        });
+        let (rows, _, _) = s.pane();
+        let joined = rows.join("\n");
+        assert!(!joined.contains("]52"), "{joined}");
+        assert!(rows.iter().any(|r| super::super::render::strip_ansi(r).contains("evilmodel")), "{rows:?}");
     }
 }

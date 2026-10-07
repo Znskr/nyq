@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::sandbox::Mode;
+
 const MAX_BYTES: usize = 10 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100;
 
@@ -20,6 +22,7 @@ enum Before {
 struct Entry {
     path: PathBuf,
     cwd: PathBuf,
+    mode: Mode,
     before: Before,
     missing_dirs: Vec<PathBuf>,
 }
@@ -31,7 +34,7 @@ pub struct UndoLog {
 
 impl UndoLog {
     /// Capture before running a file tool; discard the entry if the tool fails.
-    pub fn snapshot(&mut self, cwd: &Path, tool: &str, args: &Value) {
+    pub fn snapshot(&mut self, cwd: &Path, mode: Mode, tool: &str, args: &Value) {
         if !matches!(tool, "write_file" | "edit_file") {
             return;
         }
@@ -69,6 +72,7 @@ impl UndoLog {
         self.entries.push_back(Entry {
             path,
             cwd,
+            mode,
             before,
             missing_dirs,
         });
@@ -90,7 +94,7 @@ impl UndoLog {
             .display();
         let message = match &entry.before {
             Before::Bytes(bytes) => {
-                fs::write(&entry.path, bytes)
+                restore_bytes(&entry.path, &entry.cwd, entry.mode, bytes)
                     .with_context(|| format!("Could not restore {display}"))?;
                 format!("Restored {display}")
             }
@@ -132,6 +136,25 @@ impl UndoLog {
     }
 }
 
+/// Put `bytes` back without truncating in place. Sandboxed restores use the
+/// same symlink rules as `write_file`: in-root links may be followed, links
+/// that leave the root are refused. Unsandboxed restores follow a final symlink.
+fn restore_bytes(path: &Path, cwd: &Path, mode: Mode, bytes: &[u8]) -> std::io::Result<()> {
+    if mode == Mode::Off {
+        return crate::tools::safeio::write_atomic(path, bytes);
+    }
+    if let Some(text) = path.to_str() {
+        if let Some(rel) = crate::tools::safeio::relative_under(cwd, text) {
+            return crate::tools::safeio::write_beneath(cwd, &rel, bytes);
+        }
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file name"));
+    };
+    crate::tools::safeio::write_beneath(parent, Path::new(name), bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,7 +167,7 @@ mod tests {
         let path = dir.path().join("file");
         fs::write(&path, [0, 255, 42]).unwrap();
         let mut log = UndoLog::default();
-        log.snapshot(dir.path(), "edit_file", &json!({"path": "file"}));
+        log.snapshot(dir.path(), Mode::WorkspaceWrite, "edit_file", &json!({"path": "file"}));
         fs::write(&path, "external change").unwrap();
         assert_eq!(log.undo().unwrap(), "Restored file");
         assert_eq!(fs::read(path).unwrap(), [0, 255, 42]);
@@ -158,7 +181,7 @@ mod tests {
         fs::create_dir(dir.path().join("existing")).unwrap();
         let path = dir.path().join("existing/new/nested/file");
         let mut log = UndoLog::default();
-        log.snapshot(dir.path(), "write_file", &json!({"path": path}));
+        log.snapshot(dir.path(), Mode::WorkspaceWrite, "write_file", &json!({"path": path}));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "new").unwrap();
         assert_eq!(
@@ -175,7 +198,7 @@ mod tests {
         let path = dir.path().join("file");
         let mut log = UndoLog::default();
         for content in ["first", "second", "third"] {
-            log.snapshot(dir.path(), "write_file", &json!({"path": "file"}));
+            log.snapshot(dir.path(), Mode::WorkspaceWrite, "write_file", &json!({"path": "file"}));
             fs::write(&path, content).unwrap();
         }
         log.discard_last();
@@ -195,7 +218,7 @@ mod tests {
         let mut log = UndoLog::default();
         fs::write(&path, "0").unwrap();
         for i in 1..=101 {
-            log.snapshot(dir.path(), "edit_file", &json!({"path": "file"}));
+            log.snapshot(dir.path(), Mode::WorkspaceWrite, "edit_file", &json!({"path": "file"}));
             fs::write(&path, i.to_string()).unwrap();
         }
         assert_eq!(log.len(), MAX_ENTRIES);
@@ -212,7 +235,7 @@ mod tests {
         let file = File::create(&path).unwrap();
         file.set_len(MAX_BYTES as u64).unwrap();
         let mut log = UndoLog::default();
-        log.snapshot(dir.path(), "edit_file", &json!({"path": "large"}));
+        log.snapshot(dir.path(), Mode::WorkspaceWrite, "edit_file", &json!({"path": "large"}));
         fs::write(&path, "small").unwrap();
         log.undo().unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), MAX_BYTES as u64);
@@ -222,7 +245,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_BYTES as u64 + 1)
             .unwrap();
-        log.snapshot(dir.path(), "write_file", &json!({"path": "large"}));
+        log.snapshot(dir.path(), Mode::WorkspaceWrite, "write_file", &json!({"path": "large"}));
         fs::write(&path, "replacement").unwrap();
         assert!(log.undo().unwrap_err().to_string().contains("10 MB"));
         assert_eq!(fs::read_to_string(path).unwrap(), "replacement");
@@ -234,10 +257,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut log = UndoLog::default();
         for tool in ["bash", "read_file", "list_dir"] {
-            log.snapshot(dir.path(), tool, &json!({"path": "file"}));
+            log.snapshot(dir.path(), Mode::WorkspaceWrite, tool, &json!({"path": "file"}));
         }
         for args in [json!({}), json!({"path": 4}), json!({"path": ""})] {
-            log.snapshot(dir.path(), "write_file", &args);
+            log.snapshot(dir.path(), Mode::WorkspaceWrite, "write_file", &args);
         }
         assert!(log.is_empty());
     }
@@ -250,7 +273,7 @@ mod tests {
         let mut log = UndoLog::default();
         for relative in ["new/file", "../outside/file"] {
             let path = cwd.join(relative);
-            log.snapshot(&cwd, "write_file", &json!({"path": relative}));
+            log.snapshot(&cwd, Mode::WorkspaceWrite, "write_file", &json!({"path": relative}));
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, "new").unwrap();
             fs::write(path.parent().unwrap().join("keep"), "keep").unwrap();
@@ -258,10 +281,30 @@ mod tests {
             assert!(path.parent().unwrap().is_dir());
         }
         let path = dir.path().join("new-outside/another");
-        log.snapshot(&cwd, "write_file", &json!({"path": path}));
+        log.snapshot(&cwd, Mode::WorkspaceWrite, "write_file", &json!({"path": path}));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "new").unwrap();
         log.undo().unwrap();
         assert!(dir.path().join("new-outside").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_undo_does_not_follow_an_escaped_symlink() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("authorized_keys");
+        fs::write(&secret, "secret").unwrap();
+        let path = dir.path().join("file");
+        fs::write(&path, "original").unwrap();
+        let mut log = UndoLog::default();
+        log.snapshot(dir.path(), Mode::WorkspaceWrite, "edit_file", &json!({"path": "file"}));
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+        let err = log.undo().unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("symlink"), "{text}");
+        assert_eq!(fs::read(&secret).unwrap(), b"secret");
+        assert_eq!(log.len(), 1);
     }
 }
