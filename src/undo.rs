@@ -99,7 +99,12 @@ impl UndoLog {
                 format!("Restored {display}")
             }
             Before::Missing => {
-                match fs::remove_file(&entry.path) {
+                let removed = if entry.mode == Mode::Off {
+                    fs::remove_file(&entry.path)
+                } else {
+                    remove_created(&entry.path, &entry.cwd)
+                };
+                match removed {
                     Ok(()) => {}
                     Err(e) if e.kind() == ErrorKind::NotFound => {}
                     Err(e) => return Err(e).with_context(|| format!("Could not remove {display}")),
@@ -139,6 +144,17 @@ impl UndoLog {
 /// Put `bytes` back without truncating in place. Sandboxed restores use the
 /// same symlink rules as `write_file`: in-root links may be followed, links
 /// that leave the root are refused. Unsandboxed restores follow a final symlink.
+fn remove_created(path: &Path, cwd: &Path) -> std::io::Result<()> {
+    if let Some(text) = path.to_str() {
+        if let Some(rel) = crate::tools::safeio::relative_under(cwd, text) {
+            return crate::tools::safeio::remove_beneath(cwd, &rel);
+        }
+    }
+    // Outside the workspace there is no root to confine the removal to.
+    // Parent cleanup still refuses directories that are not inside cwd.
+    fs::remove_file(path)
+}
+
 fn restore_bytes(path: &Path, cwd: &Path, mode: Mode, bytes: &[u8]) -> std::io::Result<()> {
     if mode == Mode::Off {
         return crate::tools::safeio::write_atomic(path, bytes);
@@ -190,6 +206,24 @@ mod tests {
         );
         assert!(!dir.path().join("existing/new").exists());
         assert!(dir.path().join("existing").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_does_not_delete_through_a_replaced_directory() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("file");
+        fs::write(&victim, "keep").unwrap();
+        let mut log = UndoLog::default();
+        log.snapshot(dir.path(), Mode::WorkspaceWrite, "write_file", &json!({"path": "sub/file"}));
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/file"), "new").unwrap();
+        fs::remove_dir_all(dir.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        let err = log.undo().unwrap_err();
+        assert!(format!("{err:#}").contains("symlink") || format!("{err:#}").contains("Could not remove"), "{err:#}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
     }
 
     #[test]

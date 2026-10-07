@@ -22,20 +22,25 @@ pub struct Skill {
     pub path: PathBuf,
     /// The skill's directory (its base for relative references).
     pub dir: PathBuf,
+    /// Canonical files must stay under this directory.
+    root: PathBuf,
     /// "project" or "user".
     pub scope: &'static str,
 }
 
 /// Skill roots in precedence order (the first skill with a given name wins).
-fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<(PathBuf, &'static str)> {
-    let mut roots: Vec<(PathBuf, &'static str)> = [".agents", ".codex", ".claude", ".nyq"]
+/// `(scan directory, containment root, scope)`.
+fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<(PathBuf, PathBuf, &'static str)> {
+    let mut roots: Vec<(PathBuf, PathBuf, &'static str)> = [".agents", ".codex", ".claude", ".nyq"]
         .iter()
-        .map(|d| (cwd.join(d).join("skills"), "project"))
+        .map(|d| (cwd.join(d).join("skills"), cwd.to_path_buf(), "project"))
         .collect();
-    roots.push((home.join("skills"), "user"));
+    let user_skills = home.join("skills");
+    roots.push((user_skills.clone(), user_skills, "user"));
     if let Some(user_home) = user_home {
         for d in [".agents", ".codex", ".claude"] {
-            roots.push((user_home.join(d).join("skills"), "user"));
+            let dir = user_home.join(d).join("skills");
+            roots.push((dir.clone(), dir, "user"));
         }
     }
     roots
@@ -46,15 +51,15 @@ pub fn discover(home: &Path, cwd: &Path) -> Vec<Skill> {
     discover_in(&roots(home, dirs::home_dir().as_deref(), cwd))
 }
 
-fn discover_in(roots: &[(PathBuf, &'static str)]) -> Vec<Skill> {
+fn discover_in(roots: &[(PathBuf, PathBuf, &'static str)]) -> Vec<Skill> {
     let mut skills: Vec<Skill> = Vec::new();
-    for (root, scope) in roots {
-        let Ok(entries) = std::fs::read_dir(root) else { continue };
+    for (scan, root, scope) in roots {
+        let Ok(entries) = std::fs::read_dir(scan) else { continue };
         let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
         dirs.sort();
         for dir in dirs {
             let path = dir.join("SKILL.md");
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = crate::tools::read_rooted_text(root, &path) else { continue };
             let (meta, _) = split_frontmatter(&text);
             let dir_name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let name = meta.name.filter(|n| !n.is_empty()).unwrap_or(dir_name);
@@ -62,7 +67,7 @@ fn discover_in(roots: &[(PathBuf, &'static str)]) -> Vec<Skill> {
                 continue;
             }
             let description = meta.description.unwrap_or_default();
-            skills.push(Skill { name, description, path, dir, scope });
+            skills.push(Skill { name, description, path, dir, root: root.clone(), scope });
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -331,7 +336,7 @@ impl Tool for SkillTool {
         let Some(skill) = self.find(name) else {
             return ToolOutput::err(self.unknown(name));
         };
-        let text = match std::fs::read_to_string(&skill.path) {
+        let text = match crate::tools::read_rooted_text(&skill.root, &skill.path) {
             Ok(t) => t,
             Err(e) => return ToolOutput::err(format!("reading {}: {e}", slash_path(&skill.path))),
         };
@@ -422,19 +427,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn follows_symlinked_skill_dirs() {
+    fn skill_files_must_stay_inside_their_root() {
         let t = tempfile::tempdir().unwrap();
         write_skill(&t.path().join("store"), "linked", &md("linked", "via symlink"));
-        let root = t.path().join("proj/.claude/skills");
+        let proj = t.path().join("proj");
+        let root = proj.join(".claude/skills");
         fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(t.path().join("store/linked"), root.join("linked")).unwrap();
-        let skills = discover_in(&roots(&t.path().join("fx"), None, &t.path().join("proj")));
+        let skills = discover_in(&roots(&t.path().join("fx"), None, &proj));
+        assert!(skills.is_empty(), "a skill directory symlink must not leave the project");
+
+        write_skill(&root, "real", &md("real", "inside"));
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        let skills = discover_in(&roots(&t.path().join("fx"), None, &proj));
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].description, "via symlink");
+        assert_eq!(skills[0].description, "inside");
+
+        let evil = root.join("evil");
+        fs::create_dir(&evil).unwrap();
+        std::os::unix::fs::symlink(t.path().join("store/linked/SKILL.md"), evil.join("SKILL.md")).unwrap();
+        let skills = discover_in(&roots(&t.path().join("fx"), None, &proj));
+        assert!(skills.iter().all(|s| s.name != "linked"));
+        if Path::new("/dev/zero").exists() {
+            let huge = root.join("huge");
+            fs::create_dir(&huge).unwrap();
+            std::os::unix::fs::symlink("/dev/zero", huge.join("SKILL.md")).unwrap();
+            let _ = discover_in(&roots(&t.path().join("fx"), None, &proj));
+        }
     }
 
     fn skill(name: &str, description: &str) -> Skill {
-        Skill { name: name.into(), description: description.into(), path: name.into(), dir: name.into(), scope: "user" }
+        Skill {
+            name: name.into(),
+            description: description.into(),
+            path: name.into(),
+            dir: name.into(),
+            root: name.into(),
+            scope: "user",
+        }
     }
 
     #[test]

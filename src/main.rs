@@ -135,6 +135,7 @@ async fn run() -> Result<()> {
         context_tokens: 0,
         context_estimated: false,
         suppress_auto_compact: false,
+        submitted: 0,
         sandbox,
         undo: Default::default(),
     };
@@ -276,19 +277,14 @@ async fn run() -> Result<()> {
                 s.queue.drain(..).map(|(_, t)| t).collect::<Vec<_>>()
             }
         };
-        let (commands, messages): (Vec<String>, Vec<String>) =
-            leftover.into_iter().partition(|t| is_slash_command(t));
         match result {
             Ok(TurnEnd::Done) => {}
             Ok(TurnEnd::Cancelled) => ui::info("Interrupted."),
             Err(e) => ui::error(&format!("{e:#}")),
         }
-        // Queued slash commands run now; messages queued just as the run
-        // finished start the next one.
-        pending.extend(commands);
-        if !messages.is_empty() {
-            pending.push_back(messages.join("\n\n"));
-        }
+        // Keep queue order: a slash command is a barrier, so a later message
+        // does not run before it, and an earlier message is not held behind it.
+        pending.extend(queue_leftovers(leftover));
     }
     drop(tui);
     mcp.shutdown().await;
@@ -436,27 +432,13 @@ async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig, qu
 
 /// `!cmd`: run a command yourself (unsandboxed) and show its output.
 async fn shell(cmd: &str, cwd: &Path, tui: &Tui) {
+    let cancel = CancellationToken::new();
+    tui.screen().set_busy(Some("Running"), Some(cancel.clone()));
     let policy = sandbox::Policy { mode: sandbox::Mode::Off, ..Default::default() };
-    let out = match sandbox::shell_command(&policy, cwd, cmd) {
-        Ok(mut command) => {
-            command.stdin(std::process::Stdio::null());
-            command.output().await
-        }
-        Err(e) => Err(std::io::Error::other(e)),
-    };
-    let output = match out {
-        Ok(o) => {
-            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            let ok = o.status.success();
-            if !ok {
-                text.push_str(&format!("\nexit code {}", o.status.code().unwrap_or(-1)));
-            }
-            tools::ToolOutput { content: if text.trim().is_empty() { "(no output)".into() } else { text }, is_error: !ok, ..Default::default() }
-        }
-        Err(e) => tools::ToolOutput::err(e.to_string()),
-    };
-    tui.screen().print_tool("bash", cmd, Some(&output));
+    let output = tools::run_shell(cmd, cwd, &policy, &cancel, None).await;
+    let mut screen = tui.screen();
+    screen.set_busy(None, None);
+    screen.print_tool("bash", cmd, Some(&output));
 }
 
 fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
@@ -641,6 +623,30 @@ fn is_slash_command(text: &str) -> bool {
     text.trim_start().starts_with('/')
 }
 
+/// Preserve FIFO order. Consecutive chat messages still join into one turn;
+/// a slash command is not pulled ahead of or skipped past a message.
+fn queue_leftovers(leftover: Vec<String>) -> Vec<String> {
+    let mut pending = Vec::new();
+    let mut batch = String::new();
+    for text in leftover {
+        if is_slash_command(&text) {
+            if !batch.is_empty() {
+                pending.push(std::mem::take(&mut batch));
+            }
+            pending.push(text);
+        } else if batch.is_empty() {
+            batch = text;
+        } else {
+            batch.push_str("\n\n");
+            batch.push_str(&text);
+        }
+    }
+    if !batch.is_empty() {
+        pending.push(batch);
+    }
+    pending
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +668,17 @@ mod tests {
         assert_eq!(session_label("ééééééééEXTRA").chars().count(), 8);
         assert!(is_slash_command("  /model x"));
         assert!(!is_slash_command("  model"));
+    }
+
+    #[test]
+    fn queued_slash_commands_stay_in_order() {
+        assert_eq!(
+            queue_leftovers(vec!["/new".into(), "next prompt".into(), "/compact".into()]),
+            vec!["/new".to_string(), "next prompt".into(), "/compact".into()]
+        );
+        assert_eq!(
+            queue_leftovers(vec!["one".into(), "two".into(), "/new".into()]),
+            vec!["one\n\ntwo".to_string(), "/new".into()]
+        );
     }
 }

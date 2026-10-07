@@ -97,7 +97,11 @@ struct ToolRow {
 
 struct PendingApproval {
     title: String,
+    /// Sanitized preview. Wrapped to the terminal width unless `prewrapped`.
     lines: Vec<String>,
+    /// Diff rows are already display width; plain text is wrapped while painting.
+    prewrapped: bool,
+    scroll: usize,
     /// What "always" grants; None when the call can't be scoped.
     rule: Option<String>,
     reply: oneshot::Sender<Approval>,
@@ -297,11 +301,17 @@ fn take_steer_texts(queue: &mut Vec<(Queued, String)>) -> Vec<String> {
 }
 
 fn wrap(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut rows = vec![String::new()];
     let mut w = 0;
     for c in s.chars() {
+        if c == '\n' {
+            rows.push(String::new());
+            w = 0;
+            continue;
+        }
         let cw = c.width().unwrap_or(0);
-        if w + cw > width.max(1) {
+        if w + cw > width && w > 0 {
             rows.push(String::new());
             w = 0;
         }
@@ -309,6 +319,14 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
         w += cw;
     }
     rows
+}
+
+fn approval_rows(a: &PendingApproval, width: usize) -> Vec<String> {
+    if a.prewrapped {
+        return a.lines.clone();
+    }
+    let width = width.saturating_sub(2).max(1);
+    a.lines.iter().flat_map(|line| wrap(line, width)).map(|line| paint(fg(GRAY), &format!("  {line}"))).collect()
 }
 
 fn rule(width: usize) -> String {
@@ -427,8 +445,8 @@ impl Screen {
         let (w, h) = terminal::size().unwrap_or((80, 24));
         Screen {
             out: io::stdout(),
-            width: w.max(20) as usize,
-            height: h.max(8) as usize,
+            width: (w as usize).max(1),
+            height: (h as usize).max(1),
             pane_rows: 0,
             cursor_row: 0,
             live: String::new(),
@@ -590,7 +608,14 @@ impl Screen {
             rows.push(rule(w));
             rows.push(paint(fg(BRIGHT).bold(), "Approve"));
             rows.push(String::new());
-            rows.extend(a.lines.iter().cloned());
+            let shown = approval_rows(a, w);
+            let max_scroll = shown.len().saturating_sub(MAX_PREVIEW);
+            let scroll = a.scroll.min(max_scroll);
+            let more = shown.len().saturating_sub(scroll + MAX_PREVIEW);
+            rows.extend(shown.into_iter().skip(scroll).take(MAX_PREVIEW));
+            if scroll > 0 || more > 0 {
+                rows.push(paint(fg(GRAY), &format!("  … {scroll} above, {more} below")));
+            }
             if !a.lines.is_empty() {
                 rows.push(String::new());
             }
@@ -602,7 +627,7 @@ impl Screen {
                 rows.push(format!("{}  {}", paint(fg(BRIGHT), key), paint(fg(MID), &truncate(text, w.saturating_sub(3)))));
             }
             rows.push(rule(w));
-            rows.push(hints(&[("y", "Once"), ("a", "Always"), ("n", "Deny"), ("Esc", "Interrupt")]));
+            rows.push(hints(&[("y", "Once"), ("a", "Always"), ("n", "Deny"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]));
         } else {
             let view = self.editor.render(w.saturating_sub(2).max(1));
             let top = rows.len();
@@ -614,14 +639,15 @@ impl Screen {
             if let Some(q) = &self.question {
                 rows.push(rule(w));
                 rows.push(paint(fg(BRIGHT).bold(), "Question"));
-                for l in wrap(&q.question, w.saturating_sub(2)) {
+                let question = sanitize_text(&q.question);
+                for l in wrap(&question, w.saturating_sub(2).max(1)) {
                     rows.push(paint(fg(MID), &l));
                 }
                 rows.push(String::new());
                 for (i, o) in q.options.iter().enumerate() {
                     let sel = i == q.selected;
                     let lead = if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() };
-                    let text = truncate(&format!("{}. {o}", i + 1), w.saturating_sub(2));
+                    let text = one_line(&format!("{}. {o}", i + 1), w.saturating_sub(2).max(1));
                     rows.push(format!("{lead}{}", if sel { paint(fg(BRIGHT).bold(), &text) } else { paint(fg(MID), &text) }));
                 }
                 rows.push(rule(w));
@@ -633,7 +659,7 @@ impl Screen {
         }
 
         // Keep the pane on screen: drop rows above the cursor first.
-        let max = self.height.saturating_sub(1).max(4);
+        let max = self.height.max(1);
         let excess = rows.len().saturating_sub(max);
         let dropped = excess.min(cursor_row);
         rows.drain(..dropped);
@@ -665,7 +691,7 @@ impl Screen {
         if f.yolo {
             right.push("yolo".into());
         }
-        right.push(tilde(&f.cwd));
+        right.push(one_line(&tilde(&f.cwd), self.width.max(1)));
         let mut right = right.join(" · ");
         let room = self.width.saturating_sub(visible_width(&left) + 4);
         right = truncate(&right, room);
@@ -717,7 +743,11 @@ impl Screen {
             let now = chrono::Utc::now();
             let items = visible
                 .iter()
-                .map(|m| MenuItem { label: m.title.clone(), detail: String::new(), tag: format!("{} · {}", ago(m.created, now), tilde(&m.cwd.display().to_string())) })
+                .map(|m| MenuItem {
+                    label: one_line(&m.title, 200),
+                    detail: String::new(),
+                    tag: one_line(&format!("{} · {}", ago(m.created, now), tilde(&m.cwd.display().to_string())), 200),
+                })
                 .collect();
             (header, items, m.selected, vec![("↑↓", "Navigate"), ("Enter", "Resume"), ("Esc", "Close")])
         } else {
@@ -739,7 +769,7 @@ impl Screen {
                 rows.push(paint(fg(GRAY), "  No models found."));
             }
             for warn in &m.warnings {
-                rows.push(paint(fg(YELLOW), &truncate(&format!("  {warn}"), w)));
+                rows.push(paint(fg(YELLOW), &format!("  {}", one_line(warn, w.saturating_sub(2).max(1)))));
             }
         }
         if self.sessions.is_some() && items.is_empty() {
@@ -753,7 +783,7 @@ impl Screen {
             let lead = if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() };
             // Rows without a detail column give the label all the room left of the tag.
             let tag_w = visible_width(&item.tag);
-            let label_w = if item.detail.is_empty() { w.saturating_sub(tag_w + 6).max(8) } else { label_w };
+            let label_w = if item.detail.is_empty() { w.saturating_sub(tag_w + 6).max(1) } else { label_w.max(1) };
             let label = truncate(&item.label, label_w - 1);
             let label = if item.detail.is_empty() { label } else { format!("{label:<label_w$}") };
             let label = if sel { paint(fg(BRIGHT).bold(), &label) } else { paint(fg(MID), &label) };
@@ -1031,7 +1061,7 @@ impl Screen {
 
     fn set_label(&mut self, label: &str) {
         if let Some((l, _)) = &mut self.busy {
-            *l = label.to_string();
+            *l = one_line(label, 120);
         }
     }
 
@@ -1198,9 +1228,11 @@ impl Screen {
     }
 
     fn on_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
-        if let Some(a) = self.approval.take() {
+        if let Some(mut a) = self.approval.take() {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('d')) {
+            if key.code == KeyCode::Esc
+                || (ctrl && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('c')))
+            {
                 let _ = a.reply.send(Approval::No);
                 if let Some(c) = &self.cancel {
                     c.cancel();
@@ -1211,11 +1243,20 @@ impl Screen {
                 self.redraw();
                 return;
             }
+            if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+                if key.code == KeyCode::Up {
+                    a.scroll = a.scroll.saturating_sub(1);
+                } else {
+                    a.scroll = a.scroll.saturating_add(1);
+                }
+                self.approval = Some(a);
+                self.redraw();
+                return;
+            }
             let answer = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Approval::Yes),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(Approval::Always),
                 KeyCode::Char('n') | KeyCode::Char('N') => Some(Approval::No),
-                KeyCode::Char('c') if ctrl => Some(Approval::No),
                 _ => None,
             };
             match answer {
@@ -1418,8 +1459,8 @@ impl Tui {
                             s.redraw();
                         }
                         Event::Resize(w, h) => {
-                            s.width = (w as usize).max(20);
-                            s.height = (h as usize).max(8);
+                            s.width = (w as usize).max(1);
+                            s.height = (h as usize).max(1);
                             s.redraw();
                         }
                         _ => {}
@@ -1555,27 +1596,31 @@ pub async fn approve_active(tool: &str, summary: &str, preview: Option<&str>, ru
         s.flush_live();
         let w = s.width;
         let (verb, target) = describe_tool(tool, summary);
-        let title = format!("{} {}", paint(fg(BRIGHT), &verb), paint(fg(GRAY), &truncate(&target, w.saturating_sub(verb.len() + 3))));
+        let title = format!("{} {}", paint(fg(BRIGHT), &verb), paint(fg(GRAY), &one_line(&target, w.saturating_sub(verb.len() + 3).max(1))));
         let mut lines = Vec::new();
+        let mut prewrapped = false;
         if let Some(p) = preview {
-            let p = sanitize_text(p);
-            let body: Vec<String> = if looks_like_diff(&p) {
-                diff(&p, true, usize::MAX, w, "  ").lines().map(str::to_string).collect()
+            let mut p = sanitize_text(p);
+            const MAX_PREVIEW_CHARS: usize = 200_000;
+            if p.chars().count() > MAX_PREVIEW_CHARS {
+                let cut = p.char_indices().nth(MAX_PREVIEW_CHARS).map(|(i, _)| i).unwrap_or(p.len());
+                p.truncate(cut);
+                p.push_str("\n… [preview truncated; the rest is omitted from the display]");
+            }
+            if looks_like_diff(&p) {
+                lines = diff(&p, true, usize::MAX, w, "  ").lines().map(str::to_string).collect();
+                prewrapped = true;
             } else {
-                p.lines().map(|l| paint(fg(GRAY), &format!("  {}", truncate(l, w.saturating_sub(2))))).collect()
-            };
-            let more = body.len().saturating_sub(MAX_PREVIEW);
-            lines.extend(body.into_iter().take(MAX_PREVIEW));
-            if more > 0 {
-                lines.push(paint(fg(GRAY), &format!("  … {more} lines more")));
+                lines = p.lines().map(str::to_string).collect();
             }
         } else if tool == "bash" || tool == "web_fetch" {
-            let summary = sanitize_text(summary);
-            for l in summary.lines().take(MAX_PREVIEW) {
-                lines.push(format!("  {}", paint(fg(MID), &truncate(l, w.saturating_sub(2)))));
-            }
+            lines = sanitize_text(summary).lines().map(str::to_string).collect();
         }
-        s.approval = Some(PendingApproval { title, lines, rule, reply: tx });
+        if lines.len() > 500 {
+            lines.truncate(500);
+            lines.push("… [preview truncated]".into());
+        }
+        s.approval = Some(PendingApproval { title, lines, prewrapped, scroll: 0, rule, reply: tx });
         s.redraw();
     }
     let guard = ClearApproval(Arc::clone(&screen));
@@ -1624,7 +1669,7 @@ impl Ui for TuiUi {
             StreamEvent::Reasoning(t) => s.stream(Block::Reasoning, t),
             StreamEvent::ToolCallStart { name, .. } => {
                 s.flush_live();
-                s.set_label(&format!("Preparing {}", name.replace('_', " ")));
+                s.set_label(&format!("Preparing {}", one_line(&name.replace('_', " "), 80)));
                 s.redraw();
             }
         }
@@ -1679,7 +1724,12 @@ impl Ui for TuiUi {
         {
             let mut s = self.s();
             s.flush_all();
-            s.question = Some(PendingQuestion { question: question.to_string(), options: options.to_vec(), selected: 0, reply: tx });
+            s.question = Some(PendingQuestion {
+                question: sanitize_text(question),
+                options: options.iter().map(|o| one_line(o, 200)).collect(),
+                selected: 0,
+                reply: tx,
+            });
             s.redraw();
         }
         // Dropped on cancel: clear the pane so the next key isn't answered into a closed channel.
@@ -1703,12 +1753,19 @@ impl Ui for TuiUi {
     fn take_follow_up(&mut self) -> Option<Item> {
         let text = {
             let mut s = self.s();
-            // Slash commands queued while busy are run by the app loop.
-            let i = s.queue.iter().position(|(k, t)| *k == Queued::FollowUp && !is_slash_command(t))?;
-            s.queue.remove(i).1
+            take_follow_up_text(&mut s.queue)?
         };
         Some(self.deliver(text))
     }
+}
+
+/// A slash command is a barrier: a later follow-up does not run before it.
+fn take_follow_up_text(queue: &mut Vec<(Queued, String)>) -> Option<String> {
+    let (kind, text) = queue.first()?;
+    if *kind != Queued::FollowUp || is_slash_command(text) {
+        return None;
+    }
+    Some(queue.remove(0).1)
 }
 
 #[cfg(test)]
@@ -1723,6 +1780,8 @@ mod tests {
         assert_eq!(truncate("abc", 3), "abc");
         assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"]);
         assert_eq!(wrap("", 4), vec![""]);
+        assert_eq!(wrap("a\nb", 10), vec!["a".to_string(), "b".into()]);
+        assert_eq!(wrap("a\nb", 1).len(), 2);
         assert_eq!(tokens(950), "950");
         assert_eq!(tokens(14_000), "14k");
         assert_eq!(tokens(1_400), "1.4k");
@@ -1846,6 +1905,44 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_stops_at_a_slash_command() {
+        let mut queue = vec![
+            (Queued::FollowUp, "/new".into()),
+            (Queued::FollowUp, "next prompt".into()),
+        ];
+        assert!(take_follow_up_text(&mut queue).is_none());
+        assert_eq!(queue.len(), 2);
+        queue.remove(0);
+        assert_eq!(take_follow_up_text(&mut queue).as_deref(), Some("next prompt"));
+        let mut joined = vec![
+            (Queued::FollowUp, "one".into()),
+            (Queued::FollowUp, "two".into()),
+        ];
+        assert_eq!(take_follow_up_text(&mut joined).as_deref(), Some("one"));
+        assert_eq!(joined.len(), 1);
+    }
+
+    #[test]
+    fn question_newlines_are_rows_and_controls_are_stripped() {
+        let mut s = screen();
+        s.width = 20;
+        s.height = 24;
+        let (tx, _rx) = oneshot::channel();
+        s.question = Some(PendingQuestion {
+            question: "line\n\x1b]52;c;eA==\x07next".into(),
+            options: vec!["ok\nmore".into()],
+            selected: 0,
+            reply: tx,
+        });
+        let (rows, _, _) = s.pane();
+        let text = rows.join("\n");
+        assert!(text.contains("line"), "{text}");
+        assert!(text.contains("next"), "{text}");
+        assert!(!text.contains("\x1b]52"), "{text}");
+        assert!(rows.iter().all(|r| visible_width(r) <= 20), "{rows:?}");
+    }
+
+    #[test]
     fn pane_rows_stay_within_width() {
         let mut s = screen();
         s.width = 30;
@@ -1855,6 +1952,8 @@ mod tests {
         s.approval = Some(PendingApproval {
             title: "Approve".into(),
             lines: vec!["x".repeat(400)],
+            prewrapped: false,
+            scroll: 0,
             rule: None,
             reply: tx,
         });
@@ -1899,7 +1998,7 @@ mod tests {
         let cancel = CancellationToken::new();
         s.cancel = Some(cancel.clone());
         let (tx, mut rx) = oneshot::channel();
-        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), rule: None, reply: tx });
+        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, reply: tx });
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &cmd_tx);
         assert_eq!(rx.try_recv().unwrap(), Approval::No);
@@ -1907,7 +2006,7 @@ mod tests {
         assert!(s.approval.is_none());
 
         let (tx, mut rx) = oneshot::channel();
-        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), rule: None, reply: tx });
+        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, reply: tx });
         s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &cmd_tx);
         assert_eq!(rx.try_recv().unwrap(), Approval::No);
         assert!(matches!(cmd_rx.try_recv().unwrap(), Command::Exit));
@@ -1977,7 +2076,7 @@ mod tests {
         {
             let mut s = lock(&screen);
             let (tx, _rx) = oneshot::channel();
-            s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), rule: None, reply: tx });
+            s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, reply: tx });
         }
         drop(ClearApproval(Arc::clone(&screen)));
         assert!(lock(&screen).approval.is_none());

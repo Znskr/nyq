@@ -51,15 +51,14 @@ fn int_arg(args: &Value, name: &str) -> Option<i64> {
     args.get(name).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
 }
 
-/// Stop reading once this many bytes have been seen. Larger files are paged
-/// from the prefix instead of being loaded whole.
+/// `edit_file` refuses files larger than this rather than rewriting a prefix.
 const MAX_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
+const DISPLAY_CHARS: usize = 2000;
 
-/// Read at most `max + 1` bytes, rejecting directories and other non-files
-/// before any byte is copied (so `/dev/zero` cannot grow without bound).
-fn read_regular(path: &Path, max: u64) -> Result<Vec<u8>, ToolOutput> {
-    use std::io::Read;
+/// Open a regular file. Directories and devices are rejected before any byte
+/// is copied (so `/dev/zero` cannot grow without bound).
+fn open_regular(path: &Path) -> Result<fs::File, ToolOutput> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -77,11 +76,100 @@ fn read_regular(path: &Path, max: u64) -> Result<Vec<u8>, ToolOutput> {
     if !meta.is_file() {
         return Err(ToolOutput::err(format!("read_file: {} is not a regular file.", display_path(path))));
     }
-    let mut bytes = Vec::new();
-    if let Err(e) = file.take(max.saturating_add(1)).read_to_end(&mut bytes) {
-        return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path))));
+    Ok(file)
+}
+
+enum ScanLine {
+    Eof,
+    Line(Vec<u8>),
+    /// No newline within [`MAX_LINE_BYTES`]. `prefix` is that many bytes;
+    /// the rest of the line has been discarded.
+    TooLong(Vec<u8>),
+}
+
+fn fill_has(buf: &[u8], byte: u8) -> Option<usize> {
+    buf.iter().position(|b| *b == byte)
+}
+
+/// Next logical line, bounded to [`MAX_LINE_BYTES`]. A NUL anywhere is an error.
+fn next_line(reader: &mut impl std::io::BufRead, path: &Path) -> Result<ScanLine, ToolOutput> {
+    let mut buf = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) => return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path)))),
+        };
+        if available.is_empty() {
+            return Ok(if buf.is_empty() { ScanLine::Eof } else { ScanLine::Line(buf) });
+        }
+        let room = MAX_LINE_BYTES - buf.len();
+        let scan = &available[..available.len().min(room)];
+        if let Some(i) = fill_has(scan, 0) {
+            if fill_has(&scan[..i], b'\n').is_none() {
+                return Err(ToolOutput::err(format!("read_file: {} is a binary file.", display_path(path))));
+            }
+        }
+        if let Some(i) = fill_has(scan, b'\n') {
+            buf.extend_from_slice(&available[..=i]);
+            reader.consume(i + 1);
+            return Ok(ScanLine::Line(buf));
+        }
+        if available.len() > room {
+            buf.extend_from_slice(scan);
+            reader.consume(room);
+            skip_rest(reader, path)?;
+            return Ok(ScanLine::TooLong(buf));
+        }
+        let n = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(n);
     }
-    Ok(bytes)
+}
+
+fn skip_rest(reader: &mut impl std::io::BufRead, path: &Path) -> Result<(), ToolOutput> {
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) => return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path)))),
+        };
+        if available.is_empty() {
+            return Ok(());
+        }
+        if let Some(i) = fill_has(available, 0) {
+            if fill_has(&available[..i], b'\n').is_none() {
+                return Err(ToolOutput::err(format!("read_file: {} is a binary file.", display_path(path))));
+            }
+        }
+        if let Some(i) = fill_has(available, b'\n') {
+            reader.consume(i + 1);
+            return Ok(());
+        }
+        let n = available.len();
+        reader.consume(n);
+    }
+}
+
+fn line_text(bytes: &[u8], path: &Path, cut: bool) -> Result<String, ToolOutput> {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    match std::str::from_utf8(bytes) {
+        Ok(t) => Ok(t.to_string()),
+        Err(e) if cut && e.error_len().is_none() => match std::str::from_utf8(&bytes[..e.valid_up_to()]) {
+            Ok(t) => Ok(t.to_string()),
+            Err(_) => Err(ToolOutput::err(format!("read_file: {} is not UTF-8 text.", display_path(path)))),
+        },
+        Err(_) => Err(ToolOutput::err(format!("read_file: {} is not UTF-8 text.", display_path(path)))),
+    }
+}
+
+fn push_numbered(out: &mut String, n: u64, line: &str, exceeds: bool) {
+    if exceeds || line.chars().count() > DISPLAY_CHARS {
+        let shown: String = line.chars().take(DISPLAY_CHARS).collect();
+        let note = if exceeds { " [line exceeds 1 MiB]" } else { "" };
+        out.push_str(&format!("{n:>6}\t{shown}…{note}\n"));
+    } else {
+        out.push_str(&format!("{n:>6}\t{line}\n"));
+    }
 }
 
 // --------------------------------------------------------------------------- read_file
@@ -115,6 +203,10 @@ impl Tool for ReadFile {
         summary_path(args)
     }
 
+    fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
+        super::outside_path_arg(cwd, args)
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(p) = args.get("path").and_then(Value::as_str) else {
             return ToolOutput::err("read_file: missing required argument `path`.");
@@ -131,66 +223,53 @@ impl Tool for ReadFile {
         if limit < 1 {
             return ToolOutput::err(format!("read_file: limit must be at least 1, got {limit}."));
         }
-        let mut bytes = match read_regular(&path, MAX_SCAN_BYTES) {
-            Ok(b) => b,
+        let file = match open_regular(&path) {
+            Ok(f) => f,
             Err(e) => return e,
         };
-        let truncated = bytes.len() as u64 > MAX_SCAN_BYTES;
-        if truncated {
-            match bytes[..MAX_SCAN_BYTES as usize].iter().rposition(|b| *b == b'\n') {
-                Some(i) => bytes.truncate(i),
-                None => {
-                    return ToolOutput::err(format!(
-                        "read_file: {} has no complete line within the first 8 MiB.",
-                        display_path(&path)
-                    ))
-                }
+        let mut reader = std::io::BufReader::new(file);
+        let mut out = String::new();
+        let mut line_no: u64 = 0;
+        let mut emitted: u64 = 0;
+        let mut more: u64 = 0;
+        let limit = limit as u64;
+        let offset = offset as u64;
+        loop {
+            let scanned = match next_line(&mut reader, &path) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            let (bytes, exceeds) = match scanned {
+                ScanLine::Eof => break,
+                ScanLine::Line(b) => (b, false),
+                ScanLine::TooLong(b) => (b, true),
+            };
+            let text = match line_text(&bytes, &path, exceeds) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            line_no += 1;
+            if line_no < offset {
+                continue;
+            }
+            if emitted < limit {
+                push_numbered(&mut out, line_no, &text, exceeds);
+                emitted += 1;
+            } else {
+                more += 1;
             }
         }
-        if bytes.contains(&0) {
-            return ToolOutput::err(format!("read_file: {} is a binary file.", display_path(&path)));
-        }
-        let text = match String::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(_) => return ToolOutput::err(format!("read_file: {} is not UTF-8 text.", display_path(&path))),
-        };
-
-        let lines: Vec<&str> = text.lines().collect();
-        let total = lines.len();
-        if total == 0 && !truncated {
+        if line_no == 0 {
             return ToolOutput::ok(format!("read_file: {} is empty.", display_path(&path)));
         }
-        let start = offset as usize - 1;
-        if start >= total {
-            return if truncated {
-                ToolOutput::err(format!(
-                    "read_file: offset {offset} is past the first 8 MiB of {}.",
-                    display_path(&path)
-                ))
-            } else {
-                ToolOutput::err(format!(
-                    "read_file: offset {offset} is past the end of {} ({total} lines).",
-                    display_path(&path)
-                ))
-            };
+        if emitted == 0 {
+            return ToolOutput::err(format!(
+                "read_file: offset {offset} is past the end of {} ({line_no} lines).",
+                display_path(&path)
+            ));
         }
-        let end = (start + limit as usize).min(total);
-        let mut out = String::new();
-        for (i, line) in lines[start..end].iter().enumerate() {
-            let n = start + i + 1;
-            if line.chars().count() > 2000 {
-                let note = if line.len() > MAX_LINE_BYTES { " [line exceeds 1 MiB]" } else { "" };
-                out.push_str(&format!("{n:>6}\t{}…{note}\n", line.chars().take(2000).collect::<String>()));
-            } else {
-                out.push_str(&format!("{n:>6}\t{line}\n"));
-            }
-        }
-        if end < total || truncated {
-            if truncated {
-                out.push_str(&format!("(more lines below — use offset {})\n", end + 1));
-            } else {
-                out.push_str(&format!("({} more lines below — use offset {} to read on)\n", total - end, end + 1));
-            }
+        if more > 0 {
+            out.push_str(&format!("({more} more lines below — use offset {} to read on)\n", offset + emitted));
         }
         ToolOutput::ok(out)
     }
@@ -219,6 +298,10 @@ impl Tool for ListDir {
 
     fn summary(&self, args: &Value) -> String {
         summary_path(args)
+    }
+
+    fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
+        super::outside_path_arg(cwd, args)
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
@@ -896,6 +979,29 @@ mod tests {
         let out = run(&ReadFile, json!({"path": "app.min.js", "offset": 2, "limit": 1}), dir.path());
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("after"), "{}", out.content);
+    }
+
+    #[test]
+    fn read_reaches_past_eight_mebibytes() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(dir.path().join("big.txt")).unwrap();
+        let chunk = vec![b'a'; 1024 * 1024];
+        for _ in 0..9 {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(b"\nMARKER-TAIL\n").unwrap();
+        let out = run(&ReadFile, json!({"path": "big.txt", "offset": 2, "limit": 1}), dir.path());
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("MARKER-TAIL"), "{}", out.content);
+    }
+
+    #[test]
+    fn reads_outside_the_workspace_need_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!ReadFile.needs_approval_for(&json!({"path": "notes.txt"}), dir.path()));
+        assert!(ReadFile.needs_approval_for(&json!({"path": "../notes.txt"}), dir.path()));
+        assert!(!ListDir.needs_approval_for(&json!({}), dir.path()));
     }
 
     #[test]

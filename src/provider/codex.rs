@@ -266,7 +266,7 @@ impl CodexProvider {
             let mut file = options.open(&temp)?;
             file.write_all(&serde_json::to_vec(auth)?)?;
             file.sync_all()?;
-            std::fs::rename(&temp, &self.auth_path)?;
+            crate::tools::safeio::rename_over(&temp, &self.auth_path)?;
             Ok(())
         })();
         if result.is_err() {
@@ -297,8 +297,8 @@ fn output_item(item: &Value) -> Option<Item> {
             text: item["content"]
                 .as_array()?
                 .iter()
-                .filter(|part| part["type"] == "output_text")
-                .filter_map(|part| part["text"].as_str())
+                .filter(|part| part["type"] == "output_text" || part["type"] == "refusal")
+                .filter_map(|part| part["text"].as_str().or_else(|| part["refusal"].as_str()))
                 .collect::<String>(),
         }),
         "function_call" => Some(Item::ToolCall {
@@ -375,7 +375,7 @@ impl Provider for CodexProvider {
             let data: Value = serde_json::from_str(&event.data)?;
             let kind = data["type"].as_str().unwrap_or(&event.event);
             match kind {
-                "response.output_text.delta" => {
+                "response.output_text.delta" | "response.refusal.delta" => {
                     on_event(StreamEvent::Text(sse::string(&data, "delta")))
                 }
                 "response.reasoning_summary_text.delta" => {
@@ -442,6 +442,25 @@ mod tests {
         provider::sse::tests::{events, server, Env, ENV},
         types::ToolSpec,
     };
+
+    #[test]
+    fn refusal_is_assistant_text() {
+        let item = output_item(&json!({
+            "type": "message",
+            "content": [
+                {"type": "output_text", "text": "Hello. "},
+                {"type": "refusal", "refusal": "I won't do that."}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(item, Item::Assistant { text: "Hello. I won't do that.".into() });
+        let text_field = output_item(&json!({
+            "type": "message",
+            "content": [{"type": "refusal", "text": "No."}]
+        }))
+        .unwrap();
+        assert_eq!(text_field, Item::Assistant { text: "No.".into() });
+    }
 
     fn auth_file(dir: &tempfile::TempDir, expires: i64) -> PathBuf {
         let path = dir.path().join("auth.json");

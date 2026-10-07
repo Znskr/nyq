@@ -1,8 +1,10 @@
 //! Descriptor-relative file IO.
 //!
-//! On Linux a workspace write opens the whole relative path in one `openat2`
-//! against the root descriptor with `RESOLVE_BENEATH` only. Symlinks that stay
-//! inside the root are followed; a symlink that escapes it is rejected.
+//! On Linux a workspace write walks one component at a time with `openat2`
+//! (`RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`). A symlink is resolved from
+//! its directory entry and followed only when the target stays inside the
+//! root, including a dangling link. A symlink that escapes the root is
+//! rejected. The walk does not use `/proc`.
 //! `RESOLVE_BENEATH` has no equivalent on macOS or other Unix, so those
 //! platforms keep `openat` + `O_NOFOLLOW` and refuse every symlink. Windows
 //! refuses symlinks via `symlink_metadata`. Bytes land in a temporary file in
@@ -169,6 +171,47 @@ pub fn write_beneath(root: &Path, rel: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Remove `rel` underneath `root` without following a symlink that leaves it.
+///
+/// `NotFound` means the file is already gone. A symlink is removed only when
+/// it is the final component; intermediate links are followed when they stay
+/// inside `root` and rejected otherwise, matching [`write_beneath`].
+pub fn remove_beneath(root: &Path, rel: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        match remove_at(root, rel) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
+            Err(e) => return Err(explain_beneath(e)),
+            Ok(()) => return Ok(()),
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let (dir, name) = descend(root, rel, false)?;
+        let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+        unlink_at(&dir, &c)
+    }
+    #[cfg(not(unix))]
+    {
+        let (parent, name) = walk_beneath(root, rel, false)?;
+        fs::remove_file(parent.join(name))
+    }
+}
+
+/// Replace `to` with `from`, including when `to` already exists.
+pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::rename(from, to)
+    }
+    #[cfg(not(unix))]
+    {
+        replace_existing(from, to)
+    }
+}
+
 /// Read a regular file underneath `root`. Symlink policy matches [`write_beneath`].
 pub fn read_beneath(root: &Path, rel: &Path, max: u64) -> io::Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
@@ -262,7 +305,7 @@ fn replace_in_dir(dir: &Path, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Resul
                 perms.set_readonly(true);
                 fs::set_permissions(&tmp, perms)?;
             }
-            replace_existing(&tmp, &dest)
+            rename_over(&tmp, &dest)
         })();
         if let Err(e) = write_tmp {
             let _ = fs::remove_file(&tmp);
@@ -367,17 +410,19 @@ fn copy_owner_mode(dir: &File, dest: &std::ffi::CStr, file: &File) -> io::Result
         return Err(err);
     }
     let fd = file.as_raw_fd();
+    // Owner first: on Linux `fchown` clears setuid/setgid even when the ids
+    // do not change, so the mode has to be applied afterwards.
     // SAFETY: `fd` is the temporary file just written in this directory.
-    if unsafe { libc::fchmod(fd, (st.st_mode & 0o7777) as libc::mode_t) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: same fd. EPERM means the caller cannot adopt the original owner.
+    // EPERM means the caller cannot adopt the original owner.
     let rc = unsafe { libc::fchown(fd, st.st_uid, st.st_gid) };
     if rc < 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EPERM) {
             return Err(err);
         }
+    }
+    if unsafe { libc::fchmod(fd, (st.st_mode & 0o7777) as libc::mode_t) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -617,78 +662,224 @@ fn write_resolving(root: &Path, rel: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn write_at(root: &Path, rel: &Path, bytes: &[u8]) -> io::Result<()> {
     let root_fd = open_directory(root)?;
-    let path = rel_cstr(rel)?;
-    match open_raw(&root_fd, &path, libc::O_RDONLY | libc::O_CLOEXEC) {
-        Ok(file) => {
-            if !file.metadata()?.is_file() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
-            }
-            write_existing(&root_fd, &file, bytes)
-        }
-        Err(e) if is_enoent(&e) => write_new(&root_fd, rel, bytes),
-        Err(e) => Err(e),
+    let parts = path_parts(rel);
+    if parts.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
     }
+    write_parts(&root_fd, root, &parts, bytes, 0)
 }
 
-/// Replace the file `openat2` already resolved, not the symlink that named it.
 #[cfg(target_os = "linux")]
-fn write_existing(root_fd: &File, file: &File, bytes: &[u8]) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let root_path = fs::read_link(format!("/proc/self/fd/{}", root_fd.as_raw_fd()))?;
-    let file_path = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
-    if !file_path.starts_with(&root_path) {
+fn remove_at(root: &Path, rel: &Path) -> io::Result<()> {
+    let root_fd = open_directory(root)?;
+    let parts = path_parts(rel);
+    if parts.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
+    }
+    remove_parts(&root_fd, root, &parts, 0)
+}
+
+#[cfg(target_os = "linux")]
+enum Entry {
+    Dir(File),
+    File,
+    Link(PathBuf),
+    Missing,
+}
+
+#[cfg(target_os = "linux")]
+fn classify(dir: &File, name: &std::ffi::OsStr, want_dir: bool) -> io::Result<Entry> {
+    let st = match fstat_at(dir, name, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(st) => st,
+        Err(e) if is_enoent(&e) => return Ok(Entry::Missing),
+        Err(e) => return Err(e),
+    };
+    let kind = st.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFLNK {
+        return Ok(Entry::Link(read_link_at(dir, name)?));
+    }
+    if kind == libc::S_IFDIR {
+        if !want_dir {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        }
+        return Ok(Entry::Dir(open_subdir(dir, name)?));
+    }
+    if kind == libc::S_IFREG {
+        if want_dir {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory"));
+        }
+        let file = open_read(dir, name)?;
+        let opened = fstat_fd(&file)?;
+        if opened.st_ino != st.st_ino || opened.st_dev != st.st_dev {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "file changed during write"));
+        }
+        return Ok(Entry::File);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        if want_dir { "not a directory" } else { "not a regular file" },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn write_parts(root_fd: &File, root: &Path, parts: &[OsString], bytes: &[u8], depth: u32) -> io::Result<()> {
+    if depth > 32 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
     }
-    let Some(name) = file_path.file_name() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
-    };
-    let Some(parent) = file_path.parent() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"));
-    };
-    let parent_fd = if parent == root_path {
-        root_fd.try_clone()?
-    } else {
-        let rel = parent.strip_prefix(&root_path).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")
-        })?;
-        let path = rel_cstr(rel)?;
-        open_raw(root_fd, &path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)?
-    };
-    let opened = fstat_fd(file)?;
-    let named = fstatat_follow(&parent_fd, name)?;
-    if opened.st_ino != named.st_ino || opened.st_dev != named.st_dev {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "file changed during write"));
+    let mut current = root_fd.try_clone()?;
+    let mut walked = PathBuf::new();
+    for (i, name) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        match classify(&current, name, !last)? {
+            Entry::Missing if !last => {
+                mkdir_at(&current, name)?;
+                current = open_subdir(&current, name)?;
+                walked.push(name);
+            }
+            Entry::Missing => return replace_at(&current, name, bytes),
+            Entry::Dir(dir) => {
+                current = dir;
+                walked.push(name);
+            }
+            Entry::File => return replace_at(&current, name, bytes),
+            Entry::Link(target) => {
+                let next = retarget(root, &walked, &target, &parts[i + 1..])?;
+                return write_parts(root_fd, root, &next, bytes, depth + 1);
+            }
+        }
     }
-    replace_at(&parent_fd, name, bytes)
+    Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))
 }
 
 #[cfg(target_os = "linux")]
-fn write_new(root_fd: &File, rel: &Path, bytes: &[u8]) -> io::Result<()> {
-    let (dirs, file_name) = split_rel(rel)?;
+fn remove_parts(root_fd: &File, root: &Path, parts: &[OsString], depth: u32) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    if depth > 32 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+    }
     let mut current = root_fd.try_clone()?;
-    let mut prefix = PathBuf::new();
-    for name in &dirs {
-        prefix.push(name);
-        let path = rel_cstr(&prefix)?;
-        match open_raw(root_fd, &path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) {
-            Ok(dir) => current = dir,
-            Err(e) if is_enoent(&e) => {
-                mkdir_at(&current, name)?;
-                current = open_subdir(&current, name)?;
+    let mut walked = PathBuf::new();
+    for (i, name) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        match classify(&current, name, !last)? {
+            Entry::Missing => return Err(io::Error::new(io::ErrorKind::NotFound, "not found")),
+            Entry::Dir(dir) => {
+                current = dir;
+                walked.push(name);
             }
-            Err(e) => return Err(e),
+            Entry::File => {
+                let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+                return unlink_at(&current, &c);
+            }
+            Entry::Link(target) => {
+                let next = retarget(root, &walked, &target, &parts[i + 1..])?;
+                return remove_parts(root_fd, root, &next, depth + 1);
+            }
         }
     }
-    let path = rel_cstr(rel)?;
-    match open_raw(root_fd, &path, libc::O_RDONLY | libc::O_CLOEXEC) {
-        Ok(file) => {
-            if !file.metadata()?.is_file() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))
+}
+
+#[cfg(target_os = "linux")]
+fn path_parts(path: &Path) -> Vec<OsString> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_os_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn retarget(root: &Path, walked: &Path, target: &Path, rest: &[OsString]) -> io::Result<Vec<OsString>> {
+    let base = if target.is_absolute() {
+        absolute_under(root, target)?
+    } else {
+        normalize_rel(&walked.join(target))?
+    };
+    let mut parts = path_parts(&base);
+    parts.extend(rest.iter().cloned());
+    if parts.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+    }
+    Ok(parts)
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_rel(path: &Path) -> io::Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(s) => out.push(s),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                }
             }
-            write_existing(root_fd, &file, bytes)
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")),
         }
-        Err(e) if is_enoent(&e) => replace_at(&current, &file_name, bytes),
-        Err(e) => Err(e),
+    }
+    Ok(out)
+}
+
+/// Resolve an absolute symlink target that may not exist yet, and keep it
+/// only when the existing prefix is inside `root`.
+#[cfg(target_os = "linux")]
+fn absolute_under(root: &Path, target: &Path) -> io::Result<PathBuf> {
+    let root_real = fs::canonicalize(root)?;
+    let mut cur = target.to_path_buf();
+    let mut suffix = Vec::new();
+    loop {
+        match fs::canonicalize(&cur) {
+            Ok(real) => {
+                if !real.starts_with(&root_real) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                }
+                let mut out = real.strip_prefix(&root_real).unwrap_or(Path::new("")).to_path_buf();
+                for name in suffix.iter().rev() {
+                    out.push(name);
+                }
+                return Ok(out);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = cur.file_name() else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                };
+                suffix.push(name.to_os_string());
+                match cur.parent() {
+                    Some(parent) if parent != cur => cur = parent.to_path_buf(),
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")),
+                }
+            }
+            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_link_at(dir: &File, name: &std::ffi::OsStr) -> io::Result<PathBuf> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::io::AsRawFd;
+    let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let mut buf = vec![0u8; 256];
+    loop {
+        // SAFETY: `c` is NUL-terminated and `buf` is writable for `buf.len()` bytes.
+        let rc = unsafe { libc::readlinkat(dir.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = rc as usize;
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)));
+        }
+        if buf.len() >= 64 * 1024 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "symlink target too long"));
+        }
+        buf.resize(buf.len() * 2, 0);
     }
 }
 
@@ -702,14 +893,14 @@ fn fstat_fd(file: &File) -> io::Result<libc::stat> {
 }
 
 #[cfg(target_os = "linux")]
-fn fstatat_follow(dir: &File, name: &std::ffi::OsStr) -> io::Result<libc::stat> {
+fn fstat_at(dir: &File, name: &std::ffi::OsStr, flags: i32) -> io::Result<libc::stat> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
     let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `st` is a valid `stat` buffer and `c` is NUL-terminated.
-    let rc = unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, 0) };
+    let rc = unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, flags) };
     if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(st) }
 }
 
@@ -816,5 +1007,34 @@ mod tests {
         .unwrap();
         write_beneath(&root, Path::new("packages/web/node_modules/@acme/file.txt"), b"ok").unwrap();
         assert_eq!(std::fs::read_to_string(root.join("node_modules/.pnpm/pkg/file.txt")).unwrap(), "ok");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_beneath_creates_the_target_of_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink("generated/config", root.join("alias")).unwrap();
+        write_beneath(&root, Path::new("alias"), b"value").unwrap();
+        assert!(std::fs::symlink_metadata(root.join("alias")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(root.join("generated/config")).unwrap(), "value");
+        assert!(!root.join("alias").metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_keeps_setuid_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tool");
+        std::fs::write(&file, b"old").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o4755);
+        std::fs::set_permissions(&file, perms).unwrap();
+        write_atomic(&file, b"new").unwrap();
+        let got = std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(got, 0o4755, "setuid bit cleared");
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
     }
 }

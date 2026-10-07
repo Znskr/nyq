@@ -12,7 +12,8 @@ use crate::types::ToolSpec;
 
 const MAX_GLOB: usize = 200;
 const MAX_GREP: usize = 300;
-const MAX_GREP_BYTES: u64 = 8 * 1024 * 1024;
+const GREP_WINDOW: usize = 1024 * 1024;
+const GREP_OVERLAP: usize = 64 * 1024;
 
 /// Resolve a possibly relative path against `cwd`.
 fn resolve(cwd: &Path, p: &str) -> PathBuf {
@@ -71,6 +72,10 @@ impl Tool for GlobFiles {
 
     fn summary(&self, args: &Value) -> String {
         args.get("pattern").and_then(Value::as_str).unwrap_or_default().to_string()
+    }
+
+    fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
+        super::outside_path_arg(cwd, args)
     }
 
     fn handles_cancel(&self) -> bool {
@@ -173,6 +178,10 @@ impl Tool for Grep {
         args.get("pattern").and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
+    fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
+        super::outside_path_arg(cwd, args)
+    }
+
     fn handles_cancel(&self) -> bool {
         true
     }
@@ -258,29 +267,11 @@ fn collect_grep(
         if owned.blocks_path(abs) {
             return false;
         }
-        let Some(bytes) = read_grep_file(abs, cancel) else { return false };
-        let text = String::from_utf8_lossy(&bytes);
-        for (i, line) in text.lines().enumerate() {
-            if !re.is_match(line) {
-                continue;
-            }
-            if files_only {
-                matches.push(super::slash_path(rel));
-            } else {
-                let mut snippet = line.trim().to_string();
-                if snippet.chars().count() > 300 {
-                    snippet = snippet.chars().take(300).collect::<String>() + "…";
-                }
-                matches.push(format!("{}:{}: {}", super::slash_path(rel), i + 1, snippet));
-            }
-            if matches.len() >= MAX_GREP {
-                return true;
-            }
-            if files_only {
-                break; // one entry per file is enough
-            }
+        match grep_file(abs, rel, re, files_only, &mut matches, cancel) {
+            GrepFile::Skip => false,
+            GrepFile::Continue => false,
+            GrepFile::Cap => true,
         }
-        false
     };
 
     if root.is_file() {
@@ -313,29 +304,170 @@ fn collect_grep(
     Ok((matches, truncated))
 }
 
-/// Read at most [`MAX_GREP_BYTES`] of a regular file, skipping binaries and
-/// devices. `None` means "skip this file".
-fn read_grep_file(path: &Path, cancel: &tokio_util::sync::CancellationToken) -> Option<Vec<u8>> {
+enum GrepFile {
+    Skip,
+    Continue,
+    Cap,
+}
+
+/// Scan a whole regular file. A NUL drops every match from that file.
+/// Lines longer than [`GREP_WINDOW`] are searched in overlapping windows so a
+/// match past the first mebibyte is still found.
+fn grep_file(
+    path: &Path,
+    rel: &Path,
+    re: &regex::Regex,
+    files_only: bool,
+    matches: &mut Vec<String>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> GrepFile {
     use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return GrepFile::Skip,
+    };
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return GrepFile::Skip;
     }
-    let mut file = file.take(MAX_GREP_BYTES);
-    let mut buf = Vec::new();
+    let start = matches.len();
+    let mut reader = std::io::BufReader::new(file);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut line_no: usize = 1;
     let mut chunk = [0u8; 64 * 1024];
+    let mut binary = false;
+    let mut cap = false;
+    let mut hit = false;
+    let mut file_done = false;
     loop {
         if cancel.is_cancelled() {
-            return None;
+            matches.truncate(start);
+            return GrepFile::Skip;
         }
-        match file.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) if chunk[..n].contains(&0) => return None,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(_) => return None,
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => {
+                if !pending.is_empty() && !hit && !file_done && !binary {
+                    cap = record_line(&pending, line_no, rel, re, files_only, matches);
+                }
+                break;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                matches.truncate(start);
+                return GrepFile::Skip;
+            }
+        };
+        let mut rest = &chunk[..n];
+        while let Some(i) = rest.iter().position(|b| *b == b'\n' || *b == 0) {
+            if rest[i] == 0 {
+                binary = true;
+                break;
+            }
+            pending.extend_from_slice(&rest[..=i]);
+            rest = &rest[i + 1..];
+            if !hit && !file_done {
+                let before = matches.len();
+                cap = record_line(&pending, line_no, rel, re, files_only, matches) || cap;
+                if files_only && matches.len() > before {
+                    file_done = true;
+                }
+            }
+            pending.clear();
+            hit = false;
+            line_no += 1;
+            if cap || binary {
+                break;
+            }
+        }
+        if binary {
+            break;
+        }
+        if cap {
+            if rest.contains(&0) || read_has_nul(&mut reader) {
+                binary = true;
+            }
+            break;
+        }
+        pending.extend_from_slice(rest);
+        if pending.contains(&0) {
+            binary = true;
+            break;
+        }
+        if pending.len() > GREP_WINDOW {
+            if !hit && !file_done && line_matches(re, &pending) {
+                cap = record_line(&pending, line_no, rel, re, files_only, matches);
+                hit = true;
+                if files_only {
+                    file_done = true;
+                }
+            }
+            let keep = GREP_OVERLAP.min(pending.len());
+            pending.drain(..pending.len() - keep);
+            if cap && read_has_nul(&mut reader) {
+                binary = true;
+                break;
+            }
         }
     }
-    Some(buf)
+    if binary {
+        matches.truncate(start);
+        return GrepFile::Skip;
+    }
+    if cap { GrepFile::Cap } else { GrepFile::Continue }
+}
+
+fn read_has_nul(reader: &mut impl std::io::Read) -> bool {
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return false,
+            Ok(n) if chunk[..n].contains(&0) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+fn record_line(
+    line: &[u8],
+    line_no: usize,
+    rel: &Path,
+    re: &regex::Regex,
+    files_only: bool,
+    matches: &mut Vec<String>,
+) -> bool {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    if !line_matches(re, line) {
+        return false;
+    }
+    if files_only {
+        matches.push(super::slash_path(rel));
+    } else {
+        let text = String::from_utf8_lossy(line);
+        let mut snippet = text.trim().to_string();
+        if snippet.chars().count() > 300 {
+            snippet = snippet.chars().take(300).collect::<String>() + "…";
+        }
+        matches.push(format!("{}:{line_no}: {snippet}", super::slash_path(rel)));
+    }
+    matches.len() >= MAX_GREP
+}
+
+fn line_matches(re: &regex::Regex, line: &[u8]) -> bool {
+    if line.len() <= GREP_WINDOW {
+        return re.is_match(&String::from_utf8_lossy(line));
+    }
+    let mut start = 0;
+    while start < line.len() {
+        let end = (start + GREP_WINDOW).min(line.len());
+        if re.is_match(&String::from_utf8_lossy(&line[start..end])) {
+            return true;
+        }
+        if end == line.len() {
+            break;
+        }
+        start = end - GREP_OVERLAP;
+    }
+    false
 }
 
 // ------------------------------------------------------------------------------- misc
@@ -538,5 +670,21 @@ mod tests {
         assert!(!out.content.contains("leak"), "{}", out.content);
         if let Some(v) = old_home { std::env::set_var("NYQ_HOME", v); } else { std::env::remove_var("NYQ_HOME"); }
         if let Some(v) = old_auth { std::env::set_var("NYQ_CODEX_AUTH", v); } else { std::env::remove_var("NYQ_CODEX_AUTH"); }
+    }
+
+    #[tokio::test]
+    async fn grep_finds_a_match_past_eight_mebibytes() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(dir.path().join("big.txt")).unwrap();
+        let chunk = vec![b'a'; 1024 * 1024];
+        for _ in 0..9 {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(b"\nMARKER-TAIL\n").unwrap();
+        let out = run(&Grep, json!({"pattern": "MARKER-TAIL", "path": "big.txt"}), dir.path()).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("MARKER-TAIL"), "{}", out.content);
+        assert!(!out.content.contains("No matches"));
     }
 }

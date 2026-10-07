@@ -2,6 +2,7 @@
 //! tools are adapted into the same [`Tool`] trait by `crate::mcp`.
 
 mod bash;
+pub(crate) use bash::run_shell;
 mod fs;
 pub mod image;
 pub(crate) mod safeio;
@@ -10,6 +11,8 @@ pub mod web;
 pub mod subagent;
 
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
@@ -37,15 +40,10 @@ impl SecretRoots {
             add_secret(&mut roots, user.join(".netrc"));
         }
         let auth = crate::config::codex_auth_path(&fx);
-        // Deny the auth file's directory when it is a dedicated folder.
-        // Skip `/`, the user home, and temp dirs so a custom `NYQ_CODEX_AUTH`
-        // cannot make the whole home or `/tmp` unreadable; the file itself
-        // is always denied below.
-        if let Some(parent) = auth.parent() {
-            if !broad_dir(parent) {
-                add_secret(&mut roots, parent.to_path_buf());
-            }
-        }
+        // Always deny the auth file itself. Its parent is denied only when it
+        // is a known credential directory (`~/.fx`, `~/.codex`), which are
+        // added above. A custom `NYQ_CODEX_AUTH` such as `/repo/auth.json`
+        // must not make the rest of that directory unreadable.
         add_secret(&mut roots, auth);
         Self { roots }
     }
@@ -80,15 +78,6 @@ fn add_secret(roots: &mut Vec<PathBuf>, path: PathBuf) {
             roots.push(candidate);
         }
     }
-}
-
-fn broad_dir(path: &Path) -> bool {
-    let path = lexical(path);
-    path == Path::new("/")
-        || path == Path::new("/tmp")
-        || path == Path::new("/var/tmp")
-        || path == Path::new("/private/tmp")
-        || dirs::home_dir().is_some_and(|home| path == lexical(&home))
 }
 
 fn expand_tilde(p: &str) -> Option<PathBuf> {
@@ -146,6 +135,54 @@ fn resolved_path(path: &Path) -> PathBuf {
     lexical
 }
 
+/// Instruction and skill files are capped before they are decoded.
+pub(crate) const MAX_ROOTED_TEXT: u64 = 1024 * 1024;
+
+/// Read a regular file that stays inside `root`.
+///
+/// The final component must not be a symlink. The canonical path must remain
+/// under `root`. Credential locations are refused unless `root` itself is one
+/// (user skills live under `~/.fx`). At most [`MAX_ROOTED_TEXT`] bytes are read.
+pub(crate) fn read_rooted_text(root: &Path, path: &Path) -> Result<String, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if meta.file_type().is_symlink() {
+        return Err("refusing to follow a symlink".into());
+    }
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    let root_real = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let real = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    if !real.starts_with(&root_real) {
+        return Err("outside the project root".into());
+    }
+    let secrets = SecretRoots::load();
+    if secrets.blocks_path(&real) && !secrets.blocks_path(&root_real) {
+        return Err("refusing to read credential files".into());
+    }
+    let file = File::open(&real).map_err(|e| e.to_string())?;
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return Err("not a regular file".into());
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_ROOTED_TEXT.saturating_add(1)).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() as u64 > MAX_ROOTED_TEXT {
+        return Err(format!("file exceeds {MAX_ROOTED_TEXT} bytes"));
+    }
+    String::from_utf8(buf).map_err(|_| "not UTF-8 text".into())
+}
+
+/// Whether `user_path` resolves outside `cwd` (including through a symlink).
+pub(crate) fn outside_workspace(cwd: &Path, user_path: &str) -> bool {
+    !crate::agent::inside(cwd, user_path)
+}
+
+/// A `path` argument that points outside the workspace needs approval.
+pub(crate) fn outside_path_arg(cwd: &Path, args: &Value) -> bool {
+    let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    outside_workspace(cwd, path)
+}
+
 /// A path as shown to the model and user: always with `/` separators.
 pub(crate) fn slash_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
@@ -199,6 +236,12 @@ pub trait Tool: Send + Sync {
     /// Whether running this call needs user approval (mutations, shell, MCP).
     fn needs_approval(&self, _args: &Value) -> bool {
         false
+    }
+    /// Like [`needs_approval`], but with the workspace root so reads outside
+    /// it can ask even when the tool is otherwise free.
+    fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
+        let _ = cwd;
+        self.needs_approval(args)
     }
     /// One-line human summary of a call, e.g. `src/main.rs` or `cargo test`.
     fn summary(&self, args: &Value) -> String;
@@ -300,6 +343,27 @@ mod secret_tests {
             let link = dir.path().join("link");
             std::os::unix::fs::symlink(secret.join("token"), &link).unwrap();
             assert!(roots.blocks_path(&link));
+        }
+    }
+
+    #[test]
+    fn custom_auth_file_does_not_block_its_parent() {
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, "{}").unwrap();
+        let project = dir.path().join("src/main.rs");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "fn main() {}\n").unwrap();
+        let old = std::env::var_os("NYQ_CODEX_AUTH");
+        std::env::set_var("NYQ_CODEX_AUTH", &auth);
+        let roots = SecretRoots::load();
+        assert!(roots.blocks_path(&auth), "the auth file itself is denied");
+        assert!(!roots.blocks_path(&project), "a custom auth parent must stay readable");
+        assert!(!roots.blocks_path(dir.path()));
+        match old {
+            Some(v) => std::env::set_var("NYQ_CODEX_AUTH", v),
+            None => std::env::remove_var("NYQ_CODEX_AUTH"),
         }
     }
 }

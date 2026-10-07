@@ -148,7 +148,7 @@ pub fn save_last(home: &Path, choice: &ModelChoice, effort: Option<&str>) -> Res
     let temp = dir.join(format!(".last-model-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         std::fs::write(&temp, serde_json::to_vec_pretty(&last)?)?;
-        std::fs::rename(&temp, dir.join("last-model.json"))?;
+        crate::tools::safeio::rename_over(&temp, &dir.join("last-model.json"))?;
         Ok(())
     })();
     if result.is_err() {
