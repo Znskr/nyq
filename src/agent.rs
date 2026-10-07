@@ -126,6 +126,8 @@ pub struct Agent {
     pub context_window: u64,
     /// Latest context size (input plus output), or an estimate after compaction.
     pub context_tokens: u64,
+    /// Set when compaction cannot get under the limit, so later turns don't retry.
+    pub(crate) suppress_auto_compact: bool,
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
     /// File contents before each write/edit, for `/undo`.
     pub undo: crate::undo::UndoLog,
@@ -135,7 +137,7 @@ impl Agent {
     pub fn push(&mut self, item: Item) {
         if let Some(s) = &mut self.session {
             if let Err(e) = s.append(&item) {
-                eprintln!("warning: could not save session: {e}");
+                crate::ui::error(&format!("could not save session: {e:#}"));
             }
         }
         self.items.push(item);
@@ -150,17 +152,20 @@ impl Agent {
     ) -> Result<TurnEnd> {
         self.push(input);
         for _ in 0..MAX_STEPS {
-            if self.context_window > 0
+            if !self.suppress_auto_compact
+                && self.context_window > 0
                 && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT
             {
                 ui.notice("Context is nearly full; compacting the conversation…");
                 if !self.compact(ui, &cancel).await? {
                     return Ok(TurnEnd::Cancelled);
                 }
-                anyhow::ensure!(
-                    (self.context_tokens as f64) < self.context_window as f64 * AUTO_COMPACT_AT,
-                    "context is still over the automatic compaction limit after compacting"
-                );
+                if self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT {
+                    self.suppress_auto_compact = true;
+                    ui.notice(
+                        "Still over the automatic compaction limit after compacting (the system prompt alone may exceed it). Automatic compaction is off for the rest of this session.",
+                    );
+                }
             }
             let specs = self.tools.specs();
             let req = Request {
@@ -300,6 +305,8 @@ impl Agent {
             cancel: cancel.clone(),
             sandbox: self.sandbox.clone(),
             provider: Some(std::sync::Arc::from(self.provider.fork())),
+            yolo: self.yolo,
+            allowed: self.allowed.clone(),
         };
         let summary = tool.summary(&args);
 
@@ -428,6 +435,7 @@ impl Agent {
         self.session = session;
         self.usage = Usage::default();
         self.context_tokens = 0;
+        self.undo = Default::default();
     }
 }
 
@@ -459,28 +467,53 @@ fn plain_word(w: &str) -> bool {
         && w.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '@' | '+'))
 }
 
-/// The prefix "always" grants for a shell command: the program plus its
-/// subcommand (`cargo test`, `git status`, `npm run build`), or None if the
-/// command can't be safely scoped.
+/// A leading flag (`-la`, `--force`), not a lone `-` (often stdin).
+fn is_flag(w: &str) -> bool {
+    w.starts_with('-') && w.len() > 1
+}
+
+/// Last path component, so `./sh` and `bin/bash` match wrappers by name.
+fn program_base(program: &str) -> &str {
+    program.rsplit(['/', '\\']).next().unwrap_or(program)
+}
+
+/// The prefix "always" grants for a shell command: the program, any leading
+/// flags (`rm -rf`, `git -C`), and a subcommand when there is no leading flag
+/// (`cargo test`, `npm run build`). None when the command can't be safely
+/// scoped. Wrappers and interpreters are matched on the program name with any
+/// directory stripped (`./sh`, `bin/bash`, `./python`).
 pub fn bash_prefix(cmd: &str) -> Option<String> {
     if has_control(cmd) {
         return None;
     }
     let words: Vec<&str> = cmd.split_whitespace().collect();
     let program = *words.first()?;
-    if !plain_word(program.strip_prefix("./").unwrap_or(program)) || WRAPPERS.contains(&program) || program.contains('=') {
+    let base = program_base(program);
+    if !plain_word(program.strip_prefix("./").unwrap_or(program)) || WRAPPERS.contains(&base) || program.contains('=') {
         return None;
     }
     let mut prefix = vec![program];
-    match words.get(1).filter(|w| plain_word(w)) {
-        Some(sub) => {
+    let mut i = 1;
+    while words.get(i).is_some_and(|w| is_flag(w)) {
+        prefix.push(words[i]);
+        i += 1;
+    }
+    let flags = i > 1;
+    if INTERPRETERS.contains(&base) {
+        // `-c` / `-m` / `-e` would scope the interpreter to anything.
+        if flags {
+            return None;
+        }
+        prefix.push(words.get(i).filter(|w| plain_word(w))?);
+        return Some(prefix.join(" "));
+    }
+    if !flags {
+        if let Some(sub) = words.get(i).filter(|w| plain_word(w)) {
             prefix.push(sub);
-            if RUNNERS.contains(&program) && matches!(*sub, "run" | "exec" | "x") {
-                prefix.extend(words.get(2).filter(|w| plain_word(w)));
+            if RUNNERS.contains(&base) && matches!(*sub, "run" | "exec" | "x") {
+                prefix.extend(words.get(i + 1).filter(|w| plain_word(w)));
             }
         }
-        None if INTERPRETERS.contains(&program) => return None,
-        None => {}
     }
     Some(prefix.join(" "))
 }
@@ -497,28 +530,40 @@ fn is_file_tool(tool: &str) -> bool {
 }
 
 /// The rule "always" would grant for this call, as stored in `Agent::allowed`.
+fn subagent_mode(args: &Value) -> &'static str {
+    if args.get("mode").and_then(Value::as_str) == Some("general") { "general" } else { "explore" }
+}
+
 pub fn grant_rule(tool: &str, args: &Value) -> Option<String> {
     if tool == "bash" {
         let cmd = args.get("command").and_then(Value::as_str)?;
         return bash_prefix(cmd).map(|p| format!("bash:{p}"));
+    }
+    if tool == "subagent" {
+        return Some(format!("subagent:{}", subagent_mode(args)));
     }
     Some(tool.to_string())
 }
 
 /// How a rule reads in the approval menu.
 pub fn rule_label(rule: &str) -> String {
-    match rule.strip_prefix("bash:") {
-        Some(p) => format!("`{p} …`"),
-        None if is_file_tool(rule) => format!("{} in this workspace", rule.replace('_', " ")),
-        None => format!("`{rule}`"),
+    if let Some(p) = rule.strip_prefix("bash:") {
+        return format!("`{p} …`");
     }
+    if let Some(mode) = rule.strip_prefix("subagent:") {
+        return format!("`subagent` ({mode})");
+    }
+    if is_file_tool(rule) {
+        return format!("{} in this workspace", rule.replace('_', " "));
+    }
+    format!("`{rule}`")
 }
 
-/// Whether `path` (relative to `cwd` or absolute) stays inside `cwd`, after
+/// Whether `path` (relative to `root` or absolute) stays inside `root`, after
 /// resolving `..` and any symlinks along the existing part of the path.
-fn inside(cwd: &Path, path: &str) -> bool {
+pub(crate) fn inside(root: &Path, path: &str) -> bool {
     let mut full = PathBuf::new();
-    for c in cwd.join(path).components() {
+    for c in root.join(path).components() {
         match c {
             Component::ParentDir => {
                 if !full.pop() {
@@ -529,12 +574,12 @@ fn inside(cwd: &Path, path: &str) -> bool {
             c => full.push(c),
         }
     }
-    if !full.starts_with(cwd) {
+    if !full.starts_with(root) {
         return false;
     }
-    // A symlink inside the workspace may point out of it.
-    let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    full.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_none_or(|real| real.starts_with(&root))
+    // A symlink inside the root may point out of it.
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    full.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_none_or(|real| real.starts_with(&canon))
 }
 
 /// Whether a granted rule covers this call.
@@ -546,6 +591,9 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
     if is_file_tool(tool) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
         return allowed.contains(tool) && !path.is_empty() && inside(cwd, path);
+    }
+    if tool == "subagent" {
+        return allowed.contains(&format!("subagent:{}", subagent_mode(args)));
     }
     allowed.contains(tool)
 }
@@ -596,6 +644,7 @@ mod tests {
             usage: Usage::default(),
             context_window: 1000,
             context_tokens: 900,
+            suppress_auto_compact: false,
             sandbox: Default::default(),
             undo: Default::default(),
         }
@@ -724,13 +773,16 @@ mod tests {
         assert_eq!(p("cargo test").as_deref(), Some("cargo test"));
         assert_eq!(p("cargo test --release -p nyq").as_deref(), Some("cargo test"));
         assert_eq!(p("  git   status  ").as_deref(), Some("git status"));
-        assert_eq!(p("git -C foo status").as_deref(), Some("git"));
+        assert_eq!(p("git -C foo status").as_deref(), Some("git -C"));
         assert_eq!(p("npm run build").as_deref(), Some("npm run build"));
         assert_eq!(p("npm run build -- --watch").as_deref(), Some("npm run build"));
         assert_eq!(p("npm test").as_deref(), Some("npm test"));
         assert_eq!(p("uv run pytest -x").as_deref(), Some("uv run pytest"));
         assert_eq!(p("ls").as_deref(), Some("ls"));
-        assert_eq!(p("ls -la src").as_deref(), Some("ls"));
+        assert_eq!(p("ls -la src").as_deref(), Some("ls -la"));
+        assert_eq!(p("rm -rf target/debug").as_deref(), Some("rm -rf"));
+        assert_eq!(p("chmod -R 755 .").as_deref(), Some("chmod -R"));
+        assert_eq!(p("./python script.py").as_deref(), Some("./python script.py"));
         assert_eq!(p("python -m pytest"), None);
         assert_eq!(p("./gradlew build").as_deref(), Some("./gradlew build"));
         assert_eq!(p("python script.py").as_deref(), Some("python script.py"));
@@ -741,7 +793,7 @@ mod tests {
             "cargo test; rm -rf /", "cargo test && echo", "a || b", "ls | wc", "echo $(id)", "echo `id`",
             "ls > out", "wc < in", "sleep 1 &", "ls\nrm x", "sh -c 'x'", "bash script.sh", "sudo ls",
             "env X=1 ls", "xargs rm", "FOO=1 cargo test", "../x", "\"git\" status", "", "   ", "node -e 1",
-            "eval ls", "$HOME/bin/x",
+            "eval ls", "$HOME/bin/x", "./sh -c echo", "bin/bash -c echo", "./python -c 1", "usr/bin/python -m pytest",
         ] {
             assert_eq!(p(c), None, "{c:?}");
         }
@@ -761,6 +813,12 @@ mod tests {
         assert!(!bash_matches("cargo test", "cargo test\nrm x"));
         assert!(bash_matches("ls", "ls -la"));
         assert!(!bash_matches("ls", "lsof"));
+        assert!(bash_matches("rm -rf", "rm -rf dir"));
+        assert!(!bash_matches("rm -rf", "rm dir"));
+        assert!(bash_matches("ls -la", "ls -la src"));
+        assert!(!bash_matches("ls -la", "ls src"));
+        assert!(!bash_matches("git -C", "git status"));
+        assert!(bash_matches("git -C", "git -C elsewhere reset --hard"));
         assert!(!bash_matches("", "anything"));
     }
 
@@ -775,9 +833,12 @@ mod tests {
         assert_eq!(grant_rule("mcp__wiki__ask", &json!({})).as_deref(), Some("mcp__wiki__ask"));
         assert_eq!(rule_label("bash:cargo test"), "`cargo test …`");
         assert_eq!(rule_label("edit_file"), "edit file in this workspace");
+        assert_eq!(grant_rule("subagent", &json!({"mode": "general", "task": "x"})).as_deref(), Some("subagent:general"));
+        assert_eq!(grant_rule("subagent", &json!({"task": "x"})).as_deref(), Some("subagent:explore"));
+        assert_eq!(rule_label("subagent:general"), "`subagent` (general)");
         assert_eq!(rule_label("subagent"), "`subagent`");
 
-        let allowed: HashSet<String> = ["bash:cargo test", "write_file", "subagent"].map(String::from).into();
+        let allowed: HashSet<String> = ["bash:cargo test", "write_file", "subagent:general"].map(String::from).into();
         let ok = |tool: &str, args: Value| is_allowed(&allowed, tool, &args, cwd);
         assert!(ok("bash", json!({"command": "cargo test --all"})));
         assert!(!ok("bash", json!({"command": "cargo build"})));
@@ -790,6 +851,10 @@ mod tests {
         assert!(!ok("write_file", json!({})));
         assert!(!ok("edit_file", json!({"path": "src/new.rs"})));
         assert!(ok("subagent", json!({"mode": "general"})));
+        assert!(!ok("subagent", json!({"mode": "explore"})));
+        let explore: HashSet<String> = ["subagent:explore"].map(String::from).into();
+        assert!(!is_allowed(&explore, "subagent", &json!({"mode": "general", "task": "x"}), cwd));
+        assert!(is_allowed(&explore, "subagent", &json!({"task": "look"}), cwd));
         assert!(!ok("mcp__wiki__ask", json!({})));
         #[cfg(unix)]
         {
@@ -797,5 +862,95 @@ mod tests {
             std::os::unix::fs::symlink(outside.path(), cwd.join("link")).unwrap();
             assert!(!ok("write_file", json!({"path": "link/x.txt"})));
         }
+    }
+
+    #[test]
+    fn reset_drops_the_undo_log() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = agent(Response::default(), None);
+        agent.cwd = dir.path().to_path_buf();
+        std::fs::write(dir.path().join("f.txt"), "a").unwrap();
+        agent.undo.snapshot(&agent.cwd, "edit_file", &json!({"path": "f.txt"}));
+        assert_eq!(agent.undo.len(), 1);
+        agent.reset(None);
+        assert!(agent.undo.is_empty());
+    }
+
+    #[test]
+    fn push_keeps_the_item_when_the_session_cannot_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut agent = agent(Response::default(), None);
+        agent.session = Some(Session::create(&blocker, std::path::Path::new("."), "m").unwrap());
+        agent.items.clear();
+        agent.push(Item::user("hello"));
+        assert_eq!(agent.items, vec![Item::user("hello")]);
+    }
+
+    #[tokio::test]
+    async fn failed_autocompact_does_not_repeat() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Scripted {
+            left: Arc<Mutex<Vec<Response>>>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for Scripted {
+            fn name(&self) -> &str { "fake" }
+            fn model(&self) -> &str { "fake" }
+            fn set_model(&mut self, _: String) {}
+            fn fork(&self) -> Box<dyn Provider> { Box::new(self.clone()) }
+            async fn stream(&self, _: Request<'_>, _: EventSink<'_>) -> Result<Response> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut left = self.left.lock().unwrap();
+                anyhow::ensure!(!left.is_empty(), "script exhausted");
+                Ok(left.remove(0))
+            }
+        }
+
+        struct NoteUi(Vec<String>);
+        #[async_trait::async_trait]
+        impl Ui for NoteUi {
+            fn stream(&mut self, _: &StreamEvent) {}
+            fn end_message(&mut self) {}
+            fn tool_start(&mut self, _: &str, _: &str) {}
+            fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
+            async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval { Approval::Yes }
+            fn notice(&mut self, msg: &str) { self.0.push(msg.to_string()); }
+        }
+
+        let scripted = Scripted {
+            left: Arc::new(Mutex::new(vec![
+                Response {
+                    items: vec![Item::Assistant { text: "summary".into() }],
+                    usage: Some(Usage { input_tokens: 1, output_tokens: 1000, cached_tokens: 0 }),
+                },
+                Response {
+                    items: vec![Item::Assistant { text: "answer".into() }],
+                    usage: Some(Usage { input_tokens: 900, output_tokens: 50, cached_tokens: 0 }),
+                },
+                Response {
+                    items: vec![Item::Assistant { text: "next".into() }],
+                    usage: Some(Usage { input_tokens: 900, output_tokens: 10, cached_tokens: 0 }),
+                },
+            ])),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let calls = scripted.calls.clone();
+        let mut agent = agent(Response::default(), None);
+        agent.provider = Box::new(scripted);
+        let mut ui = NoteUi(Vec::new());
+        assert!(matches!(agent.turn(Item::user("hi"), &mut ui, CancellationToken::new()).await.unwrap(), TurnEnd::Done));
+        assert!(agent.suppress_auto_compact);
+        assert!(ui.0.iter().any(|m| m.contains("Automatic compaction is off")));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(agent.turn(Item::user("again"), &mut ui, CancellationToken::new()).await.unwrap(), TurnEnd::Done));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

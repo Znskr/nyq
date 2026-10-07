@@ -267,12 +267,21 @@ pub fn looks_like_diff(s: &str) -> bool {
 
 /// Render at most `max` lines of `text`, each prefixed by `indent` and styled
 /// by `style`, plus a `… N more lines` note when truncated.
-pub fn capped<'a>(lines: impl Iterator<Item = &'a str>, max: usize, indent: &str, color: bool, style: impl Fn(&str) -> String) -> String {
+pub fn capped<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    max: usize,
+    width: usize,
+    indent: &str,
+    color: bool,
+    style: impl Fn(&str) -> String,
+) -> String {
+    let budget = width.saturating_sub(visible_width(indent));
     let lines: Vec<&str> = lines.collect();
     let mut out = String::new();
     for l in lines.iter().take(max) {
+        let plain = truncate(l.trim_end_matches('\r'), budget);
         out.push_str(indent);
-        out.push_str(&style(l.trim_end_matches('\r')));
+        out.push_str(&style(&plain));
         out.push('\n');
     }
     if lines.len() > max {
@@ -284,14 +293,14 @@ pub fn capped<'a>(lines: impl Iterator<Item = &'a str>, max: usize, indent: &str
 
 /// Colorize a unified diff (+ green, - red, @@ cyan). File header lines
 /// before the first hunk are dropped when hunks are present.
-pub fn diff(text: &str, color: bool, max: usize, indent: &str) -> String {
+pub fn diff(text: &str, color: bool, max: usize, width: usize, indent: &str) -> String {
     let has_hunks = text.lines().any(|l| l.starts_with("@@"));
     let mut seen_hunk = false;
     let lines = text.lines().filter(move |l| {
         seen_hunk |= l.starts_with("@@");
         !(has_hunks && !seen_hunk && (l.starts_with("--- ") || l.starts_with("+++ ")))
     });
-    capped(lines, max, indent, color, |l| {
+    capped(lines, max, width, indent, color, |l| {
         let style = if l.starts_with("+++ ") || l.starts_with("--- ") {
             Style::new().bold()
         } else if l.starts_with('+') {
@@ -366,16 +375,27 @@ mod tests {
     #[test]
     fn diff_colors_and_caps() {
         let d = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new";
-        let out = diff(d, true, 60, "  ");
+        let out = diff(d, true, 60, usize::MAX, "  ");
         assert!(!out.contains("a/x")); // header dropped
         assert!(out.contains(&Color::Green.paint("+new").to_string()));
         assert!(out.contains(&Color::Red.paint("-old").to_string()));
         assert!(out.contains(&Color::Cyan.paint("@@ -1,2 +1,2 @@").to_string()));
-        assert_eq!(diff(d, false, 60, ""), "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n");
+        assert_eq!(diff(d, false, 60, usize::MAX, ""), "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n");
         let long: String = (0..100).map(|i| format!("+{i}\n")).collect();
-        let out = diff(&long, false, 60, "");
+        let out = diff(&long, false, 60, usize::MAX, "");
         assert_eq!(out.lines().count(), 61);
         assert!(out.ends_with("… 40 more lines\n"));
+    }
+
+    #[test]
+    fn diff_lines_are_width_limited() {
+        let long = "x".repeat(400);
+        let out = diff(&long, false, 5, 20, "");
+        let line = out.lines().next().unwrap();
+        assert!(line.chars().count() <= 20, "{line}");
+        assert!(line.ends_with('…'));
+        let colored = diff(&format!("+{long}"), true, 5, 24, "  ");
+        assert!(visible_width(colored.lines().next().unwrap()) <= 24);
     }
 
     #[test]

@@ -258,6 +258,9 @@ impl Tool for WriteFile {
             return ToolOutput::err("write_file: missing required argument `content`.");
         };
         let path = resolve(&ctx.cwd, p);
+        if let Some(msg) = sandbox_denied(ctx, p, &path, "write_file") {
+            return ToolOutput::err(msg);
+        }
         let preview = write_preview(&path, content);
 
         if let Some(parent) = path.parent() {
@@ -332,6 +335,9 @@ impl Tool for EditFile {
             return ToolOutput::err("edit_file: missing required argument `new_string`.");
         }
         let path = resolve(&ctx.cwd, p);
+        if let Some(msg) = sandbox_denied(ctx, p, &path, "edit_file") {
+            return ToolOutput::err(msg);
+        }
         let (old, new) = match apply_edit(&path, &args) {
             Ok(v) => v,
             Err(e) => return e,
@@ -347,6 +353,31 @@ impl Tool for EditFile {
             images: Vec::new(),
         }
     }
+}
+
+/// `None` when this write is allowed by the sandbox. Read-only refuses every
+/// write; workspace-write allows the workspace and any extra writable roots.
+fn sandbox_denied(ctx: &ToolCtx, user_path: &str, path: &Path, tool: &str) -> Option<String> {
+    let allowed = match ctx.sandbox.mode {
+        crate::sandbox::Mode::Off => true,
+        crate::sandbox::Mode::ReadOnly => false,
+        crate::sandbox::Mode::WorkspaceWrite => {
+            crate::agent::inside(&ctx.cwd, user_path)
+                || ctx.sandbox.writable.iter().any(|root| {
+                    crate::agent::inside(root, path.to_str().unwrap_or(""))
+                })
+        }
+    };
+    if allowed {
+        return None;
+    }
+    Some(match ctx.sandbox.mode {
+        crate::sandbox::Mode::ReadOnly => format!("{tool}: sandbox is read-only; refusing to write {}", display_path(path)),
+        _ => format!(
+            "{tool}: sandbox is workspace-write; refusing to write outside the workspace: {}",
+            display_path(path)
+        ),
+    })
 }
 
 /// Pure version of an edit: (old content, new content). `Err` is the user-facing error.
@@ -604,5 +635,88 @@ mod tests {
         assert!(!ReadFile.needs_approval(&args));
         assert!(!ListDir.needs_approval(&args));
         assert!(WriteFile.needs_approval(&args));
+    }
+
+    fn ctx_mode(dir: &Path, mode: crate::sandbox::Mode) -> ToolCtx {
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            sandbox: std::sync::Arc::new(crate::sandbox::Policy { mode, ..Default::default() }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn writes_follow_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("x.txt");
+        let abs = outside_file.to_str().unwrap().to_string();
+        let escape_name = format!("nyq-write-escape-{}", std::process::id());
+        let escape = dir.path().join("..").join(&escape_name);
+        let _ = std::fs::remove_file(&escape);
+
+        let ro = ctx_mode(dir.path(), crate::sandbox::Mode::ReadOnly);
+        let out = futures::executor::block_on(WriteFile.run(json!({"path": "a.txt", "content": "hi"}), &ro));
+        assert!(out.is_error && out.content.contains("read-only"), "{}", out.content);
+        assert!(!dir.path().join("a.txt").exists());
+
+        let ww = ctx_mode(dir.path(), crate::sandbox::Mode::WorkspaceWrite);
+        let out = futures::executor::block_on(WriteFile.run(json!({"path": &abs, "content": "hi"}), &ww));
+        assert!(out.is_error && out.content.contains("outside"), "{}", out.content);
+        assert!(!outside_file.exists());
+
+        let out = futures::executor::block_on(
+            WriteFile.run(json!({"path": format!("../{escape_name}"), "content": "nope"}), &ww),
+        );
+        assert!(out.is_error, "{}", out.content);
+        assert!(!escape.exists(), "write escaped to {}", escape.display());
+
+        let out = futures::executor::block_on(WriteFile.run(json!({"path": "a.txt", "content": "hi"}), &ww));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "hi");
+
+        let off = ctx_mode(dir.path(), crate::sandbox::Mode::Off);
+        let out = futures::executor::block_on(WriteFile.run(json!({"path": &abs, "content": "out"}), &off));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "out");
+
+        std::fs::write(dir.path().join("e.txt"), "one").unwrap();
+        let out = futures::executor::block_on(
+            EditFile.run(json!({"path": &abs, "old_string": "out", "new_string": "OUT"}), &ww),
+        );
+        assert!(out.is_error && out.content.contains("outside"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "out");
+        let out = futures::executor::block_on(
+            EditFile.run(json!({"path": "e.txt", "old_string": "one", "new_string": "two"}), &ro),
+        );
+        assert!(out.is_error && out.content.contains("read-only"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(dir.path().join("e.txt")).unwrap(), "one");
+
+        let mut extra_ctx = ctx_mode(dir.path(), crate::sandbox::Mode::WorkspaceWrite);
+        let extra = tempfile::tempdir().unwrap();
+        extra_ctx.sandbox = std::sync::Arc::new(crate::sandbox::Policy {
+            mode: crate::sandbox::Mode::WorkspaceWrite,
+            writable: vec![extra.path().to_path_buf()],
+            ..Default::default()
+        });
+        let dest = extra.path().join("ok.txt");
+        let out = futures::executor::block_on(
+            WriteFile.run(json!({"path": dest.to_str().unwrap(), "content": "ok"}), &extra_ctx),
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "ok");
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            let out = futures::executor::block_on(
+                WriteFile.run(json!({"path": "link/via-symlink.txt", "content": "x"}), &ww),
+            );
+            assert!(out.is_error, "{}", out.content);
+            assert!(!outside.path().join("via-symlink.txt").exists());
+        }
+        let _ = std::fs::remove_file(&escape);
     }
 }

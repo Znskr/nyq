@@ -1,6 +1,6 @@
 //! ChatGPT-subscription Codex Responses API provider.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use eventsource_stream::Eventsource;
@@ -16,7 +16,7 @@ pub struct CodexProvider {
     pub auth_path: PathBuf,
     pub model: String,
     pub effort: Option<String>,
-    auth: Mutex<Option<Auth>>,
+    auth: Arc<Mutex<Option<Auth>>>,
     session_id: String,
     client: reqwest::Client,
 }
@@ -64,9 +64,10 @@ pub fn jwt_exp_ms(token: &str) -> Option<i64> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .ok()?;
-    serde_json::from_slice::<Value>(&bytes).ok()?["exp"]
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?["exp"]
         .as_i64()
-        .map(|s| s * 1000)
+        .and_then(|s| s.checked_mul(1000))
 }
 
 impl CodexProvider {
@@ -75,7 +76,7 @@ impl CodexProvider {
             auth_path,
             model,
             effort,
-            auth: Mutex::new(None),
+            auth: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4().to_string(),
             client: reqwest::Client::new(),
         }
@@ -163,30 +164,42 @@ impl CodexProvider {
         body
     }
 
-    async fn token(&self, rejected: Option<&str>) -> Result<Auth> {
-        let mut cached = self.auth.lock().await;
-        if cached.is_none() {
-            let bytes = tokio::fs::read(&self.auth_path)
-                .await
-                .context("reading Codex auth file")?;
-            *cached = Some(Auth::parse(&bytes).context("parsing Codex auth file")?);
-        }
-        let auth = cached.as_ref().unwrap();
-        let expired =
-            auth.expires_at_ms.saturating_sub(60_000) <= chrono::Utc::now().timestamp_millis();
-        if !expired && rejected != Some(auth.access_token.as_str()) {
-            return Ok(auth.clone());
-        }
-        anyhow::ensure!(
-            !auth.read_only,
-            "the codex CLI login has expired; run `codex` once to refresh it"
-        );
+    fn token_usable(auth: &Auth, rejected: Option<&str>) -> bool {
+        let expired = auth.expires_at_ms.saturating_sub(60_000) <= chrono::Utc::now().timestamp_millis();
+        !expired && rejected != Some(auth.access_token.as_str())
+    }
+
+    async fn load_auth(&self) -> Result<Auth> {
+        let bytes = tokio::fs::read(&self.auth_path).await.context("reading Codex auth file")?;
+        Auth::parse(&bytes).context("parsing Codex auth file")
+    }
+
+    /// Pick up a token another fork or process already rotated into the auth file.
+    async fn reread_usable(&self, previous: &Auth, rejected: Option<&str>) -> Option<Auth> {
+        let fresh = self.load_auth().await.ok()?;
+        let changed = fresh.access_token != previous.access_token || fresh.refresh_token != previous.refresh_token;
+        (changed && Self::token_usable(&fresh, rejected)).then_some(fresh)
+    }
+
+    async fn refresh(&self, auth: &Auth) -> Result<Auth> {
         let url = std::env::var("NYQ_CODEX_TOKEN_URL").unwrap_or_else(|_| {
-            let issuer = std::env::var("NYQ_CODEX_ISSUER")
-                .unwrap_or_else(|_| "https://auth.openai.com".into());
+            let issuer = std::env::var("NYQ_CODEX_ISSUER").unwrap_or_else(|_| "https://auth.openai.com".into());
             format!("{}/oauth/token", issuer.trim_end_matches('/'))
         });
-        let result: Value = sse::checked(self.client.post(url).json(&json!({"client_id":"app_EMoamEEZ73f0CkXaXp7hrann","grant_type":"refresh_token","refresh_token":auth.refresh_token})).send().await?).await?.json().await?;
+        let result: Value = sse::checked(
+            self.client
+                .post(url)
+                .json(&json!({
+                    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                    "grant_type": "refresh_token",
+                    "refresh_token": auth.refresh_token,
+                }))
+                .send()
+                .await?,
+        )
+        .await?
+        .json()
+        .await?;
         let mut refreshed = auth.clone();
         refreshed.access_token = result["access_token"]
             .as_str()
@@ -195,16 +208,44 @@ impl CodexProvider {
         if let Some(token) = result["refresh_token"].as_str() {
             refreshed.refresh_token = token.to_owned();
         }
-        let seconds = result["expires_in"]
-            .as_i64()
-            .context("token response missing expires_in")?;
+        let seconds = result["expires_in"].as_i64().context("token response missing expires_in")?;
         anyhow::ensure!(seconds > 0, "token response has invalid expires_in");
-        refreshed.expires_at_ms = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_add(seconds.saturating_mul(1000));
+        refreshed.expires_at_ms = chrono::Utc::now().timestamp_millis().saturating_add(seconds.saturating_mul(1000));
         self.save_auth(&refreshed)?;
-        *cached = Some(refreshed.clone());
         Ok(refreshed)
+    }
+
+    async fn token(&self, rejected: Option<&str>) -> Result<Auth> {
+        let mut cached = self.auth.lock().await;
+        if cached.is_none() {
+            *cached = Some(self.load_auth().await?);
+        }
+        let auth = cached.as_ref().unwrap().clone();
+        if Self::token_usable(&auth, rejected) {
+            return Ok(auth);
+        }
+        if let Some(fresh) = self.reread_usable(&auth, rejected).await {
+            *cached = Some(fresh.clone());
+            return Ok(fresh);
+        }
+        let auth = cached.as_ref().unwrap().clone();
+        anyhow::ensure!(
+            !auth.read_only,
+            "the codex CLI login has expired; run `codex` once to refresh it"
+        );
+        match self.refresh(&auth).await {
+            Ok(new_auth) => {
+                *cached = Some(new_auth.clone());
+                Ok(new_auth)
+            }
+            Err(e) => {
+                if let Some(fresh) = self.reread_usable(&auth, rejected).await {
+                    *cached = Some(fresh.clone());
+                    return Ok(fresh);
+                }
+                Err(e)
+            }
+        }
     }
 
     fn save_auth(&self, auth: &Auth) -> Result<()> {
@@ -285,7 +326,14 @@ fn output_item(item: &Value) -> Option<Item> {
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
     fn fork(&self) -> Box<dyn Provider> {
-        Box::new(Self::new(self.auth_path.clone(), self.model.clone(), self.effort.clone()))
+        Box::new(Self {
+            auth_path: self.auth_path.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            auth: Arc::clone(&self.auth),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            client: self.client.clone(),
+        })
     }
     fn name(&self) -> &str {
         "codex"
@@ -790,6 +838,82 @@ mod tests {
         assert_eq!(saved["refresh_token"], "refresh");
         task.await.unwrap();
         token_task.await.unwrap();
+    }
+
+    fn jwt(exp: &str) -> String {
+        use base64::Engine;
+        let enc = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes());
+        format!("{}.{}.x", enc(r#"{"alg":"none"}"#), enc(&format!(r#"{{"exp":{exp}}}"#)))
+    }
+
+    #[test]
+    fn jwt_exp_ms_rejects_overflow() {
+        assert_eq!(jwt_exp_ms(&jwt("1700000000")), Some(1_700_000_000_000));
+        assert_eq!(jwt_exp_ms(&jwt(&i64::MAX.to_string())), None);
+        assert_eq!(jwt_exp_ms(&jwt(&i64::MIN.to_string())), None);
+        assert_eq!(jwt_exp_ms(&jwt("9e18")), None);
+        assert_eq!(jwt_exp_ms("not-a-jwt"), None);
+    }
+
+    #[tokio::test]
+    async fn fork_shares_rotated_refresh_token() {
+        let _lock = ENV.lock().unwrap();
+        let _env = Env;
+        let dir = tempfile::tempdir().unwrap();
+        let path = auth_file(&dir, chrono::Utc::now().timestamp_millis() + 30_000);
+        let parent = CodexProvider::new(path.clone(), "test".into(), None);
+        let child = parent.fork();
+        let (url, mut requests, task) = server(vec![
+            (200, events(&[completed()])),
+            (200, events(&[completed()])),
+        ])
+        .await;
+        let (token_url, mut token_requests, token_task) = server(vec![(
+            200,
+            json!({"access_token":"new","refresh_token":"rotated","expires_in":3600}).to_string(),
+        )])
+        .await;
+        Env::set("NYQ_CODEX_URL", &url);
+        Env::set("NYQ_CODEX_TOKEN_URL", &token_url);
+        let req = || Request { system: "", items: &[], tools: &[] };
+        child.stream(req(), &mut |_| {}).await.unwrap();
+        parent.stream(req(), &mut |_| {}).await.unwrap();
+        assert!(requests.recv().await.unwrap().contains("Bearer new"));
+        assert!(requests.recv().await.unwrap().contains("Bearer new"));
+        let token_request = token_requests.recv().await.unwrap();
+        assert!(token_request.contains("\"refresh_token\":\"refresh\""), "{token_request}");
+        assert!(token_requests.try_recv().is_err());
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["refresh_token"], "rotated");
+        assert_eq!(saved["access_token"], "new");
+        task.await.unwrap();
+        token_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_cache_rereads_rotated_auth_file() {
+        let _lock = ENV.lock().unwrap();
+        let _env = Env;
+        Env::set("NYQ_CODEX_TOKEN_URL", "http://127.0.0.1:1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = auth_file(&dir, i64::MAX);
+        let provider = CodexProvider::new(path.clone(), "test".into(), None);
+        assert_eq!(provider.token(None).await.unwrap().access_token, "old");
+        std::fs::write(
+            &path,
+            json!({
+                "version": 1,
+                "access_token": "fresh",
+                "refresh_token": "fresh-refresh",
+                "expires_at_ms": i64::MAX,
+                "account_id": "account"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let got = provider.token(Some("old")).await.unwrap();
+        assert_eq!(got.access_token, "fresh");
+        assert_eq!(got.refresh_token, "fresh-refresh");
     }
 }
 
