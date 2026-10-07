@@ -233,6 +233,52 @@ fn paint(style: Style, s: &str) -> String {
 }
 
 /// Soft-wrap plain text into rows of at most `width` columns.
+/// Cut a possibly-styled row to `width` columns, keeping escape sequences.
+fn clip_width(s: &str, width: usize) -> String {
+    if width == 0 || visible_width(s) <= width {
+        return if width == 0 { String::new() } else { s.to_string() };
+    }
+    let limit = width - 1;
+    let mut out = String::new();
+    let mut w = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            for c in chars.by_ref() {
+                out.push(c);
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let cw = c.width().unwrap_or(0);
+        if w + cw > limit {
+            break;
+        }
+        w += cw;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// Header plus a filter that cannot grow past the terminal width.
+fn fit_header(prefix: String, filter: &str, placeholder: bool, width: usize) -> String {
+    let room = width.saturating_sub(visible_width(&prefix));
+    let style = if placeholder { fg(FAINT) } else { fg(MID) };
+    format!("{prefix}{}", paint(style, &truncate(filter, room)))
+}
+
+/// Steering texts, leaving slash commands in `queue` for the app loop.
+fn take_steer_texts(queue: &mut Vec<(Queued, String)>) -> Vec<String> {
+    let (steer, rest): (Vec<_>, Vec<_>) =
+        queue.drain(..).partition(|(k, t)| *k == Queued::Steer && !t.starts_with('/'));
+    *queue = rest;
+    steer.into_iter().map(|(_, t)| t).collect()
+}
+
 fn wrap(s: &str, width: usize) -> Vec<String> {
     let mut rows = vec![String::new()];
     let mut w = 0;
@@ -417,7 +463,8 @@ impl Screen {
                 _ => fg(GRAY),
             };
             let note = if t.note.is_empty() { String::new() } else { format!(" {}", t.note) };
-            let target = truncate(&t.target, w.saturating_sub(lead.chars().count() + t.verb.len() + note.len() + 2));
+            let used = visible_width(lead) + t.verb.chars().count() + note.chars().count() + 1;
+            let target = truncate(&t.target, w.saturating_sub(used));
             let verb = if t.status == Status::Running && live { shimmer(&t.verb, self.frame) } else { paint(verb_style, &t.verb) };
             format!("{lead}{verb} {}{}", paint(fg(GRAY), &target), paint(fg(GRAY), &note))
         };
@@ -484,14 +531,16 @@ impl Screen {
         // Status: what the agent is doing.
         if let Some((label, start)) = &self.busy {
             let secs = start.elapsed().as_secs();
+            let suffix = format!(" ({secs}s · esc to interrupt)");
+            let label = truncate(label, w.saturating_sub(suffix.chars().count() + 4).max(1));
             let detail = if self.live_block == Block::Reasoning {
                 let last = self.live.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-                truncate(last, w.saturating_sub(label.len() + 30))
+                truncate(last, w.saturating_sub(label.chars().count() + suffix.chars().count() + 4))
             } else {
                 String::new()
             };
-            let mut line = format!("{} {}", paint(fg(BRIGHT), "•"), shimmer(label, self.frame));
-            line.push_str(&paint(fg(GRAY), &format!(" ({secs}s · esc to interrupt)")));
+            let mut line = format!("{} {}", paint(fg(BRIGHT), "•"), shimmer(&label, self.frame));
+            line.push_str(&paint(fg(GRAY), &suffix));
             if !detail.is_empty() {
                 line.push_str(&paint(fg(FAINT).italic(), &format!(" {detail}")));
             }
@@ -536,7 +585,7 @@ impl Screen {
                 rows.push(format!("{}  {}", paint(fg(BRIGHT), key), paint(fg(MID), &truncate(text, w.saturating_sub(3)))));
             }
             rows.push(rule(w));
-            rows.push(hints(&[("y", "Once"), ("a", "Always"), ("n", "Deny"), ("Esc", "Deny")]));
+            rows.push(hints(&[("y", "Once"), ("a", "Always"), ("n", "Deny"), ("Esc", "Interrupt")]));
         } else {
             let view = self.editor.render(w.saturating_sub(2).max(1));
             let top = rows.len();
@@ -572,6 +621,11 @@ impl Screen {
         let dropped = excess.min(cursor_row);
         rows.drain(..dropped);
         rows.truncate(max);
+        for row in &mut rows {
+            if visible_width(row) > w {
+                *row = clip_width(row, w);
+            }
+        }
         (rows, cursor_row - dropped, cursor_col)
     }
 
@@ -608,8 +662,14 @@ impl Screen {
                 .enumerate()
                 .map(|(i, t)| if i == m.tab { paint(fg(BRIGHT), &format!("[{t}]")) } else { paint(fg(GRAY), t) })
                 .collect();
-            let filter = if m.filter.is_empty() { paint(fg(FAINT), "Type to filter") } else { paint(fg(MID), &m.filter) };
-            let header = format!("{} {}  {}  {}", paint(fg(BRIGHT).bold(), "Models"), paint(fg(GRAY), &visible.len().to_string()), tabs.join(" "), filter);
+            let prefix = format!(
+                "{} {}  {}  ",
+                paint(fg(BRIGHT).bold(), "Models"),
+                paint(fg(GRAY), &visible.len().to_string()),
+                tabs.join(" ")
+            );
+            let filter_text = if m.filter.is_empty() { "Type to filter" } else { m.filter.as_str() };
+            let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
             let current = (self.footer.provider.as_str(), self.footer.model.as_str());
             let items = visible
                 .iter()
@@ -630,8 +690,9 @@ impl Screen {
             (header, items, m.selected, vec![("↑↓", "Navigate"), ("Tab", "Provider"), ("Enter", "Use"), ("Esc", "Close")])
         } else if let Some(m) = &self.sessions {
             let visible = m.visible();
-            let filter = if m.filter.is_empty() { paint(fg(FAINT), "Type to filter") } else { paint(fg(MID), &m.filter) };
-            let header = format!("{} {}  {}", paint(fg(BRIGHT).bold(), "Sessions"), paint(fg(GRAY), &visible.len().to_string()), filter);
+            let prefix = format!("{} {}  ", paint(fg(BRIGHT).bold(), "Sessions"), paint(fg(GRAY), &visible.len().to_string()));
+            let filter_text = if m.filter.is_empty() { "Type to filter" } else { m.filter.as_str() };
+            let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
             let now = chrono::Utc::now();
             let items = visible
                 .iter()
@@ -1110,11 +1171,23 @@ impl Screen {
 
     fn on_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
         if let Some(a) = self.approval.take() {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('d')) {
+                let _ = a.reply.send(Approval::No);
+                if let Some(c) = &self.cancel {
+                    c.cancel();
+                }
+                if ctrl && key.code == KeyCode::Char('d') {
+                    let _ = commands.send(Command::Exit);
+                }
+                self.redraw();
+                return;
+            }
             let answer = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Approval::Yes),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(Approval::Always),
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Approval::No),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Approval::No),
+                KeyCode::Char('n') | KeyCode::Char('N') => Some(Approval::No),
+                KeyCode::Char('c') if ctrl => Some(Approval::No),
                 _ => None,
             };
             match answer {
@@ -1384,6 +1457,52 @@ fn restore_terminal() {
 
 // ---------------------------------------------------------------- agent::Ui
 
+/// Clears a pending question if `ask` is cancelled before the user answers.
+struct ClearQuestion(Arc<Mutex<Screen>>);
+
+impl Drop for ClearQuestion {
+    fn drop(&mut self) {
+        let mut s = lock(&self.0);
+        if s.question.take().is_some() {
+            s.redraw();
+        }
+    }
+}
+
+/// Prompt on the active TUI, if one is running. `None` when there is no screen
+/// (print mode, tests): the caller denies the call.
+pub async fn approve_active(tool: &str, summary: &str, preview: Option<&str>, rule: Option<String>) -> Option<Approval> {
+    let screen = active()?;
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut s = lock(&screen);
+        s.flush_live();
+        let w = s.width;
+        let (verb, target) = describe_tool(tool, summary);
+        let title = format!("{} {}", paint(fg(BRIGHT), &verb), paint(fg(GRAY), &truncate(&target, w.saturating_sub(verb.len() + 3))));
+        let mut lines = Vec::new();
+        if let Some(p) = preview {
+            let body: Vec<String> = if looks_like_diff(p) {
+                diff(p, true, usize::MAX, w, "  ").lines().map(str::to_string).collect()
+            } else {
+                p.lines().map(|l| paint(fg(GRAY), &format!("  {}", truncate(l, w.saturating_sub(2))))).collect()
+            };
+            let more = body.len().saturating_sub(MAX_PREVIEW);
+            lines.extend(body.into_iter().take(MAX_PREVIEW));
+            if more > 0 {
+                lines.push(paint(fg(GRAY), &format!("  … {more} lines more")));
+            }
+        } else if tool == "bash" {
+            for l in summary.lines().take(MAX_PREVIEW) {
+                lines.push(format!("  {}", paint(fg(MID), &truncate(l, w.saturating_sub(2)))));
+            }
+        }
+        s.approval = Some(PendingApproval { title, lines, rule, reply: tx });
+        s.redraw();
+    }
+    Some(rx.await.unwrap_or(Approval::No))
+}
+
 pub struct TuiUi {
     screen: Arc<Mutex<Screen>>,
     cwd: PathBuf,
@@ -1439,34 +1558,9 @@ impl Ui for TuiUi {
     }
 
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut s = self.s();
-            s.flush_live();
-            let w = s.width;
-            let (verb, target) = describe_tool(req.tool, req.summary);
-            let title = format!("{} {}", paint(fg(BRIGHT), &verb), paint(fg(GRAY), &truncate(&target, w.saturating_sub(verb.len() + 3))));
-            let mut lines = Vec::new();
-            if let Some(p) = req.preview {
-                let body: Vec<String> = if looks_like_diff(p) {
-                    diff(p, true, usize::MAX, "  ").lines().map(str::to_string).collect()
-                } else {
-                    p.lines().map(|l| paint(fg(GRAY), &format!("  {}", truncate(l, w.saturating_sub(2))))).collect()
-                };
-                let more = body.len().saturating_sub(MAX_PREVIEW);
-                lines.extend(body.into_iter().take(MAX_PREVIEW));
-                if more > 0 {
-                    lines.push(paint(fg(GRAY), &format!("  … {more} lines more")));
-                }
-            } else if req.tool == "bash" {
-                for l in req.summary.lines().take(MAX_PREVIEW) {
-                    lines.push(format!("  {}", paint(fg(MID), &truncate(l, w.saturating_sub(2)))));
-                }
-            }
-            s.approval = Some(PendingApproval { title, lines, rule: req.rule.clone(), reply: tx });
-            s.redraw();
-        }
-        let answer = rx.await.unwrap_or(Approval::No);
+        let answer = approve_active(req.tool, req.summary, req.preview, req.rule.clone())
+            .await
+            .unwrap_or(Approval::No);
         if answer == Approval::No {
             // The loop reports the denial through tool_end.
             self.s().tool_start(req.tool, req.summary);
@@ -1495,7 +1589,10 @@ impl Ui for TuiUi {
             s.question = Some(PendingQuestion { question: question.to_string(), options: options.to_vec(), selected: 0, reply: tx });
             s.redraw();
         }
+        // Dropped on cancel: clear the pane so the next key isn't answered into a closed channel.
+        let guard = ClearQuestion(Arc::clone(&self.screen));
         let answer = rx.await.ok().flatten();
+        drop(guard);
         let mut s = self.s();
         let shown = answer.clone().unwrap_or_else(|| "(skipped)".into());
         s.print_info(&format!("{} {}\n  {}", paint(fg(BRIGHT), "?"), paint(fg(MID), question), paint(fg(GRAY), &shown)), Style::new());
@@ -1503,11 +1600,9 @@ impl Ui for TuiUi {
     }
 
     fn take_steering(&mut self) -> Vec<Item> {
-        let steer: Vec<String> = {
+        let steer = {
             let mut s = self.s();
-            let (steer, rest): (Vec<_>, Vec<_>) = s.queue.drain(..).partition(|(k, _)| *k == Queued::Steer);
-            s.queue = rest;
-            steer.into_iter().map(|(_, t)| t).collect()
+            take_steer_texts(&mut s.queue)
         };
         steer.into_iter().map(|t| self.deliver(t)).collect()
     }
@@ -1526,6 +1621,7 @@ impl Ui for TuiUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
 
     #[test]
     fn widths_and_wrapping() {
@@ -1633,5 +1729,106 @@ mod tests {
         assert_eq!(ago_s(2 * 86_400), "2d ago");
         assert_eq!(ago_s(15 * 86_400), "2w ago");
         assert_eq!(ago_s(400 * 86_400).len(), 10);
+    }
+
+    #[test]
+    fn steering_keeps_slash_commands_queued() {
+        let mut queue = vec![
+            (Queued::Steer, "/compact now".into()),
+            (Queued::Steer, "look at main".into()),
+            (Queued::FollowUp, "later".into()),
+            (Queued::Steer, "/model gpt".into()),
+        ];
+        assert_eq!(take_steer_texts(&mut queue), vec!["look at main".to_string()]);
+        assert_eq!(
+            queue,
+            vec![
+                (Queued::Steer, "/compact now".into()),
+                (Queued::FollowUp, "later".into()),
+                (Queued::Steer, "/model gpt".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_rows_stay_within_width() {
+        let mut s = screen();
+        s.width = 30;
+        s.height = 40;
+        s.busy = Some(("Running an extremely long tool name that must not wrap".into(), Instant::now()));
+        let (tx, _rx) = oneshot::channel();
+        s.approval = Some(PendingApproval {
+            title: "Approve".into(),
+            lines: vec!["x".repeat(400)],
+            rule: None,
+            reply: tx,
+        });
+        let (rows, _, _) = s.pane();
+        assert!(rows.iter().all(|r| visible_width(r) <= 30), "{rows:?}");
+        s.approval = None;
+        s.menu = Some(ModelMenu {
+            choices: Vec::new(),
+            tabs: vec!["All".into()],
+            tab: 0,
+            filter: "y".repeat(200),
+            selected: 0,
+            loading: false,
+            warnings: Vec::new(),
+        });
+        let (rows, _, _) = s.pane();
+        assert!(rows.iter().all(|r| visible_width(r) <= 30), "{rows:?}");
+    }
+
+    #[test]
+    fn tool_rows_keep_the_path_visible() {
+        let mut s = screen();
+        s.width = 24;
+        s.height = 40;
+        let row = |target: &str, note: &str| ToolRow {
+            tool: "read_file".into(),
+            verb: "Read".into(),
+            target: target.into(),
+            note: note.into(),
+            detail: Vec::new(),
+            status: Status::Ok,
+        };
+        s.tools = vec![row("a.rs", ""), row("src/lib.rs", "+1")];
+        let (rows, _, _) = s.pane();
+        assert!(rows.iter().any(|r| super::super::render::strip_ansi(r).contains("src/lib.rs")), "{rows:?}");
+        assert!(rows.iter().all(|r| visible_width(r) <= 24), "{rows:?}");
+    }
+
+    #[test]
+    fn approval_esc_cancels_and_ctrl_d_exits() {
+        let mut s = screen();
+        let cancel = CancellationToken::new();
+        s.cancel = Some(cancel.clone());
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), rule: None, reply: tx });
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), Approval::No);
+        assert!(cancel.is_cancelled());
+        assert!(s.approval.is_none());
+
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), rule: None, reply: tx });
+        s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), Approval::No);
+        assert!(matches!(cmd_rx.try_recv().unwrap(), Command::Exit));
+    }
+
+    #[test]
+    fn dropping_ask_clears_the_question() {
+        let screen = Arc::new(Mutex::new(screen()));
+        let mut ui = TuiUi { screen: Arc::clone(&screen), cwd: PathBuf::new() };
+        let options = vec!["a".to_string()];
+        let mut fut = Box::pin(Ui::ask(&mut ui, "pick", &options));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert!(lock(&screen).question.is_some());
+        drop(fut);
+        assert!(lock(&screen).question.is_none());
     }
 }
