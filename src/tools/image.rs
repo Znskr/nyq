@@ -75,6 +75,15 @@ pub fn user_message(text: &str, cwd: &Path) -> Result<(Item, Vec<String>)> {
     Ok((Item::User { text: text.to_string(), images }, attached))
 }
 
+/// Like [`user_message`], but a failed `@image` keeps the text. The third
+/// value is the load error, so the caller can warn and still send the message.
+pub fn user_turn(text: &str, cwd: &Path) -> (Item, Vec<String>, Option<String>) {
+    match user_message(text, cwd) {
+        Ok((item, attached)) => (item, attached, None),
+        Err(e) => (Item::user(text), Vec::new(), Some(format!("{e:#}"))),
+    }
+}
+
 struct ViewImage;
 
 #[async_trait::async_trait]
@@ -123,6 +132,8 @@ mod tests {
         assert_eq!(images[0].media_type, "image/png");
         assert!(text.contains("@shot.png"));
         assert!(images[0].data_url().starts_with("data:image/png;base64,iVBOR"));
+        let (_, attached, warning) = user_turn("see @shot.png", dir.path());
+        assert!(warning.is_none() && attached == vec!["shot.png"]);
     }
 
     #[test]
@@ -132,6 +143,11 @@ mod tests {
         std::fs::write(dir.path().join("fake.jpg"), b"text").unwrap();
         assert!(user_message("see @fake.jpg", dir.path()).is_err());
         assert!(user_message("plain text only", dir.path()).unwrap().1.is_empty());
+        let (item, attached, warning) = user_turn("long note @nope.png", dir.path());
+        let Item::User { text, images } = item else { panic!() };
+        assert_eq!(text, "long note @nope.png");
+        assert!(images.is_empty() && attached.is_empty());
+        assert!(warning.unwrap().contains("nope.png"));
     }
 
     #[tokio::test]

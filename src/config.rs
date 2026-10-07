@@ -101,6 +101,10 @@ fn env(name: &str) -> Option<String> {
 /// The ChatGPT login to use: `$NYQ_CODEX_AUTH`, else the codex CLI's login
 /// while its access token is still valid (it keeps that file fresh), else
 /// `<home>/chatgpt-auth.json`, which nyq refreshes itself.
+pub(crate) fn access_token_fresh(exp_ms: i64, now_ms: i64) -> bool {
+    exp_ms.saturating_sub(60_000) > now_ms
+}
+
 pub(crate) fn codex_auth_path(home: &Path) -> PathBuf {
     if let Some(p) = env("NYQ_CODEX_AUTH") {
         return PathBuf::from(p);
@@ -117,7 +121,7 @@ pub(crate) fn codex_auth_path(home: &Path) -> PathBuf {
                 .as_str()
                 .and_then(crate::provider::codex::jwt_exp_ms)
         })
-        .is_some_and(|exp| exp - 60_000 > chrono::Utc::now().timestamp_millis());
+        .is_some_and(|exp| access_token_fresh(exp, chrono::Utc::now().timestamp_millis()));
     let own = home.join("chatgpt-auth.json");
     if cli_valid && (std::env::var_os("NYQ_HOME").is_none() || !own.exists()) {
         cli
@@ -221,6 +225,14 @@ pub fn context_window_for(provider: &str, reported: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_deadline_does_not_overflow() {
+        assert!(!access_token_fresh(i64::MIN, 0));
+        assert!(!access_token_fresh(0, 1));
+        assert!(!access_token_fresh(60_000, 60_000));
+        assert!(access_token_fresh(i64::MAX, 0));
+    }
 
     #[test]
     fn ollama_hosts() {

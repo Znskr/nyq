@@ -32,14 +32,58 @@ pub struct Policy {
 /// First argument of the hidden re-exec helper: `nyq __sandbox ...`.
 pub const HELPER_ARG: &str = "__sandbox";
 
+fn temp_roots() -> Vec<PathBuf> {
+    let mut v = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
+    if cfg!(target_os = "macos") {
+        v.extend(["/private/tmp", "/private/var/folders"].map(PathBuf::from));
+    }
+    v
+}
+
+/// Canonical `path` if it is a real directory under a system temp root and is
+/// not `/` or an ancestor of `home`. Otherwise None.
+fn accepted_tmpdir(path: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let canon = std::fs::canonicalize(path).ok()?;
+    if !canon.is_dir() || canon == Path::new("/") {
+        return None;
+    }
+    if let Some(home) = home {
+        let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        if home.starts_with(&canon) {
+            return None;
+        }
+    }
+    let under = temp_roots().into_iter().any(|root| {
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        canon.starts_with(&root)
+    });
+    under.then_some(canon)
+}
+
+fn warn_tmpdir(path: &Path) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if ONCE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    crate::ui::error(&format!(
+        "ignoring TMPDIR ({}); it is not under a system temporary directory",
+        path.display()
+    ));
+}
+
 /// Paths every sandboxed command may write: temp dirs and harmless devices.
 fn scratch_paths() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = ["/tmp", "/var/tmp", "/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/pts", "/dev/shm"]
         .iter()
         .map(PathBuf::from)
         .collect();
-    if let Some(t) = std::env::var_os("TMPDIR") {
-        v.push(PathBuf::from(t));
+    if let Some(t) = std::env::var_os("TMPDIR").filter(|t| !t.is_empty()) {
+        let path = PathBuf::from(&t);
+        match accepted_tmpdir(&path, dirs::home_dir().as_deref()) {
+            Some(canon) => v.push(canon),
+            None => warn_tmpdir(&path),
+        }
     }
     if cfg!(target_os = "macos") {
         v.extend(["/private/tmp", "/private/var/folders"].map(PathBuf::from));
@@ -62,14 +106,19 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
-/// The shell used for commands: bash when available, else sh (cmd on Windows).
-fn shell(script: &str) -> Vec<String> {
+/// `windows` / `bash_exe` / `bash` are injected so tests can cover every branch.
+fn shell_argv(script: &str, windows: bool, bash_exe: bool, bash: bool) -> Vec<String> {
     let script = script.to_string();
-    if cfg!(windows) && find_in_path("bash.exe").is_none() {
+    if windows && !bash_exe {
         return vec!["cmd".into(), "/C".into(), script];
     }
-    let sh = if cfg!(windows) || find_in_path("bash").is_some() { "bash" } else { "sh" };
+    let sh = if windows || bash { "bash" } else { "sh" };
     vec![sh.into(), "-c".into(), script]
+}
+
+/// The shell used for commands: bash when available, else sh (cmd on Windows).
+fn shell(script: &str) -> Vec<String> {
+    shell_argv(script, cfg!(windows), find_in_path("bash.exe").is_some(), find_in_path("bash").is_some())
 }
 
 /// A shell command running `script` in `cwd`, confined according to the policy.
@@ -116,7 +165,9 @@ fn seatbelt_profile(roots: &[PathBuf], network: bool) -> String {
     }
     s.push_str(")\n");
     if !network {
-        s.push_str("(deny network*)\n(allow network* (remote unix-socket))\n");
+        // `(deny network*)` includes unix sockets. Re-allowing them was an
+        // escape through host daemons such as the Docker socket.
+        s.push_str("(deny network*)\n");
     }
     s
 }
@@ -144,9 +195,9 @@ pub fn describe(policy: &Policy) -> String {
     let net = if policy.network { "network on" } else { "network off" };
     #[cfg(target_os = "linux")]
     if let Some(abi) = linux::abi() {
-        // TCP rules need Landlock ABI v4.
+        // TCP rules need Landlock ABI v4. Landlock cannot restrict AF_UNIX.
         let net = if !policy.network && abi < 4 { "network not restricted (kernel too old)" } else { net };
-        return format!("sandbox: {mode} · {net} (landlock v{abi})");
+        return format!("sandbox: {mode} · {net} (landlock v{abi}; unix sockets not restricted)");
     }
     let engine = if cfg!(target_os = "macos") { "seatbelt" } else { "unavailable" };
     format!("sandbox: {mode} · {net} ({engine})")
@@ -280,7 +331,59 @@ mod tests {
         assert!(p.contains("(deny file-write*)"));
         assert!(p.contains(r#""/tmp/a\"b""#));
         assert!(p.contains("(deny network*)"));
+        assert!(!p.contains("unix-socket"));
         assert!(!seatbelt_profile(&[], true).contains("deny network"));
+    }
+
+    #[test]
+    fn shell_selection_matches_the_platform() {
+        assert_eq!(
+            shell_argv("echo hi", true, false, false),
+            vec!["cmd".to_string(), "/C".into(), "echo hi".into()]
+        );
+        assert_eq!(shell_argv("echo hi", true, true, false)[..2], ["bash", "-c"]);
+        assert_eq!(shell_argv("echo hi", false, false, false)[0], "sh");
+        assert_eq!(shell_argv("echo hi", false, false, true)[0], "bash");
+    }
+
+    #[test]
+    fn tmpdir_must_sit_under_a_system_temp_root() {
+        // Not under /tmp: a workspace `tmp` must not become a writable root.
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("nyq-fake-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let nested = home.join("tmp");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(accepted_tmpdir(&nested, Some(&home)).is_none());
+        assert!(accepted_tmpdir(&home, Some(&home)).is_none());
+        assert!(accepted_tmpdir(Path::new("/"), Some(&home)).is_none());
+        if Path::new("/tmp").is_dir() {
+            let t = tempfile::Builder::new().prefix("nyq-tmp-").tempdir_in("/tmp").unwrap();
+            assert!(accepted_tmpdir(t.path(), Some(&home)).is_some());
+            #[cfg(unix)]
+            {
+                let link = std::env::temp_dir().join(format!("nyq-tmpdir-link-{}", std::process::id()));
+                let _ = std::fs::remove_file(&link);
+                if std::os::unix::fs::symlink(&nested, &link).is_ok() {
+                    assert!(accepted_tmpdir(&link, Some(&home)).is_none());
+                    let _ = std::fs::remove_file(&link);
+                }
+            }
+        }
+        if Path::new("/var/tmp").is_dir() {
+            let t = tempfile::Builder::new().prefix("nyq-tmp-").tempdir_in("/var/tmp").unwrap();
+            assert!(accepted_tmpdir(t.path(), Some(&home)).is_some());
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn describe_mentions_the_unix_socket_gap_on_linux() {
+        let p = describe(&Policy { mode: Mode::ReadOnly, network: false, ..Default::default() });
+        assert!(p.contains("read-only"), "{p}");
+        #[cfg(target_os = "linux")]
+        if p.contains("landlock") {
+            assert!(p.contains("unix sockets not restricted"), "{p}");
+        }
     }
 
     #[test]

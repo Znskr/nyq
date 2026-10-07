@@ -14,7 +14,7 @@ mod undo;
 mod ui;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -120,11 +120,12 @@ async fn run() -> Result<()> {
     }
 
     let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
+    let sandbox = std::sync::Arc::new(sandbox_policy(&cli)?);
     let mut agent = Agent {
         session: Some(Session::create(&sessions_dir, &cwd, provider.model())?),
         provider,
         tools: Registry::builtin(),
-        system: prompt::system(&cwd),
+        system: prompt::system(&cwd, &sandbox),
         items: Vec::new(),
         cwd: cwd.clone(),
         yolo: cli.yolo,
@@ -132,7 +133,8 @@ async fn run() -> Result<()> {
         usage: Usage::default(),
         context_window: 0,
         context_tokens: 0,
-        sandbox: std::sync::Arc::new(sandbox_policy(&cli)?),
+        suppress_auto_compact: false,
+        sandbox,
         undo: Default::default(),
     };
     agent.context_window = config::context_window_for(agent.provider.name(), None);
@@ -247,19 +249,13 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        let item = match tools::image::user_message(&line, &cwd) {
-            Ok((item, attached)) => {
-                tui.screen().print_user(&line);
-                if !attached.is_empty() {
-                    ui::info(&format!("Attached {}", attached.join(", ")));
-                }
-                item
-            }
-            Err(e) => {
-                ui::error(&format!("{e:#}"));
-                continue;
-            }
-        };
+        let (item, attached, warning) = tools::image::user_turn(&line, &cwd);
+        tui.screen().print_user(&line);
+        if let Some(warning) = warning {
+            ui::error(&warning);
+        } else if !attached.is_empty() {
+            ui::info(&format!("Attached {}", attached.join(", ")));
+        }
         let cancel = CancellationToken::new();
         tui.screen().set_busy(Some("Working"), Some(cancel.clone()));
         let result = agent.turn(item, &mut tui.ui(cwd.clone()), cancel.clone()).await;
@@ -411,8 +407,15 @@ async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig, qu
 }
 
 /// `!cmd`: run a command yourself (unsandboxed) and show its output.
-async fn shell(cmd: &str, cwd: &PathBuf, tui: &Tui) {
-    let out = tokio::process::Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).stdin(std::process::Stdio::null()).output().await;
+async fn shell(cmd: &str, cwd: &Path, tui: &Tui) {
+    let policy = sandbox::Policy { mode: sandbox::Mode::Off, ..Default::default() };
+    let out = match sandbox::shell_command(&policy, cwd, cmd) {
+        Ok(mut command) => {
+            command.stdin(std::process::Stdio::null());
+            command.output().await
+        }
+        Err(e) => Err(std::io::Error::other(e)),
+    };
     let output = match out {
         Ok(o) => {
             let mut text = String::from_utf8_lossy(&o.stdout).into_owned();

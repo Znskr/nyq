@@ -1,7 +1,6 @@
 //! `subagent`: delegate a self-contained task to a fresh agent with its own
 //! context; only its final report comes back to the parent model.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -95,6 +94,12 @@ impl Tool for Subagent {
         if is_general(args) { format!("{label} (general)") } else { label.to_string() }
     }
 
+    fn preview(&self, args: &Value, _: &ToolCtx) -> Option<String> {
+        let task = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty())?;
+        let mode = if is_general(args) { "general" } else { "explore" };
+        Some(format!("mode: {mode}\n{task}"))
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(task) = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) else {
             return ToolOutput::err("Missing required argument `task`.");
@@ -107,17 +112,19 @@ impl Tool for Subagent {
         let mut agent = Agent {
             provider,
             tools: child_tools(is_general(&args)),
-            system: format!("{}\n\n{PREAMBLE}", crate::prompt::system(&ctx.cwd)),
+            system: format!("{}\n\n{PREAMBLE}", crate::prompt::system(&ctx.cwd, &ctx.sandbox)),
             items: Vec::new(),
             session: None,
             cwd: ctx.cwd.clone(),
-            // Explore tools need no approval; for general mode the parent's
-            // approval of this call covers the subagent's actions.
-            yolo: true,
-            allowed: HashSet::new(),
+            // Inherit the parent's yolo flag and "always" grants. Further
+            // mutations are asked on the parent's UI, or denied when there
+            // is none — approving this call does not auto-approve them.
+            yolo: ctx.yolo,
+            allowed: ctx.allowed.clone(),
             usage: Usage::default(),
             context_window,
             context_tokens: 0,
+            suppress_auto_compact: false,
             sandbox: ctx.sandbox.clone(),
             undo: Default::default(),
         };
@@ -163,7 +170,8 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}\n[… report truncated, {} more bytes]", &s[..end], s.len() - end)
 }
 
-/// Headless UI for the child agent: records tool calls, approves everything.
+/// Headless UI for the child agent: records tool calls. Approvals go to the
+/// parent terminal when one is active; otherwise the call is denied.
 #[derive(Default)]
 struct Collector {
     calls: Vec<(String, String)>,
@@ -190,8 +198,10 @@ impl Ui for Collector {
         self.calls.push((tool.to_string(), summary.to_string()));
     }
     fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
-    async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval {
-        Approval::Yes
+    async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
+        crate::ui::tui::approve_active(req.tool, req.summary, req.preview, req.rule.clone())
+            .await
+            .unwrap_or(Approval::No)
     }
 }
 
@@ -272,6 +282,69 @@ mod tests {
         assert!(names.contains(&"bash".to_string()) && names.contains(&"write_file".to_string()));
         assert!(!names.contains(&"subagent".to_string()));
         assert_eq!(Subagent.summary(&json!({"task": "first\nsecond"})), "first");
+        let preview = Subagent
+            .preview(
+                &json!({"task": "rm -rf /", "description": "check the test names", "mode": "general"}),
+                &ToolCtx::default(),
+            )
+            .unwrap();
+        assert!(preview.contains("rm -rf /") && preview.contains("mode: general"), "{preview}");
+        assert_eq!(
+            Subagent.summary(&json!({"task": "rm -rf /", "description": "check the test names", "mode": "general"})),
+            "check the test names (general)"
+        );
+    }
+
+    #[tokio::test]
+    async fn general_subagent_does_not_auto_approve_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            resp(vec![Item::ToolCall {
+                id: "1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"out.txt","content":"x"}"#.into(),
+            }]),
+            resp(vec![Item::Assistant { text: "done".into() }]),
+        ];
+        let out = Subagent
+            .run(json!({"task": "write out.txt", "mode": "general"}), &ctx(&fake, dir.path()))
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!dir.path().join("out.txt").exists());
+        assert!(out.content.starts_with("done"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn general_subagent_inherits_yolo_and_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = || {
+            resp(vec![
+                Item::ToolCall {
+                    id: "1".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"out.txt","content":"x"}"#.into(),
+                },
+            ])
+        };
+        let done = || resp(vec![Item::Assistant { text: "wrote".into() }]);
+
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![write(), done()];
+        let mut c = ctx(&fake, dir.path());
+        c.yolo = true;
+        let out = Subagent.run(json!({"task": "write", "mode": "general"}), &c).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "x");
+        std::fs::remove_file(dir.path().join("out.txt")).unwrap();
+
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![write(), done()];
+        let mut c = ctx(&fake, dir.path());
+        c.allowed.insert("write_file".into());
+        let out = Subagent.run(json!({"task": "write", "mode": "general"}), &c).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "x");
     }
 
     #[tokio::test]

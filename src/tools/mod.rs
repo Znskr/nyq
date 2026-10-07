@@ -8,6 +8,7 @@ mod search;
 pub mod web;
 pub mod subagent;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -32,6 +33,10 @@ pub struct ToolCtx {
     /// A copy of the session's model provider, for tools that run their own
     /// model calls (subagents). None in tests.
     pub provider: Option<std::sync::Arc<dyn crate::provider::Provider>>,
+    /// The session's `--yolo` flag, inherited by subagents.
+    pub yolo: bool,
+    /// Rules granted with "always", inherited by subagents.
+    pub allowed: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]

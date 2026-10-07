@@ -334,7 +334,7 @@ fn view_image_sends_result_then_user_image() {
 }
 
 #[test]
-fn oversized_compaction_errors_without_another_request() {
+fn oversized_compaction_warns_and_continues() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let (url, seen) = fake_server(vec![
@@ -346,14 +346,20 @@ fn oversized_compaction_errors_without_another_request() {
             delta(json!({"content":"A summary."})),
             json!({"choices":[],"usage":{"prompt_tokens":970,"completion_tokens":1000}}),
         ],
+        vec![delta(json!({"content":"Continued."}))],
     ]);
     let out = print_command(work.path(), home.path(), &url)
         .arg("look around")
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("still over the automatic compaction limit")
-    );
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_success(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Automatic compaction is off"), "{stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Continued."));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    let compact = seen[1]["messages"].to_string();
+    assert!(compact.contains("Summarize this conversation"), "{compact}");
+    let next = seen[2]["messages"].to_string();
+    assert!(!next.contains("Summarize this conversation"), "{next}");
 }
