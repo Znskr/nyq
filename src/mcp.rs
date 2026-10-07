@@ -516,16 +516,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Open `url` in the user's browser, ignoring failures (the URL is printed too).
 pub fn open_browser(url: &str) {
-    let mut cmd = if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
-    } else if cfg!(windows) {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/c", "start", ""]);
-        c
-    } else {
-        std::process::Command::new("xdg-open")
-    };
-    let _ = cmd.arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    crate::login::open_browser(url);
 }
 
 #[derive(Debug, PartialEq)]
@@ -737,43 +728,75 @@ impl Tool for McpTool {
 }
 
 fn convert(r: CallToolResult) -> ToolOutput {
-    let parts: Vec<String> = r
-        .content
-        .iter()
-        .map(|c| match c {
-            ContentBlock::Text(t) => t.text.clone(),
-            ContentBlock::Image(i) => format!("[{}]", i.mime_type),
-            ContentBlock::Audio(a) => format!("[{}]", a.mime_type),
+    let mut images = Vec::new();
+    let mut parts = Vec::new();
+    for c in &r.content {
+        match c {
+            ContentBlock::Text(t) => parts.push(t.text.clone()),
+            ContentBlock::Image(i) => match image_from_encoded(&i.data, &i.mime_type) {
+                Ok(image) => images.push(image),
+                Err(reason) => parts.push(format!("[image omitted ({reason})]")),
+            },
+            ContentBlock::Audio(a) => parts.push(format!("[{}]", a.mime_type)),
             ContentBlock::Resource(e) => match &e.resource {
-                ResourceContents::TextResourceContents { uri, text, .. } => format!("[resource {uri}]\n{text}"),
+                ResourceContents::TextResourceContents { uri, text, .. } => parts.push(format!("[resource {uri}]\n{text}")),
                 ResourceContents::BlobResourceContents { uri, mime_type, .. } => {
-                    format!("[resource {uri} ({})]", mime_type.as_deref().unwrap_or("binary"))
+                    parts.push(format!("[resource {uri} ({})]", mime_type.as_deref().unwrap_or("binary")))
                 }
                 #[allow(unreachable_patterns)]
-                _ => "[resource]".into(),
+                _ => parts.push("[resource]".into()),
             },
-            ContentBlock::ResourceLink(l) => format!("[resource link {}]", l.uri),
+            ContentBlock::ResourceLink(l) => parts.push(format!("[resource link {}]", l.uri)),
             #[allow(unreachable_patterns)]
-            _ => "[unsupported content]".into(),
-        })
-        .collect();
-    let has_text = r.content.iter().any(|c| matches!(c, ContentBlock::Text(_)));
-    let mut content = parts.join("\n");
-    if !has_text {
-        if let Some(s) = &r.structured_content {
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str(&s.to_string());
+            _ => parts.push("[unsupported content]".into()),
         }
     }
-    ToolOutput { content, is_error: r.is_error.unwrap_or(false), display: None, images: Vec::new(), changed: false }
+    let mut content = parts.join("\n");
+    if let Some(s) = &r.structured_content {
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str("Structured content:\n");
+        content.push_str(&serde_json::to_string_pretty(s).unwrap_or_else(|_| s.to_string()));
+    }
+    ToolOutput { content, is_error: r.is_error.unwrap_or(false), display: None, images, changed: false }
+}
+
+fn image_from_encoded(data: &str, mime: &str) -> Result<crate::types::Image, String> {
+    let compact: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, compact.as_bytes())
+        .map_err(|_| "invalid base64".to_string())?;
+    crate::tools::image::image_from_bytes(&bytes, mime).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn images_and_structured_content_are_preserved() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png);
+        let mut result = CallToolResult::success(vec![
+            ContentBlock::text("hello"),
+            ContentBlock::image(format!(" {data}\n"), "image/png"),
+        ]);
+        result.structured_content = Some(serde_json::json!({"n": 1}));
+        let out = convert(result);
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].media_type, "image/png");
+        assert!(out.images[0].data.starts_with("iVBOR"));
+        assert!(out.content.contains("hello"), "{}", out.content);
+        assert!(out.content.contains("Structured content:"), "{}", out.content);
+        assert!(out.content.contains("\"n\": 1"), "{}", out.content);
+
+        let bad = convert(CallToolResult::success(vec![ContentBlock::image(&data, "image/jpeg")]));
+        assert!(bad.images.is_empty());
+        assert!(bad.content.contains("image omitted"), "{}", bad.content);
+        let junk = convert(CallToolResult::success(vec![ContentBlock::image("@@@", "image/png")]));
+        assert!(junk.images.is_empty() && junk.content.contains("image omitted"));
+    }
 
     #[test]
     fn configs_and_warnings() {
@@ -907,7 +930,8 @@ for line in sys.stdin:
 
         let ctx = ToolCtx { cwd: dir.path().into(), cancel: CancellationToken::new(), ..Default::default() };
         let out = tools[0].run(serde_json::json!({"text": "hi"}), &ctx).await;
-        assert_eq!(out.content, "{\"text\": \"hi\"}\n[image/png]");
+        assert!(out.content.starts_with("{\"text\": \"hi\"}\n[image omitted"), "{}", out.content);
+        assert!(out.images.is_empty());
         assert!(!out.is_error);
         let out = tools[0].run(serde_json::json!({"fail": true}), &ctx).await;
         assert!(out.is_error);
@@ -927,7 +951,8 @@ for line in sys.stdin:
         let tools = mgr.connect(&cfg).await.unwrap();
         assert_eq!(mgr.connected(), vec![("fake".to_string(), 1)]);
         let out = tools[0].run(serde_json::json!({}), &ctx).await;
-        assert_eq!(out.content, "{}\n[image/png]");
+        assert!(out.content.starts_with("{}\n[image omitted"), "{}", out.content);
+        assert!(out.images.is_empty());
 
         mgr.disconnect("fake").await.unwrap();
         assert!(mgr.connected().is_empty());

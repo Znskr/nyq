@@ -155,6 +155,9 @@ async fn fetch(raw: &str, allow_loopback: bool) -> Result<Page> {
         .timeout(TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(Arc::new(PublicResolver { allow_loopback }))
+        // A system HTTP proxy would resolve the destination itself, so the
+        // public-address checks below would never see it. Connect directly.
+        .no_proxy()
         .build()?;
     let mut redirects = 0;
     let mut resp = loop {
@@ -278,15 +281,6 @@ fn format_page(page: &Page, prompt: Option<&str>, max_chars: usize) -> String {
     out + "\n" + &truncate(body, max_chars)
 }
 
-/// Query strings longer than this need approval so a fetch cannot smuggle
-/// a stolen token out in the URL without the user seeing it.
-const QUERY_APPROVAL_LEN: usize = 32;
-
-fn query_len(url: &str) -> usize {
-    let Some((_, rest)) = url.split_once('?') else { return 0 };
-    rest.split_once('#').map(|(q, _)| q.len()).unwrap_or(rest.len())
-}
-
 struct WebFetch;
 
 impl WebFetch {
@@ -326,8 +320,8 @@ impl Tool for WebFetch {
         }
     }
 
-    fn needs_approval(&self, args: &Value) -> bool {
-        args["url"].as_str().is_some_and(|url| query_len(url) > QUERY_APPROVAL_LEN)
+    fn needs_approval(&self, _args: &Value) -> bool {
+        true
     }
 
     fn summary(&self, args: &Value) -> String {
@@ -335,8 +329,7 @@ impl Tool for WebFetch {
     }
 
     fn preview(&self, args: &Value, _ctx: &ToolCtx) -> Option<String> {
-        let url = args["url"].as_str()?;
-        (query_len(url) > QUERY_APPROVAL_LEN).then(|| url.to_string())
+        args["url"].as_str().filter(|url| !url.is_empty()).map(str::to_string)
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
@@ -726,10 +719,16 @@ mod tests {
     }
 
     #[test]
-    fn long_query_needs_approval_and_shows_the_url() {
-        let short = json!({"url": "https://example.com/docs?q=rust"});
-        assert!(!WebFetch.needs_approval(&short));
-        assert!(WebFetch.preview(&short, &ToolCtx::default()).is_none());
+    fn every_fetch_needs_approval_and_shows_the_url() {
+        let short = json!({"url": "https://example.com/docs"});
+        assert!(WebFetch.needs_approval(&short));
+        assert_eq!(
+            WebFetch.preview(&short, &ToolCtx::default()).as_deref(),
+            Some("https://example.com/docs")
+        );
+        let path_only = json!({"url": "https://evil.example/x"});
+        assert!(WebFetch.needs_approval(&path_only));
+        assert!(WebFetch.preview(&path_only, &ToolCtx::default()).unwrap().contains("evil.example"));
         let long = format!("https://attacker.example/?t={}", "x".repeat(80));
         let args = json!({"url": &long});
         assert!(WebFetch.needs_approval(&args));

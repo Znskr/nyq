@@ -132,6 +132,7 @@ impl Tool for Subagent {
             context_tokens: 0,
             context_estimated: false,
             suppress_auto_compact: false,
+            submitted: 0,
             sandbox: ctx.sandbox.clone(),
             undo: Default::default(),
         };

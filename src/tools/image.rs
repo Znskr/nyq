@@ -17,7 +17,7 @@ pub fn register(r: &mut Registry) {
 }
 
 /// Media type from the file's magic bytes.
-fn media_type(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn media_type(bytes: &[u8]) -> Option<&'static str> {
     match bytes {
         [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
         [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
@@ -25,6 +25,21 @@ fn media_type(bytes: &[u8]) -> Option<&'static str> {
         [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
         _ => None,
     }
+}
+
+/// Decode image bytes, requiring the claimed MIME type to match the magic bytes.
+pub(crate) fn image_from_bytes(bytes: &[u8], claimed: &str) -> Result<Image> {
+    if bytes.len() as u64 > MAX_BYTES {
+        bail!("image exceeds 20 MB");
+    }
+    let Some(detected) = media_type(bytes) else {
+        bail!("not a PNG, JPEG, GIF or WebP image");
+    };
+    let claimed = claimed.split(';').next().unwrap_or(claimed).trim();
+    if !claimed.eq_ignore_ascii_case(detected) {
+        bail!("mime type {claimed} does not match the image bytes ({detected})");
+    }
+    Ok(Image { media_type: detected.into(), data: base64::engine::general_purpose::STANDARD.encode(bytes) })
 }
 
 pub fn load(path: &Path) -> Result<Image> {
@@ -101,6 +116,10 @@ impl Tool for ViewImage {
 
     fn summary(&self, args: &Value) -> String {
         args["path"].as_str().unwrap_or("").to_string()
+    }
+
+    fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
+        super::outside_path_arg(cwd, args)
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {

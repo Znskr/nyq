@@ -208,9 +208,16 @@ pub fn describe(policy: &Policy) -> String {
     let net = if policy.network { "network on" } else { "network off" };
     #[cfg(target_os = "linux")]
     if let Some(abi) = linux::abi() {
-        // TCP rules need Landlock ABI v4. Landlock cannot restrict AF_UNIX.
-        let net = if !policy.network && abi < 4 { "network not restricted (kernel too old)" } else { net };
-        return format!("sandbox: {mode} · {net} (landlock v{abi}; unix sockets not restricted)");
+        // Landlock ABI v4 can deny TCP bind/connect only. UDP and AF_UNIX
+        // stay open; there is no Landlock rule for them.
+        let net = if policy.network {
+            "network on; unix sockets not restricted"
+        } else if abi < 4 {
+            "network not restricted (kernel too old)"
+        } else {
+            "TCP blocked; UDP and unix sockets not restricted"
+        };
+        return format!("sandbox: {mode} · {net} (landlock v{abi})");
     }
     let engine = if cfg!(target_os = "macos") { "seatbelt" } else { "unavailable" };
     format!("sandbox: {mode} · {net} ({engine})")
@@ -395,7 +402,12 @@ mod tests {
         assert!(p.contains("read-only"), "{p}");
         #[cfg(target_os = "linux")]
         if p.contains("landlock") {
-            assert!(p.contains("unix sockets not restricted"), "{p}");
+            if p.contains("kernel too old") {
+                assert!(p.contains("network not restricted"), "{p}");
+            } else {
+                assert!(p.contains("TCP blocked; UDP and unix sockets not restricted"), "{p}");
+                assert_eq!(p.matches("unix sockets").count(), 1, "{p}");
+            }
         }
     }
 

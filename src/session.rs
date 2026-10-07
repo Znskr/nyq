@@ -159,7 +159,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = opts.open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
-    fs::rename(&tmp, path)?;
+    crate::tools::safeio::rename_over(&tmp, path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -233,14 +233,14 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         }
     };
 
-    let data = fs::read_to_string(&meta.path).with_context(|| format!("reading {}", meta.path.display()))?;
+    let data = fs::read(&meta.path).with_context(|| format!("reading {}", meta.path.display()))?;
     let (mut items, good) = read_items(&data, &meta.path)?;
-    if good < data.len() || !data.ends_with('\n') {
-        // Drop a half-written final line and make sure appends start on a
-        // fresh line.
+    if good < data.len() || !data[..good].ends_with(b"\n") {
+        // Drop a half-written final record (including a torn UTF-8 byte) and
+        // make sure appends start on a fresh line.
         let mut f = OpenOptions::new().write(true).open(&meta.path)?;
         f.set_len(good as u64)?;
-        if !data[..good].ends_with('\n') {
+        if good == 0 || !data[..good].ends_with(b"\n") {
             f.seek(SeekFrom::End(0))?;
             f.write_all(b"\n")?;
         }
@@ -264,22 +264,29 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
 }
 
 /// Items after the header plus the byte length of the well-formed prefix.
-/// An unparsable final line (crash mid-write) is ignored; an unparsable line
-/// elsewhere is an error.
-fn read_items(data: &str, path: &Path) -> Result<(Vec<Item>, usize)> {
+/// An unparsable final record (crash mid-write, including torn UTF-8) is
+/// ignored; an unparsable record elsewhere is an error.
+fn read_items(data: &[u8], path: &Path) -> Result<(Vec<Item>, usize)> {
     let mut items = Vec::new();
     let mut good = 0;
-    let mut lines = data.split_inclusive('\n').enumerate().peekable();
-    while let Some((n, raw)) = lines.next() {
-        let line = raw.trim();
-        if n > 0 && !line.is_empty() {
-            match serde_json::from_str::<Item>(line) {
+    let mut offset = 0;
+    let mut n = 0usize;
+    while offset < data.len() {
+        let end = data[offset..].iter().position(|b| *b == b'\n').map(|i| offset + i + 1).unwrap_or(data.len());
+        let raw = &data[offset..end];
+        let mut line = raw.strip_suffix(b"\n").unwrap_or(raw);
+        line = line.strip_suffix(b"\r").unwrap_or(line);
+        let blank = line.iter().all(u8::is_ascii_whitespace);
+        if n > 0 && !blank {
+            match serde_json::from_slice::<Item>(line) {
                 Ok(item) => items.push(item),
-                Err(_) if lines.peek().is_none() => break,
+                Err(_) if end == data.len() => break,
                 Err(e) => bail!("{}: line {} is corrupt: {e}", path.display(), n + 1),
             }
         }
-        good += raw.len();
+        good = end;
+        offset = end;
+        n += 1;
     }
     Ok((items, good))
 }
@@ -413,6 +420,19 @@ mod tests {
         assert_eq!(items, vec![user("hi")]);
         s.append(&user("again")).unwrap();
         assert_eq!(load(tmp.path(), "abc", Path::new("/w")).unwrap().2.len(), 2);
+    }
+
+    #[test]
+    fn torn_utf8_tail_keeps_the_previous_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("kept")).unwrap();
+        drop(s);
+        let path = dir.join(fs::read_dir(dir).unwrap().next().unwrap().unwrap().file_name());
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(&[0xc3]).unwrap();
+        let (_, _, items) = load(dir, "last", Path::new("/w")).unwrap();
+        assert_eq!(items, vec![user("kept")]);
     }
 
     #[test]

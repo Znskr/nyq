@@ -131,6 +131,10 @@ pub struct Agent {
     pub context_estimated: bool,
     /// Set when compaction cannot get under the limit, so later turns don't retry.
     pub(crate) suppress_auto_compact: bool,
+    /// How many leading transcript items have already been sent to the provider.
+    /// Automatic compaction may summarize only that prefix, so a user message
+    /// that has not been submitted yet is kept verbatim.
+    pub(crate) submitted: usize,
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
     /// File contents before each write/edit, for `/undo`.
     pub undo: crate::undo::UndoLog,
@@ -156,26 +160,8 @@ impl Agent {
         self.push_counted(input);
         for _ in 0..MAX_STEPS {
             self.sync_estimate();
-            // One oversized item (an attached image, a huge paste) must not be
-            // summarized away: compaction clears the transcript. An image still
-            // sitting in a trailing user message has not been shown to the model
-            // yet — compacting now would drop a `view_image` result the same way.
-            if !self.suppress_auto_compact
-                && self.items.len() >= 2
-                && !tail_holds_unsent_image(&self.items)
-                && self.context_window > 0
-                && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT
-            {
-                ui.notice("Context is nearly full; compacting the conversation…");
-                if !self.compact(ui, &cancel).await? {
-                    return Ok(TurnEnd::Cancelled);
-                }
-                if self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT {
-                    self.suppress_auto_compact = true;
-                    ui.notice(
-                        "Still over the automatic compaction limit after compacting (the system prompt alone may exceed it). Automatic compaction is off for the rest of this session.",
-                    );
-                }
+            if !self.auto_compact(ui, &cancel).await? {
+                return Ok(TurnEnd::Cancelled);
             }
             let specs = self.tools.specs();
             let req = Request {
@@ -222,6 +208,10 @@ impl Agent {
                 self.push(item);
             }
             if calls.is_empty() {
+                // This response has been shown to the model. A later tool
+                // result is submitted only once it has been recorded, so a
+                // compaction cannot split a call from its result.
+                self.submitted = self.items.len();
                 // Queued input keeps the run going: steering first, then one
                 // follow-up at a time.
                 let mut queued = ui.take_steering();
@@ -267,6 +257,7 @@ impl Agent {
                     is_error: out.is_error,
                 });
             }
+            self.submitted = self.items.len();
             // Tool results are text-only in both APIs, so images a tool
             // produced are handed over in a follow-up user message.
             if !images.is_empty() {
@@ -327,7 +318,7 @@ impl Agent {
         };
         let summary = tool.summary(&args);
 
-        if tool.needs_approval(&args) && !self.yolo && !is_allowed(&self.allowed, name, &args, &self.cwd) {
+        if tool.needs_approval_for(&args, &self.cwd) && !self.yolo && !is_allowed(&self.allowed, name, &args, &self.cwd) {
             let preview = tool.preview(&args, &ctx);
             let rule = grant_rule(name, &args);
             let req = ApprovalRequest {
@@ -336,7 +327,18 @@ impl Agent {
                 preview: preview.as_deref(),
                 rule: rule.as_deref().map(rule_label),
             };
-            match ui.approve(&req).await {
+            let decision = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                answer = ui.approve(&req) => Some(answer),
+            };
+            let Some(answer) = decision else {
+                ui.tool_start(name, &summary);
+                let out = ToolOutput::err("Cancelled by user.");
+                ui.tool_end(name, &out);
+                return out;
+            };
+            match answer {
                 Approval::Yes => {}
                 Approval::Always => {
                     self.allowed.extend(rule);
@@ -461,6 +463,7 @@ impl Agent {
         self.context_tokens = 0;
         self.context_estimated = false;
         self.suppress_auto_compact = false;
+        self.submitted = 0;
         self.undo = Default::default();
     }
 
@@ -474,6 +477,53 @@ impl Agent {
     pub(crate) fn adopt_transcript(&mut self) {
         self.context_estimated = true;
         self.context_tokens = estimate_context(&self.system, &self.items);
+        self.submitted = self.items.len();
+    }
+
+    /// Compact only the prefix already sent to the provider. Trailing items
+    /// (a new user paste, tool results, images) stay in the transcript.
+    async fn auto_compact(&mut self, ui: &mut dyn Ui, cancel: &CancellationToken) -> Result<bool> {
+        if self.suppress_auto_compact
+            || self.submitted == 0
+            || self.context_window == 0
+            || (self.context_tokens as f64) < (self.context_window as f64) * AUTO_COMPACT_AT
+        {
+            return Ok(true);
+        }
+        let split = self.submitted.min(self.items.len());
+        // One item has nothing to summarize, and an image the model has not
+        // been sent yet must stay in the request that shows it.
+        if self.items.len() < 2 || split == 0 || tail_has_unsent_image(&self.items[split..]) {
+            return Ok(true);
+        }
+        let tail = self.items.split_off(split);
+        ui.notice("Context is nearly full; compacting the conversation…");
+        let compacted = match self.compact(ui, cancel).await {
+            Ok(ok) => ok,
+            Err(e) => {
+                self.items.extend(tail);
+                return Err(e);
+            }
+        };
+        if !compacted {
+            self.items.extend(tail);
+            return Ok(false);
+        }
+        if !self.context_estimated {
+            for item in &tail {
+                self.context_tokens = self.context_tokens.saturating_add(item_tokens(item));
+            }
+        }
+        let kept = self.items.len();
+        self.items.extend(tail);
+        self.submitted = kept;
+        if self.context_window > 0 && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT {
+            self.suppress_auto_compact = true;
+            ui.notice(
+                "Still over the automatic compaction limit after compacting (the system prompt alone may exceed it). Automatic compaction is off for the rest of this session.",
+            );
+        }
+        Ok(true)
     }
 
     fn push_counted(&mut self, item: Item) {
@@ -497,13 +547,8 @@ fn text_tokens(text: &str) -> u64 {
 /// Flat cost for one image. Base64 length is not the model's token cost.
 const IMAGE_TOKENS: u64 = 1_500;
 
-/// True when a user message that the model has not been sent yet carries an image.
-fn tail_holds_unsent_image(items: &[Item]) -> bool {
-    items
-        .iter()
-        .rev()
-        .take_while(|item| matches!(item, Item::User { .. }))
-        .any(|item| matches!(item, Item::User { images, .. } if !images.is_empty()))
+fn tail_has_unsent_image(items: &[Item]) -> bool {
+    items.iter().any(|item| matches!(item, Item::User { images, .. } if !images.is_empty()))
 }
 
 fn item_tokens(item: &Item) -> u64 {
@@ -538,6 +583,11 @@ const WRAPPERS: &[&str] = &[
 const INTERPRETERS: &[&str] = &["python", "python3", "node", "perl", "ruby", "deno", "php", "lua", "npx", "bunx"];
 /// Package runners whose `run`/`exec` subcommand takes a script name.
 const RUNNERS: &[&str] = &["npm", "pnpm", "yarn", "bun", "uv", "poetry", "pipenv", "pdm", "hatch"];
+/// Clients whose later arguments can start another transfer or change the
+/// destination. A prefix grant would approve a different operation.
+const NETWORK_CLIENTS: &[&str] = &[
+    "curl", "wget", "aria2c", "scp", "rsync", "sftp", "nc", "ncat", "socat", "ftp", "rclone",
+];
 
 /// Whether a command chains, pipes, substitutes or redirects (or spans lines).
 fn has_control(cmd: &str) -> bool {
@@ -595,7 +645,11 @@ pub fn bash_prefix(cmd: &str) -> Option<String> {
     let words: Vec<&str> = cmd.split_whitespace().collect();
     let program = *words.first()?;
     let base = program_base(program);
-    if !plain_word(program.strip_prefix("./").unwrap_or(program)) || WRAPPERS.contains(&base) || program.contains('=') {
+    if !plain_word(program.strip_prefix("./").unwrap_or(program))
+        || WRAPPERS.contains(&base)
+        || NETWORK_CLIENTS.contains(&base)
+        || program.contains('=')
+    {
         return None;
     }
     if INTERPRETERS.contains(&base) && words.get(1).is_some_and(|w| is_flag(w)) {
@@ -603,9 +657,7 @@ pub fn bash_prefix(cmd: &str) -> Option<String> {
     }
     let mut prefix = vec![program];
     let mut i = 1;
-    let mut saw_flag = false;
     while words.get(i).is_some_and(|w| is_flag(w)) {
-        saw_flag = true;
         match flag_operand(program, words[i]) {
             Some(true) => {
                 let operand = words.get(i + 1).copied().filter(|w| plain_word(w))?;
@@ -630,7 +682,9 @@ pub fn bash_prefix(cmd: &str) -> Option<String> {
             if RUNNERS.contains(&base) && matches!(*sub, "run" | "exec" | "x") {
                 prefix.extend(words.get(i + 1).filter(|w| plain_word(w)));
             }
-        } else if saw_flag {
+        } else {
+            // A quoted, escaped, or otherwise unparsed operand must not fall
+            // back to a grant of the bare program (`rm 'file'` is not `rm`).
             return None;
         }
     }
@@ -661,6 +715,14 @@ pub fn grant_rule(tool: &str, args: &Value) -> Option<String> {
     if tool == "subagent" {
         return Some(format!("subagent:{}", subagent_mode(args)));
     }
+    if tool == "web_fetch" {
+        let url = args.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+        return Some(format!("web_fetch:{url}"));
+    }
+    if matches!(tool, "read_file" | "list_dir" | "glob" | "grep" | "view_image") {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        return Some(format!("{tool}:{path}"));
+    }
     Some(tool.to_string())
 }
 
@@ -671,6 +733,14 @@ pub fn rule_label(rule: &str) -> String {
     }
     if let Some(mode) = rule.strip_prefix("subagent:") {
         return format!("`subagent` ({mode})");
+    }
+    if let Some(url) = rule.strip_prefix("web_fetch:") {
+        return format!("`web_fetch` {url}");
+    }
+    for name in ["read_file", "list_dir", "glob", "grep", "view_image"] {
+        if let Some(path) = rule.strip_prefix(&format!("{name}:")) {
+            return format!("`{name}` {path}");
+        }
     }
     if is_file_tool(rule) {
         return format!("{} in this workspace", rule.replace('_', " "));
@@ -713,6 +783,14 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
     }
     if tool == "subagent" {
         return allowed.contains(&format!("subagent:{}", subagent_mode(args)));
+    }
+    if tool == "web_fetch" {
+        let url = args.get("url").and_then(Value::as_str).unwrap_or("");
+        return allowed.contains(&format!("web_fetch:{url}"));
+    }
+    if matches!(tool, "read_file" | "list_dir" | "glob" | "grep" | "view_image") {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        return allowed.contains(&format!("{tool}:{path}"));
     }
     allowed.contains(tool)
 }
@@ -786,6 +864,7 @@ mod tests {
             context_tokens: 900,
             context_estimated: false,
             suppress_auto_compact: false,
+            submitted: 1,
             sandbox: Default::default(),
             undo: Default::default(),
         }
@@ -925,10 +1004,11 @@ mod tests {
         assert_eq!(p("ls -la src"), None);
         assert_eq!(p("rm -rf target/debug"), None);
         assert_eq!(p("chmod -R 755 ."), None);
-        assert_eq!(
-            p("curl -o approved-file https://example.com/a").as_deref(),
-            Some("curl -o approved-file https://example.com/a")
-        );
+        assert_eq!(p("curl -o approved-file https://example.com/a"), None);
+        assert_eq!(p("curl https://example.com/health"), None);
+        assert_eq!(p("wget https://example.com/a"), None);
+        assert_eq!(p("rm 'target/file'"), None);
+        assert_eq!(p("rm target/file").as_deref(), Some("rm target/file"));
         assert_eq!(
             p("cargo --manifest-path safe/Cargo.toml test").as_deref(),
             Some("cargo --manifest-path safe/Cargo.toml test")
@@ -938,7 +1018,7 @@ mod tests {
         assert_eq!(p("./gradlew build").as_deref(), Some("./gradlew build"));
         assert_eq!(p("python script.py").as_deref(), Some("python script.py"));
         assert_eq!(p("make").as_deref(), Some("make"));
-        assert_eq!(p("rg 'a b' src").as_deref(), Some("rg"));
+        assert_eq!(p("rg 'a b' src"), None);
         // Control operators, wrappers, assignments and odd programs can't be scoped.
         for c in [
             "cargo test; rm -rf /", "cargo test && echo", "a || b", "ls | wc", "echo $(id)", "echo `id`",
@@ -983,6 +1063,22 @@ mod tests {
         assert_eq!(grant_rule("bash", &json!({"command": "a; b"})), None);
         assert_eq!(grant_rule("write_file", &json!({"path": "x"})).as_deref(), Some("write_file"));
         assert_eq!(grant_rule("mcp__wiki__ask", &json!({})).as_deref(), Some("mcp__wiki__ask"));
+        assert_eq!(
+            grant_rule("web_fetch", &json!({"url": "https://example.com/a"})).as_deref(),
+            Some("web_fetch:https://example.com/a")
+        );
+        assert!(!is_allowed(
+            &["web_fetch:https://example.com/a".into()].into(),
+            "web_fetch",
+            &json!({"url": "https://example.com/a?x=1"}),
+            cwd
+        ));
+        assert!(is_allowed(
+            &["web_fetch:https://example.com/a".into()].into(),
+            "web_fetch",
+            &json!({"url": "https://example.com/a"}),
+            cwd
+        ));
         assert_eq!(rule_label("bash:cargo test"), "`cargo test …`");
         assert_eq!(rule_label("edit_file"), "edit file in this workspace");
         assert_eq!(grant_rule("subagent", &json!({"mode": "general", "task": "x"})).as_deref(), Some("subagent:general"));
@@ -1119,6 +1215,42 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(matches!(agent.turn(Item::user("again"), &mut ui, CancellationToken::new()).await.unwrap(), TurnEnd::Done));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn unsent_user_text_reaches_the_model() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Rec(Arc<Mutex<bool>>);
+
+        #[async_trait::async_trait]
+        impl Provider for Rec {
+            fn name(&self) -> &str { "fake" }
+            fn model(&self) -> &str { "fake" }
+            fn set_model(&mut self, _: String) {}
+            fn fork(&self) -> Box<dyn Provider> { Box::new(self.clone()) }
+            async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> Result<Response> {
+                let answering = req.items.last().is_none_or(|item| !matches!(item, Item::User { text, .. } if text == COMPACT_PROMPT));
+                if answering && req.items.iter().any(|item| matches!(item, Item::User { text, .. } if text.contains("UNIQUE_PASTE"))) {
+                    *self.0.lock().unwrap() = true;
+                }
+                Ok(Response {
+                    items: vec![Item::Assistant { text: "ok".into() }],
+                    usage: Some(Usage { input_tokens: 10, output_tokens: 1, cached_tokens: 0 }),
+                })
+            }
+        }
+
+        let saw = Arc::new(Mutex::new(false));
+        let mut agent = agent(Response::default(), None);
+        agent.provider = Box::new(Rec(saw.clone()));
+        let paste = format!("UNIQUE_PASTE {}", "line\n".repeat(50));
+        let end = agent.turn(Item::user(paste), &mut QuietUi, CancellationToken::new()).await.unwrap();
+        assert!(matches!(end, TurnEnd::Done));
+        assert!(*saw.lock().unwrap(), "the unsent paste was summarized away before the model saw it");
+        assert!(agent.items.iter().any(|item| matches!(item, Item::User { text, .. } if text.contains("UNIQUE_PASTE")))
+            || agent.items.iter().any(|item| matches!(item, Item::Compaction { .. })));
     }
 
     #[tokio::test]
