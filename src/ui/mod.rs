@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::agent::{Approval, ApprovalRequest, Ui};
 use crate::tools::ToolOutput;
 use crate::types::{Item, StreamEvent};
-use render::{dim, one_line, paint};
+use render::{dim, one_line, paint, sanitize_text};
 
 fn color_err() -> bool {
     std::env::var_os("NO_COLOR").is_none() && io::stderr().is_terminal()
@@ -35,10 +35,11 @@ impl PlainUi {
 #[async_trait::async_trait]
 impl Ui for PlainUi {
     fn notice(&mut self, msg: &str) {
-        eprintln!("{msg}");
+        eprintln!("{}", sanitize_text(msg));
     }
     fn stream(&mut self, event: &StreamEvent) {
         if let StreamEvent::Text(t) = event {
+            let t = sanitize_text(t);
             if !t.is_empty() {
                 let mut out = io::stdout().lock();
                 let _ = out.write_all(t.as_bytes());
@@ -121,16 +122,18 @@ pub fn list(lines: &[String]) {
 }
 
 pub fn info(msg: &str) {
+    let msg = sanitize_text(msg);
     match tui::active() {
-        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_info(msg, Style::new()),
+        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_info(&msg, Style::new()),
         None => eprintln!("{msg}"),
     }
 }
 
 pub fn error(msg: &str) {
+    let msg = sanitize_text(msg);
     let style = Style::new().fg(Color::Red);
     match tui::active() {
-        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_error(msg),
+        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_error(&msg),
         None => eprintln!("{}", paint(color_err(), style, &format!("error: {msg}"))),
     }
 }

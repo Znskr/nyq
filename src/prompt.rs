@@ -23,7 +23,7 @@ fn sandbox_guidance(policy: &crate::sandbox::Policy) -> String {
     match policy.mode {
         crate::sandbox::Mode::Off => format!("{described}. Avoid destructive commands unless asked."),
         crate::sandbox::Mode::ReadOnly => format!(
-            "{described}. The shell cannot write files{net}. write_file and edit_file are refused."
+            "{described}. Workspace writes are blocked{net}, but temporary directories remain writable. write_file and edit_file are refused."
         ),
         crate::sandbox::Mode::WorkspaceWrite => format!(
             "{described}. The shell can write only inside the workspace and temporary directories{net}. write_file and edit_file can write only inside the workspace."
@@ -69,7 +69,8 @@ mod tests {
 
         let ro = system(dir.path(), &Policy { mode: Mode::ReadOnly, network: false, ..Policy::default() });
         assert!(ro.contains("read-only"), "{ro}");
-        assert!(ro.contains("cannot write files") || ro.contains("cannot open TCP"));
+        assert!(ro.contains("temporary directories remain writable"), "{ro}");
+        assert!(ro.contains("write_file and edit_file are refused"), "{ro}");
         assert!(!ro.contains("without a sandbox"));
 
         let ww = system(dir.path(), &Policy::default());
