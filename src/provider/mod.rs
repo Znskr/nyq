@@ -3,7 +3,7 @@
 
 pub mod codex;
 pub mod openai;
-mod sse;
+pub(crate) mod sse;
 
 use crate::types::{Request, Response, StreamEvent};
 
@@ -15,6 +15,11 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     fn model(&self) -> &str;
     fn set_model(&mut self, model: String);
+    /// Reasoning effort, if the provider supports choosing one (None = auto).
+    fn effort(&self) -> Option<&str> {
+        None
+    }
+    fn set_effort(&mut self, _effort: Option<String>) {}
     /// Stream one response. Cancellation is done by dropping the future.
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> anyhow::Result<Response>;
 }

@@ -96,8 +96,8 @@ pub fn replay(items: &[Item]) {
         match item {
             Item::User { text, .. } => s.print_user(text),
             Item::Assistant { text } => s.print_markdown(text),
-            Item::ToolCall { name, arguments, .. } => s.print_tool_call(name, &args_digest(arguments)),
-            Item::Compaction { .. } => s.print_info("(earlier conversation compacted)", dim()),
+            Item::ToolCall { name, arguments, .. } => s.print_tool(name, &args_digest(arguments), None),
+            Item::Compaction { .. } => s.print_info("  (earlier conversation compacted)", dim()),
             _ => {}
         }
     }
@@ -105,14 +105,9 @@ pub fn replay(items: &[Item]) {
 
 pub fn banner(version: &str) {
     let text = format!(
-        "{} {}\n{}",
-        paint(true, Style::new().bold().fg(Color::Rgb(138, 173, 244)), "nyq"),
-        paint(true, dim(), version),
-        paint(
-            true,
-            dim(),
-            "esc interrupt · enter steer while working · alt+enter queue follow-up · alt+↑ edit queue\n/ commands · ! shell · ctrl+c clear/exit · shift+enter or ctrl+j newline"
-        )
+        "{} {}",
+        paint(true, Style::new().bold().fg(Color::Rgb(238, 238, 238)), "𝒏yq"),
+        paint(true, Style::new().fg(Color::Rgb(138, 138, 138)), &format!("v{version} · Run /help for commands · ctrl+l models · ctrl+d quit"))
     );
     info(&text);
 }
@@ -127,7 +122,7 @@ pub fn info(msg: &str) {
 pub fn error(msg: &str) {
     let style = Style::new().fg(Color::Red);
     match tui::active() {
-        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_info(&format!("error: {msg}"), style),
+        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_error(msg),
         None => eprintln!("{}", paint(color_err(), style, &format!("error: {msg}"))),
     }
 }
