@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod diagnostics;
 mod doctor;
+mod hooks;
 mod pricing;
 mod usage;
 mod login;
@@ -29,7 +30,7 @@ mod workspace;
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 
@@ -192,6 +193,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/memory", "saved memories; /memory remove N forgets one"),
     ("/background", "background processes; /background kill ID|last"),
     ("/permissions", "permission rules and session grants; /permissions reload re-reads them"),
+    ("/hooks", "list hooks and trust state; /hooks trust trusts the project's hooks"),
     ("/yolo", "toggle auto-approval of tool calls"),
     ("/usage", "profile usage totals: /usage [24h|7d|30d]"),
     ("/stats", "session turns, requests, tokens, tools and duration"),
@@ -325,6 +327,10 @@ async fn run() -> Result<()> {
     policy.writable = prepared.active;
     let sandbox = std::sync::Arc::new(policy);
     let mut ws = prepared.runtime;
+    let (hooks, hook_warnings) = hooks::Hooks::load(&home, &cwd);
+    for w in &hook_warnings {
+        ui::error(w);
+    }
     let mut agent = Agent {
         session: Some(Session::create(&sessions_dir, &cwd, provider.model())?),
         provider,
@@ -342,6 +348,7 @@ async fn run() -> Result<()> {
         context_estimated: false,
         suppress_auto_compact: false,
         submitted: 0,
+        hooks: std::sync::Arc::new(hooks),
         sandbox,
         undo: Default::default(),
     };
@@ -388,8 +395,13 @@ async fn run() -> Result<()> {
         }
         connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
         mcp_features::sync(&mut agent, &mcp);
+        hooks::session_start(&agent, if resumed.is_some() { "resume" } else { "startup" }).await;
         let mut plain = ui::PlainUi::new(cli.yolo);
         let cancel = cancel_on_ctrl_c();
+        if let Some(msg) = hooks::prompt_submit(&mut agent, &text, &cancel).await {
+            mcp.shutdown().await;
+            bail!("{msg}");
+        }
         let (item, _, warning) = tools::image::user_turn(&text, &cwd);
         if let Some(warning) = warning {
             ui::error(&warning);
@@ -424,6 +436,7 @@ async fn run() -> Result<()> {
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
     mcp_features::sync(&mut agent, &mcp);
     tui.screen().editor.set_mcp_commands(mcp_features::prompt_commands(&mcp));
+    hooks::session_start(&agent, if resumed.is_some() { "resume" } else { "startup" }).await;
     agent.tools.add(Box::new(agent::AskUserTool));
     if pick {
         // A prompt given with `-r` waits in the editor until a session is picked.
@@ -450,7 +463,7 @@ async fn run() -> Result<()> {
                     continue;
                 }
                 Some(UiCommand::Resume(id)) => {
-                    if let Err(e) = resume_session(&mut agent, &sessions_dir, &id) {
+                    if let Err(e) = resume_session(&mut agent, &sessions_dir, &id).await {
                         ui::error(&format!("{e:#}"));
                     }
                     continue;
@@ -528,6 +541,13 @@ async fn run() -> Result<()> {
                 }
             }
         }
+        tui.screen().print_user(&line);
+        // UserPromptSubmit sees the text the model gets (templates and MCP
+        // prompts expanded); a blocked prompt keeps its pending attachments.
+        if let Some(msg) = hooks::prompt_submit(&mut agent, &turn_text, &CancellationToken::new()).await {
+            ui::error(&msg);
+            continue;
+        }
         let (mut item, mut attached, warning) = tools::image::user_turn(&turn_text, &cwd);
         // Images added with /image, /paste or ctrl+v go with this message.
         let extra: Vec<_> = tui.screen().attachments.drain(..).collect();
@@ -537,7 +557,6 @@ async fn run() -> Result<()> {
                 attached.push(a.label);
             }
         }
-        tui.screen().print_user(&line);
         if let Some(warning) = warning {
             ui::error(&warning);
         } else if !attached.is_empty() {
@@ -807,13 +826,14 @@ fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
 }
 
 /// Switch to a saved session (`id`, id prefix or `last`), replaying it.
-fn resume_session(agent: &mut Agent, sessions_dir: &std::path::Path, which: &str) -> Result<()> {
+async fn resume_session(agent: &mut Agent, sessions_dir: &std::path::Path, which: &str) -> Result<()> {
     let (s, meta, items) = session::load(sessions_dir, which, &agent.cwd)?;
     agent.reset(Some(s));
     ui::replay(&items);
     agent.items = items;
     agent.adopt_transcript();
     ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+    hooks::session_start(agent, "resume").await;
     Ok(())
 }
 
@@ -858,7 +878,10 @@ async fn slash(
             }
             ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts\n  Ctrl+O transcript · Ctrl+V paste an image · prompt templates: see /alias");
         }
-        "/new" | "/clear" => commands::fresh(agent, sessions_dir)?,
+        "/new" | "/clear" => {
+            commands::fresh(agent, sessions_dir)?;
+            hooks::session_start(agent, "new").await;
+        }
         "/reset" => commands::reset(agent)?,
         "/continue" => commands::continue_response(agent, tui).await?,
         "/rename" => {
@@ -924,7 +947,7 @@ async fn slash(
             }
         }
         "/resume" => match arg.first() {
-            Some(which) => resume_session(agent, sessions_dir, which)?,
+            Some(which) => resume_session(agent, sessions_dir, which).await?,
             None => open_sessions(tui, sessions_dir, agent)?,
         },
         "/model" => match arg.first() {
@@ -1040,6 +1063,7 @@ async fn slash(
                 "unknown /permissions argument `{other}` (try /permissions or /permissions reload)"
             )),
         },
+        "/hooks" => hooks::command(agent, arg.first().copied()),
         "/yolo" => {
             agent.yolo = !agent.yolo;
             ui::info(if agent.yolo {
