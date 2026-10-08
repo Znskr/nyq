@@ -16,6 +16,8 @@ use crate::types::ToolSpec;
 
 /// Output kept per process; older bytes are dropped (and reported as such).
 const BUF_CAP: usize = 1024 * 1024;
+/// A finished process whose output has all been read is dropped after this.
+const DONE_KEEP: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq)]
 enum State {
@@ -91,7 +93,22 @@ fn table() -> std::sync::MutexGuard<'static, Table> {
 }
 
 fn with_proc<T>(id: u32, f: impl FnOnce(&mut Proc) -> T) -> Option<T> {
+    compact_finished(&mut table());
     table().procs.iter_mut().find(|p| p.id == id).map(f)
+}
+
+fn fully_read(p: &Proc) -> bool {
+    p.read >= p.base + p.buf.len() as u64
+}
+
+fn finished_and_read(p: &Proc, now: Instant, keep: Duration) -> bool {
+    matches!(p.ended, Some(ended) if fully_read(p) && now.saturating_duration_since(ended) >= keep)
+}
+
+/// Drop processes that have exited, been fully read, and sat that way for a while.
+fn compact_finished(table: &mut Table) {
+    let now = Instant::now();
+    table.procs.retain(|p| !finished_and_read(p, now, DONE_KEEP));
 }
 
 fn duration(d: Duration) -> String {
@@ -110,6 +127,7 @@ pub(crate) fn start(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy)
     let job = job.map(Arc::new);
     let id = {
         let mut t = table();
+        compact_finished(&mut t);
         t.next += 1;
         let id = t.next;
         t.procs.push(Proc {
@@ -243,7 +261,9 @@ fn parse_id(v: &Value) -> Option<u32> {
 
 /// Lines for `/background`.
 pub(crate) fn list_lines() -> Vec<String> {
-    let t = table();
+    let mut t = table();
+    compact_finished(&mut t);
+    let t = &*t;
     if t.procs.is_empty() {
         return vec!["No background processes.".into()];
     }
@@ -426,5 +446,41 @@ mod tests {
         assert!(read.content.contains("[output truncated"));
         let killed = r.get("kill_shell").unwrap().run(json!({"id": format!("#{id}")}), &ctx).await;
         assert!(!killed.is_error, "{}", killed.content);
+    }
+}
+
+#[cfg(test)]
+mod retain {
+    use super::*;
+
+    fn proc(command: &str, ended: Option<Instant>, buf: &str, read: u64) -> Proc {
+        Proc {
+            id: 1,
+            command: command.into(),
+            started: Instant::now(),
+            ended,
+            state: State::Exited(Some("exit code 0".into())),
+            pid: 1,
+            job: None,
+            kill_requested: false,
+            buf: buf.as_bytes().to_vec(),
+            base: 0,
+            read,
+        }
+    }
+
+    #[test]
+    fn read_finished_processes_are_dropped_and_unread_ones_stay() {
+        let ended = Instant::now();
+        let later = ended + DONE_KEEP;
+        let mut procs = vec![
+            proc("done", Some(ended), "all", 3),
+            proc("pending", Some(ended), "still here", 0),
+            proc("live", None, "running", 0),
+        ];
+        procs.retain(|p| !finished_and_read(p, later, DONE_KEEP));
+        let commands: Vec<_> = procs.iter().map(|p| p.command.as_str()).collect();
+        assert_eq!(commands, ["pending", "live"]);
+        assert!(!finished_and_read(&procs[0], ended, DONE_KEEP));
     }
 }

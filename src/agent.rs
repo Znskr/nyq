@@ -155,6 +155,9 @@ pub struct Agent {
     pub system: String,
     pub items: Vec<Item>,
     pub session: Option<Session>,
+    /// Session id usage rows should use when this agent has no session file
+    /// (a subagent records against its parent's session).
+    pub usage_session_id: Option<String>,
     pub cwd: PathBuf,
     /// How risky calls are decided. Deny rules still block in every mode.
     pub permission_mode: crate::permissions::Mode,
@@ -209,9 +212,10 @@ impl Agent {
             .filter(|p| !p.as_os_str().is_empty())
         {
             let session = self
-                .session
-                .as_ref()
-                .map_or(self.stats.id.as_str(), |s| s.id.as_str());
+                .usage_session_id
+                .as_deref()
+                .or_else(|| self.session.as_ref().map(|s| s.id.as_str()))
+                .unwrap_or(self.stats.id.as_str());
             if let Err(e) = crate::usage::append(
                 home,
                 session,
@@ -296,6 +300,9 @@ impl Agent {
                 return Ok(TurnEnd::Cancelled);
             };
             let response = result?;
+            if response.truncated {
+                ui.notice("The reply was cut off at the output limit.");
+            }
             self.account_usage(response.usage, ui);
             if let Some(u) = response.usage {
                 self.context_tokens = u.input_tokens + u.output_tokens;
@@ -475,19 +482,8 @@ impl Agent {
         ui: &mut dyn Ui,
         cancel: &CancellationToken,
     ) -> ToolOutput {
-        if let Some(out) = self.tools.handle_meta(name, arguments) {
-            let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-            ui.tool_start(
-                name,
-                args["query"]
-                    .as_str()
-                    .or(args["name"].as_str())
-                    .unwrap_or(""),
-            );
-            ui.tool_end(name, &out);
-            return out;
-        }
-        if self.tools.get(name).is_none() {
+        let meta = self.tools.is_meta(name);
+        if !meta && self.tools.get(name).is_none() {
             return ToolOutput::err(format!("Unknown tool `{name}`."));
         }
         if name == ASK_USER {
@@ -532,15 +528,26 @@ impl Agent {
             approver: ui.approver(),
             permissions: self.permissions.clone(),
             granted: Default::default(),
-            session_id: self.session.as_ref().map(|s| s.id.clone()),
+            session_id: self
+                .session
+                .as_ref()
+                .map(|s| s.id.clone())
+                .or_else(|| self.usage_session_id.clone()),
             hooks: self.hooks.clone(),
             subagent_dir: self.session.as_ref().map(|s| crate::subagents::store_dir(&s.path)),
         };
-        let summary = self
-            .tools
-            .get(name)
-            .map(|tool| tool.summary(&args))
-            .unwrap_or_default();
+        let summary = if meta {
+            args.get("query")
+                .and_then(Value::as_str)
+                .or_else(|| args.get("name").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string()
+        } else {
+            self.tools
+                .get(name)
+                .map(|tool| tool.summary(&args))
+                .unwrap_or_default()
+        };
 
         let session_id = ctx.session_id.clone();
         if let Some(msg) = self
@@ -619,11 +626,16 @@ impl Agent {
                 }
             }
         };
-        let Some(tool) = self.tools.get(name) else {
-            return ToolOutput::err(format!("Unknown tool `{name}`."));
-        };
+        // Hidden MCP tools are not callable by a remembered name. Deny rules
+        // and hooks above still apply; this runs only once the call is allowed.
+        if let Some(msg) = self.tools.deferred_block(name) {
+            ui.tool_start(name, &summary);
+            let out = ToolOutput::err(msg);
+            ui.tool_end(name, &out);
+            return out;
+        }
+        let preview = self.tools.get(name).and_then(|tool| tool.preview(&args, &ctx));
         if let Some(forced) = forced {
-            let preview = tool.preview(&args, &ctx);
             // A call that an `ask` rule forces can't be covered by a grant.
             let rule = if forced.is_some() {
                 None
@@ -679,6 +691,24 @@ impl Agent {
             }
         }
 
+        if meta {
+            let hook_args = self.hooks.observes_post_tool_use(name).then(|| args.clone());
+            let out = self.tools.handle_meta(name, arguments).unwrap_or_else(|| {
+                ToolOutput::err(format!("`{name}` is not available."))
+            });
+            ui.tool_start(name, &summary);
+            ui.tool_end(name, &out);
+            if let Some(args) = hook_args {
+                self.hooks
+                    .post_tool_use(name, &args, &out, &self.cwd, session_id.as_deref(), cancel)
+                    .await;
+            }
+            return out;
+        }
+        let Some(tool) = self.tools.get(name) else {
+            return ToolOutput::err(format!("Unknown tool `{name}`."));
+        };
+
         ui.tool_start(name, &summary);
         let before = self.undo.len();
         self.undo
@@ -699,6 +729,9 @@ impl Agent {
             self.undo.discard_last();
         }
         self.undo.append(std::mem::take(&mut out.undo));
+        if name == "memory" && !out.is_error {
+            crate::tools::memory::refresh_section(&mut self.system, &crate::config::home());
+        }
         // "Always" answers given for a subagent's calls belong to this session.
         self.allowed.extend(
             ctx.granted
@@ -757,6 +790,9 @@ impl Agent {
         if cancel.is_cancelled() {
             return Ok(false);
         }
+        if response.truncated {
+            anyhow::bail!("compaction was cut off at the output limit");
+        }
         anyhow::ensure!(
             !response
                 .items
@@ -810,11 +846,24 @@ impl Agent {
 
     /// Drop the transcript in place: same session id, model, sandbox and rules.
     pub fn clear_context(&mut self) -> Result<()> {
+        let artifact = self.session.as_ref().and_then(|session| {
+            session
+                .path
+                .parent()
+                .and_then(|dir| dir.parent())
+                .map(|home| (home.to_path_buf(), session.id.clone()))
+        });
         if let Some(session) = &mut self.session {
             session.clear_transcript()?;
         }
+        if let Some((home, id)) = artifact {
+            crate::tools::artifacts::remove_session(&home, &id);
+        }
         self.items.clear();
         self.usage = Usage::default();
+        let stats_id = std::mem::take(&mut self.stats.id);
+        self.stats = Default::default();
+        self.stats.id = stats_id;
         self.context_tokens = 0;
         self.context_estimated = false;
         self.suppress_auto_compact = false;
@@ -1487,6 +1536,7 @@ mod tests {
     async fn compaction_preserves_unsent_tail_on_resume_and_after_manual_compact() {
         let mut agent = agent(
             Response {
+                truncated: false,
                 items: vec![Item::Assistant {
                     text: "summary".into(),
                 }],
@@ -1507,8 +1557,11 @@ mod tests {
             .await
             .unwrap());
         let id = agent.session.as_ref().unwrap().id.clone();
-        let (_, _, loaded) = crate::session::load(dir.path(), &id, &agent.cwd).unwrap();
+        let cwd = agent.cwd.clone();
+        drop(agent.session.take());
+        let (session, _, loaded) = crate::session::load(dir.path(), &id, &cwd).unwrap();
         assert_eq!(loaded, agent.items);
+        agent.session = Some(session);
         assert_eq!(loaded.last(), Some(&tail));
         agent.submitted = 40;
         assert!(agent
@@ -1561,6 +1614,7 @@ mod tests {
             system: "system".into(),
             items: vec![Item::user("original")],
             session: None,
+            usage_session_id: None,
             cwd: PathBuf::from("."),
             permission_mode: crate::permissions::Mode::Yolo,
             review_cache: Default::default(),
@@ -1576,6 +1630,21 @@ mod tests {
             hooks: Default::default(),
             sandbox: Default::default(),
             undo: Default::default(),
+        }
+    }
+
+    struct NoticeCatch(Vec<String>);
+    #[async_trait::async_trait]
+    impl Ui for NoticeCatch {
+        fn stream(&mut self, _: &StreamEvent) {}
+        fn end_message(&mut self) {}
+        fn tool_start(&mut self, _: &str, _: &str) {}
+        fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
+        async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval {
+            Approval::Yes
+        }
+        fn notice(&mut self, msg: &str) {
+            self.0.push(msg.to_string());
         }
     }
 
@@ -1596,6 +1665,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut agent = agent(
             Response {
+                truncated: false,
                 items: vec![Item::Assistant {
                     text: "summary".into(),
                 }],
@@ -1651,6 +1721,7 @@ mod tests {
         };
         let mut agent = agent(
             Response {
+                truncated: false,
                 items: vec![Item::Assistant {
                     text: "summary".into(),
                 }],
@@ -1687,6 +1758,7 @@ mod tests {
         };
         let mut agent = agent(
             Response {
+                truncated: false,
                 items: vec![Item::Assistant {
                     text: "summary".into(),
                 }],
@@ -1728,7 +1800,7 @@ mod tests {
                 },
             ],
         ] {
-            let mut agent = agent(Response { items, usage: None }, None);
+            let mut agent = agent(Response { items, usage: None, truncated: false }, None);
             let before = agent.items.clone();
             assert!(agent
                 .compact(&mut QuietUi, &CancellationToken::new())
@@ -2096,6 +2168,7 @@ mod tests {
         let scripted = Scripted {
             left: Arc::new(Mutex::new(vec![
                 Response {
+                    truncated: false,
                     items: vec![Item::Assistant {
                         text: "summary".into(),
                     }],
@@ -2106,6 +2179,7 @@ mod tests {
                     }),
                 },
                 Response {
+                    truncated: false,
                     items: vec![Item::Assistant {
                         text: "answer".into(),
                     }],
@@ -2116,6 +2190,7 @@ mod tests {
                     }),
                 },
                 Response {
+                    truncated: false,
                     items: vec![Item::Assistant {
                         text: "next".into(),
                     }],
@@ -2182,6 +2257,7 @@ mod tests {
                     *self.0.lock().unwrap() = true;
                 }
                 Ok(Response {
+                    truncated: false,
                     items: vec![Item::Assistant { text: "ok".into() }],
                     usage: Some(Usage {
                         input_tokens: 10,
@@ -2250,6 +2326,7 @@ mod tests {
             agent.provider = Box::new(ScriptedTurns {
                 left: std::sync::Arc::new(std::sync::Mutex::new(vec![
                     Response {
+                        truncated: false,
                         items: vec![Item::ToolCall {
                             id: "1".into(),
                             name: "write_file".into(),
@@ -2262,6 +2339,7 @@ mod tests {
                         }),
                     },
                     Response {
+                        truncated: false,
                         items: vec![Item::Assistant {
                             text: "done".into(),
                         }],
@@ -2334,6 +2412,7 @@ mod tests {
         let mut script = Vec::new();
         for i in 0..calls {
             script.push(Response {
+                truncated: false,
                 items: vec![Item::ToolCall {
                     id: i.to_string(),
                     name: "mcp__wiki__ask".into(),
@@ -2343,6 +2422,7 @@ mod tests {
             });
         }
         script.push(Response {
+            truncated: false,
             items: vec![Item::Assistant {
                 text: "done".into(),
             }],
@@ -2469,7 +2549,7 @@ mod tests {
     async fn auto_mode_follows_the_classifier() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         fn response(items: Vec<Item>) -> crate::types::Response {
-            crate::types::Response { items, usage: None }
+            crate::types::Response { items, usage: None, truncated: false }
         }
         fn call() -> crate::types::Response {
             response(vec![Item::ToolCall {
@@ -2641,6 +2721,7 @@ mod tests {
                     self.saw_image.store(true, Ordering::SeqCst);
                 }
                 Ok(Response {
+                    truncated: false,
                     items: vec![Item::Assistant {
                         text: "answer".into(),
                     }],
@@ -2717,6 +2798,7 @@ mod tests {
                 {
                     self.saw_compact.store(true, Ordering::SeqCst);
                     return Ok(Response {
+                        truncated: false,
                         items: vec![Item::Assistant {
                             text: "summary".into(),
                         }],
@@ -2730,6 +2812,7 @@ mod tests {
                 {
                     self.saw_image.store(true, Ordering::SeqCst);
                     return Ok(Response {
+                        truncated: false,
                         items: vec![Item::Assistant {
                             text: "A pixel.".into(),
                         }],
@@ -2741,6 +2824,7 @@ mod tests {
                     });
                 }
                 Ok(Response {
+                    truncated: false,
                     items: vec![Item::ToolCall {
                         id: "1".into(),
                         name: "view_image".into(),
@@ -2869,6 +2953,7 @@ mod tests {
                 *self.saw.lock().unwrap() = req.system.to_string();
                 assert!(req.items.iter().all(|item| !matches!(item, Item::User { text, .. } if text.contains("Continue from where"))));
                 Ok(Response {
+                    truncated: false,
                     items: vec![Item::Assistant {
                         text: self.text.clone(),
                     }],
@@ -2931,12 +3016,20 @@ mod tests {
         agent.push(Item::user("hello"));
         agent.allowed.insert("bash:ls".into());
         let id = agent.session.as_ref().unwrap().id.clone();
+        agent.stats.turns = 4;
+        agent.stats.tools.insert("bash".into(), 2);
+        let stats_id = agent.stats.id.clone();
         agent.clear_context().unwrap();
         assert_eq!(agent.session.as_ref().unwrap().id, id);
+        assert_eq!(agent.stats.id, stats_id);
+        assert_eq!(agent.stats.turns, 0);
+        assert!(agent.stats.tools.is_empty());
         assert!(agent.items.is_empty());
         assert!(agent.allowed.is_empty());
         assert!(agent.undo.is_empty());
-        let (_, _, items) = crate::session::load(dir.path(), &id, &agent.cwd).unwrap();
+        let cwd = agent.cwd.clone();
+        drop(agent.session.take());
+        let (_, _, items) = crate::session::load(dir.path(), &id, &cwd).unwrap();
         assert!(items.is_empty());
     }
 
@@ -2992,6 +3085,197 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done\n");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_reply_is_kept_and_announced() {
+        let mut agent = agent(Response::default(), None);
+        agent.context_window = 0;
+        agent.items.clear();
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(vec![Response {
+                truncated: true,
+                items: vec![Item::Assistant {
+                    text: "partial".into(),
+                }],
+                usage: None,
+            }])),
+        });
+        let mut ui = NoticeCatch(Vec::new());
+        agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(agent
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Assistant { text } if text == "partial")));
+        assert!(ui.0.iter().any(|m| m.contains("cut off")), "{:?}", ui.0);
+    }
+
+    #[tokio::test]
+    async fn memory_tool_refreshes_the_system_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("NYQ_HOME");
+        std::env::set_var("NYQ_HOME", home.path());
+        let mut agent = agent(Response::default(), None);
+        agent.context_window = 0;
+        agent.items.clear();
+        agent.system = "system".into();
+        crate::tools::memory::register(&mut agent.tools);
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(vec![
+                Response {
+                    truncated: false,
+                    items: vec![Item::ToolCall {
+                        id: "1".into(),
+                        name: "memory".into(),
+                        arguments: r#"{"action":"add","fact":"the port is 7643"}"#.into(),
+                    }],
+                    usage: None,
+                },
+                Response {
+                    truncated: false,
+                    items: vec![Item::Assistant {
+                        text: "done".into(),
+                    }],
+                    usage: None,
+                },
+            ])),
+        });
+        let turned = agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await;
+        if let Some(v) = old {
+            std::env::set_var("NYQ_HOME", v);
+        } else {
+            std::env::remove_var("NYQ_HOME");
+        }
+        turned.unwrap();
+        assert!(
+            agent.system.contains("the port is 7643"),
+            "{}",
+            agent.system
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_is_recorded_under_the_parent_session() {
+        let home = tempfile::tempdir().unwrap();
+        let mut agent = agent(Response::default(), None);
+        agent.context_window = 0;
+        agent.items.clear();
+        agent.session = None;
+        agent.usage_session_id = Some("parent-1".into());
+        agent.permissions = std::sync::Arc::new(
+            crate::permissions::Permissions::load(home.path(), home.path()).0,
+        );
+        let stats_id = agent.stats.id.clone();
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(vec![Response {
+                truncated: false,
+                items: vec![Item::Assistant {
+                    text: "ok".into(),
+                }],
+                usage: Some(Usage {
+                    input_tokens: 9,
+                    output_tokens: 2,
+                    cached_tokens: 0,
+                }),
+            }])),
+        });
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        let log = std::fs::read_to_string(home.path().join("usage.jsonl")).unwrap();
+        assert!(log.contains("parent-1"), "{log}");
+        assert!(!log.contains(&stats_id), "{log}");
+        assert!(log.contains("\"input\":9"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn deferred_mcp_calls_honor_deny_and_stay_hidden() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct McpStub {
+            name: String,
+            runs: std::sync::Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for McpStub {
+            fn spec(&self) -> crate::types::ToolSpec {
+                crate::types::ToolSpec {
+                    name: self.name.clone(),
+                    description: "d".into(),
+                    parameters: serde_json::json!({}),
+                }
+            }
+            fn needs_approval(&self, _: &serde_json::Value) -> bool {
+                true
+            }
+            fn summary(&self, _: &serde_json::Value) -> String {
+                String::new()
+            }
+            async fn run(&self, _: serde_json::Value, _: &ToolCtx) -> ToolOutput {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                ToolOutput::ok("ran")
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("permissions.json"),
+            r#"{"deny":["mcp_select_tool"]}"#,
+        )
+        .unwrap();
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(Response::default(), None);
+        agent.context_window = 0;
+        agent.items.clear();
+        agent.permission_mode = crate::permissions::Mode::Yolo;
+        agent.permissions = std::sync::Arc::new(
+            crate::permissions::Permissions::load(home.path(), home.path()).0,
+        );
+        for i in 0..41 {
+            agent.tools.add(Box::new(McpStub {
+                name: format!("mcp__s__t{i}"),
+                runs: runs.clone(),
+            }));
+        }
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(vec![
+                Response {
+                    truncated: false,
+                    items: vec![
+                        Item::ToolCall {
+                            id: "sel".into(),
+                            name: "mcp_select_tool".into(),
+                            arguments: r#"{"name":"mcp__s__t0"}"#.into(),
+                        },
+                        Item::ToolCall {
+                            id: "call".into(),
+                            name: "mcp__s__t0".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    usage: None,
+                },
+                Response {
+                    truncated: false,
+                    items: vec![Item::Assistant {
+                        text: "done".into(),
+                    }],
+                    usage: None,
+                },
+            ])),
+        });
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        let out = results(&agent);
+        assert!(out[0].contains("blocked by permissions"), "{}", out[0]);
+        assert!(out[1].contains("mcp_search_tools"), "{}", out[1]);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
     #[cfg(unix)]

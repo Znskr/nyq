@@ -424,6 +424,10 @@ fn cache_key(action: &Action) -> String {
     key.push_str(action.user_request.trim());
     key.push('\0');
     key.push_str(&action.cwd);
+    key.push('\0');
+    key.push_str(&action.origin);
+    key.push('\0');
+    key.push_str(action.branch.as_deref().unwrap_or(""));
     for prior in &action.prior {
         key.push('\0');
         key.push_str(&prior.name);
@@ -643,6 +647,19 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_changes_with_branch_and_origin() {
+        let base = bash_action();
+        let mut other_branch = base.clone();
+        other_branch.branch = Some("feature/x".into());
+        let mut other_origin = base.clone();
+        other_origin.origin = "subagent".into();
+        let key = |action: &Action| prepare(action).cache_key;
+        assert_ne!(key(&base), key(&other_branch));
+        assert_ne!(key(&base), key(&other_origin));
+        assert_ne!(key(&other_branch), key(&other_origin));
+    }
+
+    #[test]
     fn parses_allow_ask_deny_and_rejects_invalid() {
         let ok = |decision: &str| {
             parse_arguments(&format!(
@@ -711,6 +728,7 @@ mod tests {
 
     fn decision(arguments: &str) -> Response {
         Response {
+            truncated: false,
             items: vec![Item::ToolCall {
                 id: "r".into(),
                 name: TOOL_NAME.into(),

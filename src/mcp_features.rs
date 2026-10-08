@@ -18,6 +18,9 @@ use crate::types::ToolSpec;
 const LIST: &str = "mcp_list_resources";
 const READ: &str = "mcp_read_resource";
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// One text block, and the joined prompt or resource, stay under these caps.
+const BLOCK_CAP: usize = 8 * 1024;
+const TOTAL_CAP: usize = 32 * 1024;
 
 /// Re-install the resource tools for the servers connected now.
 pub fn sync(agent: &mut Agent, mcp: &McpManager) {
@@ -93,7 +96,7 @@ pub async fn prompt_turn(mcp: &McpManager, line: &str) -> Result<String> {
     if parts.is_empty() {
         bail!("MCP prompt {} returned no text", prompt.name);
     }
-    Ok(parts.join("\n\n"))
+    Ok(cap_parts(parts))
 }
 
 /// `key=value` words set that argument; other words fill the declared
@@ -133,6 +136,36 @@ fn parse_args(declared: &[(String, bool)], rest: &str) -> Result<Map<String, Val
         bail!("missing required prompt argument(s): {} (pass them in order or as name=value)", missing.join(", "));
     }
     Ok(out)
+}
+
+/// Keep the head and tail of `text` and mark the cut.
+fn cap_text(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let marker = "\n[truncated]\n";
+    if cap <= marker.len() + 2 {
+        let mut end = cap.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return format!("{}[truncated]", &text[..end]);
+    }
+    let keep = cap - marker.len();
+    let mut head = keep / 2;
+    while head > 0 && !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len().saturating_sub(keep - head);
+    while tail < text.len() && !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{marker}{}", &text[..head], &text[tail..])
+}
+
+fn cap_parts(parts: Vec<String>) -> String {
+    let capped: Vec<String> = parts.into_iter().map(|part| cap_text(&part, BLOCK_CAP)).collect();
+    cap_text(&capped.join("\n\n"), TOTAL_CAP)
 }
 
 fn block_text(c: &ContentBlock) -> String {
@@ -182,6 +215,10 @@ impl Tool for ListResources {
 
     fn summary(&self, args: &Value) -> String {
         args.get("server").and_then(Value::as_str).unwrap_or("all servers").to_string()
+    }
+
+    fn needs_approval(&self, _args: &Value) -> bool {
+        true
     }
 
     async fn run(&self, args: Value, _ctx: &ToolCtx) -> ToolOutput {
@@ -254,6 +291,10 @@ impl Tool for ReadResource {
         format!("{} {}", args["server"].as_str().unwrap_or(""), args["uri"].as_str().unwrap_or(""))
     }
 
+    fn needs_approval(&self, _args: &Value) -> bool {
+        true
+    }
+
     async fn run(&self, args: Value, _ctx: &ToolCtx) -> ToolOutput {
         let (Some(server), Some(uri)) = (args.get("server").and_then(Value::as_str), args.get("uri").and_then(Value::as_str)) else {
             return ToolOutput::err(format!("{READ}: `server` and `uri` are required"));
@@ -286,7 +327,7 @@ impl Tool for ReadResource {
                 _ => parts.push("[unsupported resource content]".into()),
             }
         }
-        out.content = if parts.is_empty() { "(empty resource)".into() } else { parts.join("\n\n") };
+        out.content = if parts.is_empty() { "(empty resource)".into() } else { cap_parts(parts) };
         out
     }
 }
@@ -350,9 +391,11 @@ for line in sys.stdin:
         let ctx = ToolCtx::default();
         let list = ListResources { servers: servers.clone(), names: names.clone() };
         let out = list.run(json!({}), &ctx).await;
+        assert!(list.needs_approval(&json!({})));
         assert!(out.content.contains("mem://notes  notes (text/plain) — Team notes"), "{}", out.content);
         assert!(list.run(json!({"server": "nope"}), &ctx).await.is_error);
         let read = ReadResource { servers, names };
+        assert!(read.needs_approval(&json!({})));
         let out = read.run(json!({"server": "docs", "uri": "mem://notes"}), &ctx).await;
         assert_eq!(out.content, "[resource mem://notes]\ncontents of mem://notes");
 
@@ -362,6 +405,19 @@ for line in sys.stdin:
         assert!(prompt_turn(&mcp, "/mcp:docs:other").await.is_err());
         mcp.shutdown().await;
         assert!(prompt_commands(&mcp).is_empty());
+    }
+
+    #[test]
+    fn long_blocks_are_truncated() {
+        let block = "é".repeat(BLOCK_CAP + 100);
+        let one = cap_text(&block, BLOCK_CAP);
+        assert!(one.len() <= BLOCK_CAP, "{}", one.len());
+        assert!(one.contains("[truncated]"));
+        assert!(one.starts_with('é') && one.ends_with('é'));
+        let joined = cap_parts(vec![block.clone(), block]);
+        assert!(joined.len() <= TOTAL_CAP, "{}", joined.len());
+        assert!(joined.contains("[truncated]"));
+        assert_eq!(cap_text("short", 100), "short");
     }
 
     #[test]

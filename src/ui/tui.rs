@@ -5,6 +5,7 @@
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -1810,6 +1811,8 @@ impl Screen {
         // Commit what is on screen so the viewer and the scrollback agree.
         self.clear_pane();
         let _ = self.out.flush();
+        // Set before entering so a panic in the viewer still leaves the alt screen.
+        TRANSCRIPT_ALT_SCREEN.store(true, Ordering::SeqCst);
         let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide);
         self.viewer = Some(super::transcript::Viewer::new(
             &self.log,
@@ -1824,7 +1827,11 @@ impl Screen {
         if self.viewer.take().is_none() {
             return;
         }
-        let _ = execute!(self.out, terminal::LeaveAlternateScreen, cursor::Show);
+        if TRANSCRIPT_ALT_SCREEN.swap(false, Ordering::SeqCst) {
+            let _ = execute!(self.out, terminal::LeaveAlternateScreen, cursor::Show);
+        } else {
+            let _ = execute!(self.out, cursor::Show);
+        }
         self.pane_rows = 0;
         self.cursor_row = 0;
         let rows = std::mem::take(&mut self.deferred);
@@ -2283,6 +2290,7 @@ impl Tui {
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
             )?;
             setup.enhanced = true;
+            KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
         }
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -2478,7 +2486,7 @@ impl Drop for Tui {
         }
         *SCREEN.lock().unwrap() = None;
         if self.enhanced {
-            let _ = execute!(crate::record_tape::stdout(), PopKeyboardEnhancementFlags);
+            pop_keyboard_enhancement();
         }
         restore_terminal();
     }
@@ -2512,7 +2520,7 @@ impl Drop for TerminalSetup {
             return;
         }
         if self.enhanced {
-            let _ = execute!(crate::record_tape::stdout(), PopKeyboardEnhancementFlags);
+            pop_keyboard_enhancement();
         }
         if self.bracketed {
             let _ = execute!(crate::record_tape::stdout(), crossterm::event::DisableBracketedPaste);
@@ -2522,8 +2530,35 @@ impl Drop for TerminalSetup {
     }
 }
 
+/// The viewer is on the alternate screen. The panic hook and `Drop` both restore.
+static TRANSCRIPT_ALT_SCREEN: AtomicBool = AtomicBool::new(false);
+/// Keyboard enhancement flags were pushed. Pop them once.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+fn pop_keyboard_enhancement() {
+    if KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(crate::record_tape::stdout(), PopKeyboardEnhancementFlags);
+    }
+}
+
+/// Flags the panic hook should undo, taken so a later `Drop` does not repeat them.
+fn take_terminal_fixes() -> (bool, bool) {
+    (
+        TRANSCRIPT_ALT_SCREEN.swap(false, Ordering::SeqCst),
+        KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst),
+    )
+}
+
 fn restore_terminal() {
-    let _ = execute!(crate::record_tape::stdout(), crossterm::event::DisableBracketedPaste, cursor::Show);
+    let (alt, enhanced) = take_terminal_fixes();
+    let mut out = crate::record_tape::stdout();
+    if alt {
+        let _ = execute!(out, terminal::LeaveAlternateScreen);
+    }
+    if enhanced {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(out, crossterm::event::DisableBracketedPaste, cursor::Show);
     let _ = terminal::disable_raw_mode();
 }
 
@@ -2799,6 +2834,14 @@ fn take_follow_up_text(queue: &mut Vec<(Queued, String)>) -> Option<String> {
 mod tests {
     use super::*;
     use std::future::Future;
+
+    #[test]
+    fn panic_restore_takes_alt_screen_and_keyboard_flags_once() {
+        TRANSCRIPT_ALT_SCREEN.store(true, Ordering::SeqCst);
+        KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
+        assert_eq!(take_terminal_fixes(), (true, true));
+        assert_eq!(take_terminal_fixes(), (false, false));
+    }
 
     #[test]
     fn windows_input_and_clipboard() {
