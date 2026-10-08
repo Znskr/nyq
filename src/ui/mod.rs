@@ -3,6 +3,10 @@
 
 pub mod editor;
 mod render;
+pub mod settings;
+pub mod statusline;
+pub mod transcript;
+pub mod clipboard;
 pub mod tui;
 
 use std::io::{self, IsTerminal, Write};
@@ -117,11 +121,14 @@ fn args_digest(args: &str) -> String {
 pub fn replay(items: &[Item]) {
     let Some(screen) = tui::active() else { return };
     let mut s = screen.lock().unwrap_or_else(|e| e.into_inner());
+    // The transcript viewer shows the resumed conversation from here on.
+    s.log.clear();
     for item in items {
         match item {
             Item::User { text, .. } => s.print_user(text),
             Item::Assistant { text } => s.print_markdown(text),
             Item::ToolCall { name, arguments, .. } => s.print_tool(name, &args_digest(arguments), None),
+            Item::ToolResult { output, is_error, .. } => s.log.tool_end(output, None, *is_error),
             Item::Compaction { .. } => s.print_info("  (earlier conversation compacted)", dim()),
             _ => {}
         }
