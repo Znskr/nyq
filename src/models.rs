@@ -7,20 +7,57 @@ use anyhow::Result;
 use crate::provider::Provider;
 
 /// One selectable model.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelChoice {
-    /// Provider group shown as a tab: "codex", "ollama", or "openai".
+    /// Provider group shown as a tab: "codex", "ollama", "openai", or a
+    /// hosted service ("opencode-go", "opencode", "xai", "vercel").
     pub provider: String,
     pub model: String,
     /// Tokens, when the provider reports it.
     pub context_window: Option<u64>,
     /// Supported reasoning efforts, lowest first (empty if not adjustable).
     pub efforts: Vec<String>,
+    /// Price summary, when known (e.g. `$1.4/$4.4 per 1M`).
+    pub price: Option<String>,
+}
+
+/// Models of every hosted service that has an API key. Services without a
+/// key are skipped silently; failures become short warnings.
+async fn hosted(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
+    use crate::provider::hosted::{api_key, HostedProvider, Service};
+    let configured: Vec<_> = Service::ALL.into_iter().filter(|s| api_key(home, *s).is_some()).collect();
+    if configured.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    crate::catalog::refresh(home).await;
+    let lists = futures::future::join_all(configured.iter().map(|&service| async move {
+        let provider = HostedProvider::configured(home, service, service.default_model().into(), None)?;
+        provider.list_models().await
+    }))
+    .await;
+    let (mut choices, mut warnings) = (Vec::new(), Vec::new());
+    for (service, list) in configured.into_iter().zip(lists) {
+        match list {
+            Ok(models) => choices.extend(models),
+            Err(e) => warnings.push(format!("{}: {}", service.id(), short(&format!("{e:#}")))),
+        }
+    }
+    (choices, warnings)
+}
+
+/// The first line of an error, capped for the switcher.
+fn short(error: &str) -> String {
+    let line = error.lines().next().unwrap_or_default();
+    match line.char_indices().nth(160) {
+        Some((i, _)) => format!("{}…", &line[..i]),
+        None => line.to_string(),
+    }
 }
 
 /// All models from every reachable provider (Codex login, local Ollama, the
-/// configured OpenAI-compatible endpoint). Unreachable providers are skipped
-/// and reported as warnings. Never takes longer than a few seconds.
+/// configured OpenAI-compatible endpoint, hosted services with an API key).
+/// Unreachable providers are skipped and reported as warnings. Never takes
+/// longer than a few seconds.
 pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
     use crate::{
         config,
@@ -53,7 +90,7 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
             Err(e) => Ok((model.into_iter().collect(), Some(format!("openai: {e}")))),
         }
     };
-    let (codex, ollama, openai): (_, _, Result<_>) = tokio::join!(codex, ollama, openai);
+    let (codex, ollama, openai, hosted): (_, _, Result<_>, _) = tokio::join!(codex, ollama, openai, hosted(home));
     let mut warnings = Vec::new();
     let mut choices = match codex {
         Ok(models) => models,
@@ -69,7 +106,7 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
         provider: "ollama".into(),
         model,
         context_window: context,
-        efforts: Vec::new(),
+        ..ModelChoice::default()
     }));
     match openai {
         Ok((models, warning)) => {
@@ -77,12 +114,13 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
             choices.extend(models.into_iter().map(|model| ModelChoice {
                 provider: "openai".into(),
                 model,
-                context_window: None,
-                efforts: Vec::new(),
+                ..ModelChoice::default()
             }));
         }
         Err(e) => warnings.push(format!("openai: {e}")),
     }
+    choices.extend(hosted.0);
+    warnings.extend(hosted.1);
     (choices, warnings)
 }
 
@@ -132,7 +170,15 @@ pub fn build(
                 choice.model.clone(),
             )))
         }
-        other => anyhow::bail!("unknown provider `{other}`"),
+        other => match crate::provider::hosted::Service::parse(other) {
+            Some(service) => Ok(Box::new(crate::provider::hosted::HostedProvider::configured(
+                home,
+                service,
+                choice.model.clone(),
+                effort,
+            )?)),
+            None => anyhow::bail!("unknown provider `{other}`"),
+        },
     }
 }
 
@@ -175,6 +221,7 @@ mod tests {
             model: "test".into(),
             context_window: Some(42),
             efforts: vec!["low".into()],
+            price: None,
         };
         save_last(dir.path(), &choice, Some("low")).unwrap();
         let read = || {
