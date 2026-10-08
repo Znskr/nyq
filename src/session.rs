@@ -36,10 +36,160 @@ pub struct Meta {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename = "session")]
 struct Header {
+    #[serde(default = "current_version")]
+    version: u32,
     id: String,
     created: DateTime<Utc>,
     cwd: PathBuf,
     model: String,
+}
+
+fn current_version() -> u32 {
+    1
+}
+
+/// Resolve files independently of header readability (needed for salvage).
+fn source_path(dir: &Path, which: &str, cwd: &Path) -> Result<PathBuf> {
+    if which == "last" {
+        return Ok(find(dir, which, cwd)?.path);
+    }
+    ensure_identifier(which)?;
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "jsonl") {
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                if id == which {
+                    return Ok(path);
+                }
+                if id.starts_with(which) {
+                    matches.push(path);
+                }
+            }
+        }
+    }
+    match matches.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => bail!("No session matches '{which}'"),
+        _ => bail!(
+            "'{which}' is ambiguous; it matches {} sessions",
+            matches.len()
+        ),
+    }
+}
+fn ensure_identifier(which: &str) -> Result<()> {
+    if which.is_empty()
+        || !which
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("invalid session id");
+    }
+    Ok(())
+}
+
+/// Salvage readable records, leaving all source bytes unchanged.
+pub fn recover(dir: &Path, which: &str, cwd: &Path) -> Result<(String, usize, usize)> {
+    let path = source_path(dir, which, cwd)?;
+    let data = fs::read(&path)?;
+    let header = data
+        .split(|b| *b == b'\n')
+        .next()
+        .and_then(|line| serde_json::from_slice::<Header>(line).ok());
+    let mut recovered = Session::create(
+        dir,
+        header.as_ref().map_or(cwd, |h| h.cwd.as_path()),
+        header.as_ref().map_or("unknown", |h| h.model.as_str()),
+    )?;
+    let mut payload = recovered.pending_header.take().expect("new header");
+    payload.push('\n');
+    let (mut kept, mut skipped) = (0, 0);
+    for (i, line) in data.split(|b| *b == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) || (i == 0 && header.is_some()) {
+            continue;
+        }
+        if let Ok(item) = serde_json::from_slice::<Item>(line) {
+            payload.push_str(&serde_json::to_string(&item)?);
+            kept += 1;
+        } else if is_title_line(line) {
+            let value: serde_json::Value = serde_json::from_slice(line)?;
+            if value["title"].as_str().is_none() {
+                skipped += 1;
+                continue;
+            }
+            payload.push_str(&serde_json::to_string(&value)?);
+        } else {
+            skipped += 1;
+            continue;
+        }
+        payload.push('\n');
+    }
+    if kept == 0 {
+        bail!("No readable items found; source unchanged");
+    }
+    write_private(&recovered.path, payload.as_bytes())?;
+    Ok((recovered.id, kept, skipped))
+}
+
+/// Upgrade the header atomically; refuse malformed bodies rather than losing data.
+pub fn migrate(dir: &Path, which: &str, cwd: &Path) -> Result<bool> {
+    let path = source_path(dir, which, cwd)?;
+    let data = fs::read(&path)?;
+    let first_end = data
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(data.len(), |n| n + 1);
+    let first = &data[..first_end];
+    let mut value = serde_json::from_slice::<serde_json::Value>(first).ok();
+    let has_header = value.as_ref().is_some_and(|v| v["type"] == "session");
+    let body = if has_header {
+        &data[first_end..]
+    } else {
+        &data[..]
+    };
+    for (i, line) in body.split(|b| *b == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) || is_title_line(line) {
+            continue;
+        }
+        serde_json::from_slice::<Item>(line)
+            .with_context(|| format!("line {} is corrupt; use nyq session recover", i + 1))?;
+    }
+    let header = if has_header {
+        let v = value.as_mut().expect("header value");
+        let _: Header = serde_json::from_value(v.clone())
+            .context("invalid session header; use nyq session recover")?;
+        if let Some(version) = v.get("version") {
+            let version = version.as_u64().context("invalid session version")?;
+            if version > u64::from(current_version()) {
+                bail!("unsupported session version {version}");
+            }
+            if version == u64::from(current_version()) {
+                return Ok(false);
+            }
+        }
+        v["version"] = serde_json::json!(current_version());
+        serde_json::to_string(v)?
+    } else {
+        serde_json::to_string(&Header {
+            version: current_version(),
+            id: path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .context("invalid filename")?
+                .into(),
+            created: Utc::now(),
+            cwd: cwd.into(),
+            model: "unknown".into(),
+        })?
+    };
+    let mut bytes = header.into_bytes();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(body);
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    write_private(&path, &bytes)?;
+    Ok(true)
 }
 
 pub struct Session {
@@ -58,6 +208,7 @@ impl Session {
     pub fn create(dir: &Path, cwd: &Path, model: &str) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string();
         let header = Header {
+            version: current_version(),
             id: id.clone(),
             created: Utc::now(),
             cwd: cwd.to_path_buf(),
@@ -859,6 +1010,61 @@ mod tests {
         assert!(load(dir, &id, Path::new("/w")).unwrap().2.is_empty());
         delete(dir, &id[..8], Path::new("/w")).unwrap();
         assert!(list(dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_skips_broken_lines_and_preserves_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("broken.jsonl");
+        let mut data = b"broken header\n".to_vec();
+        data.extend_from_slice(serde_json::to_string(&user("one")).unwrap().as_bytes());
+        data.extend_from_slice(b"\n{bad}\n");
+        data.extend_from_slice(serde_json::to_string(&user("two")).unwrap().as_bytes());
+        data.extend_from_slice(b"\n{truncated");
+        fs::write(&path, &data).unwrap();
+        let (id, kept, skipped) = recover(tmp.path(), "broken", Path::new("/w")).unwrap();
+        assert_eq!((kept, skipped), (2, 3));
+        assert_eq!(fs::read(path).unwrap(), data);
+        assert_eq!(
+            load(tmp.path(), &id, Path::new("/w")).unwrap().2,
+            vec![user("one"), user("two")]
+        );
+        assert!(recover(tmp.path(), "../broken", Path::new("/w")).is_err());
+    }
+
+    #[test]
+    fn migration_refuses_corruption_without_changing_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("corrupt.jsonl");
+        let data = b"{broken}\n";
+        fs::write(&path, data).unwrap();
+        assert!(migrate(tmp.path(), "corrupt", Path::new("/w")).is_err());
+        assert_eq!(fs::read(path).unwrap(), data);
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_keeps_first_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.jsonl");
+        fs::write(&path, serde_json::to_vec(&user("first")).unwrap()).unwrap();
+        assert!(migrate(tmp.path(), "legacy", Path::new("/w")).unwrap());
+        let once = fs::read(&path).unwrap();
+        assert!(!migrate(tmp.path(), "legacy", Path::new("/w")).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), once);
+        assert_eq!(
+            load(tmp.path(), "legacy", Path::new("/w")).unwrap().2,
+            vec![user("first")]
+        );
+        let mut header: serde_json::Value =
+            serde_json::from_slice(once.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        header.as_object_mut().unwrap().remove("version");
+        let legacy = format!(
+            "{header}\n{}\n",
+            serde_json::to_string(&user("first")).unwrap()
+        );
+        fs::write(&path, legacy).unwrap();
+        assert!(migrate(tmp.path(), "legacy", Path::new("/w")).unwrap());
+        assert!(!migrate(tmp.path(), "legacy", Path::new("/w")).unwrap());
     }
 
     #[test]
