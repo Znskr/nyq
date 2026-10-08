@@ -157,6 +157,8 @@ pub struct Agent {
     /// Automatic compaction may summarize only that prefix, so a user message
     /// that has not been submitted yet is kept verbatim.
     pub(crate) submitted: usize,
+    /// User-configured lifecycle hooks (see `crate::hooks`); empty by default.
+    pub hooks: std::sync::Arc<crate::hooks::Hooks>,
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
     /// File contents before each write/edit, for `/undo`.
     pub undo: crate::undo::UndoLog,
@@ -245,6 +247,7 @@ impl Agent {
                 }
                 if queued.is_empty() {
                     self.sync_estimate();
+                    crate::hooks::stop(self, &cancel).await;
                     return Ok(TurnEnd::Done);
                 }
                 for item in queued {
@@ -343,8 +346,17 @@ impl Agent {
             approver: ui.approver(),
             permissions: self.permissions.clone(),
             granted: Default::default(),
+            hooks: self.hooks.clone(),
         };
         let summary = tool.summary(&args);
+
+        let session_id = self.session.as_ref().map(|s| s.id.clone());
+        if let Some(msg) = self.hooks.pre_tool_use(name, &args, &self.cwd, session_id.as_deref(), cancel).await {
+            ui.tool_start(name, &summary);
+            let out = ToolOutput::err(msg);
+            ui.tool_end(name, &out);
+            return out;
+        }
 
         let needs_approval = tool.needs_approval_for(&args, &self.cwd);
         let forced = match self.permissions.decide(&self.allowed, name, &args, &self.cwd, needs_approval, self.yolo) {
@@ -410,6 +422,7 @@ impl Agent {
         ui.tool_start(name, &summary);
         let before = self.undo.len();
         self.undo.snapshot(&self.cwd, self.sandbox.mode, name, &args);
+        let hook_args = self.hooks.observes_post_tool_use(name).then(|| args.clone());
         let mut out = if tool.handles_cancel() {
             tool.run(args, &ctx).await
         } else {
@@ -425,6 +438,9 @@ impl Agent {
         // "Always" answers given for a subagent's calls belong to this session.
         self.allowed.extend(ctx.granted.lock().unwrap_or_else(|e| e.into_inner()).drain(..));
         ui.tool_end(name, &out);
+        if let Some(args) = hook_args {
+            self.hooks.post_tool_use(name, &args, &out, &self.cwd, session_id.as_deref(), cancel).await;
+        }
         out
     }
 
@@ -586,7 +602,7 @@ impl Agent {
         Ok(true)
     }
 
-    fn push_counted(&mut self, item: Item) {
+    pub(crate) fn push_counted(&mut self, item: Item) {
         if !self.context_estimated {
             self.context_tokens = self.context_tokens.saturating_add(item_tokens(&item));
         }
@@ -981,6 +997,7 @@ mod tests {
             context_estimated: false,
             suppress_auto_compact: false,
             submitted: 1,
+            hooks: Default::default(),
             sandbox: Default::default(),
             undo: Default::default(),
         }
@@ -1702,5 +1719,67 @@ mod tests {
         agent.turn(Item::user("inspect the screenshot"), &mut QuietUi, CancellationToken::new()).await.unwrap();
         assert!(!saw_compact.load(Ordering::SeqCst));
         assert!(saw_image.load(Ordering::SeqCst));
+    }
+
+    /// A hooks configuration with one user hook, for the wiring tests.
+    #[cfg(unix)]
+    fn hooks_with(event: crate::hooks::Event, command: &str) -> std::sync::Arc<crate::hooks::Hooks> {
+        std::sync::Arc::new(crate::hooks::Hooks::from_user_hook(crate::hooks::Hook {
+            event,
+            matcher: None,
+            command: command.to_string(),
+            timeout_secs: 5,
+        }))
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pre_tool_use_hook_blocks_the_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut blocked = calling_agent(&runs, 1);
+        blocked.hooks = hooks_with(
+            crate::hooks::Event::PreToolUse,
+            r#"echo '{"decision":"block","reason":"not on my watch"}'"#,
+        );
+        blocked
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        let out = &results(&blocked)[0];
+        assert!(out.contains("PreToolUse hook"), "{out}");
+        assert!(out.contains("not on my watch"), "{out}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stop_hook_runs_after_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("stopped");
+        let mut agent = calling_agent(&std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)), 0);
+        agent.hooks = hooks_with(
+            crate::hooks::Event::Stop,
+            &format!("echo done >> {}", marker.display()),
+        );
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done\n");
+    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn prompt_hooks_add_context_or_block() {
+        let mut agent = calling_agent(&std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)), 0);
+        agent.hooks = hooks_with(crate::hooks::Event::UserPromptSubmit, "echo branch: main");
+        let live = CancellationToken::new();
+        assert_eq!(crate::hooks::prompt_submit(&mut agent, "hi", &live).await, None);
+        assert!(matches!(agent.items.last(), Some(Item::User { text, .. }) if text.ends_with("branch: main")));
+        agent.hooks = hooks_with(crate::hooks::Event::UserPromptSubmit, r#"echo '{"decision":"block","reason":"no"}'"#);
+        let n = agent.items.len();
+        let msg = crate::hooks::prompt_submit(&mut agent, "hi", &live).await.unwrap();
+        assert!(msg.contains("no"), "{msg}");
+        assert_eq!(agent.items.len(), n);
     }
 }
