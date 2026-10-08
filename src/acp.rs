@@ -368,7 +368,7 @@ async fn open(
         sandbox,
         undo: Default::default(),
     };
-    agent.context_window = config::context_window_for(agent.provider.name(), None);
+    agent.context_window = config::context_window_for(agent.provider.name(), agent.provider.context_window());
     let skills = skills::discover(&state.home, &cwd);
     if !skills.is_empty() {
         agent.system.push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
@@ -541,7 +541,7 @@ async fn set_config_option(state: &Arc<State>, req: acp::SetSessionConfigOptionR
         None => {
             let (provider, model) =
                 value.split_once(':').ok_or_else(|| sdk::Error::invalid_params().data(format!("unknown model {value}")))?;
-            ModelChoice { provider: provider.into(), model: model.into(), context_window: None, efforts: Vec::new() }
+            ModelChoice { provider: provider.into(), model: model.into(), ..Default::default() }
         }
     };
     let window = config::context_window_for(&choice.provider, choice.context_window);
