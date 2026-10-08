@@ -788,9 +788,21 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
             c.as_os_str().to_str().is_some_and(|s| s.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"))
         });
         let resolved = cwd.join(path);
-        let in_git = git_component(Path::new(path)) || resolved.ancestors()
-            .find_map(|a| std::fs::canonicalize(a).ok())
-            .is_some_and(|real| git_component(&real));
+        // Follow links by hand too: canonicalize fails on a dangling link
+        // (e.g. `notes.txt -> .git/commondir`), which would otherwise slip by.
+        let link_into_git = |mut p: PathBuf| {
+            for _ in 0..8 {
+                let Ok(target) = std::fs::read_link(&p) else { return false };
+                if git_component(&target) {
+                    return true;
+                }
+                p = p.parent().map_or(target.clone(), |dir| dir.join(&target));
+            }
+            true // too many hops: treat as suspicious
+        };
+        let in_git = git_component(Path::new(path))
+            || resolved.ancestors().take_while(|a| a.starts_with(cwd)).any(|a| link_into_git(a.to_path_buf()))
+            || resolved.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_some_and(|real| git_component(&real));
         return allowed.contains(tool) && !path.is_empty() && !in_git && inside(cwd, path);
     }
     if tool == "subagent" {
@@ -1102,6 +1114,14 @@ mod tests {
         assert!(!is_allowed(&write, "write_file", &json!({"path": ".git/hooks/pre-commit"}), cwd));
         assert!(!is_allowed(&write, "edit_file", &json!({"path": "./.git/config"}), cwd));
         assert!(!is_allowed(&write, "write_file", &json!({"path": "sub/.git/config"}), cwd));
+        #[cfg(unix)]
+        {
+            // A dangling link into .git must not ride on an "always" grant.
+            std::os::unix::fs::symlink(".git/commondir", cwd.join("notes.txt")).unwrap();
+            assert!(!is_allowed(&write, "write_file", &json!({"path": "notes.txt"}), cwd));
+            std::os::unix::fs::symlink("src", cwd.join("code")).unwrap();
+            assert!(is_allowed(&write, "write_file", &json!({"path": "code/x.rs"}), cwd));
+        }
         for path in [".GIT/config", ".git. /hooks/new"] {
             assert!(!is_allowed(&write, "write_file", &json!({"path": path}), cwd));
         }

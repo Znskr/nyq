@@ -1433,9 +1433,20 @@ fn clipboard_bytes(text: &str, windows_clip: bool) -> Vec<u8> {
 }
 
 #[cfg(any(windows, test))]
-fn paste_enter(key: KeyEvent, previous: Option<Instant>, now: Instant) -> bool {
-    key.code == KeyCode::Enter && key.modifiers.is_empty()
-        && previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10))
+/// Windows has no bracketed paste: a paste arrives as a burst of key events.
+/// Enter or Tab inside a burst (several keys under 10ms apart) is text, not
+/// a command. Requiring a streak keeps a real Enter after a brief UI stall.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn paste_key(key: KeyEvent, previous: Option<Instant>, now: Instant, streak: usize) -> Option<&'static str> {
+    let fast = previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10));
+    if !fast || streak < 3 || !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Enter => Some("\n"),
+        KeyCode::Tab => Some("\t"),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -1481,7 +1492,7 @@ impl Tui {
             tokio::spawn(async move {
                 let mut events = EventStream::new();
                 #[cfg(windows)]
-                let mut previous = None;
+                let (mut previous, mut streak) = (None::<Instant>, 0usize);
                 while let Some(Ok(ev)) = events.next().await {
                     let mut s = lock(&screen);
                     match ev {
@@ -1489,9 +1500,10 @@ impl Tui {
                             #[cfg(windows)]
                             {
                                 let now = Instant::now();
-                                let paste = paste_enter(k, previous, now);
-                                if paste && s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() {
-                                    s.editor.paste("\n");
+                                let pasted = paste_key(k, previous, now, streak);
+                                streak = if previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10)) { streak + 1 } else { 0 };
+                                if let Some(text) = pasted.filter(|_| s.approval.is_none() && s.menu.is_none() && s.sessions.is_none()) {
+                                    s.editor.paste(text);
                                     s.redraw();
                                     previous = Some(Instant::now());
                                     continue;
@@ -1501,7 +1513,7 @@ impl Tui {
                             // Exclude rendering time when measuring the pause between keys.
                             #[cfg(windows)]
                             {
-                                previous = matches!(k.code, KeyCode::Char(_) | KeyCode::Enter).then_some(Instant::now());
+                                previous = matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab).then_some(Instant::now());
                             }
                         }
                         Event::Paste(text) => {
@@ -1829,15 +1841,19 @@ mod tests {
     fn windows_input_and_clipboard() {
         let now = Instant::now();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(paste_enter(enter, Some(now), now + Duration::from_millis(1)));
-        assert!(!paste_enter(enter, Some(now), now + Duration::from_millis(50)));
-        assert!(!paste_enter(enter, None, now));
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(paste_key(enter, Some(now), now + Duration::from_millis(1), 5), Some("\n"));
+        assert_eq!(paste_key(tab, Some(now), now + Duration::from_millis(1), 5), Some("\t"));
+        assert_eq!(paste_key(enter, Some(now), now + Duration::from_millis(50), 5), None);
+        assert_eq!(paste_key(enter, None, now, 5), None);
+        // A couple of keys released together after a stall are not a paste.
+        assert_eq!(paste_key(enter, Some(now), now + Duration::from_millis(1), 1), None);
         let mut editor = Editor::default();
         for (i, c) in "a\\\nb\n".chars().enumerate() {
             let key = KeyEvent::new(if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) }, KeyModifiers::NONE);
             let time = now + Duration::from_millis(i as u64);
-            if paste_enter(key, Some(now), time) {
-                editor.paste("\n");
+            if let Some(text) = paste_key(key, Some(now), time, 3) {
+                editor.paste(text);
             } else {
                 assert_eq!(editor.handle_key(key, true), Action::None);
             }
