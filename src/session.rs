@@ -200,6 +200,8 @@ pub struct Session {
     /// Items accepted by `append` whose write has not landed yet.
     queued: Vec<String>,
     file: Option<File>,
+    /// Held while the session is open (see `lock_session`).
+    lock: Option<File>,
 }
 
 impl Session {
@@ -220,6 +222,7 @@ impl Session {
             pending_header: Some(serde_json::to_string(&header)?),
             queued: Vec::new(),
             file: None,
+            lock: None,
         })
     }
 
@@ -293,7 +296,9 @@ impl Session {
             fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("securing {}", self.path.display()))?;
         }
-        lock_session(&file, &self.path)?;
+        if self.lock.is_none() {
+            self.lock = Some(lock_session(&self.path)?);
+        }
         self.file = Some(file);
         Ok(())
     }
@@ -318,7 +323,8 @@ impl Session {
         }
         let mut bytes = header.into_bytes();
         bytes.push(b'\n');
-        // Drop the locked handle so the replacement can be opened.
+        // Drop the old handle so the replacement can be opened (the session
+        // keeps its lock, which lives on a separate file).
         self.file.take();
         write_private(&self.path, &bytes).with_context(|| format!("clearing session {}", self.id))?;
         self.ensure_file()?;
@@ -357,17 +363,28 @@ impl Session {
 /// moment (the old descriptor is closed on another thread, or `close` has not
 /// dropped the lock yet), so a busy lock is retried briefly. A session that
 /// is actually still open stays locked for much longer than this.
-fn lock_session(file: &File, path: &Path) -> Result<()> {
+fn lock_session(path: &Path) -> Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("securing {}", path.display()))?;
     }
+    // Lock a sidecar file, not the transcript: Windows locks are mandatory
+    // and would stop every other reader (listing, resume, copy) of the log.
+    let lock_path = lock_path(path);
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&lock_path).with_context(|| format!("opening {}", lock_path.display()))?;
     let mut tries = 0u32;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(e).with_context(|| format!("locking {}", path.display()));
             }
@@ -382,10 +399,17 @@ fn lock_session(file: &File, path: &Path) -> Result<()> {
     }
 }
 
+/// `<id>.jsonl` → `<id>.jsonl.lock`.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(file) = self.file.as_ref() {
-            let _ = file.unlock();
+        if let Some(lock) = self.lock.as_ref() {
+            let _ = lock.unlock();
         }
     }
 }
@@ -590,6 +614,7 @@ pub fn print_summary(dir: &Path, which: &str, cwd: &Path) -> Result<()> {
 pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
     let meta = find(dir, which, cwd)?;
     fs::remove_file(&meta.path).with_context(|| format!("deleting {}", meta.path.display()))?;
+    let _ = fs::remove_file(lock_path(&meta.path));
     // Its named subagents go with it.
     let _ = fs::remove_dir_all(crate::subagents::store_dir(&meta.path));
     if let Some(home) = dir.parent() {
@@ -706,7 +731,7 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         .write(true)
         .open(&meta.path)
         .with_context(|| format!("opening {}", meta.path.display()))?;
-    lock_session(&file, &meta.path)?;
+    let lock = lock_session(&meta.path)?;
     let mut data = Vec::new();
     file.read_to_end(&mut data)
         .with_context(|| format!("reading {}", meta.path.display()))?;
@@ -728,6 +753,7 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         pending_header: None,
         queued: Vec::new(),
         file: Some(file),
+        lock: Some(lock),
     };
     for item in repairs(&items) {
         session.append(&item)?;

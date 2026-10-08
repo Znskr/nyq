@@ -3114,7 +3114,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Serializes NYQ_HOME with other env-mutating tests.
     async fn memory_tool_refreshes_the_system_prompt() {
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let old = std::env::var_os("NYQ_HOME");
         std::env::set_var("NYQ_HOME", home.path());
