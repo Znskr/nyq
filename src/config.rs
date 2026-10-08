@@ -171,7 +171,7 @@ pub fn provider(
     match kind.as_deref() {
         Some("codex") => {
             if !auth_path.exists() {
-                bail!("codex provider needs a ChatGPT login: run `codex login`, or set NYQ_CODEX_AUTH");
+                bail!("codex provider needs a ChatGPT login: run `nyq login` (or `codex login`), or set NYQ_CODEX_AUTH");
             }
             let model = model_flag
                 .map(str::to_string)

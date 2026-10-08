@@ -521,7 +521,15 @@ async fn slash(
             });
             match last {
                 Some(text) => {
-                    let via = tui.screen().copy(&text);
+                    tui.screen().copy_osc52(&text);
+                    let native = {
+                        let text = text.clone();
+                        tokio::time::timeout(std::time::Duration::from_secs(3), tokio::task::spawn_blocking(move || ui::tui::copy_native(&text))).await
+                    };
+                    let via = match native {
+                        Ok(Ok(Some(tool))) => tool,
+                        _ => "terminal (OSC 52)",
+                    };
                     ui::info(&format!("  Copied the last answer ({} chars) via {via}.", text.chars().count()));
                 }
                 None => ui::info("  Nothing to copy yet."),
