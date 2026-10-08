@@ -219,6 +219,8 @@ pub struct ToolOutput {
     /// The tool already changed the workspace, so a failed result must keep
     /// its undo snapshot.
     pub changed: bool,
+    /// File snapshots returned by a subagent, including on failure.
+    pub undo: crate::undo::UndoLog,
 }
 
 impl ToolOutput {
