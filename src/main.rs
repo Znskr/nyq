@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod diagnostics;
 mod doctor;
+mod github;
 mod hooks;
 mod pricing;
 mod usage;
@@ -25,6 +26,7 @@ mod tools;
 mod types;
 mod ui;
 mod undo;
+mod upgrade;
 mod workspace;
 
 use std::collections::HashSet;
@@ -124,6 +126,37 @@ enum Command {
     },
     /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
     Acp,
+    /// Draft a pull request for the current branch with the model; publish it with gh.
+    Pr {
+        /// Publish without asking (the branch is still pushed only after confirmation).
+        #[arg(long, alias = "create")]
+        publish: bool,
+        /// Open the pull request as a draft.
+        #[arg(long)]
+        draft: bool,
+        /// Base branch [default: the repository's default branch].
+        #[arg(long, value_name = "BRANCH")]
+        base: Option<String>,
+        /// Extra context for the draft.
+        context: Vec<String>,
+    },
+    /// Draft a GitHub issue from the context and repository state; publish it with gh.
+    Issue {
+        /// Publish without asking.
+        #[arg(long, alias = "create")]
+        publish: bool,
+        /// What the issue is about.
+        context: Vec<String>,
+    },
+    /// Upgrade nyq to the newest release (verifies SHA256SUMS).
+    Upgrade {
+        /// Release channel; remembered for later upgrades [default: stable].
+        #[arg(long, value_enum)]
+        channel: Option<upgrade::Channel>,
+        /// Only report whether an update is available.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -300,6 +333,17 @@ async fn run() -> Result<()> {
             tools::background::kill_all();
             return result;
         }
+        Some(Command::Upgrade { channel, check }) => return upgrade::run(&home, channel, check).await,
+        Some(Command::Pr { publish, draft, base, context }) => {
+            let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
+            let opts = github::Options { context: context.join(" "), publish, draft, base };
+            return github::run(&cwd, provider.as_ref(), github::Workflow::PullRequest, opts).await;
+        }
+        Some(Command::Issue { publish, context }) => {
+            let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
+            let opts = github::Options { context: context.join(" "), publish, ..Default::default() };
+            return github::run(&cwd, provider.as_ref(), github::Workflow::Issue, opts).await;
+        }
         _ => {}
     }
 
@@ -429,6 +473,7 @@ async fn run() -> Result<()> {
     sync_footer(&tui, &agent, None);
     ui::banner(env!("CARGO_PKG_VERSION"));
     ui::info(&sandbox::describe(&agent.sandbox));
+    upgrade::startup_hint(&home);
     if let Some(meta) = &resumed {
         ui::replay(&agent.items);
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
