@@ -58,6 +58,33 @@ impl Auth {
 }
 
 /// The `exp` claim of a JWT, in milliseconds.
+/// The Codex client version reported when listing models. The backend only
+/// lists newer models (e.g. the GPT-6 family) to new enough clients, so use
+/// the installed codex CLI's version when it is newer than our baseline.
+pub fn client_version() -> String {
+    const BASELINE: &str = "0.160.1";
+    if let Ok(v) = std::env::var("NYQ_CODEX_CLIENT_VERSION") {
+        return v;
+    }
+    let installed = std::process::Command::new("codex")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.split_whitespace().last().map(str::to_string));
+    newest(BASELINE, installed.as_deref()).to_string()
+}
+
+fn newest<'a>(baseline: &'a str, other: Option<&'a str>) -> &'a str {
+    let parse = |v: &str| -> Option<Vec<u64>> { v.trim_start_matches('v').split('.').map(|p| p.parse().ok()).collect() };
+    match other {
+        Some(o) if parse(o).zip(parse(baseline)).is_some_and(|(a, b)| a > b) => o,
+        _ => baseline,
+    }
+}
+
 pub fn jwt_exp_ms(token: &str) -> Option<i64> {
     use base64::Engine;
     let payload = token.split('.').nth(1)?;
@@ -103,7 +130,7 @@ impl CodexProvider {
             effort: String,
         }
         let url = std::env::var("NYQ_CODEX_MODELS_URL").unwrap_or_else(|_| {
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.148.0".into()
+            format!("https://chatgpt.com/backend-api/codex/models?client_version={}", client_version())
         });
         let send = |auth: Auth| {
             self.client
@@ -486,7 +513,7 @@ mod tests {
         let old = std::env::var_os("NYQ_CODEX_MODELS_URL");
         std::env::set_var(
             "NYQ_CODEX_MODELS_URL",
-            format!("{url}/models?client_version=0.148.0"),
+            format!("{url}/models?client_version={}", client_version()),
         );
         let result = provider.list_models().await;
         if let Some(old) = old {
@@ -503,7 +530,7 @@ mod tests {
         assert_eq!(models[1].context_window, Some(272000));
         assert_eq!(models[0].provider, "codex");
         let request = requests.recv().await.unwrap().to_lowercase();
-        assert!(request.starts_with("get /models?client_version=0.148.0 "));
+        assert!(request.starts_with(&format!("get /models?client_version={} ", client_version())));
         for header in [
             "authorization: bearer old",
             "chatgpt-account-id: account",
@@ -512,6 +539,14 @@ mod tests {
             assert!(request.contains(header));
         }
         task.await.unwrap();
+    }
+
+    #[test]
+    fn client_version_prefers_newer_installed_codex() {
+        assert_eq!(newest("0.160.1", Some("0.170.0")), "0.170.0");
+        assert_eq!(newest("0.160.1", Some("0.150.9")), "0.160.1");
+        assert_eq!(newest("0.160.1", Some("garbage")), "0.160.1");
+        assert_eq!(newest("0.160.1", None), "0.160.1");
     }
 
     #[test]

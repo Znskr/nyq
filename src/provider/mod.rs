@@ -20,6 +20,10 @@ pub trait Provider: Send + Sync {
         None
     }
     fn set_effort(&mut self, _effort: Option<String>) {}
+    /// A stable id for the current conversation, sent where the backend uses
+    /// one for routing and prompt caching (Codex `session_id`,
+    /// OpenCode Go `x-opencode-session`).
+    fn set_conversation(&mut self, _id: &str) {}
     /// A fresh provider with the same settings (for subagents).
     fn fork(&self) -> Box<dyn Provider>;
     /// Stream one response. Cancellation is done by dropping the future.

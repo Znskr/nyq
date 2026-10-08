@@ -179,6 +179,9 @@ impl Agent {
         ui: &mut dyn Ui,
         cancel: CancellationToken,
     ) -> Result<TurnEnd> {
+        if let Some(s) = &self.session {
+            self.provider.set_conversation(&s.id);
+        }
         self.push_counted(input);
         for _ in 0..MAX_STEPS {
             self.sync_estimate();
