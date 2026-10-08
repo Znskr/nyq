@@ -142,6 +142,8 @@ impl Tool for Subagent {
             context_estimated: false,
             suppress_auto_compact: false,
             submitted: 0,
+            // The parent's tool hooks also vet the subagent's calls.
+            hooks: std::sync::Arc::new(ctx.hooks.for_subagent()),
             sandbox: ctx.sandbox.clone(),
             undo: Default::default(),
         };
