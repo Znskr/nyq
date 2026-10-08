@@ -348,6 +348,11 @@ impl Editor {
         self.set_text(&text);
         self.browsing = next;
     }
+    /// Replace the commands that come and go with MCP servers (`/mcp:…`).
+    pub fn set_mcp_commands(&mut self, extra: Vec<(String, String)>) {
+        self.commands.retain(|(name, _)| !name.starts_with("/mcp:"));
+        self.commands.extend(extra);
+    }
     fn matches(&self) -> impl Iterator<Item = &(String, String)> {
         let prefix = &self.lines[0];
         let eligible = self.lines.len() == 1

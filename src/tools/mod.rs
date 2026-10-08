@@ -1,9 +1,13 @@
 //! Tools the model can call. Built-in workspace tools live in submodules; MCP
 //! tools are adapted into the same [`Tool`] trait by `crate::mcp`.
 
+pub(crate) mod artifacts;
+pub(crate) mod background;
 mod bash;
 pub(crate) use bash::run_shell;
 mod fs;
+pub(crate) mod mcp_search;
+pub(crate) mod memory;
 pub mod image;
 pub(crate) mod safeio;
 mod search;
@@ -212,6 +216,8 @@ pub struct ToolCtx {
     /// Rules granted with "always" while this call ran (a subagent's calls);
     /// the loop adds them to its session grants afterwards.
     pub granted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The conversation's id; scopes stored tool results (`read_tool_result`).
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -272,16 +278,22 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct Registry {
     tools: Vec<Box<dyn Tool>>,
+    /// MCP tools picked with `mcp_select_tool` while MCP tools are deferred.
+    selected: HashSet<String>,
 }
 
 impl Registry {
     /// The built-in workspace tools: read_file, write_file, edit_file, bash,
-    /// glob, grep, list_dir, view_image, web_fetch, web_search, subagent.
+    /// glob, grep, list_dir, view_image, web_fetch, web_search, subagent,
+    /// memory, bash_output, kill_shell, read_tool_result.
     pub fn builtin() -> Self {
         let mut r = Self::default();
         fs::register(&mut r);
         search::register(&mut r);
         bash::register(&mut r);
+        background::register(&mut r);
+        memory::register(&mut r);
+        artifacts::register(&mut r);
         image::register(&mut r);
         web::register(&mut r);
         subagent::register(&mut r);
@@ -319,6 +331,46 @@ impl Registry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.iter().map(|t| t.spec()).collect()
+    }
+
+    fn mcp_specs(&self) -> Vec<ToolSpec> {
+        self.specs().into_iter().filter(|s| mcp_search::is_mcp(&s.name)).collect()
+    }
+
+    /// The tools offered to the model on the next request. When MCP tools are
+    /// too many to list, only selected ones are, plus the search/select tools.
+    pub fn advertised(&self) -> Vec<ToolSpec> {
+        let mcp = self.mcp_specs();
+        if !mcp_search::should_defer(&mcp) {
+            return self.specs();
+        }
+        let mut out: Vec<ToolSpec> =
+            self.specs().into_iter().filter(|s| !mcp_search::is_mcp(&s.name) || self.selected.contains(&s.name)).collect();
+        out.extend(mcp_search::meta_specs(&mcp));
+        out
+    }
+
+    /// Run `mcp_search_tools` / `mcp_select_tool` (None for any other call,
+    /// or when MCP tools are not being deferred).
+    pub fn handle_meta(&mut self, name: &str, arguments: &str) -> Option<ToolOutput> {
+        if name != mcp_search::SEARCH && name != mcp_search::SELECT {
+            return None;
+        }
+        let mcp = self.mcp_specs();
+        if !mcp_search::should_defer(&mcp) {
+            return None;
+        }
+        let args: Value = serde_json::from_str(arguments).unwrap_or_default();
+        if name == mcp_search::SEARCH {
+            return Some(mcp_search::search(&mcp, &args).map_or_else(ToolOutput::err, ToolOutput::ok));
+        }
+        let wanted = args.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        Some(if mcp.iter().any(|s| s.name == wanted) {
+            self.selected.insert(wanted.to_string());
+            ToolOutput::ok(format!("Selected `{wanted}`. It is callable from the next step on; call `{wanted}` with arguments matching its schema."))
+        } else {
+            ToolOutput::err(format!("No connected MCP tool is named `{wanted}`; use {} to find exact names.", mcp_search::SEARCH))
+        })
     }
 }
 

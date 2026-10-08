@@ -12,12 +12,12 @@ use tokio::process::Child;
 use super::{Tool, ToolCtx, ToolOutput, Registry};
 use crate::types::ToolSpec;
 
-const MAX_OUTPUT: usize = 30_000;
+pub(super) const MAX_OUTPUT: usize = 30_000;
 const DEFAULT_TIMEOUT: u64 = 120;
 const MAX_TIMEOUT: u64 = 600;
 /// How long to wait after the child exits for its output pipes to close, and
 /// how long a terminated process group gets before we SIGKILL it.
-const GRACE: Duration = Duration::from_secs(2);
+pub(super) const GRACE: Duration = Duration::from_secs(2);
 
 struct Bash;
 
@@ -30,13 +30,16 @@ impl Tool for Bash {
                 stderr (truncated to the last 30000 chars). Non-zero exits are reported as errors \
                 with \"exit code N\" appended. The command runs in its own process group with a \
                 timeout in seconds (default 120, max 600); on timeout or cancellation the whole \
-                group is terminated."
+                group is terminated. Set run_in_background for servers, watchers and other long-running \
+                commands: it returns a process id at once; read new output with bash_output and stop it \
+                with kill_shell."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command line to run with bash -c."},
-                    "timeout_secs": {"type": "integer", "description": "Kill the process group after this many seconds (default 120, max 600)."}
+                    "timeout_secs": {"type": "integer", "description": "Kill the process group after this many seconds (default 120, max 600)."},
+                    "run_in_background": {"type": "boolean", "description": "Start the command in the background and return its id immediately (no timeout)."}
                 },
                 "required": ["command"]
             }),
@@ -64,6 +67,9 @@ impl Tool for Bash {
         let Some(command) = args.get("command").and_then(Value::as_str).filter(|c| !c.is_empty()) else {
             return ToolOutput::err("bash: missing required argument `command`.");
         };
+        if args.get("run_in_background").and_then(Value::as_bool) == Some(true) {
+            return super::background::started_message(command, &ctx.cwd, &ctx.sandbox);
+        }
         let timeout = Duration::from_secs(
             args.get("timeout_secs")
                 .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
@@ -194,7 +200,7 @@ impl Tail {
     }
 }
 
-fn spawn(command: &str, cwd: &std::path::Path, sandbox: &crate::sandbox::Policy) -> io::Result<(Child, Option<WinJob>)> {
+pub(super) fn spawn(command: &str, cwd: &std::path::Path, sandbox: &crate::sandbox::Policy) -> io::Result<(Child, Option<WinJob>)> {
     let mut cmd = crate::sandbox::shell_command(sandbox, cwd, command).map_err(io::Error::other)?;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     #[cfg(unix)]
@@ -238,7 +244,7 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(mut r: R, tail: std::sync::Arc<st
     }
 }
 
-async fn finish_pumps(pumps: Vec<tokio::task::JoinHandle<()>>) {
+pub(super) async fn finish_pumps(pumps: Vec<tokio::task::JoinHandle<()>>) {
     let deadline = tokio::time::Instant::now() + GRACE;
     for mut handle in pumps {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -268,7 +274,7 @@ async fn terminate(child: &mut Child, pid: u32, job: Option<&WinJob>) -> Option<
     child.wait().await.ok()
 }
 
-fn kill_group(pid: u32, signal: &str, job: Option<&WinJob>) {
+pub(super) fn kill_group(pid: u32, signal: &str, job: Option<&WinJob>) {
     #[cfg(unix)]
     {
         let _ = job;
@@ -293,12 +299,12 @@ fn kill_group(pid: u32, signal: &str, job: Option<&WinJob>) {
 /// Windows job that kills the whole process tree when closed or terminated.
 /// On other platforms this is an empty placeholder.
 #[cfg(windows)]
-struct WinJob {
+pub(super) struct WinJob {
     handle: *mut std::ffi::c_void,
 }
 
 #[cfg(not(windows))]
-struct WinJob;
+pub(super) struct WinJob;
 
 #[cfg(windows)]
 unsafe impl Send for WinJob {}
@@ -419,7 +425,7 @@ fn terminate_process(child: &Child) {
 }
 
 /// After the shell leader has exited, stop anything still in its process group.
-async fn reap_leftovers(child: &mut Child, pid: u32, job: Option<&WinJob>) {
+pub(super) async fn reap_leftovers(child: &mut Child, pid: u32, job: Option<&WinJob>) {
     #[cfg(not(unix))]
     let _ = pid;
     #[cfg(unix)]
@@ -458,7 +464,7 @@ fn group_alive(pid: u32) -> bool {
 }
 
 /// Lossy-decode and keep only the last `MAX_OUTPUT` chars, with a note.
-fn render_output(bytes: &[u8], dropped_bytes: usize) -> String {
+pub(super) fn render_output(bytes: &[u8], dropped_bytes: usize) -> String {
     let text = String::from_utf8_lossy(bytes);
     let len = text.chars().count();
     let skipped = len.saturating_sub(MAX_OUTPUT);
@@ -470,7 +476,7 @@ fn render_output(bytes: &[u8], dropped_bytes: usize) -> String {
 }
 
 /// Appended to output when the exit status is not clean success.
-fn exit_note(status: &std::process::ExitStatus) -> Option<String> {
+pub(super) fn exit_note(status: &std::process::ExitStatus) -> Option<String> {
     if status.success() {
         return None;
     }

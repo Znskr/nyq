@@ -58,6 +58,8 @@ pub fn system(cwd: &Path, sandbox: &crate::sandbox::Policy) -> String {
             }
         }
     }
+    let facts = crate::tools::memory::load(&crate::config::home()).unwrap_or_default();
+    s.push_str(&crate::tools::memory::prompt_section(&facts));
     s
 }
 
