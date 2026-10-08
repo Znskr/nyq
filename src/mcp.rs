@@ -33,11 +33,10 @@ use crate::types::ToolSpec;
 // Resolve batch-file launchers explicitly: Windows process lookup only adds .exe.
 #[cfg(any(windows, test))]
 fn resolve_launcher(command: &str, paths: &[PathBuf], extensions: &str) -> PathBuf {
-    for dir in paths {
-        let base = dir.join(command);
-        if base.is_file() {
-            return base;
-        }
+    // npm ships an extensionless `npx` shell script next to `npx.cmd`; Windows
+    // cannot run the former, so PATHEXT matches win. Relative or empty PATH
+    // entries would resolve into the workspace and are skipped.
+    for dir in paths.iter().filter(|d| d.is_absolute()) {
         if Path::new(command).extension().is_none() {
             for ext in extensions.split(';').filter(|e| e.starts_with('.')) {
                 let candidate = dir.join(format!("{command}{ext}"));
@@ -45,6 +44,10 @@ fn resolve_launcher(command: &str, paths: &[PathBuf], extensions: &str) -> PathB
                     return candidate;
                 }
             }
+        }
+        let base = dir.join(command);
+        if base.is_file() && Path::new(command).extension().is_some() {
+            return base;
         }
     }
     command.into()
@@ -838,6 +841,11 @@ mod tests {
         assert_eq!(resolve_launcher("npx", &paths, ".exe;.cmd"), launcher);
         assert_eq!(resolve_launcher("npx.cmd", &paths, ".exe;.cmd"), launcher);
         assert_eq!(resolve_launcher("missing", &paths, ".cmd"), PathBuf::from("missing"));
+        // npm's extensionless `npx` script sits next to npx.cmd; the .cmd wins.
+        std::fs::write(dir.path().join("npx"), "#!/bin/sh").unwrap();
+        assert_eq!(resolve_launcher("npx", &paths, ".exe;.cmd"), launcher);
+        // Relative PATH entries are ignored.
+        assert_eq!(resolve_launcher("npx", &[PathBuf::from("rel")], ".cmd"), PathBuf::from("npx"));
     }
 
     #[test]
