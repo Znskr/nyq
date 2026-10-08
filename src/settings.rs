@@ -22,8 +22,15 @@ pub enum Segment {
 }
 
 impl Segment {
-    pub const ALL: [Segment; 7] =
-        [Segment::Model, Segment::Provider, Segment::Context, Segment::Tokens, Segment::Sandbox, Segment::Folder, Segment::Branch];
+    pub const ALL: [Segment; 7] = [
+        Segment::Model,
+        Segment::Provider,
+        Segment::Context,
+        Segment::Tokens,
+        Segment::Sandbox,
+        Segment::Folder,
+        Segment::Branch,
+    ];
 
     pub fn key(self) -> &'static str {
         match self {
@@ -55,7 +62,7 @@ impl Segment {
             Segment::Provider => "Show the provider",
             Segment::Context => "Show context-window usage",
             Segment::Tokens => "Show input and output tokens",
-            Segment::Sandbox => "Show the sandbox and yolo mode",
+            Segment::Sandbox => "Show the sandbox and permission mode",
             Segment::Folder => "Show the workspace folder",
             Segment::Branch => "Show the current Git branch",
         }
@@ -63,13 +70,16 @@ impl Segment {
 
     pub fn parse(s: &str) -> Option<Segment> {
         let s = s.trim().to_ascii_lowercase();
-        Segment::ALL.into_iter().find(|seg| seg.key() == s).or(match s.as_str() {
-            "effort" => Some(Segment::Model),
-            "git" => Some(Segment::Branch),
-            "workspace" | "cwd" => Some(Segment::Folder),
-            "usage" => Some(Segment::Tokens),
-            _ => None,
-        })
+        Segment::ALL
+            .into_iter()
+            .find(|seg| seg.key() == s)
+            .or(match s.as_str() {
+                "effort" => Some(Segment::Model),
+                "git" => Some(Segment::Branch),
+                "workspace" | "cwd" => Some(Segment::Folder),
+                "usage" => Some(Segment::Tokens),
+                _ => None,
+            })
     }
 }
 
@@ -97,7 +107,15 @@ pub struct StatusLine {
 
 impl Default for StatusLine {
     fn default() -> Self {
-        Self { model: true, provider: true, context: true, tokens: true, sandbox: true, folder: true, branch: true }
+        Self {
+            model: true,
+            provider: true,
+            context: true,
+            tokens: true,
+            sandbox: true,
+            folder: true,
+            branch: true,
+        }
     }
 }
 
@@ -143,8 +161,12 @@ pub struct Settings {
     pub effort: Option<String>,
     /// Codex fast mode (the `priority` service tier) where the model offers it.
     pub fast_mode: bool,
-    /// `ask` or `yolo`: whether tools run without approval by default.
+    /// `ask` (default), `auto` (classifier), or `yolo` (never ask). Deny rules still block.
     pub permission_mode: String,
+    /// Model id for the auto-mode classifier. Empty uses the session model.
+    /// A small or cheap model is the right choice when one is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier_model: Option<String>,
     /// Default sandbox when `--sandbox` isn't given: workspace-write, read-only or off.
     pub sandbox: String,
     /// Compact automatically at this share of the context window (percent; 0 = never).
@@ -169,10 +191,16 @@ impl Default for Settings {
             effort: None,
             fast_mode: false,
             permission_mode: "ask".into(),
+            classifier_model: None,
             sandbox: "workspace-write".into(),
             auto_compact: 80,
             // Elsewhere the bell is the only sound, so it stays opt-in.
-            sound: if cfg!(target_os = "macos") { "on" } else { "off" }.into(),
+            sound: if cfg!(target_os = "macos") {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
             notifications: false,
             notify_after_secs: 10,
             statusline: StatusLine::default(),
@@ -188,12 +216,28 @@ static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 pub fn current() -> Settings {
     let mut guard = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
     // Tests never read the real profile.
-    guard.get_or_insert_with(|| if cfg!(test) { Settings::default() } else { load(&crate::config::home()).0 }).clone()
+    guard
+        .get_or_insert_with(|| {
+            if cfg!(test) {
+                Settings::default()
+            } else {
+                load(&crate::config::home()).0
+            }
+        })
+        .clone()
 }
 
 /// Make `s` the settings in effect (without saving).
 pub fn install(s: Settings) {
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+}
+
+/// The configured classifier model, when it is non-empty.
+pub fn classifier_model() -> Option<String> {
+    current()
+        .classifier_model
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
 }
 
 /// Change the settings in effect and save them to `home`.
@@ -212,28 +256,42 @@ pub fn load(home: &Path) -> (Settings, Option<String>) {
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), None),
-        Err(e) => return (Settings::default(), Some(format!("reading {}: {e}", path.display()))),
+        Err(e) => {
+            return (
+                Settings::default(),
+                Some(format!("reading {}: {e}", path.display())),
+            )
+        }
     };
     match serde_json::from_str::<Settings>(&text) {
         Ok(s) => (s, None),
-        Err(e) => (Settings::default(), Some(format!("{}: {e} (using default settings)", path.display()))),
+        Err(e) => (
+            Settings::default(),
+            Some(format!("{}: {e} (using default settings)", path.display())),
+        ),
     }
 }
 
 /// Write the settings atomically (0600), merged over the file's other keys.
 pub fn save(home: &Path, s: &Settings) -> Result<()> {
     let path = home.join("settings.json");
-    let mut merged = match std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+    let mut merged = match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    {
         Some(Value::Object(m)) => m,
         _ => Map::new(),
     };
-    let Value::Object(ours) = serde_json::to_value(s)? else { unreachable!("settings serialize to an object") };
+    let Value::Object(ours) = serde_json::to_value(s)? else {
+        unreachable!("settings serialize to an object")
+    };
     if s.effort.is_none() {
         merged.remove("effort");
     }
     merged.extend(ours);
     let bytes = serde_json::to_vec_pretty(&Value::Object(merged))?;
-    crate::session::write_private(&path, &bytes).with_context(|| format!("writing {}", path.display()))
+    crate::session::write_private(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 // ------------------------------------------------------------------ catalog
@@ -248,7 +306,13 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 5] = [Category::All, Category::StatusLine, Category::Agent, Category::Notifications, Category::Advanced];
+    pub const ALL: [Category; 5] = [
+        Category::All,
+        Category::StatusLine,
+        Category::Agent,
+        Category::Notifications,
+        Category::Advanced,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -285,7 +349,8 @@ pub struct Live {
     pub efforts: Vec<String>,
     pub fast: bool,
     pub fast_supported: bool,
-    pub yolo: bool,
+    /// Session permission mode (`ask`, `auto`, or `yolo`).
+    pub permission_mode: String,
 }
 
 pub struct Spec {
@@ -298,15 +363,61 @@ pub struct Spec {
 /// Every setting in menu order.
 pub fn specs() -> Vec<Spec> {
     let mut v = vec![
-        Spec { id: Id::Model, category: Category::Agent, label: "Model", description: "Choose the model used for new turns" },
-        Spec { id: Id::Effort, category: Category::Agent, label: "Reasoning effort", description: "Control how much reasoning the model applies" },
-        Spec { id: Id::Fast, category: Category::Agent, label: "Fast mode", description: "Use faster inference when the model supports it" },
-        Spec { id: Id::Permission, category: Category::Agent, label: "Permission mode", description: "Ask before tools change things, or run them freely (yolo)" },
-        Spec { id: Id::Sandbox, category: Category::Agent, label: "Default sandbox", description: "Sandbox for shell commands from the next start" },
-        Spec { id: Id::AutoCompact, category: Category::Agent, label: "Auto-compact at", description: "Summarize the conversation at this share of the context" },
-        Spec { id: Id::Sound, category: Category::Notifications, label: "Sound level", description: "Terminal bell: off, on (long turns, prompts) or max" },
-        Spec { id: Id::Notifications, category: Category::Notifications, label: "Desktop notifications", description: "Notify when a long turn ends or nyq needs you" },
-        Spec { id: Id::NotifyAfter, category: Category::Notifications, label: "Long turn after", description: "Turns longer than this ring and notify" },
+        Spec {
+            id: Id::Model,
+            category: Category::Agent,
+            label: "Model",
+            description: "Choose the model used for new turns",
+        },
+        Spec {
+            id: Id::Effort,
+            category: Category::Agent,
+            label: "Reasoning effort",
+            description: "Control how much reasoning the model applies",
+        },
+        Spec {
+            id: Id::Fast,
+            category: Category::Agent,
+            label: "Fast mode",
+            description: "Use faster inference when the model supports it",
+        },
+        Spec {
+            id: Id::Permission,
+            category: Category::Agent,
+            label: "Permission mode",
+            description:
+                "Ask before risky calls, let a classifier decide (auto), or run them freely (yolo)",
+        },
+        Spec {
+            id: Id::Sandbox,
+            category: Category::Agent,
+            label: "Default sandbox",
+            description: "Sandbox for shell commands from the next start",
+        },
+        Spec {
+            id: Id::AutoCompact,
+            category: Category::Agent,
+            label: "Auto-compact at",
+            description: "Summarize the conversation at this share of the context",
+        },
+        Spec {
+            id: Id::Sound,
+            category: Category::Notifications,
+            label: "Sound level",
+            description: "Terminal bell: off, on (long turns, prompts) or max",
+        },
+        Spec {
+            id: Id::Notifications,
+            category: Category::Notifications,
+            label: "Desktop notifications",
+            description: "Notify when a long turn ends or nyq needs you",
+        },
+        Spec {
+            id: Id::NotifyAfter,
+            category: Category::Notifications,
+            label: "Long turn after",
+            description: "Turns longer than this ring and notify",
+        },
     ];
     v.extend(Segment::ALL.into_iter().map(|seg| Spec {
         id: Id::Segment(seg),
@@ -314,7 +425,12 @@ pub fn specs() -> Vec<Spec> {
         label: seg.label(),
         description: seg.description(),
     }));
-    v.push(Spec { id: Id::PromptHistory, category: Category::Advanced, label: "Prompt history", description: "Save accepted prompts for history across sessions" });
+    v.push(Spec {
+        id: Id::PromptHistory,
+        category: Category::Advanced,
+        label: "Prompt history",
+        description: "Save accepted prompts for history across sessions",
+    });
     v
 }
 
@@ -329,7 +445,13 @@ pub fn value(id: Id, s: &Settings, live: &Live) -> String {
         Id::Effort => live.effort.clone().unwrap_or_else(|| "auto".into()),
         Id::Fast if !live.fast_supported && !live.fast => "unavailable".into(),
         Id::Fast => on_off(live.fast),
-        Id::Permission => if live.yolo { "yolo" } else { "ask" }.into(),
+        Id::Permission => {
+            if live.permission_mode.is_empty() {
+                "ask".into()
+            } else {
+                live.permission_mode.clone()
+            }
+        }
         Id::Sandbox => s.sandbox.clone(),
         Id::AutoCompact if s.auto_compact == 0 => "off".into(),
         Id::AutoCompact => format!("{}%", s.auto_compact),
@@ -347,9 +469,11 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
     match id {
         Id::Model => Vec::new(),
         Id::Effort if live.efforts.is_empty() => Vec::new(),
-        Id::Effort => std::iter::once("auto".to_string()).chain(live.efforts.iter().cloned()).collect(),
+        Id::Effort => std::iter::once("auto".to_string())
+            .chain(live.efforts.iter().cloned())
+            .collect(),
         Id::Fast if !live.fast_supported && !live.fast => Vec::new(),
-        Id::Permission => list(&["ask", "yolo"]),
+        Id::Permission => list(&["ask", "auto", "yolo"]),
         Id::Sandbox => list(&["workspace-write", "read-only", "off"]),
         Id::AutoCompact => list(&["off", "50%", "60%", "70%", "80%", "90%"]),
         Id::Sound => list(&["off", "on", "max"]),
@@ -366,7 +490,10 @@ pub fn cycle(id: Id, s: &Settings, live: &Live, delta: i32) -> Option<String> {
     }
     let cur = value(id, s, live);
     let n = opts.len() as i32;
-    let i = opts.iter().position(|o| o.eq_ignore_ascii_case(&cur)).map_or(if delta > 0 { -1 } else { 0 }, |i| i as i32);
+    let i = opts
+        .iter()
+        .position(|o| o.eq_ignore_ascii_case(&cur))
+        .map_or(if delta > 0 { -1 } else { 0 }, |i| i as i32);
     Some(opts[(i + delta).rem_euclid(n) as usize].clone())
 }
 
@@ -394,7 +521,13 @@ pub fn filtered(category: Category, query: &str, s: &Settings, live: &Live) -> V
         .into_iter()
         .filter(|spec| category == Category::All || spec.category == category)
         .filter(|spec| {
-            let hay = format!("{} {} {}", spec.label, spec.description, value(spec.id, s, live)).to_lowercase();
+            let hay = format!(
+                "{} {} {}",
+                spec.label,
+                spec.description,
+                value(spec.id, s, live)
+            )
+            .to_lowercase();
             words.iter().all(|w| hay.contains(w))
         })
         .collect()
@@ -413,7 +546,11 @@ mod tests {
     #[test]
     fn save_merges_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("settings.json"), r#"{"provider":"codex","models":{"codex":"m"},"custom":1}"#).unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"provider":"codex","models":{"codex":"m"},"custom":1}"#,
+        )
+        .unwrap();
         let (mut s, warn) = load(dir.path());
         assert!(warn.is_none());
         assert_eq!(s.auto_compact, 80);
@@ -422,7 +559,9 @@ mod tests {
         s.statusline.set(Segment::Branch, false);
         s.effort = Some("high".into());
         save(dir.path(), &s).unwrap();
-        let raw: Value = serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap();
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap())
+                .unwrap();
         assert_eq!(raw["provider"], "codex");
         assert_eq!(raw["models"]["codex"], "m");
         assert_eq!(raw["custom"], 1);
@@ -433,12 +572,17 @@ mod tests {
         // Clearing the effort removes the key instead of leaving a stale one.
         s.effort = None;
         save(dir.path(), &s).unwrap();
-        let raw: Value = serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap();
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap())
+                .unwrap();
         assert!(raw.get("effort").is_none());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join("settings.json")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.path().join("settings.json"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         // Only the settings file is left behind (no temp files).
@@ -448,7 +592,11 @@ mod tests {
     #[test]
     fn partial_and_bad_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("settings.json"), r#"{"statusline":{"tokens":false}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"statusline":{"tokens":false}}"#,
+        )
+        .unwrap();
         let (s, warn) = load(dir.path());
         assert!(warn.is_none());
         assert!(!s.statusline.tokens && s.statusline.model && s.prompt_history);
@@ -461,8 +609,14 @@ mod tests {
 
     #[test]
     fn catalog_cycles_values() {
-        let s = Settings { sound: "off".into(), ..Settings::default() };
-        let live = Live { efforts: vec!["low".into(), "high".into()], ..Live::default() };
+        let s = Settings {
+            sound: "off".into(),
+            ..Settings::default()
+        };
+        let live = Live {
+            efforts: vec!["low".into(), "high".into()],
+            ..Live::default()
+        };
         assert_eq!(cycle(Id::Sound, &s, &live, 1).as_deref(), Some("on"));
         assert_eq!(cycle(Id::Sound, &s, &live, -1).as_deref(), Some("max"));
         assert_eq!(cycle(Id::Effort, &s, &live, 1).as_deref(), Some("low"));
@@ -471,7 +625,10 @@ mod tests {
         // Fast mode can't be turned on for a model without it.
         assert_eq!(value(Id::Fast, &s, &live), "unavailable");
         assert_eq!(cycle(Id::Fast, &s, &live, 1), None);
-        let fast = Live { fast_supported: true, ..live.clone() };
+        let fast = Live {
+            fast_supported: true,
+            ..live.clone()
+        };
         assert_eq!(cycle(Id::Fast, &s, &fast, 1).as_deref(), Some("on"));
         assert_eq!(cycle(Id::AutoCompact, &s, &live, 1).as_deref(), Some("90%"));
         let mut t = s.clone();
@@ -479,10 +636,22 @@ mod tests {
         assert!(apply(Id::NotifyAfter, "30s", &mut t) && t.notify_after_secs == 30);
         assert!(apply(Id::Segment(Segment::Folder), "off", &mut t) && !t.statusline.folder);
         assert!(!apply(Id::Fast, "on", &mut t));
-        assert_eq!(filtered(Category::StatusLine, "", &s, &live).len(), Segment::ALL.len());
-        assert_eq!(filtered(Category::All, "git branch", &s, &live)[0].id, Id::Segment(Segment::Branch));
+        assert_eq!(
+            filtered(Category::StatusLine, "", &s, &live).len(),
+            Segment::ALL.len()
+        );
+        assert_eq!(
+            filtered(Category::All, "git branch", &s, &live)[0].id,
+            Id::Segment(Segment::Branch)
+        );
         assert!(filtered(Category::Agent, "nothing like this", &s, &live).is_empty());
         assert_eq!(Segment::parse("git"), Some(Segment::Branch));
-        assert_eq!(sandbox_mode(&Settings { sandbox: "read-only".into(), ..s }), crate::sandbox::Mode::ReadOnly);
+        assert_eq!(
+            sandbox_mode(&Settings {
+                sandbox: "read-only".into(),
+                ..s
+            }),
+            crate::sandbox::Mode::ReadOnly
+        );
     }
 }
