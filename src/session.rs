@@ -233,6 +233,16 @@ impl Session {
         self.flush_queue()
     }
 
+    /// Write anything still queued from an earlier failed append.
+    pub fn flush(&mut self) -> Result<()> {
+        self.flush_queue()
+    }
+
+    /// Whether the session has been written to disk (and can be resumed).
+    pub fn is_saved(&self) -> bool {
+        self.pending_header.is_none() && self.path.exists()
+    }
+
     /// Write the header (once) and every queued item. A failed write is rolled
     /// back and the items stay queued for the next attempt.
     fn flush_queue(&mut self) -> Result<()> {

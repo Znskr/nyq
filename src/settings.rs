@@ -180,6 +180,8 @@ pub struct Settings {
     pub statusline: StatusLine,
     /// Save accepted prompts to `<home>/history`.
     pub prompt_history: bool,
+    /// Download and install new releases in the background (interactive sessions).
+    pub auto_upgrade: bool,
     /// Keys nyq doesn't manage here (`provider`, `models`, …), kept on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -205,6 +207,7 @@ impl Default for Settings {
             notify_after_secs: 10,
             statusline: StatusLine::default(),
             prompt_history: true,
+            auto_upgrade: true,
             extra: Map::new(),
         }
     }
@@ -338,6 +341,7 @@ pub enum Id {
     NotifyAfter,
     Segment(Segment),
     PromptHistory,
+    AutoUpgrade,
 }
 
 /// Session state the menu shows next to the saved settings.
@@ -431,6 +435,12 @@ pub fn specs() -> Vec<Spec> {
         label: "Prompt history",
         description: "Save accepted prompts for history across sessions",
     });
+    v.push(Spec {
+        id: Id::AutoUpgrade,
+        category: Category::Advanced,
+        label: "Auto-upgrade",
+        description: "Install new nyq releases in the background; ctrl+g reloads",
+    });
     v
 }
 
@@ -460,6 +470,7 @@ pub fn value(id: Id, s: &Settings, live: &Live) -> String {
         Id::NotifyAfter => format!("{}s", s.notify_after_secs),
         Id::Segment(seg) => on_off(s.statusline.get(seg)),
         Id::PromptHistory => on_off(s.prompt_history),
+        Id::AutoUpgrade => on_off(s.auto_upgrade),
     }
 }
 
@@ -478,7 +489,9 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
         Id::AutoCompact => list(&["off", "50%", "60%", "70%", "80%", "90%"]),
         Id::Sound => list(&["off", "on", "max"]),
         Id::NotifyAfter => list(&["0s", "5s", "10s", "30s", "60s", "120s"]),
-        Id::Fast | Id::Notifications | Id::Segment(_) | Id::PromptHistory => list(&["off", "on"]),
+        Id::Fast | Id::Notifications | Id::Segment(_) | Id::PromptHistory | Id::AutoUpgrade => {
+            list(&["off", "on"])
+        }
     }
 }
 
@@ -509,6 +522,7 @@ pub fn apply(id: Id, value: &str, s: &mut Settings) -> bool {
         Id::NotifyAfter => s.notify_after_secs = value.trim_end_matches('s').parse().unwrap_or(10),
         Id::Segment(seg) => s.statusline.set(seg, on),
         Id::PromptHistory => s.prompt_history = on,
+        Id::AutoUpgrade => s.auto_upgrade = on,
         Id::Model | Id::Effort | Id::Fast | Id::Permission => return false,
     }
     true
@@ -599,7 +613,7 @@ mod tests {
         .unwrap();
         let (s, warn) = load(dir.path());
         assert!(warn.is_none());
-        assert!(!s.statusline.tokens && s.statusline.model && s.prompt_history);
+        assert!(!s.statusline.tokens && s.statusline.model && s.prompt_history && s.auto_upgrade);
         std::fs::write(dir.path().join("settings.json"), r#"{"sound": 5}"#).unwrap();
         let (s, warn) = load(dir.path());
         assert!(warn.is_some());
@@ -636,6 +650,14 @@ mod tests {
         assert!(apply(Id::NotifyAfter, "30s", &mut t) && t.notify_after_secs == 30);
         assert!(apply(Id::Segment(Segment::Folder), "off", &mut t) && !t.statusline.folder);
         assert!(!apply(Id::Fast, "on", &mut t));
+        // Auto-upgrade is on by default and saved as a plain flag.
+        assert!(Settings::default().auto_upgrade);
+        assert_eq!(value(Id::AutoUpgrade, &s, &live), "on");
+        assert_eq!(cycle(Id::AutoUpgrade, &s, &live, 1).as_deref(), Some("off"));
+        assert!(apply(Id::AutoUpgrade, "off", &mut t) && !t.auto_upgrade);
+        assert_eq!(filtered(Category::Advanced, "upgrade", &s, &live)[0].id, Id::AutoUpgrade);
+        let off: Settings = serde_json::from_str(r#"{"auto_upgrade": false}"#).unwrap();
+        assert!(!off.auto_upgrade);
         assert_eq!(
             filtered(Category::StatusLine, "", &s, &live).len(),
             Segment::ALL.len()
