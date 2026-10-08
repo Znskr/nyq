@@ -183,10 +183,9 @@ fn assert_success(out: &std::process::Output) {
 fn session_items(home: &std::path::Path) -> Vec<Value> {
     let path = std::fs::read_dir(home.join("sessions"))
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .unwrap();
     std::fs::read_to_string(path)
         .unwrap()
         .lines()

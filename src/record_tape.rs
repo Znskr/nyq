@@ -220,10 +220,9 @@ mod tests {
         assert_eq!(frames[1].kind, "r");
         assert_eq!(frames[1].data, "100x30");
         // Use a fresh tape for live timestamps and split UTF-8 output.
-        tape.file.set_len(0).unwrap();
-        tape.file
-            .write_all(b"{\"version\":2,\"width\":80,\"height\":24}\n")
-            .unwrap();
+        // (Reopen rather than truncate: Windows refuses set_len on an append handle.)
+        fs::write(&path, "{\"version\":2,\"width\":80,\"height\":24}\n").unwrap();
+        tape.file = OpenOptions::new().append(true).open(&path).unwrap();
         tape.output(&[0xc3]).unwrap();
         tape.output(&[0xa9]).unwrap();
         let frames = read(&path).unwrap();
