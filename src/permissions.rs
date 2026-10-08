@@ -20,6 +20,10 @@ use crate::agent::{bash_matches, is_file_tool, program_base, subagent_mode};
 /// never covers those.
 const READ_TOOLS: &[&str] = &["read_file", "list_dir", "glob", "grep", "view_image"];
 
+pub(crate) fn is_read_tool(tool: &str) -> bool {
+    READ_TOOLS.contains(&tool)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Allow,
@@ -43,7 +47,9 @@ pub enum Decision {
     Run,
     /// Ask the user. `forced` names the `ask` rule that requires it; a
     /// session grant can't skip such a call, so "always" isn't offered.
-    Ask { forced: Option<String> },
+    Ask {
+        forced: Option<String>,
+    },
     /// Blocked by this rule (already described for the model).
     Deny(String),
 }
@@ -89,13 +95,19 @@ fn parse(text: &str) -> Result<Rules, String> {
                 .iter()
                 .map(|i| match i.as_str().map(str::trim) {
                     Some(s) if !s.is_empty() => Ok(s.to_string()),
-                    _ => Err(format!("\"{key}\" entries must be non-empty strings, got {i}")),
+                    _ => Err(format!(
+                        "\"{key}\" entries must be non-empty strings, got {i}"
+                    )),
                 })
                 .collect(),
             Some(other) => Err(format!("\"{key}\" must be a list of strings, got {other}")),
         }
     };
-    Ok(Rules { allow: list("allow")?, ask: list("ask")?, deny: list("deny")? })
+    Ok(Rules {
+        allow: list("allow")?,
+        ask: list("ask")?,
+        deny: list("deny")?,
+    })
 }
 
 /// Read one file: `Ok(None)` when it doesn't exist.
@@ -111,7 +123,10 @@ impl Permissions {
     /// Load the user and project files. Problems come back as warnings (to
     /// show once); a malformed file is ignored as a whole.
     pub fn load(home: &Path, cwd: &Path) -> (Self, Vec<String>) {
-        let mut perms = Permissions { path: user_path(home), ..Default::default() };
+        let mut perms = Permissions {
+            path: user_path(home),
+            ..Default::default()
+        };
         let mut warnings = Vec::new();
         match read(&perms.path) {
             Ok(Some(r)) => {
@@ -164,6 +179,7 @@ impl Permissions {
     }
 
     /// Decide a call. `needs_approval` is the tool's own default.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn decide(
         &self,
         session: &HashSet<String>,
@@ -173,16 +189,35 @@ impl Permissions {
         needs_approval: bool,
         yolo: bool,
     ) -> Decision {
+        self.decide_in(session, tool, args, cwd, &[], needs_approval, yolo)
+    }
+
+    /// Like [`decide`], treating `extra` directories as inside the workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_in(
+        &self,
+        session: &HashSet<String>,
+        tool: &str,
+        args: &Value,
+        cwd: &Path,
+        extra: &[PathBuf],
+        needs_approval: bool,
+        yolo: bool,
+    ) -> Decision {
         if let Some(rule) = self.find(Action::Deny, tool, args) {
             return Decision::Deny(rule);
         }
         if let Some(rule) = self.find(Action::Ask, tool, args) {
-            return if yolo { Decision::Run } else { Decision::Ask { forced: Some(rule) } };
+            return if yolo {
+                Decision::Run
+            } else {
+                Decision::Ask { forced: Some(rule) }
+            };
         }
-        if self.find(Action::Allow, tool, args).is_some() && allow_applies(tool, args, cwd) {
+        if self.find(Action::Allow, tool, args).is_some() && allow_applies(tool, args, cwd, extra) {
             return Decision::Run;
         }
-        if !needs_approval || yolo || crate::agent::is_allowed(session, tool, args, cwd) {
+        if !needs_approval || yolo || crate::agent::is_allowed_in(session, tool, args, cwd, extra) {
             return Decision::Run;
         }
         Decision::Ask { forced: None }
@@ -203,10 +238,16 @@ impl Permissions {
         } else {
             Action::Ask
         };
-        let specific = [&self.allow, &self.ask, &self.deny, &self.project_ask, &self.project_deny]
-            .iter()
-            .flat_map(|r| r.iter())
-            .any(|p| p.starts_with(prefix) && !glob(p, &probe));
+        let specific = [
+            &self.allow,
+            &self.ask,
+            &self.deny,
+            &self.project_ask,
+            &self.project_deny,
+        ]
+        .iter()
+        .flat_map(|r| r.iter())
+        .any(|p| p.starts_with(prefix) && !glob(p, &probe));
         (action, specific)
     }
 
@@ -218,17 +259,24 @@ impl Permissions {
         }
         let mut doc = match std::fs::read_to_string(&self.path) {
             Ok(text) => {
-                parse(&text).map_err(|e| anyhow::anyhow!("{} is malformed ({e}); fix it first", self.path.display()))?;
+                parse(&text).map_err(|e| {
+                    anyhow::anyhow!("{} is malformed ({e}); fix it first", self.path.display())
+                })?;
                 serde_json::from_str::<Value>(&text)?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
             Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
         };
-        let map = doc.as_object_mut().context("permissions file is not a JSON object")?;
+        let map = doc
+            .as_object_mut()
+            .context("permissions file is not a JSON object")?;
         for key in ["allow", "ask", "deny"] {
             map.entry(key).or_insert_with(|| Value::Array(Vec::new()));
         }
-        let allow = map.get_mut("allow").and_then(Value::as_array_mut).context("\"allow\" is not a list")?;
+        let allow = map
+            .get_mut("allow")
+            .and_then(Value::as_array_mut)
+            .context("\"allow\" is not a list")?;
         if !allow.iter().any(|v| v.as_str() == Some(rule)) {
             allow.push(Value::String(rule.to_string()));
         }
@@ -244,9 +292,22 @@ impl Permissions {
 
     /// Rows for `/permissions`.
     pub fn lines(&self, session: &HashSet<String>) -> Vec<String> {
-        let list = |rules: &[String]| if rules.is_empty() { "(none)".to_string() } else { rules.join("  ") };
+        let list = |rules: &[String]| {
+            if rules.is_empty() {
+                "(none)".to_string()
+            } else {
+                rules.join("  ")
+            }
+        };
         let mut out = vec![
-            format!("Rules file   {}", if self.path.as_os_str().is_empty() { "(none)".into() } else { self.path.display().to_string() }),
+            format!(
+                "Rules file   {}",
+                if self.path.as_os_str().is_empty() {
+                    "(none)".into()
+                } else {
+                    self.path.display().to_string()
+                }
+            ),
             format!("  deny       {}", list(&self.deny)),
             format!("  ask        {}", list(&self.ask)),
             format!("  allow      {}", list(&self.allow)),
@@ -257,11 +318,20 @@ impl Permissions {
                 out.push(format!("  deny       {}", list(&self.project_deny)));
                 out.push(format!("  ask        {}", list(&self.project_ask)));
             }
-            None => out.push("Project file (none; .nyq/permissions.json may add ask/deny rules)".into()),
+            None => {
+                out.push("Project file (none; .nyq/permissions.json may add ask/deny rules)".into())
+            }
         }
         let mut grants: Vec<&str> = session.iter().map(String::as_str).collect();
         grants.sort_unstable();
-        out.push(format!("Session      {}", if grants.is_empty() { "(no grants)".into() } else { grants.join("  ") }));
+        out.push(format!(
+            "Session      {}",
+            if grants.is_empty() {
+                "(no grants)".into()
+            } else {
+                grants.join("  ")
+            }
+        ));
         out.push("Precedence: deny > ask > allow > session grants > default. /permissions reload re-reads the files.".into());
         out
     }
@@ -269,18 +339,24 @@ impl Permissions {
 
 /// Whether a persistent allow may skip the prompt for this call: never for
 /// file writes outside the workspace or under `.git`, nor for reads (which
-/// only ask outside the workspace).
-fn allow_applies(tool: &str, args: &Value, cwd: &Path) -> bool {
+/// only ask outside the workspace). `extra` directories count as inside.
+fn allow_applies(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) -> bool {
     if is_file_tool(tool) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-        return crate::agent::file_grant_ok(path, cwd);
+        return crate::agent::file_grant_ok_in(path, cwd, extra);
     }
     !READ_TOOLS.contains(&tool)
 }
 
 /// Whether the session's "always" rule for this call may also be saved.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn saveable(tool: &str, args: &Value, cwd: &Path) -> bool {
-    allow_applies(tool, args, cwd)
+    saveable_in(tool, args, cwd, &[])
+}
+
+/// Like [`saveable`], treating `extra` directories as inside the workspace.
+pub fn saveable_in(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) -> bool {
+    allow_applies(tool, args, cwd, extra)
 }
 
 /// Names a call answers to: the tool, plus `subagent:<mode>` or `web_fetch:<url>`.
@@ -306,7 +382,11 @@ pub fn matches(pattern: &str, tool: &str, args: &Value, strict: bool) -> bool {
             return false;
         }
         let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-        return if strict { bash_matches(prefix, cmd) } else { bash_mentions(prefix, cmd) };
+        return if strict {
+            bash_matches(prefix, cmd)
+        } else {
+            bash_mentions(prefix, cmd)
+        };
     }
     call_keys(tool, args).iter().any(|k| glob(pattern, k))
 }
@@ -317,8 +397,13 @@ pub fn matches(pattern: &str, tool: &str, args: &Value, strict: bool) -> bool {
 /// aliases can still hide a command); the sandbox is the real boundary.
 pub fn bash_mentions(prefix: &str, cmd: &str) -> bool {
     let want: Vec<&str> = prefix.split_whitespace().collect();
-    let Some(first) = want.first() else { return false };
-    let cleaned: String = cmd.chars().filter(|c| !matches!(c, '\'' | '"' | '\\')).collect();
+    let Some(first) = want.first() else {
+        return false;
+    };
+    let cleaned: String = cmd
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
     let words: Vec<&str> = cleaned
         .split(|c: char| c.is_whitespace() || ";&|`()<>{}$".contains(c))
         .filter(|w| !w.is_empty())
@@ -362,7 +447,12 @@ mod tests {
 
     fn perms(allow: &[&str], ask: &[&str], deny: &[&str]) -> Permissions {
         let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect();
-        Permissions { allow: v(allow), ask: v(ask), deny: v(deny), ..Default::default() }
+        Permissions {
+            allow: v(allow),
+            ask: v(ask),
+            deny: v(deny),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -377,34 +467,82 @@ mod tests {
         assert!(!glob("mcp__*__read*", "mcp__fs__write_file"));
         assert!(glob("a*b*c", "aXbYbZc"));
         assert!(!glob("a*b*c", "aXbYbZ"));
-        assert!(glob("web_fetch:https://docs.rs/*", "web_fetch:https://docs.rs/serde"));
+        assert!(glob(
+            "web_fetch:https://docs.rs/*",
+            "web_fetch:https://docs.rs/serde"
+        ));
     }
 
     #[test]
     fn pattern_kinds() {
         let sub = |mode: &str| json!({"task": "x", "mode": mode});
-        assert!(matches("subagent:general", "subagent", &sub("general"), false));
-        assert!(!matches("subagent:general", "subagent", &sub("explore"), false));
-        assert!(matches("subagent:explore", "subagent", &json!({"task": "x"}), false));
+        assert!(matches(
+            "subagent:general",
+            "subagent",
+            &sub("general"),
+            false
+        ));
+        assert!(!matches(
+            "subagent:general",
+            "subagent",
+            &sub("explore"),
+            false
+        ));
+        assert!(matches(
+            "subagent:explore",
+            "subagent",
+            &json!({"task": "x"}),
+            false
+        ));
         assert!(matches("subagent", "subagent", &sub("general"), false));
         assert!(matches("subagent:*", "subagent", &sub("general"), false));
-        assert!(matches("web_fetch", "web_fetch", &json!({"url": "https://a"}), false));
+        assert!(matches(
+            "web_fetch",
+            "web_fetch",
+            &json!({"url": "https://a"}),
+            false
+        ));
         assert!(!matches("web_fetch", "web_search", &json!({}), false));
         let bash = |c: &str| json!({ "command": c });
-        assert!(matches("bash:cargo test", "bash", &bash("cargo test --lib"), true));
-        assert!(!matches("bash:cargo test", "bash", &bash("cargo test && rm x"), true));
+        assert!(matches(
+            "bash:cargo test",
+            "bash",
+            &bash("cargo test --lib"),
+            true
+        ));
+        assert!(!matches(
+            "bash:cargo test",
+            "bash",
+            &bash("cargo test && rm x"),
+            true
+        ));
         assert!(!matches("bash:cargo test", "write_file", &json!({}), true));
-        for c in ["rm -rf x", "ls; rm x", "ls && /bin/rm x", "sh -c 'rm x'", "echo $(rm x)", "r\\m x", "'r'm x"] {
+        for c in [
+            "rm -rf x",
+            "ls; rm x",
+            "ls && /bin/rm x",
+            "sh -c 'rm x'",
+            "echo $(rm x)",
+            "r\\m x",
+            "'r'm x",
+        ] {
             assert!(matches("bash:rm", "bash", &bash(c), false), "{c}");
         }
-        assert!(matches("bash:git push", "bash", &bash("git status && git push --force"), false));
+        assert!(matches(
+            "bash:git push",
+            "bash",
+            &bash("git status && git push --force"),
+            false
+        ));
         assert!(!matches("bash:git push", "bash", &bash("git pull"), false));
         assert!(!matches("bash:rm", "bash", &bash("rmdir x"), false));
     }
 
     #[test]
     fn parsing_and_malformed_files() {
-        let r = parse(r#"{"allow": ["web_fetch", " mcp__a__* "], "deny": ["bash:rm"], "other": 1}"#).unwrap();
+        let r =
+            parse(r#"{"allow": ["web_fetch", " mcp__a__* "], "deny": ["bash:rm"], "other": 1}"#)
+                .unwrap();
         assert_eq!(r.allow, ["web_fetch", "mcp__a__*"]);
         assert_eq!(r.deny, ["bash:rm"]);
         assert!(r.ask.is_empty());
@@ -433,7 +571,10 @@ mod tests {
         )
         .unwrap();
         let (p, warnings) = Permissions::load(home.path(), cwd.path());
-        assert!(warnings.iter().any(|w| w.contains("may only add")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("may only add")),
+            "{warnings:?}"
+        );
         assert!(p.allow.is_empty());
         assert_eq!(p.project_ask, ["web_fetch"]);
         assert_eq!(p.project_deny, ["mcp__evil__*"]);
@@ -442,7 +583,14 @@ mod tests {
         assert_eq!(d, Decision::Ask { forced: None });
         let d = p.decide(&none, "mcp__evil__x", &json!({}), cwd.path(), true, true);
         assert!(matches!(d, Decision::Deny(r) if r.contains("project")));
-        let d = p.decide(&none, "web_fetch", &json!({"url": "https://a"}), cwd.path(), false, false);
+        let d = p.decide(
+            &none,
+            "web_fetch",
+            &json!({"url": "https://a"}),
+            cwd.path(),
+            false,
+            false,
+        );
         assert!(matches!(d, Decision::Ask { forced: Some(_) }));
     }
 
@@ -457,24 +605,47 @@ mod tests {
         for yolo in [false, true] {
             // deny beats everything, even yolo.
             let p = perms(&["mcp__*"], &["mcp__*"], &["mcp__wiki__*"]);
-            assert!(matches!(p.decide(&session, tool, &args, cwd, true, yolo), Decision::Deny(_)));
+            assert!(matches!(
+                p.decide(&session, tool, &args, cwd, true, yolo),
+                Decision::Deny(_)
+            ));
             // ask beats allow and a session grant; yolo skips it.
             let p = perms(&["mcp__*"], &["mcp__wiki__*"], &[]);
             let d = p.decide(&session, tool, &args, cwd, true, yolo);
-            if yolo { assert_eq!(d, Decision::Run) } else { assert!(matches!(d, Decision::Ask { forced: Some(_) })) }
+            if yolo {
+                assert_eq!(d, Decision::Run)
+            } else {
+                assert!(matches!(d, Decision::Ask { forced: Some(_) }))
+            }
             // allow runs without asking.
             let p = perms(&["mcp__wiki__*"], &[], &[]);
             assert_eq!(p.decide(&none, tool, &args, cwd, true, yolo), Decision::Run);
             // session grant.
             let p = perms(&[], &[], &[]);
-            assert_eq!(p.decide(&session, tool, &args, cwd, true, yolo), Decision::Run);
+            assert_eq!(
+                p.decide(&session, tool, &args, cwd, true, yolo),
+                Decision::Run
+            );
             // default: asks unless yolo; free tools run.
             let d = p.decide(&none, tool, &args, cwd, true, yolo);
-            assert_eq!(d, if yolo { Decision::Run } else { Decision::Ask { forced: None } });
-            assert_eq!(p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, yolo), Decision::Run);
+            assert_eq!(
+                d,
+                if yolo {
+                    Decision::Run
+                } else {
+                    Decision::Ask { forced: None }
+                }
+            );
+            assert_eq!(
+                p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, yolo),
+                Decision::Run
+            );
             // deny applies to tools that never ask.
             let p = perms(&[], &[], &["subagent:explore"]);
-            assert!(matches!(p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, yolo), Decision::Deny(_)));
+            assert!(matches!(
+                p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, yolo),
+                Decision::Deny(_)
+            ));
         }
     }
 
@@ -484,12 +655,24 @@ mod tests {
         let cwd = dir.path();
         let p = perms(&["write_file", "read_file", "*"], &[], &[]);
         let none = HashSet::new();
-        let d = |tool: &str, path: &str| p.decide(&none, tool, &json!({"path": path}), cwd, true, false);
+        let d = |tool: &str, path: &str| {
+            p.decide(&none, tool, &json!({"path": path}), cwd, true, false)
+        };
         assert_eq!(d("write_file", "src/a.rs"), Decision::Run);
-        assert_eq!(d("write_file", ".git/hooks/pre-commit"), Decision::Ask { forced: None });
-        assert_eq!(d("write_file", "../outside"), Decision::Ask { forced: None });
+        assert_eq!(
+            d("write_file", ".git/hooks/pre-commit"),
+            Decision::Ask { forced: None }
+        );
+        assert_eq!(
+            d("write_file", "../outside"),
+            Decision::Ask { forced: None }
+        );
         assert_eq!(d("read_file", "/etc/hosts"), Decision::Ask { forced: None });
-        assert!(!saveable("write_file", &json!({"path": ".git/config"}), cwd));
+        assert!(!saveable(
+            "write_file",
+            &json!({"path": ".git/config"}),
+            cwd
+        ));
         assert!(!saveable("read_file", &json!({"path": "/etc/hosts"}), cwd));
         assert!(saveable("write_file", &json!({"path": "a.txt"}), cwd));
         assert!(saveable("bash", &json!({"command": "cargo test"}), cwd));
@@ -516,7 +699,8 @@ mod tests {
         // Other content survives; a malformed file is left alone.
         std::fs::write(&p.path, r#"{"deny": ["bash:rm"], "note": "mine"}"#).unwrap();
         p.save_allow("web_fetch").unwrap();
-        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&p.path).unwrap()).unwrap();
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&p.path).unwrap()).unwrap();
         assert_eq!(saved["note"], "mine");
         assert_eq!(saved["deny"], json!(["bash:rm"]));
         assert_eq!(saved["allow"], json!(["web_fetch"]));

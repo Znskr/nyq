@@ -40,6 +40,12 @@ key instructions), decisions made, files read or changed (with paths) and why, c
 run and their important results, errors and how they were resolved, the current state \
 of the work, and the exact next steps. Be thorough but concise. Do not call tools.";
 
+const CONTINUE_NOTE: &str = "\n\nThe previous response was interrupted or cut off. Continue from where you stopped. Do not repeat text you already wrote.";
+
+const TITLE_PROMPT: &str = "\
+Write a 3 to 6 word title for this conversation. Reply with the title only: \
+no quotes, no trailing punctuation, and no explanation. Do not call tools.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Approval {
     Yes,
@@ -178,12 +184,18 @@ pub struct Agent {
 
 impl Agent {
     fn account_usage(&mut self, usage: Option<Usage>, ui: &mut dyn Ui) {
+        if let Some(u) = self.record_usage(usage) {
+            ui.usage(&u);
+        }
+    }
+
+    /// Count a request and record its usage (session totals and usage.jsonl).
+    fn record_usage(&mut self, usage: Option<Usage>) -> Option<Usage> {
         self.stats.requests += 1;
-        let Some(u) = usage else { return };
+        let u = usage?;
         self.usage.input_tokens += u.input_tokens;
         self.usage.output_tokens += u.output_tokens;
         self.usage.cached_tokens += u.cached_tokens;
-        ui.usage(&u);
         // Permissions are loaded from the active profile, including in ACP and subagents.
         if let Some(home) = self.permissions.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             let session = self.session.as_ref().map_or(self.stats.id.as_str(), |s| s.id.as_str());
@@ -191,6 +203,7 @@ impl Agent {
                 crate::ui::error(&format!("could not save usage: {e:#}"));
             }
         }
+        Some(u)
     }
 
     pub fn push(&mut self, item: Item) {
@@ -203,6 +216,12 @@ impl Agent {
         self.items.push(item);
     }
 
+    fn bind_conversation(&mut self) {
+        if let Some(s) = &self.session {
+            self.provider.set_conversation(&s.id);
+        }
+    }
+
     /// Run one user turn to completion (or cancellation).
     pub async fn turn(
         &mut self,
@@ -210,22 +229,42 @@ impl Agent {
         ui: &mut dyn Ui,
         cancel: CancellationToken,
     ) -> Result<TurnEnd> {
-        if let Some(s) = &self.session {
-            self.provider.set_conversation(&s.id);
-        }
+        self.bind_conversation();
         self.push_counted(input);
+        self.drive(ui, cancel, false).await
+    }
+
+    /// Continue an interrupted or cut-off response. No user message is added.
+    pub async fn continue_turn(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancel: CancellationToken,
+    ) -> Result<TurnEnd> {
+        anyhow::ensure!(!self.items.is_empty(), "Nothing to continue.");
+        self.bind_conversation();
+        self.drive(ui, cancel, true).await
+    }
+
+    async fn drive(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancel: CancellationToken,
+        continue_note: bool,
+    ) -> Result<TurnEnd> {
         for _ in 0..MAX_STEPS {
             self.sync_estimate();
             if !self.auto_compact(ui, &cancel).await? {
                 return Ok(TurnEnd::Cancelled);
             }
             let specs = self.tools.advertised();
-            let req = Request {
-                system: &self.system,
-                items: &self.items,
-                tools: &specs,
-            };
+            let note = continue_note.then(|| format!("{}{CONTINUE_NOTE}", self.system));
             let result = {
+                let system = note.as_deref().unwrap_or(self.system.as_str());
+                let req = Request {
+                    system,
+                    items: &self.items,
+                    tools: &specs,
+                };
                 let mut sink = |ev: StreamEvent| ui.stream(&ev);
                 tokio::select! {
                     r = self.provider.stream(req, &mut sink) => Some(r),
@@ -351,7 +390,11 @@ impl Agent {
             let question = args["question"].as_str().unwrap_or("").to_string();
             let options: Vec<String> = args["options"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|o| o.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|o| o.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             let answer = tokio::select! {
                 a = ui.ask(&question, &options) => a,
@@ -359,7 +402,9 @@ impl Agent {
             };
             return match answer {
                 Some(a) => ToolOutput::ok(format!("The user answered: {a}")),
-                None => ToolOutput::ok("The user skipped the question. Use your best judgment or ask in your reply."),
+                None => ToolOutput::ok(
+                    "The user skipped the question. Use your best judgment or ask in your reply.",
+                ),
             };
         }
         let args: Value = match serde_json::from_str(if arguments.trim().is_empty() {
@@ -384,8 +429,22 @@ impl Agent {
         };
         let summary = tool.summary(&args);
 
-        let needs_approval = tool.needs_approval_for(&args, &self.cwd);
-        let forced = match self.permissions.decide(&self.allowed, name, &args, &self.cwd, needs_approval, self.yolo) {
+        let mut needs_approval = tool.needs_approval_for(&args, &self.cwd);
+        if needs_approval && crate::permissions::is_read_tool(name) {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            if inside_any(&self.cwd, &self.sandbox.writable, path) {
+                needs_approval = false;
+            }
+        }
+        let forced = match self.permissions.decide_in(
+            &self.allowed,
+            name,
+            &args,
+            &self.cwd,
+            &self.sandbox.writable,
+            needs_approval,
+            self.yolo,
+        ) {
             Decision::Run => None,
             Decision::Deny(rule) => {
                 ui.tool_start(name, &summary);
@@ -401,8 +460,14 @@ impl Agent {
         if let Some(forced) = forced {
             let preview = tool.preview(&args, &ctx);
             // A call that an `ask` rule forces can't be covered by a grant.
-            let rule = if forced.is_some() { None } else { grant_rule(name, &args) };
-            let save_rule = rule.clone().filter(|_| crate::permissions::saveable(name, &args, &self.cwd));
+            let rule = if forced.is_some() {
+                None
+            } else {
+                grant_rule(name, &args)
+            };
+            let save_rule = rule.clone().filter(|_| {
+                crate::permissions::saveable_in(name, &args, &self.cwd, &self.sandbox.writable)
+            });
             let req = ApprovalRequest {
                 tool: name,
                 summary: &summary,
@@ -430,8 +495,12 @@ impl Agent {
                     self.allowed.extend(rule);
                     if let Some(r) = save_rule {
                         match std::sync::Arc::make_mut(&mut self.permissions).save_allow(&r) {
-                            Ok(()) => ui.notice(&format!("Saved `{r}` to the allow list in permissions.json.")),
-                            Err(e) => ui.notice(&format!("Could not save `{r}` to permissions.json: {e:#}")),
+                            Ok(()) => ui.notice(&format!(
+                                "Saved `{r}` to the allow list in permissions.json."
+                            )),
+                            Err(e) => ui.notice(&format!(
+                                "Could not save `{r}` to permissions.json: {e:#}"
+                            )),
                         }
                     }
                 }
@@ -447,7 +516,8 @@ impl Agent {
 
         ui.tool_start(name, &summary);
         let before = self.undo.len();
-        self.undo.snapshot(&self.cwd, self.sandbox.mode, name, &args);
+        self.undo
+            .snapshot(&self.cwd, self.sandbox.mode, name, &args);
         let mut out = if tool.handles_cancel() {
             tool.run(args, &ctx).await
         } else {
@@ -461,7 +531,12 @@ impl Agent {
         }
         self.undo.append(std::mem::take(&mut out.undo));
         // "Always" answers given for a subagent's calls belong to this session.
-        self.allowed.extend(ctx.granted.lock().unwrap_or_else(|e| e.into_inner()).drain(..));
+        self.allowed.extend(
+            ctx.granted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..),
+        );
         ui.tool_end(name, &out);
         out
     }
@@ -559,6 +634,55 @@ impl Agent {
         self.undo = Default::default();
     }
 
+    /// Drop the transcript in place: same session id, model, sandbox and rules.
+    pub fn clear_context(&mut self) -> Result<()> {
+        if let Some(session) = &mut self.session {
+            session.clear_transcript()?;
+        }
+        self.items.clear();
+        self.usage = Usage::default();
+        self.context_tokens = 0;
+        self.context_estimated = false;
+        self.suppress_auto_compact = false;
+        self.submitted = 0;
+        self.undo = Default::default();
+        self.allowed.clear();
+        Ok(())
+    }
+
+    /// Ask the model for a short title. The request is not stored in the transcript.
+    pub async fn suggest_title(&mut self, cancel: &CancellationToken) -> Result<String> {
+        anyhow::ensure!(!self.items.is_empty(), "Nothing to name yet.");
+        if cancel.is_cancelled() {
+            anyhow::bail!("Interrupted.");
+        }
+        self.bind_conversation();
+        let mut items = self.items.clone();
+        items.push(Item::user(TITLE_PROMPT));
+        let specs = [];
+        let req = Request {
+            system: &self.system,
+            items: &items,
+            tools: &specs,
+        };
+        let mut ignore = |_: StreamEvent| {};
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("Interrupted."),
+            r = self.provider.stream(req, &mut ignore) => r?,
+        };
+        self.record_usage(response.usage);
+        let raw: String = response
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Assistant { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        crate::session::generated_title(&raw)
+    }
+
     /// Replace the context-window size and allow automatic compaction again.
     pub fn set_context_window(&mut self, window: u64) {
         self.context_window = window;
@@ -618,7 +742,9 @@ impl Agent {
             self.push(item);
         }
         self.submitted = kept;
-        if self.context_window > 0 && self.context_tokens as f64 >= self.context_window as f64 * auto_compact_at() {
+        if self.context_window > 0
+            && self.context_tokens as f64 >= self.context_window as f64 * auto_compact_at()
+        {
             self.suppress_auto_compact = true;
             ui.notice(
                 "Still over the automatic compaction limit after compacting (the system prompt alone may exceed it). Automatic compaction is off for the rest of this session.",
@@ -649,7 +775,9 @@ fn text_tokens(text: &str) -> u64 {
 const IMAGE_TOKENS: u64 = 1_500;
 
 fn tail_has_unsent_image(items: &[Item]) -> bool {
-    items.iter().any(|item| matches!(item, Item::User { images, .. } if !images.is_empty()))
+    items
+        .iter()
+        .any(|item| matches!(item, Item::User { images, .. } if !images.is_empty()))
 }
 
 fn item_tokens(item: &Item) -> u64 {
@@ -658,7 +786,11 @@ fn item_tokens(item: &Item) -> u64 {
         Item::Assistant { text } => text_tokens(text),
         // `encrypted` is opaque provider state, not text the model re-reads.
         Item::Reasoning { summary, .. } => text_tokens(summary),
-        Item::ToolCall { id, name, arguments } => text_tokens(id) + text_tokens(name) + text_tokens(arguments),
+        Item::ToolCall {
+            id,
+            name,
+            arguments,
+        } => text_tokens(id) + text_tokens(name) + text_tokens(arguments),
         Item::ToolResult { id, output, .. } => text_tokens(id) + text_tokens(output),
         Item::Compaction { summary } => text_tokens(&crate::types::compaction_text(summary)),
     }
@@ -677,13 +809,17 @@ fn estimate_context(system: &str, items: &[Item]) -> u64 {
 /// Programs whose arguments are themselves commands or code: a prefix rule
 /// for them would allow anything, so "always" can't be scoped.
 const WRAPPERS: &[&str] = &[
-    "sh", "bash", "zsh", "fish", "dash", "ksh", "eval", "exec", "source", ".", "sudo", "doas", "su", "env", "xargs",
-    "nohup", "time", "timeout", "nice", "watch", "command", "builtin", "ssh",
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "eval", "exec", "source", ".", "sudo", "doas",
+    "su", "env", "xargs", "nohup", "time", "timeout", "nice", "watch", "command", "builtin", "ssh",
 ];
 /// Interpreters: scoped only with a script or module word (`python script.py`).
-const INTERPRETERS: &[&str] = &["python", "python3", "node", "perl", "ruby", "deno", "php", "lua", "npx", "bunx"];
+const INTERPRETERS: &[&str] = &[
+    "python", "python3", "node", "perl", "ruby", "deno", "php", "lua", "npx", "bunx",
+];
 /// Package runners whose `run`/`exec` subcommand takes a script name.
-const RUNNERS: &[&str] = &["npm", "pnpm", "yarn", "bun", "uv", "poetry", "pipenv", "pdm", "hatch"];
+const RUNNERS: &[&str] = &[
+    "npm", "pnpm", "yarn", "bun", "uv", "poetry", "pipenv", "pdm", "hatch",
+];
 /// Clients whose later arguments can start another transfer or change the
 /// destination. A prefix grant would approve a different operation.
 const NETWORK_CLIENTS: &[&str] = &[
@@ -692,13 +828,18 @@ const NETWORK_CLIENTS: &[&str] = &[
 
 /// Whether a command chains, pipes, substitutes or redirects (or spans lines).
 fn has_control(cmd: &str) -> bool {
-    cmd.contains("$(") || cmd.chars().any(|c| matches!(c, ';' | '&' | '|' | '`' | '>' | '<' | '\n' | '\r'))
+    cmd.contains("$(")
+        || cmd
+            .chars()
+            .any(|c| matches!(c, ';' | '&' | '|' | '`' | '>' | '<' | '\n' | '\r'))
 }
 
 /// A plain command word: no flags, quotes, globs, variables or assignments.
 fn plain_word(w: &str) -> bool {
     w.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && w.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '@' | '+'))
+        && w.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '@' | '+')
+        })
 }
 
 /// A leading flag (`-la`, `--force`), not a lone `-` (often stdin).
@@ -724,12 +865,124 @@ fn flag_operand(program: &str, flag: &str) -> Option<bool> {
     let valued = |flags: &[&str]| flags.contains(&flag).then_some(true);
     let boolean = |flags: &[&str]| flags.contains(&flag).then_some(false);
     match program_base(program) {
-        "git" => valued(&["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"])
-            .or_else(|| boolean(&["--bare", "--no-pager", "--paginate", "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs"])),
-        "cargo" => valued(&["--manifest-path", "-p", "--package", "--target", "--target-dir", "--features", "--jobs", "-j", "--color", "--config", "--profile", "--message-format", "--out-dir", "--artifact-dir", "-Z"])
-            .or_else(|| boolean(&["--release", "--offline", "--locked", "--frozen", "--all-features", "--no-default-features", "--workspace", "--all", "--lib", "--bins", "--tests", "--examples", "--benches", "--doc", "--quiet", "-q", "--verbose", "-v"])),
-        "curl" => valued(&["-o", "-d", "-H", "-X", "-u", "--url", "--output", "--data", "--header", "--request", "--user", "-A", "--user-agent", "-e", "--referer", "-b", "--cookie", "-F", "--form", "-T", "--upload-file", "--data-binary", "--data-raw", "-m", "--max-time", "--connect-timeout", "-w", "--write-out", "--proxy", "-x", "--cacert", "--cert", "--key"])
-            .or_else(|| boolean(&["-s", "-S", "-L", "-f", "-k", "-I", "-v", "-i", "-G", "--silent", "--show-error", "--location", "--fail", "--insecure", "--head", "--verbose", "--include", "--get", "--compressed"])),
+        "git" => valued(&[
+            "-C",
+            "-c",
+            "--git-dir",
+            "--work-tree",
+            "--namespace",
+            "--super-prefix",
+            "--config-env",
+        ])
+        .or_else(|| {
+            boolean(&[
+                "--bare",
+                "--no-pager",
+                "--paginate",
+                "--no-replace-objects",
+                "--literal-pathspecs",
+                "--glob-pathspecs",
+                "--noglob-pathspecs",
+                "--icase-pathspecs",
+            ])
+        }),
+        "cargo" => valued(&[
+            "--manifest-path",
+            "-p",
+            "--package",
+            "--target",
+            "--target-dir",
+            "--features",
+            "--jobs",
+            "-j",
+            "--color",
+            "--config",
+            "--profile",
+            "--message-format",
+            "--out-dir",
+            "--artifact-dir",
+            "-Z",
+        ])
+        .or_else(|| {
+            boolean(&[
+                "--release",
+                "--offline",
+                "--locked",
+                "--frozen",
+                "--all-features",
+                "--no-default-features",
+                "--workspace",
+                "--all",
+                "--lib",
+                "--bins",
+                "--tests",
+                "--examples",
+                "--benches",
+                "--doc",
+                "--quiet",
+                "-q",
+                "--verbose",
+                "-v",
+            ])
+        }),
+        "curl" => valued(&[
+            "-o",
+            "-d",
+            "-H",
+            "-X",
+            "-u",
+            "--url",
+            "--output",
+            "--data",
+            "--header",
+            "--request",
+            "--user",
+            "-A",
+            "--user-agent",
+            "-e",
+            "--referer",
+            "-b",
+            "--cookie",
+            "-F",
+            "--form",
+            "-T",
+            "--upload-file",
+            "--data-binary",
+            "--data-raw",
+            "-m",
+            "--max-time",
+            "--connect-timeout",
+            "-w",
+            "--write-out",
+            "--proxy",
+            "-x",
+            "--cacert",
+            "--cert",
+            "--key",
+        ])
+        .or_else(|| {
+            boolean(&[
+                "-s",
+                "-S",
+                "-L",
+                "-f",
+                "-k",
+                "-I",
+                "-v",
+                "-i",
+                "-G",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--fail",
+                "--insecure",
+                "--head",
+                "--verbose",
+                "--include",
+                "--get",
+                "--compressed",
+            ])
+        }),
         _ => None,
     }
 }
@@ -796,7 +1049,12 @@ pub fn bash_prefix(cmd: &str) -> Option<String> {
 /// control operators.
 pub fn bash_matches(prefix: &str, cmd: &str) -> bool {
     let want: Vec<&str> = prefix.split_whitespace().collect();
-    !want.is_empty() && !has_control(cmd) && cmd.split_whitespace().take(want.len()).eq(want.iter().copied())
+    !want.is_empty()
+        && !has_control(cmd)
+        && cmd
+            .split_whitespace()
+            .take(want.len())
+            .eq(want.iter().copied())
 }
 
 pub(crate) fn is_file_tool(tool: &str) -> bool {
@@ -805,7 +1063,11 @@ pub(crate) fn is_file_tool(tool: &str) -> bool {
 
 /// A subagent call's mode: `general` or (by default) `explore`.
 pub(crate) fn subagent_mode(args: &Value) -> &'static str {
-    if args.get("mode").and_then(Value::as_str) == Some("general") { "general" } else { "explore" }
+    if args.get("mode").and_then(Value::as_str) == Some("general") {
+        "general"
+    } else {
+        "explore"
+    }
 }
 
 /// The rule "always" would grant for this call, as stored in `Agent::allowed`.
@@ -818,10 +1080,16 @@ pub fn grant_rule(tool: &str, args: &Value) -> Option<String> {
         return Some(format!("subagent:{}", subagent_mode(args)));
     }
     if tool == "web_fetch" {
-        let url = args.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())?;
         return Some(format!("web_fetch:{url}"));
     }
-    if matches!(tool, "read_file" | "list_dir" | "glob" | "grep" | "view_image") {
+    if matches!(
+        tool,
+        "read_file" | "list_dir" | "glob" | "grep" | "view_image"
+    ) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
         return Some(format!("{tool}:{path}"));
     }
@@ -850,42 +1118,68 @@ pub fn rule_label(rule: &str) -> String {
     format!("`{rule}`")
 }
 
-/// Whether `path` (relative to `root` or absolute) stays inside `root`, after
-/// resolving `..` and any symlinks along the existing part of the path.
-pub(crate) fn inside(root: &Path, path: &str) -> bool {
+/// Lexical normalization of `base.join(path)`, or None if it escapes via `..`.
+fn lexical(base: &Path, path: &str) -> Option<PathBuf> {
     let mut full = PathBuf::new();
-    for c in root.join(path).components() {
+    for c in base.join(path).components() {
         match c {
             Component::ParentDir => {
                 if !full.pop() {
-                    return false;
+                    return None;
                 }
             }
             Component::CurDir => {}
             c => full.push(c),
         }
     }
+    Some(full)
+}
+
+/// Whether `full` stays inside `root`, including through symlinks on the existing prefix.
+fn covers(root: &Path, full: &Path) -> bool {
     if !full.starts_with(root) {
         return false;
     }
-    // A symlink inside the root may point out of it.
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    full.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_none_or(|real| real.starts_with(&canon))
+    full.ancestors()
+        .find_map(|a| std::fs::canonicalize(a).ok())
+        .is_none_or(|real| real.starts_with(&canon))
+}
+
+/// Whether `path` (relative to `root` or absolute) stays inside `root`, after
+/// resolving `..` and any symlinks along the existing part of the path.
+pub(crate) fn inside(root: &Path, path: &str) -> bool {
+    lexical(root, path).is_some_and(|full| covers(root, &full))
+}
+
+/// Whether `path`, resolved against `primary`, stays inside `primary` or any
+/// additional directory. Relative paths still start at `primary`.
+pub(crate) fn inside_any(primary: &Path, extra: &[PathBuf], path: &str) -> bool {
+    let Some(full) = lexical(primary, path) else {
+        return false;
+    };
+    covers(primary, &full) || extra.iter().any(|root| covers(root, &full))
 }
 
 /// Whether a grant for a file tool may cover writing `path`: non-empty,
 /// inside the workspace, and nowhere under (or linked into) `.git`.
 pub(crate) fn file_grant_ok(path: &str, cwd: &Path) -> bool {
     // Hooks and config under .git run later with full permissions: always ask.
-    let git_component = |p: &Path| p.components().any(|c| {
-        c.as_os_str().to_str().is_some_and(|s| s.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"))
-    });
+    let git_component = |p: &Path| {
+        p.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| s.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"))
+        })
+    };
     let resolved = cwd.join(path);
     // Follow links by hand too: canonicalize fails on a dangling link
     // (e.g. `notes.txt -> .git/commondir`), which would otherwise slip by.
     let link_into_git = |mut p: PathBuf| {
         for _ in 0..8 {
-            let Ok(target) = std::fs::read_link(&p) else { return false };
+            let Ok(target) = std::fs::read_link(&p) else {
+                return false;
+            };
             if git_component(&target) {
                 return true;
             }
@@ -894,25 +1188,67 @@ pub(crate) fn file_grant_ok(path: &str, cwd: &Path) -> bool {
         true // too many hops: treat as suspicious
     };
     let in_git = git_component(Path::new(path))
-        || resolved.ancestors().take_while(|a| a.starts_with(cwd)).any(|a| link_into_git(a.to_path_buf()))
-        || resolved.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_some_and(|real| {
-            // Only what lies below the workspace counts; a workspace that
-            // itself sits under a directory named `.git` is fine.
-            let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-            git_component(real.strip_prefix(&root).unwrap_or(&real))
-        });
+        || resolved
+            .ancestors()
+            .take_while(|a| a.starts_with(cwd))
+            .any(|a| link_into_git(a.to_path_buf()))
+        || resolved
+            .ancestors()
+            .find_map(|a| std::fs::canonicalize(a).ok())
+            .is_some_and(|real| {
+                // Only what lies below the workspace counts; a workspace that
+                // itself sits under a directory named `.git` is fine.
+                let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                git_component(real.strip_prefix(&root).unwrap_or(&real))
+            });
     !path.is_empty() && !in_git && inside(cwd, path)
 }
 
+/// Like [`file_grant_ok`], also accepting paths inside `extra` directories.
+pub(crate) fn file_grant_ok_in(path: &str, cwd: &Path, extra: &[PathBuf]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if file_grant_ok(path, cwd) {
+        return true;
+    }
+    let Some(full) = lexical(cwd, path) else {
+        return false;
+    };
+    extra.iter().any(|root| {
+        full.strip_prefix(root).is_ok_and(|rel| {
+            if rel.as_os_str().is_empty() {
+                return false;
+            }
+            file_grant_ok(rel.to_string_lossy().as_ref(), root)
+        })
+    })
+}
+
 /// Whether a granted rule covers this call.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Path) -> bool {
+    is_allowed_in(allowed, tool, args, cwd, &[])
+}
+
+/// Like [`is_allowed`], treating `extra` directories as inside the workspace.
+pub fn is_allowed_in(
+    allowed: &HashSet<String>,
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    extra: &[PathBuf],
+) -> bool {
     if tool == "bash" {
         let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-        return allowed.iter().filter_map(|r| r.strip_prefix("bash:")).any(|p| bash_matches(p, cmd));
+        return allowed
+            .iter()
+            .filter_map(|r| r.strip_prefix("bash:"))
+            .any(|p| bash_matches(p, cmd));
     }
     if is_file_tool(tool) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-        return allowed.contains(tool) && file_grant_ok(path, cwd);
+        return allowed.contains(tool) && file_grant_ok_in(path, cwd, extra);
     }
     if tool == "subagent" {
         return allowed.contains(&format!("subagent:{}", subagent_mode(args)));
@@ -921,7 +1257,10 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
         let url = args.get("url").and_then(Value::as_str).unwrap_or("");
         return allowed.contains(&format!("web_fetch:{url}"));
     }
-    if matches!(tool, "read_file" | "list_dir" | "glob" | "grep" | "view_image") {
+    if matches!(
+        tool,
+        "read_file" | "list_dir" | "glob" | "grep" | "view_image"
+    ) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
         return allowed.contains(&format!("{tool}:{path}"));
     }
@@ -936,13 +1275,23 @@ struct ScriptedTurns {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl Provider for ScriptedTurns {
-    fn name(&self) -> &str { "fake" }
-    fn model(&self) -> &str { "fake" }
+    fn name(&self) -> &str {
+        "fake"
+    }
+    fn model(&self) -> &str {
+        "fake"
+    }
     fn set_model(&mut self, _: String) {}
     fn fork(&self) -> Box<dyn Provider> {
-        Box::new(ScriptedTurns { left: std::sync::Arc::clone(&self.left) })
+        Box::new(ScriptedTurns {
+            left: std::sync::Arc::clone(&self.left),
+        })
     }
-    async fn stream(&self, _: Request<'_>, _: crate::provider::EventSink<'_>) -> Result<crate::types::Response> {
+    async fn stream(
+        &self,
+        _: Request<'_>,
+        _: crate::provider::EventSink<'_>,
+    ) -> Result<crate::types::Response> {
         let mut left = self.left.lock().unwrap();
         anyhow::ensure!(!left.is_empty(), "script exhausted");
         Ok(left.remove(0))
@@ -957,26 +1306,47 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_preserves_unsent_tail_on_resume_and_after_manual_compact() {
-        let mut agent = agent(Response { items: vec![Item::Assistant { text: "summary".into() }], usage: None }, None);
+        let mut agent = agent(
+            Response {
+                items: vec![Item::Assistant {
+                    text: "summary".into(),
+                }],
+                usage: None,
+            },
+            None,
+        );
         let dir = tempfile::tempdir().unwrap();
         agent.session = Some(Session::create(dir.path(), &agent.cwd, "fake").unwrap());
-        agent.push(Item::Assistant { text: "old answer".into() });
+        agent.push(Item::Assistant {
+            text: "old answer".into(),
+        });
         agent.submitted = agent.items.len();
         let tail = Item::user("fix the failing test");
         agent.push(tail.clone());
-        assert!(agent.auto_compact(&mut QuietUi, &CancellationToken::new()).await.unwrap());
+        assert!(agent
+            .auto_compact(&mut QuietUi, &CancellationToken::new())
+            .await
+            .unwrap());
         let id = agent.session.as_ref().unwrap().id.clone();
         let (_, _, loaded) = crate::session::load(dir.path(), &id, &agent.cwd).unwrap();
         assert_eq!(loaded, agent.items);
         assert_eq!(loaded.last(), Some(&tail));
         agent.submitted = 40;
-        assert!(agent.compact(&mut QuietUi, &CancellationToken::new()).await.unwrap());
+        assert!(agent
+            .compact(&mut QuietUi, &CancellationToken::new())
+            .await
+            .unwrap());
         assert_eq!(agent.submitted, 1);
         agent.push_counted(Item::user("large log".repeat(1000)));
-        assert!(agent.auto_compact(&mut QuietUi, &CancellationToken::new()).await.unwrap());
-        assert_eq!(agent.items.last(), Some(&Item::user("large log".repeat(1000))));
+        assert!(agent
+            .auto_compact(&mut QuietUi, &CancellationToken::new())
+            .await
+            .unwrap());
+        assert_eq!(
+            agent.items.last(),
+            Some(&Item::user("large log".repeat(1000)))
+        );
     }
-
 
     struct SummaryProvider {
         response: Response,
@@ -1173,11 +1543,17 @@ mod tests {
     fn bash_prefixes() {
         let p = |c: &str| bash_prefix(c);
         assert_eq!(p("cargo test").as_deref(), Some("cargo test"));
-        assert_eq!(p("cargo test --release -p nyq").as_deref(), Some("cargo test"));
+        assert_eq!(
+            p("cargo test --release -p nyq").as_deref(),
+            Some("cargo test")
+        );
         assert_eq!(p("  git   status  ").as_deref(), Some("git status"));
         assert_eq!(p("git -C foo status").as_deref(), Some("git -C foo status"));
         assert_eq!(p("npm run build").as_deref(), Some("npm run build"));
-        assert_eq!(p("npm run build -- --watch").as_deref(), Some("npm run build"));
+        assert_eq!(
+            p("npm run build -- --watch").as_deref(),
+            Some("npm run build")
+        );
         assert_eq!(p("npm test").as_deref(), Some("npm test"));
         assert_eq!(p("uv run pytest -x").as_deref(), Some("uv run pytest"));
         assert_eq!(p("ls").as_deref(), Some("ls"));
@@ -1193,7 +1569,10 @@ mod tests {
             p("cargo --manifest-path safe/Cargo.toml test").as_deref(),
             Some("cargo --manifest-path safe/Cargo.toml test")
         );
-        assert_eq!(p("./python script.py").as_deref(), Some("./python script.py"));
+        assert_eq!(
+            p("./python script.py").as_deref(),
+            Some("./python script.py")
+        );
         assert_eq!(p("python -m pytest"), None);
         assert_eq!(p("./gradlew build").as_deref(), Some("./gradlew build"));
         assert_eq!(p("python script.py").as_deref(), Some("python script.py"));
@@ -1201,10 +1580,33 @@ mod tests {
         assert_eq!(p("rg 'a b' src"), None);
         // Control operators, wrappers, assignments and odd programs can't be scoped.
         for c in [
-            "cargo test; rm -rf /", "cargo test && echo", "a || b", "ls | wc", "echo $(id)", "echo `id`",
-            "ls > out", "wc < in", "sleep 1 &", "ls\nrm x", "sh -c 'x'", "bash script.sh", "sudo ls",
-            "env X=1 ls", "xargs rm", "FOO=1 cargo test", "../x", "\"git\" status", "", "   ", "node -e 1",
-            "eval ls", "$HOME/bin/x", "./sh -c echo", "bin/bash -c echo", "./python -c 1", "usr/bin/python -m pytest",
+            "cargo test; rm -rf /",
+            "cargo test && echo",
+            "a || b",
+            "ls | wc",
+            "echo $(id)",
+            "echo `id`",
+            "ls > out",
+            "wc < in",
+            "sleep 1 &",
+            "ls\nrm x",
+            "sh -c 'x'",
+            "bash script.sh",
+            "sudo ls",
+            "env X=1 ls",
+            "xargs rm",
+            "FOO=1 cargo test",
+            "../x",
+            "\"git\" status",
+            "",
+            "   ",
+            "node -e 1",
+            "eval ls",
+            "$HOME/bin/x",
+            "./sh -c echo",
+            "bin/bash -c echo",
+            "./python -c 1",
+            "usr/bin/python -m pytest",
         ] {
             assert_eq!(p(c), None, "{c:?}");
         }
@@ -1230,7 +1632,10 @@ mod tests {
         assert!(!bash_matches("ls -la", "ls src"));
         assert!(!bash_matches("git -C", "git status"));
         assert!(bash_matches("git -C", "git -C elsewhere reset --hard"));
-        assert!(!bash_matches("git -C safe status", "git -C elsewhere reset --hard"));
+        assert!(!bash_matches(
+            "git -C safe status",
+            "git -C elsewhere reset --hard"
+        ));
         assert!(!bash_matches("", "anything"));
     }
 
@@ -1239,34 +1644,83 @@ mod tests {
         use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        assert_eq!(grant_rule("bash", &json!({"command": "git status -s"})).as_deref(), Some("bash:git status"));
+        assert_eq!(
+            grant_rule("bash", &json!({"command": "git status -s"})).as_deref(),
+            Some("bash:git status")
+        );
         assert_eq!(grant_rule("bash", &json!({"command": "a; b"})), None);
-        assert_eq!(grant_rule("write_file", &json!({"path": "x"})).as_deref(), Some("write_file"));
+        assert_eq!(
+            grant_rule("write_file", &json!({"path": "x"})).as_deref(),
+            Some("write_file")
+        );
         let write: HashSet<String> = ["write_file".into()].into();
-        assert!(is_allowed(&write, "write_file", &json!({"path": "src/x.rs"}), cwd));
-        assert!(!is_allowed(&write, "write_file", &json!({"path": ".git/hooks/pre-commit"}), cwd));
-        assert!(!is_allowed(&write, "edit_file", &json!({"path": "./.git/config"}), cwd));
-        assert!(!is_allowed(&write, "write_file", &json!({"path": "sub/.git/config"}), cwd));
+        assert!(is_allowed(
+            &write,
+            "write_file",
+            &json!({"path": "src/x.rs"}),
+            cwd
+        ));
+        assert!(!is_allowed(
+            &write,
+            "write_file",
+            &json!({"path": ".git/hooks/pre-commit"}),
+            cwd
+        ));
+        assert!(!is_allowed(
+            &write,
+            "edit_file",
+            &json!({"path": "./.git/config"}),
+            cwd
+        ));
+        assert!(!is_allowed(
+            &write,
+            "write_file",
+            &json!({"path": "sub/.git/config"}),
+            cwd
+        ));
         #[cfg(unix)]
         {
             // A dangling link into .git must not ride on an "always" grant.
             std::os::unix::fs::symlink(".git/commondir", cwd.join("notes.txt")).unwrap();
-            assert!(!is_allowed(&write, "write_file", &json!({"path": "notes.txt"}), cwd));
+            assert!(!is_allowed(
+                &write,
+                "write_file",
+                &json!({"path": "notes.txt"}),
+                cwd
+            ));
             std::os::unix::fs::symlink("src", cwd.join("code")).unwrap();
-            assert!(is_allowed(&write, "write_file", &json!({"path": "code/x.rs"}), cwd));
+            assert!(is_allowed(
+                &write,
+                "write_file",
+                &json!({"path": "code/x.rs"}),
+                cwd
+            ));
         }
         for path in [".GIT/config", ".git. /hooks/new"] {
-            assert!(!is_allowed(&write, "write_file", &json!({"path": path}), cwd));
+            assert!(!is_allowed(
+                &write,
+                "write_file",
+                &json!({"path": path}),
+                cwd
+            ));
         }
         #[cfg(unix)]
         {
             std::fs::create_dir(cwd.join(".git")).unwrap();
             std::os::unix::fs::symlink(".git", cwd.join("docs")).unwrap();
             for path in ["docs/config", "docs/hooks/new"] {
-                assert!(!is_allowed(&write, "write_file", &json!({"path": path}), cwd));
+                assert!(!is_allowed(
+                    &write,
+                    "write_file",
+                    &json!({"path": path}),
+                    cwd
+                ));
             }
         }
-        assert_eq!(grant_rule("mcp__wiki__ask", &json!({})).as_deref(), Some("mcp__wiki__ask"));
+        assert_eq!(
+            grant_rule("mcp__wiki__ask", &json!({})).as_deref(),
+            Some("mcp__wiki__ask")
+        );
         assert_eq!(
             grant_rule("web_fetch", &json!({"url": "https://example.com/a"})).as_deref(),
             Some("web_fetch:https://example.com/a")
@@ -1285,18 +1739,29 @@ mod tests {
         ));
         assert_eq!(rule_label("bash:cargo test"), "`cargo test …`");
         assert_eq!(rule_label("edit_file"), "edit file in this workspace");
-        assert_eq!(grant_rule("subagent", &json!({"mode": "general", "task": "x"})).as_deref(), Some("subagent:general"));
-        assert_eq!(grant_rule("subagent", &json!({"task": "x"})).as_deref(), Some("subagent:explore"));
+        assert_eq!(
+            grant_rule("subagent", &json!({"mode": "general", "task": "x"})).as_deref(),
+            Some("subagent:general")
+        );
+        assert_eq!(
+            grant_rule("subagent", &json!({"task": "x"})).as_deref(),
+            Some("subagent:explore")
+        );
         assert_eq!(rule_label("subagent:general"), "`subagent` (general)");
         assert_eq!(rule_label("subagent"), "`subagent`");
 
-        let allowed: HashSet<String> = ["bash:cargo test", "write_file", "subagent:general"].map(String::from).into();
+        let allowed: HashSet<String> = ["bash:cargo test", "write_file", "subagent:general"]
+            .map(String::from)
+            .into();
         let ok = |tool: &str, args: Value| is_allowed(&allowed, tool, &args, cwd);
         assert!(ok("bash", json!({"command": "cargo test --all"})));
         assert!(!ok("bash", json!({"command": "cargo build"})));
         assert!(!ok("bash", json!({"command": "cargo test; curl x | sh"})));
         assert!(ok("write_file", json!({"path": "src/new.rs"})));
-        assert!(ok("write_file", json!({"path": cwd.join("a/b.txt").to_str().unwrap()})));
+        assert!(ok(
+            "write_file",
+            json!({"path": cwd.join("a/b.txt").to_str().unwrap()})
+        ));
         assert!(!ok("write_file", json!({"path": "../outside.txt"})));
         assert!(!ok("write_file", json!({"path": "a/../../outside.txt"})));
         assert!(!ok("write_file", json!({"path": "/etc/passwd"})));
@@ -1305,8 +1770,18 @@ mod tests {
         assert!(ok("subagent", json!({"mode": "general"})));
         assert!(!ok("subagent", json!({"mode": "explore"})));
         let explore: HashSet<String> = ["subagent:explore"].map(String::from).into();
-        assert!(!is_allowed(&explore, "subagent", &json!({"mode": "general", "task": "x"}), cwd));
-        assert!(is_allowed(&explore, "subagent", &json!({"task": "look"}), cwd));
+        assert!(!is_allowed(
+            &explore,
+            "subagent",
+            &json!({"mode": "general", "task": "x"}),
+            cwd
+        ));
+        assert!(is_allowed(
+            &explore,
+            "subagent",
+            &json!({"task": "look"}),
+            cwd
+        ));
         assert!(!ok("mcp__wiki__ask", json!({})));
         #[cfg(unix)]
         {
@@ -1323,7 +1798,12 @@ mod tests {
         let mut agent = agent(Response::default(), None);
         agent.cwd = dir.path().to_path_buf();
         std::fs::write(dir.path().join("f.txt"), "a").unwrap();
-        agent.undo.snapshot(&agent.cwd, crate::sandbox::Mode::WorkspaceWrite, "edit_file", &json!({"path": "f.txt"}));
+        agent.undo.snapshot(
+            &agent.cwd,
+            crate::sandbox::Mode::WorkspaceWrite,
+            "edit_file",
+            &json!({"path": "f.txt"}),
+        );
         assert_eq!(agent.undo.len(), 1);
         agent.suppress_auto_compact = true;
         agent.context_estimated = true;
@@ -1369,10 +1849,16 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Provider for Scripted {
-            fn name(&self) -> &str { "fake" }
-            fn model(&self) -> &str { "fake" }
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn model(&self) -> &str {
+                "fake"
+            }
             fn set_model(&mut self, _: String) {}
-            fn fork(&self) -> Box<dyn Provider> { Box::new(self.clone()) }
+            fn fork(&self) -> Box<dyn Provider> {
+                Box::new(self.clone())
+            }
             async fn stream(&self, _: Request<'_>, _: EventSink<'_>) -> Result<Response> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let mut left = self.left.lock().unwrap();
@@ -1388,23 +1874,45 @@ mod tests {
             fn end_message(&mut self) {}
             fn tool_start(&mut self, _: &str, _: &str) {}
             fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
-            async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval { Approval::Yes }
-            fn notice(&mut self, msg: &str) { self.0.push(msg.to_string()); }
+            async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval {
+                Approval::Yes
+            }
+            fn notice(&mut self, msg: &str) {
+                self.0.push(msg.to_string());
+            }
         }
 
         let scripted = Scripted {
             left: Arc::new(Mutex::new(vec![
                 Response {
-                    items: vec![Item::Assistant { text: "summary".into() }],
-                    usage: Some(Usage { input_tokens: 1, output_tokens: 1000, cached_tokens: 0 }),
+                    items: vec![Item::Assistant {
+                        text: "summary".into(),
+                    }],
+                    usage: Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 1000,
+                        cached_tokens: 0,
+                    }),
                 },
                 Response {
-                    items: vec![Item::Assistant { text: "answer".into() }],
-                    usage: Some(Usage { input_tokens: 900, output_tokens: 50, cached_tokens: 0 }),
+                    items: vec![Item::Assistant {
+                        text: "answer".into(),
+                    }],
+                    usage: Some(Usage {
+                        input_tokens: 900,
+                        output_tokens: 50,
+                        cached_tokens: 0,
+                    }),
                 },
                 Response {
-                    items: vec![Item::Assistant { text: "next".into() }],
-                    usage: Some(Usage { input_tokens: 900, output_tokens: 10, cached_tokens: 0 }),
+                    items: vec![Item::Assistant {
+                        text: "next".into(),
+                    }],
+                    usage: Some(Usage {
+                        input_tokens: 900,
+                        output_tokens: 10,
+                        cached_tokens: 0,
+                    }),
                 },
             ])),
             calls: Arc::new(AtomicUsize::new(0)),
@@ -1413,11 +1921,26 @@ mod tests {
         let mut agent = agent(Response::default(), None);
         agent.provider = Box::new(scripted);
         let mut ui = NoteUi(Vec::new());
-        assert!(matches!(agent.turn(Item::user("hi"), &mut ui, CancellationToken::new()).await.unwrap(), TurnEnd::Done));
+        assert!(matches!(
+            agent
+                .turn(Item::user("hi"), &mut ui, CancellationToken::new())
+                .await
+                .unwrap(),
+            TurnEnd::Done
+        ));
         assert!(agent.suppress_auto_compact);
-        assert!(ui.0.iter().any(|m| m.contains("Automatic compaction is off")));
+        assert!(ui
+            .0
+            .iter()
+            .any(|m| m.contains("Automatic compaction is off")));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(matches!(agent.turn(Item::user("again"), &mut ui, CancellationToken::new()).await.unwrap(), TurnEnd::Done));
+        assert!(matches!(
+            agent
+                .turn(Item::user("again"), &mut ui, CancellationToken::new())
+                .await
+                .unwrap(),
+            TurnEnd::Done
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
@@ -1430,18 +1953,30 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Provider for Rec {
-            fn name(&self) -> &str { "fake" }
-            fn model(&self) -> &str { "fake" }
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn model(&self) -> &str {
+                "fake"
+            }
             fn set_model(&mut self, _: String) {}
-            fn fork(&self) -> Box<dyn Provider> { Box::new(self.clone()) }
+            fn fork(&self) -> Box<dyn Provider> {
+                Box::new(self.clone())
+            }
             async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> Result<Response> {
-                let answering = req.items.last().is_none_or(|item| !matches!(item, Item::User { text, .. } if text == COMPACT_PROMPT));
+                let answering = req.items.last().is_none_or(
+                    |item| !matches!(item, Item::User { text, .. } if text == COMPACT_PROMPT),
+                );
                 if answering && req.items.iter().any(|item| matches!(item, Item::User { text, .. } if text.contains("UNIQUE_PASTE"))) {
                     *self.0.lock().unwrap() = true;
                 }
                 Ok(Response {
                     items: vec![Item::Assistant { text: "ok".into() }],
-                    usage: Some(Usage { input_tokens: 10, output_tokens: 1, cached_tokens: 0 }),
+                    usage: Some(Usage {
+                        input_tokens: 10,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                    }),
                 })
             }
         }
@@ -1450,11 +1985,23 @@ mod tests {
         let mut agent = agent(Response::default(), None);
         agent.provider = Box::new(Rec(saw.clone()));
         let paste = format!("UNIQUE_PASTE {}", "line\n".repeat(50));
-        let end = agent.turn(Item::user(paste), &mut QuietUi, CancellationToken::new()).await.unwrap();
+        let end = agent
+            .turn(Item::user(paste), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
         assert!(matches!(end, TurnEnd::Done));
-        assert!(*saw.lock().unwrap(), "the unsent paste was summarized away before the model saw it");
-        assert!(agent.items.iter().any(|item| matches!(item, Item::User { text, .. } if text.contains("UNIQUE_PASTE")))
-            || agent.items.iter().any(|item| matches!(item, Item::Compaction { .. })));
+        assert!(
+            *saw.lock().unwrap(),
+            "the unsent paste was summarized away before the model saw it"
+        );
+        assert!(
+            agent.items.iter().any(
+                |item| matches!(item, Item::User { text, .. } if text.contains("UNIQUE_PASTE"))
+            ) || agent
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Compaction { .. }))
+        );
     }
 
     #[tokio::test]
@@ -1475,7 +2022,12 @@ mod tests {
                 "f.txt".into()
             }
             async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
-                ToolOutput { content: "nope".into(), is_error: true, changed: self.changed, ..ToolOutput::default() }
+                ToolOutput {
+                    content: "nope".into(),
+                    is_error: true,
+                    changed: self.changed,
+                    ..ToolOutput::default()
+                }
             }
         }
 
@@ -1492,11 +2044,21 @@ mod tests {
                             name: "write_file".into(),
                             arguments: r#"{"path":"f.txt"}"#.into(),
                         }],
-                        usage: Some(Usage { input_tokens: 1, output_tokens: 1, cached_tokens: 0 }),
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                            cached_tokens: 0,
+                        }),
                     },
                     Response {
-                        items: vec![Item::Assistant { text: "done".into() }],
-                        usage: Some(Usage { input_tokens: 2, output_tokens: 1, cached_tokens: 0 }),
+                        items: vec![Item::Assistant {
+                            text: "done".into(),
+                        }],
+                        usage: Some(Usage {
+                            input_tokens: 2,
+                            output_tokens: 1,
+                            cached_tokens: 0,
+                        }),
                     },
                 ])),
             });
@@ -1504,11 +2066,16 @@ mod tests {
         };
 
         let mut kept = script(true);
-        kept.turn(Item::user("go"), &mut QuietUi, CancellationToken::new()).await.unwrap();
+        kept.turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(kept.undo.len(), 1);
 
         let mut dropped = script(false);
-        dropped.turn(Item::user("go"), &mut QuietUi, CancellationToken::new()).await.unwrap();
+        dropped
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(dropped.undo.len(), 0);
     }
 
@@ -1517,7 +2084,11 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::tools::Tool for CountTool {
         fn spec(&self) -> crate::types::ToolSpec {
-            crate::types::ToolSpec { name: "mcp__wiki__ask".into(), description: String::new(), parameters: serde_json::json!({}) }
+            crate::types::ToolSpec {
+                name: "mcp__wiki__ask".into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            }
         }
         fn needs_approval(&self, _: &Value) -> bool {
             true
@@ -1552,21 +2123,39 @@ mod tests {
         let mut script = Vec::new();
         for i in 0..calls {
             script.push(Response {
-                items: vec![Item::ToolCall { id: i.to_string(), name: "mcp__wiki__ask".into(), arguments: "{}".into() }],
+                items: vec![Item::ToolCall {
+                    id: i.to_string(),
+                    name: "mcp__wiki__ask".into(),
+                    arguments: "{}".into(),
+                }],
                 usage: None,
             });
         }
-        script.push(Response { items: vec![Item::Assistant { text: "done".into() }], usage: None });
+        script.push(Response {
+            items: vec![Item::Assistant {
+                text: "done".into(),
+            }],
+            usage: None,
+        });
         let mut agent = agent(Response::default(), None);
         agent.yolo = false;
         agent.context_window = 0;
         agent.tools.add(Box::new(CountTool(runs.clone())));
-        agent.provider = Box::new(ScriptedTurns { left: std::sync::Arc::new(std::sync::Mutex::new(script)) });
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(script)),
+        });
         agent
     }
 
     fn results(agent: &Agent) -> Vec<String> {
-        agent.items.iter().filter_map(|i| match i { Item::ToolResult { output, .. } => Some(output.clone()), _ => None }).collect()
+        agent
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -1575,11 +2164,24 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let runs = std::sync::Arc::new(AtomicUsize::new(0));
         let mut agent = calling_agent(&runs, 2);
-        agent.permissions = std::sync::Arc::new(crate::permissions::Permissions::load(home.path(), home.path()).0);
-        let mut ui = ScriptUi { answer: Approval::AlwaysSave, asked: Vec::new() };
-        agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        agent.permissions =
+            std::sync::Arc::new(crate::permissions::Permissions::load(home.path(), home.path()).0);
+        let mut ui = ScriptUi {
+            answer: Approval::AlwaysSave,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
         // Asked once; the second call rides on the grant.
-        assert_eq!(ui.asked, vec![(Some("`mcp__wiki__ask`".into()), Some("mcp__wiki__ask".into()))]);
+        assert_eq!(
+            ui.asked,
+            vec![(
+                Some("`mcp__wiki__ask`".into()),
+                Some("mcp__wiki__ask".into())
+            )]
+        );
         assert_eq!(runs.load(Ordering::SeqCst), 2);
         assert!(agent.allowed.contains("mcp__wiki__ask"));
         assert_eq!(agent.permissions.allow, ["mcp__wiki__ask"]);
@@ -1592,26 +2194,47 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let rules = |allow: &[&str], ask: &[&str], deny: &[&str]| {
             let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect();
-            std::sync::Arc::new(crate::permissions::Permissions { allow: v(allow), ask: v(ask), deny: v(deny), ..Default::default() })
+            std::sync::Arc::new(crate::permissions::Permissions {
+                allow: v(allow),
+                ask: v(ask),
+                deny: v(deny),
+                ..Default::default()
+            })
         };
         // deny: never asks or runs, even with --yolo.
         let runs = std::sync::Arc::new(AtomicUsize::new(0));
         let mut agent = calling_agent(&runs, 1);
         agent.yolo = true;
         agent.permissions = rules(&["mcp__*"], &[], &["mcp__wiki__*"]);
-        let mut ui = ScriptUi { answer: Approval::Yes, asked: Vec::new() };
-        agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        let mut ui = ScriptUi {
+            answer: Approval::Yes,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
         assert!(ui.asked.is_empty());
         assert_eq!(runs.load(Ordering::SeqCst), 0);
-        assert!(results(&agent)[0].contains("blocked by permissions.json rule `deny mcp__wiki__*`"), "{:?}", results(&agent));
+        assert!(
+            results(&agent)[0].contains("blocked by permissions.json rule `deny mcp__wiki__*`"),
+            "{:?}",
+            results(&agent)
+        );
 
         // ask: asks every time despite a session grant, and offers no "always".
         let runs = std::sync::Arc::new(AtomicUsize::new(0));
         let mut agent = calling_agent(&runs, 2);
         agent.allowed.insert("mcp__wiki__ask".into());
         agent.permissions = rules(&["mcp__*"], &["mcp__wiki__ask"], &[]);
-        let mut ui = ScriptUi { answer: Approval::Always, asked: Vec::new() };
-        agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        let mut ui = ScriptUi {
+            answer: Approval::Always,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(ui.asked, vec![(None, None), (None, None)]);
         assert_eq!(runs.load(Ordering::SeqCst), 2);
 
@@ -1619,8 +2242,14 @@ mod tests {
         let runs = std::sync::Arc::new(AtomicUsize::new(0));
         let mut agent = calling_agent(&runs, 1);
         agent.permissions = rules(&["mcp__wiki__*"], &[], &[]);
-        let mut ui = ScriptUi { answer: Approval::No, asked: Vec::new() };
-        agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        let mut ui = ScriptUi {
+            answer: Approval::No,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
         assert!(ui.asked.is_empty());
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
@@ -1628,8 +2257,14 @@ mod tests {
     #[test]
     fn images_and_encrypted_blobs_have_a_flat_cost() {
         use crate::types::Image;
-        let image = Image { media_type: "image/png".into(), data: "A".repeat(400_000) };
-        let item = Item::User { text: "why".into(), images: vec![image.clone(), image] };
+        let image = Image {
+            media_type: "image/png".into(),
+            data: "A".repeat(400_000),
+        };
+        let item = Item::User {
+            text: "why".into(),
+            images: vec![image.clone(), image],
+        };
         let tokens = item_tokens(&item);
         assert_eq!(tokens, text_tokens("why") + 2 * IMAGE_TOKENS);
         assert!(tokens < 10_000, "{tokens}");
@@ -1649,9 +2284,9 @@ mod tests {
 
     #[tokio::test]
     async fn single_oversized_message_is_not_compacted() {
+        use crate::types::Image;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
-        use crate::types::Image;
 
         struct Probe {
             saw_compact: Arc<AtomicBool>,
@@ -1660,20 +2295,40 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Provider for Probe {
-            fn name(&self) -> &str { "fake" }
-            fn model(&self) -> &str { "fake" }
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn model(&self) -> &str {
+                "fake"
+            }
             fn set_model(&mut self, _: String) {}
-            fn fork(&self) -> Box<dyn Provider> { unimplemented!() }
+            fn fork(&self) -> Box<dyn Provider> {
+                unimplemented!()
+            }
             async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> Result<Response> {
-                if req.items.iter().any(|i| matches!(i, Item::User { text, .. } if text == COMPACT_PROMPT)) {
+                if req
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, Item::User { text, .. } if text == COMPACT_PROMPT))
+                {
                     self.saw_compact.store(true, Ordering::SeqCst);
                 }
-                if req.items.iter().any(|i| matches!(i, Item::User { images, .. } if !images.is_empty())) {
+                if req
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, Item::User { images, .. } if !images.is_empty()))
+                {
                     self.saw_image.store(true, Ordering::SeqCst);
                 }
                 Ok(Response {
-                    items: vec![Item::Assistant { text: "answer".into() }],
-                    usage: Some(Usage { input_tokens: 10, output_tokens: 1, cached_tokens: 0 }),
+                    items: vec![Item::Assistant {
+                        text: "answer".into(),
+                    }],
+                    usage: Some(Usage {
+                        input_tokens: 10,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                    }),
                 })
             }
         }
@@ -1681,26 +2336,38 @@ mod tests {
         let saw_compact = Arc::new(AtomicBool::new(false));
         let saw_image = Arc::new(AtomicBool::new(false));
         let mut agent = agent(Response::default(), None);
-        agent.provider = Box::new(Probe { saw_compact: saw_compact.clone(), saw_image: saw_image.clone() });
+        agent.provider = Box::new(Probe {
+            saw_compact: saw_compact.clone(),
+            saw_image: saw_image.clone(),
+        });
         agent.items.clear();
         agent.context_tokens = 0;
         agent.context_window = 1000;
         let item = Item::User {
             text: "why".into(),
-            images: vec![Image { media_type: "image/png".into(), data: "A".repeat(20_000) }],
+            images: vec![Image {
+                media_type: "image/png".into(),
+                data: "A".repeat(20_000),
+            }],
         };
-        agent.turn(item, &mut QuietUi, CancellationToken::new()).await.unwrap();
+        agent
+            .turn(item, &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
         assert!(!saw_compact.load(Ordering::SeqCst));
         assert!(saw_image.load(Ordering::SeqCst));
-        assert!(agent.items.iter().any(|i| matches!(i, Item::User { images, .. } if !images.is_empty())));
+        assert!(agent
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::User { images, .. } if !images.is_empty())));
     }
 
     #[tokio::test]
     async fn viewed_image_is_not_compacted_before_the_model_sees_it() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
         use crate::tools::{Tool, ToolOutput};
         use crate::types::{Image, ToolSpec};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         struct Probe {
             saw_compact: Arc<AtomicBool>,
@@ -1709,22 +2376,48 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Provider for Probe {
-            fn name(&self) -> &str { "fake" }
-            fn model(&self) -> &str { "fake" }
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn model(&self) -> &str {
+                "fake"
+            }
             fn set_model(&mut self, _: String) {}
             fn fork(&self) -> Box<dyn Provider> {
-                Box::new(Probe { saw_compact: self.saw_compact.clone(), saw_image: self.saw_image.clone() })
+                Box::new(Probe {
+                    saw_compact: self.saw_compact.clone(),
+                    saw_image: self.saw_image.clone(),
+                })
             }
             async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> Result<Response> {
-                if req.items.iter().any(|i| matches!(i, Item::User { text, .. } if text == COMPACT_PROMPT)) {
+                if req
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, Item::User { text, .. } if text == COMPACT_PROMPT))
+                {
                     self.saw_compact.store(true, Ordering::SeqCst);
-                    return Ok(Response { items: vec![Item::Assistant { text: "summary".into() }], usage: None });
+                    return Ok(Response {
+                        items: vec![Item::Assistant {
+                            text: "summary".into(),
+                        }],
+                        usage: None,
+                    });
                 }
-                if req.items.iter().any(|i| matches!(i, Item::User { images, .. } if !images.is_empty())) {
+                if req
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, Item::User { images, .. } if !images.is_empty()))
+                {
                     self.saw_image.store(true, Ordering::SeqCst);
                     return Ok(Response {
-                        items: vec![Item::Assistant { text: "A pixel.".into() }],
-                        usage: Some(Usage { input_tokens: 10, output_tokens: 1, cached_tokens: 0 }),
+                        items: vec![Item::Assistant {
+                            text: "A pixel.".into(),
+                        }],
+                        usage: Some(Usage {
+                            input_tokens: 10,
+                            output_tokens: 1,
+                            cached_tokens: 0,
+                        }),
                     });
                 }
                 Ok(Response {
@@ -1733,7 +2426,11 @@ mod tests {
                         name: "view_image".into(),
                         arguments: r#"{"path":"shot.png"}"#.into(),
                     }],
-                    usage: Some(Usage { input_tokens: 10, output_tokens: 1, cached_tokens: 0 }),
+                    usage: Some(Usage {
+                        input_tokens: 10,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                    }),
                 })
             }
         }
@@ -1742,13 +2439,22 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for ImageTool {
             fn spec(&self) -> ToolSpec {
-                ToolSpec { name: "view_image".into(), description: String::new(), parameters: serde_json::json!({}) }
+                ToolSpec {
+                    name: "view_image".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                }
             }
-            fn summary(&self, _: &Value) -> String { "shot.png".into() }
+            fn summary(&self, _: &Value) -> String {
+                "shot.png".into()
+            }
             async fn run(&self, _: Value, _: &crate::tools::ToolCtx) -> ToolOutput {
                 ToolOutput {
                     content: "Loaded shot.png".into(),
-                    images: vec![Image { media_type: "image/png".into(), data: "A".repeat(20_000) }],
+                    images: vec![Image {
+                        media_type: "image/png".into(),
+                        data: "A".repeat(20_000),
+                    }],
                     ..ToolOutput::default()
                 }
             }
@@ -1757,14 +2463,160 @@ mod tests {
         let saw_compact = Arc::new(AtomicBool::new(false));
         let saw_image = Arc::new(AtomicBool::new(false));
         let mut agent = agent(Response::default(), None);
-        agent.provider = Box::new(Probe { saw_compact: saw_compact.clone(), saw_image: saw_image.clone() });
+        agent.provider = Box::new(Probe {
+            saw_compact: saw_compact.clone(),
+            saw_image: saw_image.clone(),
+        });
         agent.tools.add(Box::new(ImageTool));
         agent.items.clear();
         agent.context_tokens = 0;
         agent.context_window = 1000;
         agent.context_estimated = false;
-        agent.turn(Item::user("inspect the screenshot"), &mut QuietUi, CancellationToken::new()).await.unwrap();
+        agent
+            .turn(
+                Item::user("inspect the screenshot"),
+                &mut QuietUi,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
         assert!(!saw_compact.load(Ordering::SeqCst));
         assert!(saw_image.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn additional_directories_count_as_inside_for_reads_and_write_grants() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("primary");
+        let extra = root.path().join("extra");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        std::fs::create_dir(extra.join(".git")).unwrap();
+        let note = extra.join("note.txt");
+        std::fs::write(&note, "x").unwrap();
+        let note = note.to_str().unwrap();
+        assert!(inside(&primary, "note.txt"));
+        assert!(inside_any(
+            &primary,
+            std::slice::from_ref(&extra),
+            "../extra/note.txt"
+        ));
+        assert!(!inside(&primary, "../extra/note.txt"));
+        assert!(!inside_any(
+            &primary,
+            std::slice::from_ref(&extra),
+            "../missing/note.txt"
+        ));
+        let mut allowed = HashSet::new();
+        allowed.insert("write_file".into());
+        assert!(is_allowed_in(
+            &allowed,
+            "write_file",
+            &json!({"path": note}),
+            &primary,
+            std::slice::from_ref(&extra)
+        ));
+        assert!(!is_allowed(
+            &allowed,
+            "write_file",
+            &json!({"path": note}),
+            &primary
+        ));
+        let git = extra.join(".git").join("config");
+        assert!(!file_grant_ok_in(git.to_str().unwrap(), &primary, &[extra]));
+    }
+
+    #[tokio::test]
+    async fn continue_and_rename_do_not_store_a_new_user_message() {
+        struct Script {
+            text: String,
+            saw: std::sync::Arc<std::sync::Mutex<String>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Script {
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn model(&self) -> &str {
+                "fake"
+            }
+            fn set_model(&mut self, _: String) {}
+            fn fork(&self) -> Box<dyn Provider> {
+                unimplemented!()
+            }
+            async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> Result<Response> {
+                *self.saw.lock().unwrap() = req.system.to_string();
+                assert!(req.items.iter().all(|item| !matches!(item, Item::User { text, .. } if text.contains("Continue from where"))));
+                Ok(Response {
+                    items: vec![Item::Assistant {
+                        text: self.text.clone(),
+                    }],
+                    usage: None,
+                })
+            }
+        }
+        let saw = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut agent = agent(Response::default(), None);
+        agent.provider = Box::new(Script {
+            text: "rest of the answer".into(),
+            saw: saw.clone(),
+        });
+        agent.items = vec![Item::Assistant {
+            text: "partial".into(),
+        }];
+        agent.system = "system".into();
+        agent
+            .continue_turn(&mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(saw
+            .lock()
+            .unwrap()
+            .contains("Continue from where you stopped"));
+        assert_eq!(agent.items.len(), 2);
+        assert!(matches!(&agent.items[0], Item::Assistant { text } if text == "partial"));
+        assert!(agent
+            .items
+            .iter()
+            .all(|item| !matches!(item, Item::User { .. })));
+
+        agent.items.clear();
+        assert!(agent
+            .continue_turn(&mut QuietUi, CancellationToken::new())
+            .await
+            .is_err());
+
+        agent.provider = Box::new(Script {
+            text: "\"Fix the parser bug.\"".into(),
+            saw,
+        });
+        agent.items = vec![Item::user("the parser fails on quotes")];
+        let before = agent.items.clone();
+        let title = agent
+            .suggest_title(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(title, "Fix the parser bug");
+        assert_eq!(agent.items, before);
+    }
+
+    #[tokio::test]
+    async fn clear_context_keeps_the_session_and_drops_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = agent(Response::default(), None);
+        agent.cwd = dir.path().to_path_buf();
+        agent.session = Some(Session::create(dir.path(), &agent.cwd, "m").unwrap());
+        agent.items.clear();
+        agent.push(Item::user("hello"));
+        agent.allowed.insert("bash:ls".into());
+        let id = agent.session.as_ref().unwrap().id.clone();
+        agent.clear_context().unwrap();
+        assert_eq!(agent.session.as_ref().unwrap().id, id);
+        assert!(agent.items.is_empty());
+        assert!(agent.allowed.is_empty());
+        assert!(agent.undo.is_empty());
+        let (_, _, items) = crate::session::load(dir.path(), &id, &agent.cwd).unwrap();
+        assert!(items.is_empty());
     }
 }
