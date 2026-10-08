@@ -64,8 +64,8 @@ impl Editor {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let double = self.empty_ctrl_c;
         self.empty_ctrl_c = false;
@@ -392,6 +392,15 @@ mod tests {
         let v = e.render(width);
         assert_eq!(v.lines, lines);
         assert_eq!((v.cursor_row, v.cursor_col), cursor);
+    }
+
+    #[test]
+    fn altgr_is_text_even_for_shortcut_letters() {
+        let mut e = Editor::default();
+        for c in "@\\{}[]|~€cdukjabfl".chars() {
+            assert_eq!(e.handle_key(KeyEvent::new(Char(c), M::CONTROL | M::ALT), false), Action::None);
+        }
+        assert_eq!(e.text(), "@\\{}[]|~€cdukjabfl");
     }
 
     #[test]

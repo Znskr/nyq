@@ -104,13 +104,20 @@ pub fn replay(items: &[Item]) {
     }
 }
 
-pub fn banner(version: &str) {
-    let text = format!(
+fn banner_text(version: &str) -> String {
+    format!(
         "{} {}",
         paint(true, Style::new().bold().fg(Color::Rgb(238, 238, 238)), "𝒏yq"),
-        paint(true, Style::new().fg(Color::Rgb(138, 138, 138)), &format!("v{version} · Run /help for commands · ctrl+l models · ctrl+d quit"))
-    );
-    info(&text);
+        paint(true, Style::new().fg(Color::Rgb(138, 138, 138)), &format!("v{} · Run /help for commands · ctrl+l models · ctrl+d quit", sanitize_text(version)))
+    )
+}
+
+pub fn banner(version: &str) {
+    let text = banner_text(version);
+    match tui::active() {
+        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_styled_info(&text, Style::new()),
+        None => eprintln!("{}", if color_err() { text } else { sanitize_text(&text) }),
+    }
 }
 
 /// A listing whose rows are cut to the terminal width.
@@ -141,6 +148,14 @@ pub fn error(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banner_keeps_its_own_colors() {
+        let text = banner_text("0.2\x1b]bad\x07");
+        assert!(text.contains("\x1b["));
+        assert!(!text.contains("bad"));
+        assert!(sanitize_text(&text).starts_with("𝒏yq v0.2 ·"));
+    }
 
     #[test]
     fn digest_prefers_meaningful_keys() {

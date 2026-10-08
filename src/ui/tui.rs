@@ -846,6 +846,10 @@ impl Screen {
 
     pub fn print_info(&mut self, text: &str, style: Style) {
         let text = sanitize_text(text);
+        self.print_styled_info(&text, style);
+    }
+
+    pub(super) fn print_styled_info(&mut self, text: &str, style: Style) {
         self.flush_all();
         let mut rows = self.begin(Block::Info);
         rows.extend(text.lines().map(|l| paint(style, l)));
@@ -1129,7 +1133,7 @@ impl Screen {
                 .spawn();
             if let Ok(mut child) = child {
                 if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
+                    let _ = stdin.write_all(&clipboard_bytes(text, *cmd == "clip.exe"));
                 }
                 if child.wait().is_ok_and(|s| s.success()) {
                     return cmd;
@@ -1172,7 +1176,7 @@ impl Screen {
         let count = m.visible().len();
         match key.code {
             KeyCode::Esc => self.sessions = None,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.sessions = None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => self.sessions = None,
             KeyCode::Up => m.selected = m.selected.checked_sub(1).unwrap_or(count.saturating_sub(1)),
             KeyCode::Down => m.selected = if count == 0 { 0 } else { (m.selected + 1) % count },
             KeyCode::Backspace => {
@@ -1185,7 +1189,7 @@ impl Screen {
                     self.sessions = None;
                 }
             }
-            KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            KeyCode::Char(ch) if text_key(key, ch) => {
                 m.filter.push(ch);
                 m.selected = 0;
             }
@@ -1226,8 +1230,8 @@ impl Screen {
                     self.menu = None;
                 }
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.menu = None,
-            KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => self.menu = None,
+            KeyCode::Char(ch) if text_key(key, ch) => {
                 m.filter.push(ch);
                 m.selected = 0;
             }
@@ -1238,7 +1242,7 @@ impl Screen {
 
     fn on_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
         if let Some(mut a) = self.approval.take() {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
             if key.code == KeyCode::Esc
                 || (ctrl && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('c')))
             {
@@ -1284,7 +1288,7 @@ impl Screen {
             return self.on_sessions_key(key, commands);
         }
         if self.question.is_some() {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
             let interrupt = key.code == KeyCode::Esc
                 || (ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')));
             if interrupt {
@@ -1321,7 +1325,7 @@ impl Screen {
             }
             return self.redraw();
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
         if ctrl && key.code == KeyCode::Char('l') {
             let _ = commands.send(Command::Submit("/model".into()));
             return;
@@ -1415,6 +1419,25 @@ impl Screen {
     }
 }
 
+fn text_key(key: KeyEvent, ch: char) -> bool {
+    let mods = key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT);
+    !ch.is_control() && (mods.is_empty() || mods == (KeyModifiers::CONTROL | KeyModifiers::ALT))
+}
+
+fn clipboard_bytes(text: &str, windows_clip: bool) -> Vec<u8> {
+    if windows_clip {
+        std::iter::once(0xfeffu16).chain(text.encode_utf16()).flat_map(u16::to_le_bytes).collect()
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn paste_enter(key: KeyEvent, previous: Option<Instant>, now: Instant) -> bool {
+    key.code == KeyCode::Enter && key.modifiers.is_empty()
+        && previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10))
+}
+
 // ---------------------------------------------------------------- lifecycle
 
 /// Owns the terminal mode for the interactive session; restores it on drop.
@@ -1457,10 +1480,30 @@ impl Tui {
             let screen = screen.clone();
             tokio::spawn(async move {
                 let mut events = EventStream::new();
+                #[cfg(windows)]
+                let mut previous = None;
                 while let Some(Ok(ev)) = events.next().await {
                     let mut s = lock(&screen);
                     match ev {
-                        Event::Key(k) if k.kind != KeyEventKind::Release => s.on_key(k, &tx),
+                        Event::Key(k) if k.kind != KeyEventKind::Release => {
+                            #[cfg(windows)]
+                            {
+                                let now = Instant::now();
+                                let paste = paste_enter(k, previous, now);
+                                if paste && s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() {
+                                    s.editor.paste("\n");
+                                    s.redraw();
+                                    previous = Some(Instant::now());
+                                    continue;
+                                }
+                            }
+                            s.on_key(k, &tx);
+                            // Exclude rendering time when measuring the pause between keys.
+                            #[cfg(windows)]
+                            {
+                                previous = matches!(k.code, KeyCode::Char(_) | KeyCode::Enter).then_some(Instant::now());
+                            }
+                        }
                         Event::Paste(text) => {
                             if s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() {
                                 s.editor.paste(&text);
@@ -1781,6 +1824,32 @@ fn take_follow_up_text(queue: &mut Vec<(Queued, String)>) -> Option<String> {
 mod tests {
     use super::*;
     use std::future::Future;
+
+    #[test]
+    fn windows_input_and_clipboard() {
+        let now = Instant::now();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(paste_enter(enter, Some(now), now + Duration::from_millis(1)));
+        assert!(!paste_enter(enter, Some(now), now + Duration::from_millis(50)));
+        assert!(!paste_enter(enter, None, now));
+        let mut editor = Editor::default();
+        for (i, c) in "a\\\nb\n".chars().enumerate() {
+            let key = KeyEvent::new(if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) }, KeyModifiers::NONE);
+            let time = now + Duration::from_millis(i as u64);
+            if paste_enter(key, Some(now), time) {
+                editor.paste("\n");
+            } else {
+                assert_eq!(editor.handle_key(key, true), Action::None);
+            }
+        }
+        assert_eq!(editor.text(), "a\\\nb\n");
+        assert_eq!(editor.handle_key(enter, true), Action::Submit("a\\\nb\n".into()));
+        assert!(text_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT), '@'));
+        let bytes = clipboard_bytes("€🙂", true);
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        assert_eq!(units[0], 0xfeff);
+        assert_eq!(String::from_utf16(&units[1..]).unwrap(), "€🙂");
+    }
 
     #[test]
     fn widths_and_wrapping() {
