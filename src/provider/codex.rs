@@ -1,16 +1,14 @@
 //! ChatGPT-subscription Codex Responses API provider.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
-use eventsource_stream::Eventsource;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use super::{sse, EventSink, Provider};
-use crate::types::{Item, Request, Response, StreamEvent, Usage};
+use super::{responses, sse, EventSink, Provider};
+use crate::types::{Request, Response};
 
 pub struct CodexProvider {
     pub auth_path: PathBuf,
@@ -201,32 +199,15 @@ impl CodexProvider {
                     .into_iter()
                     .map(|l| l.effort)
                     .collect(),
+                price: None,
             })
             .collect())
     }
 
     fn body(&self, req: Request<'_>) -> Value {
-        let input: Vec<Value> = req.items.iter().filter_map(|item| Some(match item {
-            Item::User { text, images } => {
-                let mut content = vec![json!({"type":"input_text","text":text})];
-                content.extend(images.iter().map(|i| json!({"type":"input_image","detail":"auto","image_url":i.data_url()})));
-                json!({"role":"user","content":content})
-            }
-            Item::Compaction { summary } => json!({"role":"user","content":[{"type":"input_text","text":crate::types::compaction_text(summary)}]}),
-            Item::Assistant { text } => json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}),
-            Item::Reasoning { summary, encrypted: Some(encrypted), .. } => json!({"type":"reasoning","summary":if summary.is_empty() { vec![] } else { vec![json!({"type":"summary_text","text":summary})] },"encrypted_content":encrypted}),
-            Item::Reasoning { encrypted: None, .. } => return None,
-            Item::ToolCall { id, name, arguments } => json!({"type":"function_call","call_id":id,"name":name,"arguments":arguments}),
-            Item::ToolResult { id, output, .. } => json!({"type":"function_call_output","call_id":id,"output":output}),
-        })).collect();
         // Codex has native web search; it replaces our DuckDuckGo function tool.
-        let tools: Vec<_> = req.tools.iter().map(|t| if t.name == "web_search" { json!({"type":"web_search"}) } else { json!({"type":"function","name":t.name,"description":t.description,"parameters":t.parameters,"strict":false}) }).collect();
-        let mut body = json!({"model":self.model,"store":false,"stream":true,"instructions":req.system,"input":input,"tools":tools,"tool_choice":"auto","parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"text":{"verbosity":"low"}});
-        if let Some(effort) = &self.effort {
-            body["reasoning"] =
-                json!({"effort":if effort == "minimal" { "low" } else { effort },"summary":"auto"});
-        }
-        body
+        let opts = responses::Options { native_web_search: true, low_verbosity: true };
+        responses::body(&self.model, self.effort.as_deref(), req, opts)
     }
 
     fn token_usable(auth: &Auth, rejected: Option<&str>) -> bool {
@@ -356,38 +337,6 @@ impl CodexProvider {
     }
 }
 
-fn output_item(item: &Value) -> Option<Item> {
-    match item["type"].as_str()? {
-        "message" => Some(Item::Assistant {
-            text: item["content"]
-                .as_array()?
-                .iter()
-                .filter(|part| part["type"] == "output_text" || part["type"] == "refusal")
-                .filter_map(|part| part["text"].as_str().or_else(|| part["refusal"].as_str()))
-                .collect::<String>(),
-        }),
-        "function_call" => Some(Item::ToolCall {
-            id: sse::string(item, "call_id"),
-            name: sse::string(item, "name"),
-            arguments: sse::string(item, "arguments"),
-        }),
-        "reasoning" => Some(Item::Reasoning {
-            id: item["id"].as_str().map(str::to_owned),
-            summary: item["summary"]
-                .as_array()
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter_map(|part| part["text"].as_str())
-                        .collect::<String>()
-                })
-                .unwrap_or_default(),
-            encrypted: item["encrypted_content"].as_str().map(str::to_owned),
-        }),
-        _ => None,
-    }
-}
-
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
     fn set_conversation(&mut self, id: &str) {
@@ -419,6 +368,9 @@ impl Provider for CodexProvider {
     fn set_effort(&mut self, effort: Option<String>) {
         self.effort = effort.filter(|e| e != "auto");
     }
+    fn efforts(&self) -> Vec<String> {
+        ["low", "medium", "high", "xhigh"].map(String::from).to_vec()
+    }
 
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
         let body = self.body(req);
@@ -430,74 +382,7 @@ impl Provider for CodexProvider {
             let refreshed = self.token(Some(&auth.access_token)).await?;
             http = self.send(&url, &body, &refreshed).await?;
         }
-        let mut events = sse::checked(http).await?.bytes_stream().eventsource();
-        let mut items = BTreeMap::new();
-        let mut response = Response::default();
-        let mut completed = false;
-        let mut searches = std::collections::HashSet::new();
-        while let Some(event) = events.next().await {
-            let event = event?;
-            if event.data.trim() == "[DONE]" {
-                break;
-            }
-            let data: Value = serde_json::from_str(&event.data)?;
-            let kind = data["type"].as_str().unwrap_or(&event.event);
-            match kind {
-                "response.output_text.delta" | "response.refusal.delta" => {
-                    on_event(StreamEvent::Text(sse::string(&data, "delta")))
-                }
-                "response.reasoning_summary_text.delta" => {
-                    on_event(StreamEvent::Reasoning(sse::string(&data, "delta")))
-                }
-                "response.output_item.added" if data["item"]["type"] == "function_call" => {
-                    on_event(StreamEvent::ToolCallStart {
-                        id: sse::string(&data["item"], "call_id"),
-                        name: sse::string(&data["item"], "name"),
-                    });
-                }
-                // Native web search runs server-side: show activity, but it
-                // is not a tool call for us to run (and is never replayed).
-                "response.output_item.added" | "response.output_item.done"
-                    if data["item"]["type"] == "web_search_call" =>
-                {
-                    let item = &data["item"];
-                    let id = sse::string(item, "id");
-                    let has_query = item["action"]["query"].as_str().is_some();
-                    if (kind == "response.output_item.added" || has_query) && searches.insert(id.clone()) {
-                        on_event(StreamEvent::ToolCallStart { id, name: "web_search".into() });
-                    }
-                }
-                "response.output_item.done" => {
-                    if let Some(item) = output_item(&data["item"]) {
-                        let index = data["output_index"]
-                            .as_u64()
-                            .context("output item missing output_index")?;
-                        items.insert(index, item);
-                    }
-                }
-                "response.completed" => {
-                    let usage = &data["response"]["usage"];
-                    if !usage.is_null() {
-                        response.usage = Some(Usage {
-                            input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-                            output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                            cached_tokens: usage["input_tokens_details"]["cached_tokens"]
-                                .as_u64()
-                                .unwrap_or(0),
-                        });
-                    }
-                    completed = true;
-                    break;
-                }
-                "response.failed" | "error" | "response.incomplete" => {
-                    anyhow::bail!("{}", sse::failure(&data))
-                }
-                _ => {}
-            }
-        }
-        anyhow::ensure!(completed, "Codex stream ended before response.completed");
-        response.items = items.into_values().collect();
-        Ok(response)
+        responses::read_stream(http, "Codex", on_event).await
     }
 }
 
@@ -507,8 +392,11 @@ impl Provider for CodexProvider {
 mod tests {
     use super::*;
     use crate::{
-        provider::sse::tests::{events, server, Env, ENV},
-        types::ToolSpec,
+        provider::{
+            responses::output_item,
+            sse::tests::{events, server, Env, ENV},
+        },
+        types::{Item, StreamEvent, ToolSpec, Usage},
     };
 
     #[test]
