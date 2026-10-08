@@ -584,6 +584,13 @@ impl Screen {
             _ => {}
         }
         self.tool_rows(&mut rows, true);
+        // One compact line per running subagent.
+        if self.busy.is_some() {
+            for line in crate::subagents::live_lines() {
+                let text = truncate(&sanitize_text(&line), w.saturating_sub(5).max(1));
+                rows.push(format!("  {} {}", paint(fg(FAINT), "↳"), paint(fg(GRAY), &text)));
+            }
+        }
 
         // Status: what the agent is doing.
         if let Some((label, start)) = &self.busy {

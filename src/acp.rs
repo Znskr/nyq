@@ -379,8 +379,8 @@ async fn open(
     let skills = skills::discover(&state.home, &cwd);
     if !skills.is_empty() {
         agent.system.push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
-        agent.tools.add(skills::tool(skills));
     }
+    skills::register(&mut agent.tools, skills, &state.home, &cwd);
     if !items.is_empty() {
         agent.items = items;
         agent.adopt_transcript();

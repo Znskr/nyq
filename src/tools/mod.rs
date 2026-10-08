@@ -220,6 +220,8 @@ pub struct ToolCtx {
     pub session_id: Option<String>,
     /// The session's hooks; subagents run its tool hooks for their calls.
     pub hooks: std::sync::Arc<crate::hooks::Hooks>,
+    /// Where this session's named subagents are saved; None without a session.
+    pub subagent_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
