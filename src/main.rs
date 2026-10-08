@@ -565,12 +565,16 @@ async fn slash(
             (Some("login"), Some(name)) => {
                 let cfg = servers.iter().find(|s| s.name == name).with_context(|| format!("no MCP server named `{name}`"))?;
                 drop_server_tools(agent, mcp, name);
-                let tools = mcp
-                    .login(cfg, |url| {
+                let cancel = CancellationToken::new();
+                tui.screen().set_busy(Some("Signing in"), Some(cancel.clone()));
+                let result = mcp
+                    .login(cfg, Some(&cancel), |url| {
                         ui::info(&format!("Sign in to {name} in your browser (waiting up to 5 minutes):\n  {url}"));
                         mcp::open_browser(url);
                     })
-                    .await?;
+                    .await;
+                tui.screen().set_busy(None, None);
+                let tools = result?;
                 let n = tools.len();
                 install_mcp_tools(agent, name, tools)?;
                 ui::info(&format!("MCP {name}: signed in · {n} tools"));

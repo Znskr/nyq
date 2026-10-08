@@ -172,7 +172,7 @@ async fn run_command(
         if is_error && sandbox.mode != crate::sandbox::Mode::Off && denied.iter().any(|d| content.contains(d)) {
             push_line(&mut content, "(The sandbox blocks writes outside the workspace and, unless allowed, network access. If this command needs that, ask the user to rerun nyq with --sandbox off or --allow-network.)");
         }
-        ToolOutput { content, is_error, display: None, images: Vec::new(), changed: false }
+        ToolOutput { content, is_error, display: None, images: Vec::new(), changed: false, ..ToolOutput::default() }
 }
 
 const TAIL_BYTES: usize = MAX_OUTPUT * 4;

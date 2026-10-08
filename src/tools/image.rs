@@ -119,7 +119,7 @@ impl Tool for ViewImage {
     }
 
     fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
-        super::outside_path_arg(cwd, args)
+        args["path"].as_str().is_some_and(|raw| !crate::agent::inside(cwd, &resolve(cwd, raw).to_string_lossy()))
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
@@ -140,6 +140,16 @@ impl Tool for ViewImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_uses_expanded_image_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!ViewImage.needs_approval_for(&json!({"path": "shot.png"}), dir.path()));
+        assert!(ViewImage.needs_approval_for(&json!({"path": "~/Pictures/shot.png"}), dir.path()));
+        let other = tempfile::tempdir().unwrap();
+        let raw = format!("file://{}", other.path().join("shot.png").display());
+        assert!(ViewImage.needs_approval_for(&json!({"path": raw}), dir.path()));
+    }
 
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
 

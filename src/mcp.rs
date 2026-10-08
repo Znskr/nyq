@@ -25,6 +25,8 @@ use serde_json::{Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::tools::{Tool, ToolCtx, ToolOutput};
 use crate::types::ToolSpec;
 
@@ -338,7 +340,20 @@ impl McpManager {
     /// Sign in to an HTTP server with OAuth (discovery, dynamic client
     /// registration as "nyq", PKCE, loopback redirect), save the credentials
     /// and connect. `open` receives the authorization URL to show the user.
-    pub async fn login(&mut self, cfg: &ServerConfig, open: impl FnOnce(&str)) -> Result<Vec<Box<dyn Tool>>> {
+    pub async fn login(&mut self, cfg: &ServerConfig, cancel: Option<&CancellationToken>, open: impl FnOnce(&str)) -> Result<Vec<Box<dyn Tool>>> {
+        tokio::select! {
+            biased;
+            _ = async {
+                match cancel {
+                    Some(cancel) => cancel.cancelled().await,
+                    None => { let _ = tokio::signal::ctrl_c().await; }
+                }
+            } => bail!("sign-in cancelled"),
+            result = self.login_inner(cfg, open) => result,
+        }
+    }
+
+    async fn login_inner(&mut self, cfg: &ServerConfig, open: impl FnOnce(&str)) -> Result<Vec<Box<dyn Tool>>> {
         let Transport::Http { url, headers } = &cfg.transport else {
             bail!("MCP server '{}' is not an HTTP server; only HTTP servers support sign-in", cfg.name);
         };
@@ -368,12 +383,9 @@ impl McpManager {
             .await
             .map_err(|(_, e)| anyhow!("starting sign-in: {e}"))?;
         open(session.get_authorization_url());
-        let callback = tokio::select! {
-            r = tokio::time::timeout(LOGIN_TIMEOUT, wait_for_callback(&listener, port)) => {
-                r.map_err(|_| anyhow!("sign-in timed out after 5 minutes"))??
-            }
-            _ = tokio::signal::ctrl_c() => bail!("sign-in cancelled"),
-        };
+        let callback = tokio::time::timeout(LOGIN_TIMEOUT, wait_for_callback(&listener, port))
+            .await
+            .map_err(|_| anyhow!("sign-in timed out after 5 minutes"))??;
         drop(listener);
         session.handle_callback_url(&callback).await.context("completing sign-in")?;
         self.connect(cfg).await
@@ -759,7 +771,7 @@ fn convert(r: CallToolResult) -> ToolOutput {
         content.push_str("Structured content:\n");
         content.push_str(&serde_json::to_string_pretty(s).unwrap_or_else(|_| s.to_string()));
     }
-    ToolOutput { content, is_error: r.is_error.unwrap_or(false), display: None, images, changed: false }
+    ToolOutput { content, is_error: r.is_error.unwrap_or(false), display: None, images, changed: false, ..ToolOutput::default() }
 }
 
 fn image_from_encoded(data: &str, mime: &str) -> Result<crate::types::Image, String> {
@@ -772,7 +784,17 @@ fn image_from_encoded(data: &str, mime: &str) -> Result<crate::types::Image, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn login_can_be_cancelled_without_a_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = McpManager::new(dir.path().into());
+        let cfg = http_cfg("cancel", "http://127.0.0.1:1/mcp".into(), &[]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = manager.login(&cfg, Some(&cancel), |_| panic!("cancelled login opened browser")).await.err().unwrap();
+        assert!(err.to_string().contains("sign-in cancelled"));
+    }
 
     #[test]
     fn images_and_structured_content_are_preserved() {
@@ -1139,7 +1161,7 @@ for line in sys.stdin:
             transport: Transport::Stdio { command: "true".into(), args: vec![], env: BTreeMap::new(), cwd: None },
             scope: Scope::Profile,
         };
-        assert!(mgr.login(&stdio, |_| {}).await.is_err());
+        assert!(mgr.login(&stdio, None, |_| {}).await.is_err());
     }
 
     #[tokio::test]
@@ -1157,7 +1179,7 @@ for line in sys.stdin:
         let page = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
         let p = page.clone();
         let tools = mgr
-            .login(&cfg, move |url| {
+            .login(&cfg, None, move |url| {
                 assert!(url.starts_with(&format!("{base}/authorize?")), "{url}");
                 let url = url.to_string();
                 tokio::spawn(async move {

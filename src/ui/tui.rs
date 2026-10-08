@@ -294,9 +294,9 @@ fn is_slash_command(text: &str) -> bool {
 }
 
 fn take_steer_texts(queue: &mut Vec<(Queued, String)>) -> Vec<String> {
-    let (steer, rest): (Vec<_>, Vec<_>) =
-        queue.drain(..).partition(|(k, t)| *k == Queued::Steer && !is_slash_command(t));
-    *queue = rest;
+    let end = queue.iter().position(|(_, t)| is_slash_command(t)).unwrap_or(queue.len());
+    let (steer, rest): (Vec<_>, Vec<_>) = queue.drain(..end).partition(|(k, _)| *k == Queued::Steer);
+    queue.splice(..0, rest);
     steer.into_iter().map(|(_, t)| t).collect()
 }
 
@@ -1886,8 +1886,9 @@ mod tests {
     #[test]
     fn steering_keeps_slash_commands_queued() {
         let mut queue = vec![
-            (Queued::Steer, "/compact now".into()),
             (Queued::Steer, "look at main".into()),
+            (Queued::Steer, "/compact now".into()),
+            (Queued::Steer, "after slash".into()),
             (Queued::FollowUp, "later".into()),
             (Queued::Steer, "/model gpt".into()),
             (Queued::Steer, "  /model x".into()),
@@ -1897,6 +1898,7 @@ mod tests {
             queue,
             vec![
                 (Queued::Steer, "/compact now".into()),
+                (Queued::Steer, "after slash".into()),
                 (Queued::FollowUp, "later".into()),
                 (Queued::Steer, "/model gpt".into()),
                 (Queued::Steer, "  /model x".into()),

@@ -102,23 +102,44 @@ fn writable_roots(policy: &Policy, cwd: &Path) -> Vec<PathBuf> {
     v
 }
 
+#[cfg(not(windows))]
 fn find_in_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
-/// `windows` / `bash_exe` / `bash` are injected so tests can cover every branch.
-fn shell_argv(script: &str, windows: bool, bash_exe: bool, bash: bool) -> Vec<String> {
-    let script = script.to_string();
-    if windows && !bash_exe {
-        return vec!["cmd".into(), "/C".into(), script];
-    }
-    let sh = if windows || bash { "bash" } else { "sh" };
-    vec![sh.into(), "-c".into(), script]
+/// Resolve Git Bash without selecting the WSL launcher under Windows.
+#[cfg(any(windows, test))]
+fn windows_bash(paths: impl Iterator<Item = PathBuf>, system_root: Option<&Path>) -> Option<PathBuf> {
+    paths.filter_map(|dir| std::fs::canonicalize(dir.join("bash.exe")).ok()).find(|p| {
+        let under_system = system_root.is_some_and(|root| {
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            p.to_string_lossy().to_lowercase().starts_with(&format!("{}{}", root.to_string_lossy().to_lowercase(), std::path::MAIN_SEPARATOR))
+        });
+        p.is_file() && !under_system
+    })
 }
 
-/// The shell used for commands: bash when available, else sh (cmd on Windows).
+fn shell_argv(script: &str, windows: bool, bash_exe: Option<&Path>, bash: bool) -> Vec<String> {
+    if windows {
+        return match bash_exe {
+            Some(path) => vec![path.to_string_lossy().into_owned(), "-c".into(), script.into()],
+            None => vec!["cmd".into(), "/S".into(), "/C".into(), script.into()],
+        };
+    }
+    vec![if bash { "bash" } else { "sh" }.into(), "-c".into(), script.into()]
+}
+
 fn shell(script: &str) -> Vec<String> {
-    shell_argv(script, cfg!(windows), find_in_path("bash.exe").is_some(), find_in_path("bash").is_some())
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let root = std::env::var_os("SystemRoot").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let bash = windows_bash(std::env::split_paths(&path), Some(&root));
+        shell_argv(script, true, bash.as_deref(), false)
+    }
+    #[cfg(not(windows))]
+    shell_argv(script, false, None, find_in_path("bash").is_some())
 }
 
 /// A shell command running `script` in `cwd`, confined according to the policy.
@@ -128,9 +149,22 @@ pub fn shell_command(policy: &Policy, cwd: &Path, script: &str) -> anyhow::Resul
         Mode::Off => argv,
         _ => wrap(policy, cwd, argv)?,
     };
-    let mut c = tokio::process::Command::new(&argv[0]);
-    c.args(&argv[1..]).current_dir(cwd);
+    let mut c = shell_process(&argv);
+    c.current_dir(cwd);
     Ok(c)
+}
+
+fn shell_process(argv: &[String]) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new(&argv[0]);
+    #[cfg(windows)]
+    if argv[0] == "cmd" {
+        c.raw_arg(format!("/S /C \"{}\"", argv.last().unwrap()));
+    } else {
+        c.args(&argv[1..]);
+    }
+    #[cfg(not(windows))]
+    c.args(&argv[1..]);
+    c
 }
 
 /// `NYQ_SANDBOX_HELPER` may name this same binary (a path alias). Any other
@@ -157,7 +191,7 @@ fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<St
 
 #[cfg(target_os = "macos")]
 fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<String>> {
-    let mut v = vec!["/usr/bin/sandbox-exec".to_string(), "-p".into(), seatbelt_profile(&writable_roots(policy, cwd), policy.network)];
+    let mut v = vec!["/usr/bin/sandbox-exec".to_string(), "-p".into(), seatbelt_profile(&writable_roots(policy, cwd), policy.network, cwd)];
     v.extend(argv);
     Ok(v)
 }
@@ -169,7 +203,7 @@ fn wrap(_policy: &Policy, _cwd: &Path, _argv: Vec<String>) -> anyhow::Result<Vec
 
 /// A macOS Seatbelt (SBPL) profile allowing writes only under `roots`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn seatbelt_profile(roots: &[PathBuf], network: bool) -> String {
+fn seatbelt_profile(roots: &[PathBuf], network: bool, cwd: &Path) -> String {
     let quote = |p: &Path| format!("\"{}\"", p.display().to_string().replace('\\', "\\\\").replace('"', "\\\""));
     let mut s = String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
     for r in roots {
@@ -177,6 +211,8 @@ fn seatbelt_profile(roots: &[PathBuf], network: bool) -> String {
         s.push_str(&format!(" ({kind} {})", quote(r)));
     }
     s.push_str(")\n");
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    s.push_str(&format!("(deny file-write* (subpath {}))\n", quote(&cwd.join(".git"))));
     if !network {
         // `(deny network*)` includes unix sockets. Re-allowing them was an
         // escape through host daemons such as the Docker socket.
@@ -217,7 +253,8 @@ pub fn describe(policy: &Policy) -> String {
         } else {
             "TCP blocked; UDP and unix sockets not restricted"
         };
-        return format!("sandbox: {mode} · {net} (landlock v{abi})");
+        let git = if policy.mode == Mode::WorkspaceWrite { "; .git remains writable" } else { "" };
+        return format!("sandbox: {mode} · {net}{git} (landlock v{abi})");
     }
     let engine = if cfg!(target_os = "macos") { "seatbelt" } else { "unavailable" };
     format!("sandbox: {mode} · {net} ({engine})")
@@ -346,24 +383,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_bash_skips_system_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("Windows");
+        let system_bin = system.join("System32");
+        let git = dir.path().join("Git/bin");
+        std::fs::create_dir_all(&system_bin).unwrap();
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(system_bin.join("bash.exe"), "").unwrap();
+        std::fs::write(git.join("bash.exe"), "").unwrap();
+        assert_eq!(windows_bash(vec![system_bin.clone(), git.clone()].into_iter(), Some(&system)), Some(git.join("bash.exe").canonicalize().unwrap()));
+        assert!(windows_bash(vec![system_bin].into_iter(), Some(&system)).is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_preserves_quotes() {
+        let script = "echo \"hi there\"";
+        let mut command = shell_process(&shell_argv(script, true, None, false));
+        let out = command.output().await.unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "\"hi there\"");
+    }
+
+    #[test]
     fn seatbelt_profile_escapes_and_denies() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false);
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false, Path::new("/workspace"));
         assert!(p.contains("(deny file-write*)"));
+        let git = Path::new("/workspace").join(".git").display().to_string().replace('\\', "\\\\");
+        assert!(p.contains(&format!("(deny file-write* (subpath \"{git}\"))")));
         assert!(p.contains(r#""/tmp/a\"b""#));
         assert!(p.contains("(deny network*)"));
         assert!(!p.contains("unix-socket"));
-        assert!(!seatbelt_profile(&[], true).contains("deny network"));
+        assert!(!seatbelt_profile(&[], true, Path::new("/workspace")).contains("deny network"));
     }
 
     #[test]
     fn shell_selection_matches_the_platform() {
         assert_eq!(
-            shell_argv("echo hi", true, false, false),
-            vec!["cmd".to_string(), "/C".into(), "echo hi".into()]
+            shell_argv("echo hi", true, None, false),
+            vec!["cmd".to_string(), "/S".into(), "/C".into(), "echo hi".into()]
         );
-        assert_eq!(shell_argv("echo hi", true, true, false)[..2], ["bash", "-c"]);
-        assert_eq!(shell_argv("echo hi", false, false, false)[0], "sh");
-        assert_eq!(shell_argv("echo hi", false, false, true)[0], "bash");
+        assert_eq!(shell_argv("echo hi", true, Some(Path::new("/git/bash.exe")), false)[..2], ["/git/bash.exe", "-c"]);
+        assert_eq!(shell_argv("echo hi", false, None, false)[0], "sh");
+        assert_eq!(shell_argv("echo hi", false, None, true)[0], "bash");
     }
 
     #[test]
@@ -411,6 +474,15 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn describe_mentions_git_write_gap() {
+        let text = describe(&Policy::default());
+        if text.contains("landlock") {
+            assert!(text.contains(".git remains writable"), "{text}");
+        }
+    }
+
     #[test]
     fn helper_override_must_be_this_binary() {
         let exe = std::env::current_exe().unwrap();
@@ -425,6 +497,6 @@ mod tests {
     fn off_runs_plain_shell() {
         let c = shell_command(&Policy { mode: Mode::Off, ..Default::default() }, Path::new("/"), "true").unwrap();
         let prog = c.as_std().get_program().to_string_lossy().into_owned();
-        assert!(prog == "bash" || prog == "sh" || prog == "cmd", "{prog}");
+        assert!(prog == "bash" || prog == "sh" || prog == "cmd" || Path::new(&prog).file_name().is_some_and(|n| n == "bash.exe"), "{prog}");
     }
 }

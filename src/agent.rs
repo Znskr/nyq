@@ -356,7 +356,7 @@ impl Agent {
         ui.tool_start(name, &summary);
         let before = self.undo.len();
         self.undo.snapshot(&self.cwd, self.sandbox.mode, name, &args);
-        let out = if tool.handles_cancel() {
+        let mut out = if tool.handles_cancel() {
             tool.run(args, &ctx).await
         } else {
             tokio::select! {
@@ -367,6 +367,7 @@ impl Agent {
         if out.is_error && !out.changed && self.undo.len() > before {
             self.undo.discard_last();
         }
+        self.undo.append(std::mem::take(&mut out.undo));
         ui.tool_end(name, &out);
         out
     }
@@ -451,6 +452,7 @@ impl Agent {
         let before = self.items.len();
         self.items.clear();
         self.push(Item::Compaction { summary });
+        self.submitted = self.items.len();
         ui.notice(&format!("Compacted {before} messages into a summary."));
         Ok(true)
     }
@@ -515,7 +517,9 @@ impl Agent {
             }
         }
         let kept = self.items.len();
-        self.items.extend(tail);
+        for item in tail {
+            self.push(item);
+        }
         self.submitted = kept;
         if self.context_window > 0 && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT {
             self.suppress_auto_compact = true;
@@ -821,6 +825,29 @@ mod tests {
     use super::*;
     use crate::provider::EventSink;
     use crate::types::Response;
+
+    #[tokio::test]
+    async fn compaction_preserves_unsent_tail_on_resume_and_after_manual_compact() {
+        let mut agent = agent(Response { items: vec![Item::Assistant { text: "summary".into() }], usage: None }, None);
+        let dir = tempfile::tempdir().unwrap();
+        agent.session = Some(Session::create(dir.path(), &agent.cwd, "fake").unwrap());
+        agent.push(Item::Assistant { text: "old answer".into() });
+        agent.submitted = agent.items.len();
+        let tail = Item::user("fix the failing test");
+        agent.push(tail.clone());
+        assert!(agent.auto_compact(&mut QuietUi, &CancellationToken::new()).await.unwrap());
+        let id = agent.session.as_ref().unwrap().id.clone();
+        let (_, _, loaded) = crate::session::load(dir.path(), &id, &agent.cwd).unwrap();
+        assert_eq!(loaded, agent.items);
+        assert_eq!(loaded.last(), Some(&tail));
+        agent.submitted = 40;
+        assert!(agent.compact(&mut QuietUi, &CancellationToken::new()).await.unwrap());
+        assert_eq!(agent.submitted, 1);
+        agent.push_counted(Item::user("large log".repeat(1000)));
+        assert!(agent.auto_compact(&mut QuietUi, &CancellationToken::new()).await.unwrap());
+        assert_eq!(agent.items.last(), Some(&Item::user("large log".repeat(1000))));
+    }
+
 
     struct SummaryProvider {
         response: Response,

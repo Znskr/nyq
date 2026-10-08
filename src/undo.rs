@@ -13,12 +13,14 @@ use crate::sandbox::Mode;
 const MAX_BYTES: usize = 10 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100;
 
+#[derive(Clone, Debug)]
 enum Before {
     Bytes(Vec<u8>),
     Missing,
     Unavailable(String),
 }
 
+#[derive(Clone, Debug)]
 struct Entry {
     path: PathBuf,
     cwd: PathBuf,
@@ -27,7 +29,7 @@ struct Entry {
     missing_dirs: Vec<PathBuf>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct UndoLog {
     entries: VecDeque<Entry>,
 }
@@ -76,6 +78,13 @@ impl UndoLog {
             before,
             missing_dirs,
         });
+    }
+
+    pub fn append(&mut self, other: Self) {
+        self.entries.extend(other.entries);
+        while self.entries.len() > MAX_ENTRIES {
+            self.entries.pop_front();
+        }
     }
 
     pub fn discard_last(&mut self) {

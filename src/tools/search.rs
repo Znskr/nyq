@@ -133,7 +133,7 @@ fn collect_glob(
         if cancel.is_cancelled() {
             return Err("Cancelled by user.".into());
         }
-        if entry.file_type().is_some_and(|t| t.is_dir()) {
+        if entry.path_is_symlink() || entry.file_type().is_some_and(|t| t.is_dir()) {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(root) else { continue };
@@ -285,7 +285,7 @@ fn collect_grep(
             if cancel.is_cancelled() {
                 return Err("Cancelled by user.".into());
             }
-            if entry.file_type().is_some_and(|t| t.is_dir()) {
+            if entry.path_is_symlink() || entry.file_type().is_some_and(|t| t.is_dir()) {
                 continue;
             }
             let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
@@ -480,6 +480,20 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn searches_skip_symlinked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token.txt"), "secret token").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token.txt"), dir.path().join("link.txt")).unwrap();
+        let grep = run(&Grep, json!({"pattern": "token"}), dir.path()).await;
+        assert!(!grep.content.contains("secret"), "{}", grep.content);
+        let glob = run(&GlobFiles, json!({"pattern": "**/*"}), dir.path()).await;
+        assert!(!glob.content.contains("link.txt"), "{}", glob.content);
+    }
+
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
