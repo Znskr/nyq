@@ -209,7 +209,7 @@ fn title_of(text: &str) -> String {
     }
 }
 
-/// Load a session by id, unique id prefix, or `last` (newest, preferring the
+/// Load a session by id, unique id prefix, or `last` (newest in the
 /// given cwd). Returns the session reopened for appending plus its items.
 pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<Item>)> {
     let all = list(dir)?;
@@ -217,7 +217,8 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         bail!("No saved sessions in {}", dir.display());
     }
     let meta = if which == "last" {
-        all.iter().find(|m| m.cwd == cwd).unwrap_or(&all[0]).clone()
+        all.iter().find(|m| m.cwd == cwd)
+            .ok_or_else(|| anyhow::anyhow!("No saved conversation in this directory (use -r to pick one)"))?.clone()
     } else if let Some(m) = all.iter().find(|m| m.id == which) {
         m.clone()
     } else {
@@ -373,7 +374,7 @@ mod tests {
         let titles: Vec<_> = list(dir).unwrap().into_iter().map(|m| m.title).collect();
         assert_eq!(titles, ["three", "two", "one"]);
         assert_eq!(load(dir, "last", Path::new("/a")).unwrap().1.title, "one");
-        assert_eq!(load(dir, "last", Path::new("/zzz")).unwrap().1.title, "three");
+        assert!(load(dir, "last", Path::new("/zzz")).err().unwrap().to_string().contains("No saved conversation in this directory"));
         assert_eq!(load(dir, &ids[1][..8], Path::new("/")).unwrap().1.title, "two");
         assert!(load(dir, "", Path::new("/")).err().unwrap().to_string().contains("ambiguous"));
         assert!(load(dir, "nope", Path::new("/")).err().unwrap().to_string().contains("No session"));

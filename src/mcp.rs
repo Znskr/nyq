@@ -30,6 +30,26 @@ use tokio_util::sync::CancellationToken;
 use crate::tools::{Tool, ToolCtx, ToolOutput};
 use crate::types::ToolSpec;
 
+// Resolve batch-file launchers explicitly: Windows process lookup only adds .exe.
+#[cfg(any(windows, test))]
+fn resolve_launcher(command: &str, paths: &[PathBuf], extensions: &str) -> PathBuf {
+    for dir in paths {
+        let base = dir.join(command);
+        if base.is_file() {
+            return base;
+        }
+        if Path::new(command).extension().is_none() {
+            for ext in extensions.split(';').filter(|e| e.starts_with('.')) {
+                let candidate = dir.join(format!("{command}{ext}"));
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    command.into()
+}
+
 const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -254,7 +274,20 @@ impl McpManager {
         }
         let service = match &cfg.transport {
             Transport::Stdio { command, args, env, cwd } => {
-                let mut cmd = tokio::process::Command::new(command);
+                #[cfg(windows)]
+                let program = {
+                    let variable = |name: &str| env.iter().find(|(k, _)| k.eq_ignore_ascii_case(name))
+                        .map(|(_, v)| v.clone()).or_else(|| std::env::var(name).ok());
+                    let path = variable("PATH").unwrap_or_default();
+                    let base = cwd.clone().unwrap_or(std::env::current_dir()?);
+                    let paths: Vec<PathBuf> = std::env::split_paths(&path).map(|p| base.join(p)).collect();
+                    let extensions = variable("PATHEXT")
+                        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+                    resolve_launcher(command, &paths, &extensions)
+                };
+                #[cfg(not(windows))]
+                let program = command;
+                let mut cmd = tokio::process::Command::new(program);
                 cmd.args(args).envs(env);
                 if let Some(dir) = cwd {
                     cmd.current_dir(dir);
@@ -794,6 +827,17 @@ mod tests {
         cancel.cancel();
         let err = manager.login(&cfg, Some(&cancel), |_| panic!("cancelled login opened browser")).await.err().unwrap();
         assert!(err.to_string().contains("sign-in cancelled"));
+    }
+
+    #[test]
+    fn resolves_batch_launchers_through_pathext() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("npx.cmd");
+        std::fs::write(&launcher, "").unwrap();
+        let paths = [dir.path().to_path_buf()];
+        assert_eq!(resolve_launcher("npx", &paths, ".exe;.cmd"), launcher);
+        assert_eq!(resolve_launcher("npx.cmd", &paths, ".exe;.cmd"), launcher);
+        assert_eq!(resolve_launcher("missing", &paths, ".cmd"), PathBuf::from("missing"));
     }
 
     #[test]

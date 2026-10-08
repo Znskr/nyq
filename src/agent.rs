@@ -784,7 +784,13 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
     if is_file_tool(tool) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
         // Hooks and config under .git run later with full permissions: always ask.
-        let in_git = Path::new(path).components().any(|c| c.as_os_str() == ".git");
+        let git_component = |p: &Path| p.components().any(|c| {
+            c.as_os_str().to_str().is_some_and(|s| s.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"))
+        });
+        let resolved = cwd.join(path);
+        let in_git = git_component(Path::new(path)) || resolved.ancestors()
+            .find_map(|a| std::fs::canonicalize(a).ok())
+            .is_some_and(|real| git_component(&real));
         return allowed.contains(tool) && !path.is_empty() && !in_git && inside(cwd, path);
     }
     if tool == "subagent" {
@@ -1096,6 +1102,17 @@ mod tests {
         assert!(!is_allowed(&write, "write_file", &json!({"path": ".git/hooks/pre-commit"}), cwd));
         assert!(!is_allowed(&write, "edit_file", &json!({"path": "./.git/config"}), cwd));
         assert!(!is_allowed(&write, "write_file", &json!({"path": "sub/.git/config"}), cwd));
+        for path in [".GIT/config", ".git. /hooks/new"] {
+            assert!(!is_allowed(&write, "write_file", &json!({"path": path}), cwd));
+        }
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(cwd.join(".git")).unwrap();
+            std::os::unix::fs::symlink(".git", cwd.join("docs")).unwrap();
+            for path in ["docs/config", "docs/hooks/new"] {
+                assert!(!is_allowed(&write, "write_file", &json!({"path": path}), cwd));
+            }
+        }
         assert_eq!(grant_rule("mcp__wiki__ask", &json!({})).as_deref(), Some("mcp__wiki__ask"));
         assert_eq!(
             grant_rule("web_fetch", &json!({"url": "https://example.com/a"})).as_deref(),
