@@ -1,7 +1,7 @@
 //! The core loop: send the transcript, stream the reply, run any tool calls,
 //! feed results back, repeat until the model answers without tools.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
@@ -156,8 +156,11 @@ pub struct Agent {
     pub items: Vec<Item>,
     pub session: Option<Session>,
     pub cwd: PathBuf,
-    /// Skip all approval prompts.
-    pub yolo: bool,
+    /// How risky calls are decided. Deny rules still block in every mode.
+    pub permission_mode: crate::permissions::Mode,
+    /// Identical auto-mode decisions reused for the rest of this session,
+    /// including a subagent's calls.
+    pub review_cache: std::sync::Arc<std::sync::Mutex<HashMap<String, crate::classifier::Verdict>>>,
     /// Rules granted with "always" in this session (see [`grant_rule`]).
     pub allowed: HashSet<String>,
     /// Persistent allow/ask/deny rules (see `crate::permissions`).
@@ -199,9 +202,24 @@ impl Agent {
         self.usage.output_tokens += u.output_tokens;
         self.usage.cached_tokens += u.cached_tokens;
         // Permissions are loaded from the active profile, including in ACP and subagents.
-        if let Some(home) = self.permissions.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let session = self.session.as_ref().map_or(self.stats.id.as_str(), |s| s.id.as_str());
-            if let Err(e) = crate::usage::append(home, session, self.provider.name(), self.provider.pricing_provider(), self.provider.model(), u) {
+        if let Some(home) = self
+            .permissions
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            let session = self
+                .session
+                .as_ref()
+                .map_or(self.stats.id.as_str(), |s| s.id.as_str());
+            if let Err(e) = crate::usage::append(
+                home,
+                session,
+                self.provider.name(),
+                self.provider.pricing_provider(),
+                self.provider.model(),
+                u,
+            ) {
                 crate::ui::error(&format!("could not save usage: {e:#}"));
             }
         }
@@ -336,10 +354,18 @@ impl Agent {
                     }
                     return Ok(TurnEnd::Cancelled);
                 }
-                let mut out = self.call_tool(name, arguments, ui, &cancel).await;
+                let mut out = self.call_tool(id, name, arguments, ui, &cancel).await;
                 // Oversized output is stored; the model gets head, tail and an id.
-                let key = crate::tools::artifacts::session_key(self.session.as_ref().map(|s| s.id.as_str()));
-                out.content = crate::tools::artifacts::spill(&crate::config::home(), &key, id, name, std::mem::take(&mut out.content));
+                let key = crate::tools::artifacts::session_key(
+                    self.session.as_ref().map(|s| s.id.as_str()),
+                );
+                out.content = crate::tools::artifacts::spill(
+                    &crate::config::home(),
+                    &key,
+                    id,
+                    name,
+                    std::mem::take(&mut out.content),
+                );
                 // Usage precedes tool execution, so account for the new text
                 // before deciding whether the next step needs compaction.
                 // An estimate is replaced wholesale on the next sync.
@@ -372,8 +398,78 @@ impl Agent {
         anyhow::bail!("stopped after {MAX_STEPS} steps without a final answer")
     }
 
+    /// Ask the session provider whether one risky call may run.
+    async fn auto_review(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> crate::classifier::ReviewResult {
+        let mut provider = self.provider.fork();
+        if let Some(model) = crate::settings::classifier_model() {
+            provider.set_model(model);
+        }
+        provider.set_effort(None);
+        provider.set_fast(false);
+        let (user_request, prior, older_omitted) = crate::classifier::turn_context(&self.items);
+        let mut action = crate::classifier::Action::new(name, arguments, &user_request);
+        action.call_id = id.to_string();
+        action.cwd = self.cwd.display().to_string();
+        action.background = args
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        action.prior = prior;
+        action.origin = if self.session.is_none() {
+            "subagent"
+        } else {
+            "root"
+        }
+        .to_string();
+        action.branch = crate::ui::statusline::git_branch(&self.cwd);
+        action.older_omitted = older_omitted;
+        let prepared = crate::classifier::prepare(&action);
+        if prepared.skip.is_none() {
+            let hit = self
+                .review_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&prepared.cache_key)
+                .cloned();
+            if let Some(verdict) = hit {
+                return crate::classifier::ReviewResult {
+                    verdict,
+                    fallback: false,
+                    usage: None,
+                    cancelled: false,
+                };
+            }
+        }
+        let mut local = HashMap::new();
+        let result = crate::classifier::review(
+            provider.as_ref(),
+            &action,
+            &mut local,
+            crate::classifier::TIMEOUT,
+            cancel,
+        )
+        .await;
+        if !result.fallback && !result.cancelled {
+            if let Some(verdict) = local.remove(&prepared.cache_key) {
+                self.review_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(prepared.cache_key, verdict);
+            }
+        }
+        result
+    }
+
     async fn call_tool(
         &mut self,
+        id: &str,
         name: &str,
         arguments: &str,
         ui: &mut dyn Ui,
@@ -381,13 +477,19 @@ impl Agent {
     ) -> ToolOutput {
         if let Some(out) = self.tools.handle_meta(name, arguments) {
             let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-            ui.tool_start(name, args["query"].as_str().or(args["name"].as_str()).unwrap_or(""));
+            ui.tool_start(
+                name,
+                args["query"]
+                    .as_str()
+                    .or(args["name"].as_str())
+                    .unwrap_or(""),
+            );
             ui.tool_end(name, &out);
             return out;
         }
-        let Some(tool) = self.tools.get(name) else {
+        if self.tools.get(name).is_none() {
             return ToolOutput::err(format!("Unknown tool `{name}`."));
-        };
+        }
         if name == ASK_USER {
             let args: Value = serde_json::from_str(arguments).unwrap_or_default();
             let question = args["question"].as_str().unwrap_or("").to_string();
@@ -423,7 +525,9 @@ impl Agent {
             cancel: cancel.clone(),
             sandbox: self.sandbox.clone(),
             provider: Some(std::sync::Arc::from(self.provider.fork())),
-            yolo: self.yolo,
+            yolo: self.permission_mode.is_yolo(),
+            permission_mode: self.permission_mode,
+            review_cache: std::sync::Arc::clone(&self.review_cache),
             allowed: self.allowed.clone(),
             approver: ui.approver(),
             permissions: self.permissions.clone(),
@@ -432,17 +536,28 @@ impl Agent {
             hooks: self.hooks.clone(),
             subagent_dir: self.session.as_ref().map(|s| crate::subagents::store_dir(&s.path)),
         };
-        let summary = tool.summary(&args);
+        let summary = self
+            .tools
+            .get(name)
+            .map(|tool| tool.summary(&args))
+            .unwrap_or_default();
 
         let session_id = ctx.session_id.clone();
-        if let Some(msg) = self.hooks.pre_tool_use(name, &args, &self.cwd, session_id.as_deref(), cancel).await {
+        if let Some(msg) = self
+            .hooks
+            .pre_tool_use(name, &args, &self.cwd, session_id.as_deref(), cancel)
+            .await
+        {
             ui.tool_start(name, &summary);
             let out = ToolOutput::err(msg);
             ui.tool_end(name, &out);
             return out;
         }
 
-        let mut needs_approval = tool.needs_approval_for(&args, &self.cwd);
+        let mut needs_approval = self
+            .tools
+            .get(name)
+            .is_some_and(|tool| tool.needs_approval_for(&args, &self.cwd));
         if needs_approval && crate::permissions::is_read_tool(name) {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             if inside_any(&self.cwd, &self.sandbox.writable, path) {
@@ -456,7 +571,7 @@ impl Agent {
             &self.cwd,
             &self.sandbox.writable,
             needs_approval,
-            self.yolo,
+            self.permission_mode,
         ) {
             Decision::Run => None,
             Decision::Deny(rule) => {
@@ -469,6 +584,43 @@ impl Agent {
                 return out;
             }
             Decision::Ask { forced } => Some(forced),
+            Decision::Classify => {
+                let review = self.auto_review(id, name, arguments, &args, cancel).await;
+                if let Some(usage) = review.usage {
+                    self.account_usage(Some(usage), ui);
+                }
+                if review.cancelled {
+                    ui.tool_start(name, &summary);
+                    let out = ToolOutput::err("Cancelled by user.");
+                    ui.tool_end(name, &out);
+                    return out;
+                }
+                match &review.verdict {
+                    crate::classifier::Verdict::Allow { .. } => None,
+                    crate::classifier::Verdict::Deny { .. } => {
+                        let reason = review.verdict.reason();
+                        ui.tool_start(name, &summary);
+                        let out = ToolOutput::err(format!(
+                            "The permission classifier denied this call ({reason}) and it did not run. \
+                             Do not retry it; find another way or ask the user."
+                        ));
+                        ui.tool_end(name, &out);
+                        return out;
+                    }
+                    crate::classifier::Verdict::Ask { .. } => {
+                        let reason = review.verdict.reason();
+                        if review.fallback {
+                            ui.notice(reason);
+                        } else {
+                            ui.notice(&format!("Classifier: {reason}"));
+                        }
+                        Some(None)
+                    }
+                }
+            }
+        };
+        let Some(tool) = self.tools.get(name) else {
+            return ToolOutput::err(format!("Unknown tool `{name}`."));
         };
         if let Some(forced) = forced {
             let preview = tool.preview(&args, &ctx);
@@ -531,7 +683,10 @@ impl Agent {
         let before = self.undo.len();
         self.undo
             .snapshot(&self.cwd, self.sandbox.mode, name, &args);
-        let hook_args = self.hooks.observes_post_tool_use(name).then(|| args.clone());
+        let hook_args = self
+            .hooks
+            .observes_post_tool_use(name)
+            .then(|| args.clone());
         let mut out = if tool.handles_cancel() {
             tool.run(args, &ctx).await
         } else {
@@ -553,7 +708,9 @@ impl Agent {
         );
         ui.tool_end(name, &out);
         if let Some(args) = hook_args {
-            self.hooks.post_tool_use(name, &args, &out, &self.cwd, session_id.as_deref(), cancel).await;
+            self.hooks
+                .post_tool_use(name, &args, &out, &self.cwd, session_id.as_deref(), cancel)
+                .await;
         }
         out
     }
@@ -1157,8 +1314,13 @@ fn covers(root: &Path, full: &Path) -> bool {
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // Resolve the existing prefix (symlinks, and spellings such as macOS's
     // /var vs /private/var), keep the not-yet-existing tail, then compare.
-    match full.ancestors().find_map(|a| std::fs::canonicalize(a).ok().map(|real| (a, real))) {
-        Some((existing, real)) => real.join(full.strip_prefix(existing).unwrap_or(Path::new(""))).starts_with(&canon),
+    match full
+        .ancestors()
+        .find_map(|a| std::fs::canonicalize(a).ok().map(|real| (a, real)))
+    {
+        Some((existing, real)) => real
+            .join(full.strip_prefix(existing).unwrap_or(Path::new("")))
+            .starts_with(&canon),
         None => full.starts_with(root),
     }
 }
@@ -1400,7 +1562,8 @@ mod tests {
             items: vec![Item::user("original")],
             session: None,
             cwd: PathBuf::from("."),
-            yolo: true,
+            permission_mode: crate::permissions::Mode::Yolo,
+            review_cache: Default::default(),
             allowed: HashSet::new(),
             permissions: Default::default(),
             usage: Usage::default(),
@@ -1461,7 +1624,14 @@ mod tests {
         assert_eq!(agent.context_tokens, 900);
         // A completed response still consumes tokens even when cancellation
         // prevents adopting its summary.
-        assert_eq!(agent.usage, Usage { input_tokens: 100, output_tokens: 10, cached_tokens: 5 });
+        assert_eq!(
+            agent.usage,
+            Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cached_tokens: 5
+            }
+        );
         assert_eq!(agent.stats.requests, 1);
         assert_eq!(std::fs::read(path).unwrap(), saved);
     }
@@ -1469,17 +1639,40 @@ mod tests {
     #[tokio::test]
     async fn compaction_logs_usage_once_in_active_profile() {
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("models.json"), r#"{"fake":{"models":{"fake":{"cost":{"input":2,"output":8,"cache_read":0.5}}}}}"#).unwrap();
-        let usage = Usage { input_tokens: 100, output_tokens: 20, cached_tokens: 40 };
-        let mut agent = agent(Response { items: vec![Item::Assistant { text: "summary".into() }], usage: Some(usage) }, None);
-        agent.permissions = std::sync::Arc::new(crate::permissions::Permissions { path: home.path().join("permissions.json"), ..Default::default() });
-        agent.session = Some(Session::create(&home.path().join("sessions"), &agent.cwd, "fake").unwrap());
-        assert!(agent.compact(&mut QuietUi, &CancellationToken::new()).await.unwrap());
+        std::fs::write(
+            home.path().join("models.json"),
+            r#"{"fake":{"models":{"fake":{"cost":{"input":2,"output":8,"cache_read":0.5}}}}}"#,
+        )
+        .unwrap();
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_tokens: 40,
+        };
+        let mut agent = agent(
+            Response {
+                items: vec![Item::Assistant {
+                    text: "summary".into(),
+                }],
+                usage: Some(usage),
+            },
+            None,
+        );
+        agent.permissions = std::sync::Arc::new(crate::permissions::Permissions {
+            path: home.path().join("permissions.json"),
+            ..Default::default()
+        });
+        agent.session =
+            Some(Session::create(&home.path().join("sessions"), &agent.cwd, "fake").unwrap());
+        assert!(agent
+            .compact(&mut QuietUi, &CancellationToken::new())
+            .await
+            .unwrap());
         let log = std::fs::read_to_string(home.path().join("usage.jsonl")).unwrap();
         assert_eq!(log.lines().count(), 1);
         let r: crate::usage::Record = serde_json::from_str(log.trim()).unwrap();
         assert_eq!(r.session, agent.session.as_ref().unwrap().id);
-        assert_eq!((r.input, r.output, r.cached), (100,20,40));
+        assert_eq!((r.input, r.output, r.cached), (100, 20, 40));
         assert!((r.cost_usd.unwrap() - 0.0003).abs() < 1e-12);
         assert_eq!(agent.usage, usage);
         assert_eq!(agent.stats.requests, 1);
@@ -2156,7 +2349,7 @@ mod tests {
             usage: None,
         });
         let mut agent = agent(Response::default(), None);
-        agent.yolo = false;
+        agent.permission_mode = crate::permissions::Mode::Ask;
         agent.context_window = 0;
         agent.tools.add(Box::new(CountTool(runs.clone())));
         agent.provider = Box::new(ScriptedTurns {
@@ -2222,7 +2415,7 @@ mod tests {
         // deny: never asks or runs, even with --yolo.
         let runs = std::sync::Arc::new(AtomicUsize::new(0));
         let mut agent = calling_agent(&runs, 1);
-        agent.yolo = true;
+        agent.permission_mode = crate::permissions::Mode::Yolo;
         agent.permissions = rules(&["mcp__*"], &[], &["mcp__wiki__*"]);
         let mut ui = ScriptUi {
             answer: Approval::Yes,
@@ -2269,6 +2462,115 @@ mod tests {
             .await
             .unwrap();
         assert!(ui.asked.is_empty());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_follows_the_classifier() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        fn response(items: Vec<Item>) -> crate::types::Response {
+            crate::types::Response { items, usage: None }
+        }
+        fn call() -> crate::types::Response {
+            response(vec![Item::ToolCall {
+                id: "1".into(),
+                name: "mcp__wiki__ask".into(),
+                arguments: "{}".into(),
+            }])
+        }
+        fn decision(decision: &str, reason: &str) -> crate::types::Response {
+            response(vec![Item::ToolCall {
+                id: "perm".into(),
+                name: crate::classifier::TOOL_NAME.into(),
+                arguments: serde_json::json!({"decision": decision, "reason": reason}).to_string(),
+            }])
+        }
+        fn done() -> crate::types::Response {
+            response(vec![Item::Assistant {
+                text: "done".into(),
+            }])
+        }
+        fn scripted(
+            runs: &std::sync::Arc<AtomicUsize>,
+            script: Vec<crate::types::Response>,
+        ) -> Agent {
+            let mut agent = calling_agent(runs, 0);
+            agent.permission_mode = crate::permissions::Mode::Auto;
+            agent.provider = Box::new(ScriptedTurns {
+                left: std::sync::Arc::new(std::sync::Mutex::new(script)),
+            });
+            agent
+        }
+
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut agent = scripted(
+            &runs,
+            vec![call(), decision("allow", "read only lookup"), done()],
+        );
+        let mut ui = ScriptUi {
+            answer: Approval::Yes,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(
+                Item::user("Ship the widget to staging."),
+                &mut ui,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(ui.asked.is_empty());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut agent = scripted(
+            &runs,
+            vec![call(), decision("deny", "touches production"), done()],
+        );
+        let mut ui = ScriptUi {
+            answer: Approval::Yes,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(
+                Item::user("Ship the widget to staging."),
+                &mut ui,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(ui.asked.is_empty());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert!(
+            results(&agent)[0].contains("touches production"),
+            "{:?}",
+            results(&agent)
+        );
+
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut agent = scripted(
+            &runs,
+            vec![
+                call(),
+                response(vec![Item::Assistant {
+                    text: "sure".into(),
+                }]),
+                done(),
+            ],
+        );
+        let mut ui = ScriptUi {
+            answer: Approval::Yes,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(
+                Item::user("Ship the widget to staging."),
+                &mut ui,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ui.asked.len(), 1);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
@@ -2640,7 +2942,10 @@ mod tests {
 
     /// A hooks configuration with one user hook, for the wiring tests.
     #[cfg(unix)]
-    fn hooks_with(event: crate::hooks::Event, command: &str) -> std::sync::Arc<crate::hooks::Hooks> {
+    fn hooks_with(
+        event: crate::hooks::Event,
+        command: &str,
+    ) -> std::sync::Arc<crate::hooks::Hooks> {
         std::sync::Arc::new(crate::hooks::Hooks::from_user_hook(crate::hooks::Hook {
             event,
             matcher: None,
@@ -2674,7 +2979,10 @@ mod tests {
     async fn stop_hook_runs_after_the_turn() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("stopped");
-        let mut agent = calling_agent(&std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)), 0);
+        let mut agent = calling_agent(
+            &std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            0,
+        );
         agent.hooks = hooks_with(
             crate::hooks::Event::Stop,
             &format!("echo done >> {}", marker.display()),
@@ -2688,14 +2996,27 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn prompt_hooks_add_context_or_block() {
-        let mut agent = calling_agent(&std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)), 0);
+        let mut agent = calling_agent(
+            &std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            0,
+        );
         agent.hooks = hooks_with(crate::hooks::Event::UserPromptSubmit, "echo branch: main");
         let live = CancellationToken::new();
-        assert_eq!(crate::hooks::prompt_submit(&mut agent, "hi", &live).await, None);
-        assert!(matches!(agent.items.last(), Some(Item::User { text, .. }) if text.ends_with("branch: main")));
-        agent.hooks = hooks_with(crate::hooks::Event::UserPromptSubmit, r#"echo '{"decision":"block","reason":"no"}'"#);
+        assert_eq!(
+            crate::hooks::prompt_submit(&mut agent, "hi", &live).await,
+            None
+        );
+        assert!(
+            matches!(agent.items.last(), Some(Item::User { text, .. }) if text.ends_with("branch: main"))
+        );
+        agent.hooks = hooks_with(
+            crate::hooks::Event::UserPromptSubmit,
+            r#"echo '{"decision":"block","reason":"no"}'"#,
+        );
         let n = agent.items.len();
-        let msg = crate::hooks::prompt_submit(&mut agent, "hi", &live).await.unwrap();
+        let msg = crate::hooks::prompt_submit(&mut agent, "hi", &live)
+            .await
+            .unwrap();
         assert!(msg.contains("no"), "{msg}");
         assert_eq!(agent.items.len(), n);
     }

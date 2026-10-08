@@ -6,13 +6,13 @@ pub(crate) mod background;
 mod bash;
 pub(crate) use bash::run_shell;
 mod fs;
+pub mod image;
 pub(crate) mod mcp_search;
 pub(crate) mod memory;
-pub mod image;
 pub(crate) mod safeio;
 mod search;
-pub mod web;
 pub mod subagent;
+pub mod web;
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -54,7 +54,8 @@ impl SecretRoots {
 
     /// `Some` when `user_path` or `resolved` lands in a credential location.
     pub(crate) fn reject(&self, user_path: &str, resolved: &Path) -> Option<&'static str> {
-        let hit = self.blocks_path(resolved) || expand_tilde(user_path).is_some_and(|p| self.blocks_path(&p));
+        let hit = self.blocks_path(resolved)
+            || expand_tilde(user_path).is_some_and(|p| self.blocks_path(&p));
         hit.then_some("refusing to read credential files")
     }
 
@@ -67,7 +68,9 @@ impl SecretRoots {
     }
 
     fn covers(&self, path: &Path) -> bool {
-        self.roots.iter().any(|root| path == root || path.starts_with(root))
+        self.roots
+            .iter()
+            .any(|root| path == root || path.starts_with(root))
     }
 }
 
@@ -169,7 +172,9 @@ pub(crate) fn read_rooted_text(root: &Path, path: &Path) -> Result<String, Strin
         return Err("not a regular file".into());
     }
     let mut buf = Vec::new();
-    file.take(MAX_ROOTED_TEXT.saturating_add(1)).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    file.take(MAX_ROOTED_TEXT.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
     if buf.len() as u64 > MAX_ROOTED_TEXT {
         return Err(format!("file exceeds {MAX_ROOTED_TEXT} bytes"));
     }
@@ -190,7 +195,11 @@ pub(crate) fn outside_path_arg(cwd: &Path, args: &Value) -> bool {
 /// A path as shown to the model and user: always with `/` separators.
 pub(crate) fn slash_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
-    if cfg!(windows) { s.replace('\\', "/") } else { s }
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s
+    }
 }
 
 #[derive(Clone, Default)]
@@ -204,8 +213,15 @@ pub struct ToolCtx {
     /// A copy of the session's model provider, for tools that run their own
     /// model calls (subagents). None in tests.
     pub provider: Option<std::sync::Arc<dyn crate::provider::Provider>>,
-    /// The session's `--yolo` flag, inherited by subagents.
+    /// True when the session mode is yolo. Callers that only set this still
+    /// skip prompts; `permission_mode` is used when this is false.
     pub yolo: bool,
+    /// The session permission mode, inherited by subagents.
+    pub permission_mode: crate::permissions::Mode,
+    /// Shared auto-mode decision cache for this session.
+    pub review_cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::classifier::Verdict>>,
+    >,
     /// Rules granted with "always", inherited by subagents.
     pub allowed: HashSet<String>,
     /// Asks the user about calls made outside the agent loop (a subagent's
@@ -243,10 +259,17 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), ..Self::default() }
+        Self {
+            content: content.into(),
+            ..Self::default()
+        }
     }
     pub fn err(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true, ..Self::default() }
+        Self {
+            content: content.into(),
+            is_error: true,
+            ..Self::default()
+        }
     }
 }
 
@@ -322,7 +345,8 @@ impl Registry {
         if names.is_empty() {
             return;
         }
-        self.tools.retain(|t| !names.iter().any(|n| n == &t.spec().name));
+        self.tools
+            .retain(|t| !names.iter().any(|n| n == &t.spec().name));
     }
 
     pub fn remove_prefix(&mut self, prefix: &str) {
@@ -330,7 +354,10 @@ impl Registry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.spec().name == name).map(|t| t.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.spec().name == name)
+            .map(|t| t.as_ref())
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -338,7 +365,10 @@ impl Registry {
     }
 
     fn mcp_specs(&self) -> Vec<ToolSpec> {
-        self.specs().into_iter().filter(|s| mcp_search::is_mcp(&s.name)).collect()
+        self.specs()
+            .into_iter()
+            .filter(|s| mcp_search::is_mcp(&s.name))
+            .collect()
     }
 
     /// The tools offered to the model on the next request. When MCP tools are
@@ -348,8 +378,11 @@ impl Registry {
         if !mcp_search::should_defer(&mcp) {
             return self.specs();
         }
-        let mut out: Vec<ToolSpec> =
-            self.specs().into_iter().filter(|s| !mcp_search::is_mcp(&s.name) || self.selected.contains(&s.name)).collect();
+        let mut out: Vec<ToolSpec> = self
+            .specs()
+            .into_iter()
+            .filter(|s| !mcp_search::is_mcp(&s.name) || self.selected.contains(&s.name))
+            .collect();
         out.extend(mcp_search::meta_specs(&mcp));
         out
     }
@@ -366,14 +399,23 @@ impl Registry {
         }
         let args: Value = serde_json::from_str(arguments).unwrap_or_default();
         if name == mcp_search::SEARCH {
-            return Some(mcp_search::search(&mcp, &args).map_or_else(ToolOutput::err, ToolOutput::ok));
+            return Some(
+                mcp_search::search(&mcp, &args).map_or_else(ToolOutput::err, ToolOutput::ok),
+            );
         }
-        let wanted = args.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        let wanted = args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         Some(if mcp.iter().any(|s| s.name == wanted) {
             self.selected.insert(wanted.to_string());
             ToolOutput::ok(format!("Selected `{wanted}`. It is callable from the next step on; call `{wanted}` with arguments matching its schema."))
         } else {
-            ToolOutput::err(format!("No connected MCP tool is named `{wanted}`; use {} to find exact names.", mcp_search::SEARCH))
+            ToolOutput::err(format!(
+                "No connected MCP tool is named `{wanted}`; use {} to find exact names.",
+                mcp_search::SEARCH
+            ))
         })
     }
 }
@@ -414,7 +456,9 @@ mod secret_tests {
 
     #[test]
     fn custom_auth_file_does_not_block_its_parent() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let auth = dir.path().join("auth.json");
         std::fs::write(&auth, "{}").unwrap();
@@ -425,7 +469,10 @@ mod secret_tests {
         std::env::set_var("NYQ_CODEX_AUTH", &auth);
         let roots = SecretRoots::load();
         assert!(roots.blocks_path(&auth), "the auth file itself is denied");
-        assert!(!roots.blocks_path(&project), "a custom auth parent must stay readable");
+        assert!(
+            !roots.blocks_path(&project),
+            "a custom auth parent must stay readable"
+        );
         assert!(!roots.blocks_path(dir.path()));
         match old {
             Some(v) => std::env::set_var("NYQ_CODEX_AUTH", v),

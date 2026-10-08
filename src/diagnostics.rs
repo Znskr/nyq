@@ -54,12 +54,24 @@ fn excerpt(text: &str) -> Value {
 /// One session item, reduced to what helps debugging.
 fn item_event(item: &Item) -> Value {
     match item {
-        Item::User { text, images } => json!({ "type": "user", "text": excerpt(text), "images": images.len() }),
+        Item::User { text, images } => {
+            json!({ "type": "user", "text": excerpt(text), "images": images.len() })
+        }
         Item::Assistant { text } => json!({ "type": "assistant", "text": excerpt(text) }),
-        Item::Reasoning { summary, encrypted, .. } => json!({ "type": "reasoning", "summary_chars": summary.chars().count(), "encrypted": encrypted.is_some() }),
-        Item::ToolCall { name, arguments, .. } => json!({ "type": "tool_call", "name": name, "arguments": excerpt(arguments) }),
-        Item::ToolResult { output, is_error, .. } => json!({ "type": "tool_result", "is_error": is_error, "output": excerpt(output) }),
-        Item::Compaction { summary } => json!({ "type": "compaction", "summary_chars": summary.chars().count() }),
+        Item::Reasoning {
+            summary, encrypted, ..
+        } => {
+            json!({ "type": "reasoning", "summary_chars": summary.chars().count(), "encrypted": encrypted.is_some() })
+        }
+        Item::ToolCall {
+            name, arguments, ..
+        } => json!({ "type": "tool_call", "name": name, "arguments": excerpt(arguments) }),
+        Item::ToolResult {
+            output, is_error, ..
+        } => json!({ "type": "tool_result", "is_error": is_error, "output": excerpt(output) }),
+        Item::Compaction { summary } => {
+            json!({ "type": "compaction", "summary_chars": summary.chars().count() })
+        }
     }
 }
 
@@ -70,8 +82,17 @@ fn scrub(v: &Value) -> Value {
         Value::Object(m) => Value::Object(
             m.iter()
                 .map(|(k, v)| {
-                    let secret = ["key", "token", "secret", "password", "auth"].iter().any(|s| k.to_ascii_lowercase().contains(s));
-                    (k.clone(), if secret { json!("[redacted]") } else { scrub(v) })
+                    let secret = ["key", "token", "secret", "password", "auth"]
+                        .iter()
+                        .any(|s| k.to_ascii_lowercase().contains(s));
+                    (
+                        k.clone(),
+                        if secret {
+                            json!("[redacted]")
+                        } else {
+                            scrub(v)
+                        },
+                    )
                 })
                 .collect(),
         ),
@@ -89,6 +110,7 @@ pub struct TraceInfo<'a> {
     pub fast: bool,
     pub sandbox: &'a str,
     pub yolo: bool,
+    pub permission_mode: &'a str,
     pub session_id: Option<&'a str>,
     pub context_tokens: u64,
     pub context_window: u64,
@@ -110,6 +132,7 @@ pub fn trace(info: &TraceInfo, items: &[Item]) -> Value {
         "fast": info.fast,
         "sandbox": info.sandbox,
         "yolo": info.yolo,
+        "permission_mode": info.permission_mode,
         "session": info.session_id,
         "context": { "tokens": info.context_tokens, "window": info.context_window },
         "usage": info.usage,
@@ -121,9 +144,13 @@ pub fn trace(info: &TraceInfo, items: &[Item]) -> Value {
 
 /// Write a trace to `<home>/traces/trace-<time>.json` (0600) and return its path.
 pub fn write_trace(home: &Path, trace: &Value) -> Result<PathBuf> {
-    let name = format!("trace-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let name = format!(
+        "trace-{}.json",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
     let path = home.join("traces").join(name);
-    crate::session::write_private(&path, &serde_json::to_vec_pretty(trace)?).with_context(|| format!("writing {}", path.display()))?;
+    crate::session::write_private(&path, &serde_json::to_vec_pretty(trace)?)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
 
@@ -136,19 +163,38 @@ mod tests {
         let text = "export OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234 and Authorization: Bearer abc.def.ghijklmnop \
                     token: hunter2xyz ghp_abcdefghijklmnopqrstuvwx eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig AKIAABCDEFGHIJKLMNOP";
         let out = redact(text);
-        for secret in ["sk-proj-abcdefghijklmnop1234", "abc.def.ghijklmnop", "hunter2xyz", "ghp_abcdefghijklmnopqrstuvwx", "eyJhbGciOiJIUzI1NiJ9", "AKIAABCDEFGHIJKLMNOP"] {
+        for secret in [
+            "sk-proj-abcdefghijklmnop1234",
+            "abc.def.ghijklmnop",
+            "hunter2xyz",
+            "ghp_abcdefghijklmnopqrstuvwx",
+            "eyJhbGciOiJIUzI1NiJ9",
+            "AKIAABCDEFGHIJKLMNOP",
+        ] {
             assert!(!out.contains(secret), "{secret} leaked: {out}");
         }
         assert!(out.contains("OPENAI_API_KEY=[redacted]"), "{out}");
-        assert_eq!(redact("cargo test --release in src/main.rs"), "cargo test --release in src/main.rs");
+        assert_eq!(
+            redact("cargo test --release in src/main.rs"),
+            "cargo test --release in src/main.rs"
+        );
     }
 
     #[test]
     fn trace_bundle_is_redacted_and_private() {
         let items = vec![
             Item::user("my key is sk-abcdefghijklmnopqrstuv"),
-            Item::ToolCall { id: "1".into(), name: "bash".into(), arguments: r#"{"command":"curl -H 'Authorization: Bearer abcdefghijklmnop' x"}"#.into() },
-            Item::ToolResult { id: "1".into(), output: "x".repeat(1000), is_error: false },
+            Item::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"curl -H 'Authorization: Bearer abcdefghijklmnop' x"}"#
+                    .into(),
+            },
+            Item::ToolResult {
+                id: "1".into(),
+                output: "x".repeat(1000),
+                is_error: false,
+            },
         ];
         let info = TraceInfo {
             provider: "codex",
@@ -157,6 +203,7 @@ mod tests {
             fast: false,
             sandbox: "sandboxed",
             yolo: false,
+            permission_mode: "ask",
             session_id: Some("abc"),
             context_tokens: 1,
             context_window: 2,
@@ -164,10 +211,16 @@ mod tests {
         };
         let t = trace(&info, &items);
         let text = t.to_string();
-        assert!(!text.contains("sk-abcdefghijklmnopqrstuv") && !text.contains("abcdefghijklmnop'"), "{text}");
+        assert!(
+            !text.contains("sk-abcdefghijklmnopqrstuv") && !text.contains("abcdefghijklmnop'"),
+            "{text}"
+        );
         assert_eq!(t["recent_events"].as_array().unwrap().len(), 3);
         assert_eq!(t["recent_events"][2]["output"]["truncated"], true);
-        assert_eq!(scrub(&json!({"api_key": "x", "nested": {"Token": 1}, "ok": "fine"})), json!({"api_key": "[redacted]", "nested": {"Token": "[redacted]"}, "ok": "fine"}));
+        assert_eq!(
+            scrub(&json!({"api_key": "x", "nested": {"Token": 1}, "ok": "fine"})),
+            json!({"api_key": "[redacted]", "nested": {"Token": "[redacted]"}, "ok": "fine"})
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = write_trace(dir.path(), &t).unwrap();
         assert!(path.starts_with(dir.path().join("traces")));
@@ -176,7 +229,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 }
