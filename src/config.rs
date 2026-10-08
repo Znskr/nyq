@@ -1,6 +1,6 @@
 //! Locating the profile directory and choosing a model provider.
 //!
-//! Profile directory: `$NYQ_HOME`, else `~/.fx` (shared with the original app).
+//! Profile directory: `$NYQ_HOME`, else `~/.nyq`.
 //!
 //! Provider resolution, first match wins:
 //! 1. `--provider` flag or `NYQ_PROVIDER` (`codex` | `openai`)
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{codex::CodexProvider, openai::OpenAiProvider, Provider};
 
-pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-terra";
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-6-sol";
 
 pub fn home() -> PathBuf {
     if let Some(h) = std::env::var_os("NYQ_HOME") {
@@ -25,7 +25,7 @@ pub fn home() -> PathBuf {
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".fx")
+        .join(".nyq")
 }
 
 #[derive(Default, Deserialize)]
@@ -144,7 +144,7 @@ pub fn provider(
             .iter()
             .any(|k| env(k).is_some());
     if !explicit {
-        let path = home.join("nyq/last-model.json");
+        let path = home.join("last-model.json");
         if path.exists() {
             let last: LastModel = read_json(&path)?;
             return crate::models::build(
@@ -290,7 +290,7 @@ mod tests {
             efforts: vec![],
         };
         crate::models::save_last(&home(), &choice, Some("high")).unwrap();
-        let last: LastModel = read_json(&dir.path().join("nyq/last-model.json")).unwrap();
+        let last: LastModel = read_json(&dir.path().join("last-model.json")).unwrap();
         assert_eq!(
             (
                 last.provider.as_str(),

@@ -30,18 +30,18 @@ pub(crate) struct SecretRoots {
 impl SecretRoots {
     pub(crate) fn load() -> Self {
         let mut roots = Vec::new();
-        let fx = crate::config::home();
-        add_secret(&mut roots, fx.clone());
+        let home = crate::config::home();
+        add_secret(&mut roots, home.clone());
         if let Some(user) = dirs::home_dir() {
-            add_secret(&mut roots, user.join(".fx"));
+            add_secret(&mut roots, user.join(".nyq"));
             add_secret(&mut roots, user.join(".codex"));
             add_secret(&mut roots, user.join(".ssh"));
             add_secret(&mut roots, user.join(".aws"));
             add_secret(&mut roots, user.join(".netrc"));
         }
-        let auth = crate::config::codex_auth_path(&fx);
+        let auth = crate::config::codex_auth_path(&home);
         // Always deny the auth file itself. Its parent is denied only when it
-        // is a known credential directory (`~/.fx`, `~/.codex`), which are
+        // is a known credential directory (`~/.nyq`, `~/.codex`), which are
         // added above. A custom `NYQ_CODEX_AUTH` such as `/repo/auth.json`
         // must not make the rest of that directory unreadable.
         add_secret(&mut roots, auth);
@@ -142,7 +142,7 @@ pub(crate) const MAX_ROOTED_TEXT: u64 = 1024 * 1024;
 ///
 /// The final component must not be a symlink. The canonical path must remain
 /// under `root`. Credential locations are refused unless `root` itself is one
-/// (user skills live under `~/.fx`). At most [`MAX_ROOTED_TEXT`] bytes are read.
+/// (user skills live under `~/.nyq`). At most [`MAX_ROOTED_TEXT`] bytes are read.
 pub(crate) fn read_rooted_text(root: &Path, path: &Path) -> Result<String, String> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if meta.file_type().is_symlink() {

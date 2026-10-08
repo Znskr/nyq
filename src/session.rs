@@ -1,4 +1,4 @@
-//! Saved conversations: one JSONL file per session under `<home>/nyq/sessions`.
+//! Saved conversations: one JSONL file per session under `<home>/sessions`.
 //!
 //! Line 1 is a header (`{"type":"session",...}`); every following line is one
 //! [`Item`]. Files are append-only, so a crash can at worst truncate the last
