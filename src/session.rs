@@ -1,8 +1,10 @@
 //! Saved conversations: one JSONL file per session under `<home>/sessions`.
 //!
-//! Line 1 is a header (`{"type":"session",...}`); every following line is one
-//! [`Item`]. Files are append-only, so a crash can at worst truncate the last
-//! line, which loading tolerates.
+//! Line 1 is a header (`{"type":"session",...}`). A later
+//! `{"type":"title","title":...}` line is metadata from `/rename` (the latest
+//! one wins in listings). Every other line is one [`Item`]. Files are
+//! append-only, so a crash can at worst truncate the last line, which loading
+//! tolerates.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -17,15 +19,16 @@ use crate::types::Item;
 
 const INTERRUPTED: &str = "Interrupted before this tool ran.";
 const TITLE_MAX: usize = 60;
+/// Longest `/rename` title, in bytes. Listings may still shorten it.
+pub const MAX_TITLE_BYTES: usize = 240;
 
 #[derive(Clone, Debug)]
 pub struct Meta {
     pub id: String,
     pub created: DateTime<Utc>,
     pub cwd: PathBuf,
-    #[allow(dead_code)] // not shown by the current UI
     pub model: String,
-    /// First user message, truncated for listing.
+    /// `/rename` title, or the first user message when the session was never renamed.
     pub title: String,
     pub path: PathBuf,
 }
@@ -54,7 +57,12 @@ impl Session {
     /// empty sessions leave nothing behind.
     pub fn create(dir: &Path, cwd: &Path, model: &str) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string();
-        let header = Header { id: id.clone(), created: Utc::now(), cwd: cwd.to_path_buf(), model: model.to_string() };
+        let header = Header {
+            id: id.clone(),
+            created: Utc::now(),
+            cwd: cwd.to_path_buf(),
+            model: model.to_string(),
+        };
         Ok(Self {
             path: dir.join(format!("{id}.jsonl")),
             id,
@@ -65,7 +73,8 @@ impl Session {
     }
 
     pub fn append(&mut self, item: &Item) -> Result<()> {
-        let line = serde_json::to_string(item).with_context(|| format!("encoding a session item for {}", self.id))?;
+        let line = serde_json::to_string(item)
+            .with_context(|| format!("encoding a session item for {}", self.id))?;
         self.queued.push(line);
         self.flush_queue()
     }
@@ -78,7 +87,9 @@ impl Session {
         }
         self.ensure_file()?;
         let file = self.file.as_mut().expect("file opened above");
-        let start = file.seek(SeekFrom::End(0)).with_context(|| format!("saving session {}", self.id))?;
+        let start = file
+            .seek(SeekFrom::End(0))
+            .with_context(|| format!("saving session {}", self.id))?;
         let mut payload = String::new();
         if let Some(header) = &self.pending_header {
             payload.push_str(header);
@@ -88,7 +99,10 @@ impl Session {
             payload.push_str(line);
             payload.push('\n');
         }
-        if let Err(e) = file.write_all(payload.as_bytes()).and_then(|_| file.flush()) {
+        if let Err(e) = file
+            .write_all(payload.as_bytes())
+            .and_then(|_| file.flush())
+        {
             let _ = rollback(file, start);
             return Err(e).with_context(|| format!("saving session {}", self.id));
         }
@@ -119,7 +133,9 @@ impl Session {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let file = opts.open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
+        let file = opts
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -128,6 +144,58 @@ impl Session {
         }
         self.file = Some(file);
         Ok(())
+    }
+
+    /// Append a title metadata line. The latest one is what listings show.
+    pub fn set_title(&mut self, title: &str) -> Result<()> {
+        let line = serde_json::to_string(&serde_json::json!({ "type": "title", "title": title }))
+            .with_context(|| format!("encoding a session title for {}", self.id))?;
+        self.queued.push(line);
+        self.flush_queue()
+    }
+
+    /// Replace the file with its header, keeping the session id and settings.
+    pub fn clear_transcript(&mut self) -> Result<()> {
+        self.queued.clear();
+        let header = self.header_line()?;
+        if self.file.is_none() && !self.path.exists() {
+            self.pending_header = Some(header);
+            return Ok(());
+        }
+        self.ensure_file()?;
+        let file = self.file.as_mut().expect("file opened above");
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("clearing session {}", self.id))?;
+        file.set_len(0)
+            .with_context(|| format!("clearing session {}", self.id))?;
+        file.write_all(header.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.flush())
+            .with_context(|| format!("clearing session {}", self.id))?;
+        self.pending_header = None;
+        Ok(())
+    }
+
+    fn header_line(&self) -> Result<String> {
+        if let Some(header) = &self.pending_header {
+            return Ok(header.clone());
+        }
+        let file =
+            File::open(&self.path).with_context(|| format!("reading {}", self.path.display()))?;
+        let mut line = String::new();
+        BufReader::new(file)
+            .read_line(&mut line)
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        if line.ends_with('\n') {
+            line.pop();
+        }
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            bail!("session {} is missing its header", self.id);
+        }
+        Ok(line)
     }
 }
 
@@ -189,18 +257,96 @@ pub fn list(dir: &Path) -> Result<Vec<Meta>> {
 fn read_meta(path: &Path) -> Option<Meta> {
     let mut lines = BufReader::new(File::open(path).ok()?).lines();
     let header: Header = serde_json::from_str(&lines.next()?.ok()?).ok()?;
-    let title = lines
-        .map_while(|l| l.ok())
-        .find_map(|l| match serde_json::from_str(&l) {
-            Ok(Item::User { text, .. }) => Some(title_of(&text)),
-            _ => None,
+    let mut custom = None;
+    let mut derived = None;
+    for line in lines.map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("title") => {
+                if let Some(title) = value
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.is_empty())
+                {
+                    custom = Some(title.to_string());
+                }
+            }
+            Some("user") if derived.is_none() => {
+                if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+                    derived = Some(title_of(text));
+                }
+            }
+            _ => {}
+        }
+    }
+    let title = custom.or(derived).unwrap_or_else(|| "(untitled)".into());
+    Some(Meta {
+        id: header.id,
+        created: header.created,
+        cwd: header.cwd,
+        model: header.model,
+        title,
+        path: path.into(),
+    })
+}
+
+/// A user-supplied `/rename` title: trimmed, printable, at most [`MAX_TITLE_BYTES`].
+pub fn validate_title(raw: &str) -> Result<String> {
+    let title = raw.trim();
+    if title.is_empty() {
+        bail!("Use: /rename <title>");
+    }
+    if title.len() > MAX_TITLE_BYTES {
+        bail!("title is too long");
+    }
+    if title.chars().any(char::is_control) {
+        bail!("title must be printable text");
+    }
+    Ok(title.to_string())
+}
+
+/// Turn a model's reply into a 1–6 word title.
+pub fn generated_title(raw: &str) -> Result<String> {
+    let line = raw
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let line = line
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '“' | '”' | '‘' | '’'));
+    let mut words: Vec<&str> = line.split_whitespace().collect();
+    if words.len() > 6 {
+        words.truncate(6);
+    }
+    let mut title = words.join(" ");
+    while title.ends_with(['.', '!', '?', ',', ':', ';']) {
+        title.pop();
+        title = title.trim_end().to_string();
+    }
+    let title: String = title.chars().filter(|c| !c.is_control()).collect();
+    validate_title(&title).map_err(|_| anyhow::anyhow!("the model did not return a usable title"))
+}
+
+fn is_title_line(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(|kind| kind.as_str())
+                .map(|kind| kind == "title")
         })
-        .unwrap_or_else(|| "(untitled)".into());
-    Some(Meta { id: header.id, created: header.created, cwd: header.cwd, model: header.model, title, path: path.into() })
+        .unwrap_or(false)
 }
 
 fn title_of(text: &str) -> String {
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     if line.chars().count() > TITLE_MAX {
         let cut: String = line.chars().take(TITLE_MAX - 1).collect();
         format!("{}…", cut.trim_end())
@@ -209,30 +355,131 @@ fn title_of(text: &str) -> String {
     }
 }
 
-/// Load a session by id, unique id prefix, or `last` (newest in the
-/// given cwd). Returns the session reopened for appending plus its items.
-pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<Item>)> {
+/// Resolve `last`, an id, or a unique id prefix to one session in `dir`.
+pub fn find(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
     let all = list(dir)?;
     if all.is_empty() {
         bail!("No saved sessions in {}", dir.display());
     }
-    let meta = if which == "last" {
-        all.iter().find(|m| m.cwd == cwd)
-            .ok_or_else(|| anyhow::anyhow!("No saved conversation in this directory (use -r to pick one)"))?.clone()
-    } else if let Some(m) = all.iter().find(|m| m.id == which) {
-        m.clone()
-    } else {
-        let matches: Vec<&Meta> = all.iter().filter(|m| m.id.starts_with(which)).collect();
-        match matches.as_slice() {
-            [] => bail!("No session matches '{which}' (see `nyq sessions` or /sessions)."),
-            [m] => (*m).clone(),
-            many => bail!(
-                "'{which}' is ambiguous; it matches {} sessions: {}",
-                many.len(),
-                many.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ")
-            ),
+    if which == "last" {
+        return all.into_iter().find(|m| m.cwd == cwd).ok_or_else(|| {
+            anyhow::anyhow!("No saved conversation in this directory (use -r to pick one)")
+        });
+    }
+    if let Some(meta) = all.iter().find(|m| m.id == which) {
+        return Ok(meta.clone());
+    }
+    let matches: Vec<Meta> = all
+        .into_iter()
+        .filter(|m| m.id.starts_with(which))
+        .collect();
+    match matches.as_slice() {
+        [] => bail!("No session matches '{which}' (see `nyq sessions` or /sessions)."),
+        [meta] => Ok(meta.clone()),
+        many => bail!(
+            "'{which}' is ambiguous; it matches {} sessions: {}",
+            many.len(),
+            many.iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Print a short transcript summary for `nyq session show`.
+pub fn print_summary(dir: &Path, which: &str, cwd: &Path) -> Result<()> {
+    let meta = find(dir, which, cwd)?;
+    let items = read_stored_items(&meta.path)?;
+    println!("{}", format_summary(&meta, &items));
+    Ok(())
+}
+
+/// Delete one saved session. Does not open it for append.
+pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
+    let meta = find(dir, which, cwd)?;
+    fs::remove_file(&meta.path).with_context(|| format!("deleting {}", meta.path.display()))?;
+    Ok(meta)
+}
+
+pub fn format_summary(meta: &Meta, items: &[Item]) -> String {
+    let mut users = 0usize;
+    let mut assistants = 0usize;
+    let mut tools = 0usize;
+    let mut recent = Vec::new();
+    for item in items {
+        match item {
+            Item::User { text, .. } => {
+                users += 1;
+                recent.push(format!("user: {}", preview_line(text)));
+            }
+            Item::Assistant { text } if !text.trim().is_empty() => {
+                assistants += 1;
+                recent.push(format!("assistant: {}", preview_line(text)));
+            }
+            Item::ToolCall { name, .. } => {
+                tools += 1;
+                recent.push(format!("tool: {name}"));
+            }
+            Item::Compaction { summary } => {
+                recent.push(format!("summary: {}", preview_line(summary)))
+            }
+            _ => {}
         }
+    }
+    let shown = if recent.len() > 8 {
+        &recent[recent.len() - 8..]
+    } else {
+        recent.as_slice()
     };
+    let mut out = format!(
+        "{}\ntitle: {}\ncreated: {}\ndirectory: {}\nmodel: {}\n{} messages · {} user · {} assistant · {} tool calls\n",
+        meta.id,
+        meta.title,
+        meta.created.to_rfc3339(),
+        meta.cwd.display(),
+        meta.model,
+        items.len(),
+        users,
+        assistants,
+        tools,
+    );
+    if shown.is_empty() {
+        out.push_str("\n(no messages yet)\n");
+    } else {
+        out.push('\n');
+        for line in shown {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn preview_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    const MAX: usize = 120;
+    if line.chars().count() > MAX {
+        let cut: String = line.chars().take(MAX - 1).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        line.to_string()
+    }
+}
+
+fn read_stored_items(path: &Path) -> Result<Vec<Item>> {
+    let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(read_items(&data, path)?.0)
+}
+
+/// Load a session by id, unique id prefix, or `last` (newest in the
+/// given cwd). Returns the session reopened for appending plus its items.
+pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<Item>)> {
+    let meta = find(dir, which, cwd)?;
 
     let data = fs::read(&meta.path).with_context(|| format!("reading {}", meta.path.display()))?;
     let (mut items, good) = read_items(&data, &meta.path)?;
@@ -258,7 +505,10 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         items.push(item);
     }
     // Everything before the latest compaction is summarized by it.
-    if let Some(i) = items.iter().rposition(|it| matches!(it, Item::Compaction { .. })) {
+    if let Some(i) = items
+        .iter()
+        .rposition(|it| matches!(it, Item::Compaction { .. }))
+    {
         items.drain(..i);
     }
     Ok((session, meta, items))
@@ -273,12 +523,16 @@ fn read_items(data: &[u8], path: &Path) -> Result<(Vec<Item>, usize)> {
     let mut offset = 0;
     let mut n = 0usize;
     while offset < data.len() {
-        let end = data[offset..].iter().position(|b| *b == b'\n').map(|i| offset + i + 1).unwrap_or(data.len());
+        let end = data[offset..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|i| offset + i + 1)
+            .unwrap_or(data.len());
         let raw = &data[offset..end];
         let mut line = raw.strip_suffix(b"\n").unwrap_or(raw);
         line = line.strip_suffix(b"\r").unwrap_or(line);
         let blank = line.iter().all(u8::is_ascii_whitespace);
-        if n > 0 && !blank {
+        if n > 0 && !blank && !is_title_line(line) {
             match serde_json::from_slice::<Item>(line) {
                 Ok(item) => items.push(item),
                 Err(_) if end == data.len() => break,
@@ -310,7 +564,11 @@ fn repairs(items: &[Item]) -> Vec<Item> {
     tail.iter()
         .filter_map(|i| match i {
             Item::ToolCall { id, .. } if !answered.contains(id.as_str()) => {
-                Some(Item::ToolResult { id: id.clone(), output: INTERRUPTED.into(), is_error: true })
+                Some(Item::ToolResult {
+                    id: id.clone(),
+                    output: INTERRUPTED.into(),
+                    is_error: true,
+                })
             }
             _ => None,
         })
@@ -325,7 +583,11 @@ mod tests {
         Item::user(t)
     }
     fn call(id: &str) -> Item {
-        Item::ToolCall { id: id.into(), name: "bash".into(), arguments: "{}".into() }
+        Item::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }
     }
 
     #[test]
@@ -338,7 +600,8 @@ mod tests {
         s.append(&user("hello there\nsecond line")).unwrap();
         s.append(&Item::Assistant { text: "hi".into() }).unwrap();
         let first = fs::read_to_string(&s.path).unwrap();
-        let header: serde_json::Value = serde_json::from_str(first.lines().next().unwrap()).unwrap();
+        let header: serde_json::Value =
+            serde_json::from_str(first.lines().next().unwrap()).unwrap();
         assert_eq!(header["type"], "session");
         assert_eq!(header["id"], s.id.as_str());
         assert_eq!(header["model"], "m1");
@@ -348,7 +611,13 @@ mod tests {
         assert_eq!(metas[0].title, "hello there");
         let (_, meta, items) = load(&dir, &s.id, Path::new("/w")).unwrap();
         assert_eq!(meta.cwd, Path::new("/w"));
-        assert_eq!(items, vec![user("hello there\nsecond line"), Item::Assistant { text: "hi".into() }]);
+        assert_eq!(
+            items,
+            vec![
+                user("hello there\nsecond line"),
+                Item::Assistant { text: "hi".into() }
+            ]
+        );
     }
 
     #[test]
@@ -374,10 +643,25 @@ mod tests {
         let titles: Vec<_> = list(dir).unwrap().into_iter().map(|m| m.title).collect();
         assert_eq!(titles, ["three", "two", "one"]);
         assert_eq!(load(dir, "last", Path::new("/a")).unwrap().1.title, "one");
-        assert!(load(dir, "last", Path::new("/zzz")).err().unwrap().to_string().contains("No saved conversation in this directory"));
-        assert_eq!(load(dir, &ids[1][..8], Path::new("/")).unwrap().1.title, "two");
-        assert!(load(dir, "", Path::new("/")).err().unwrap().to_string().contains("ambiguous"));
-        assert!(load(dir, "nope", Path::new("/")).err().unwrap().to_string().contains("No session"));
+        assert!(load(dir, "last", Path::new("/zzz"))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("No saved conversation in this directory"));
+        assert_eq!(
+            load(dir, &ids[1][..8], Path::new("/")).unwrap().1.title,
+            "two"
+        );
+        assert!(load(dir, "", Path::new("/"))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("ambiguous"));
+        assert!(load(dir, "nope", Path::new("/"))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("No session"));
         // Garbage files are skipped silently.
         fs::write(dir.join("junk.jsonl"), "not json\n").unwrap();
         assert_eq!(list(dir).unwrap().len(), 3);
@@ -391,17 +675,39 @@ mod tests {
         s.append(&user("run it")).unwrap();
         s.append(&call("c1")).unwrap();
         s.append(&call("c2")).unwrap();
-        s.append(&Item::ToolResult { id: "c1".into(), output: "ok".into(), is_error: false }).unwrap();
+        s.append(&Item::ToolResult {
+            id: "c1".into(),
+            output: "ok".into(),
+            is_error: false,
+        })
+        .unwrap();
         drop(s);
-        let path = dir.join(fs::read_dir(dir).unwrap().next().unwrap().unwrap().file_name());
+        let path = dir.join(
+            fs::read_dir(dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .file_name(),
+        );
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(br#"{"type":"tool_res"#).unwrap();
         drop(f);
 
         let (mut s, _, items) = load(dir, "last", Path::new("/w")).unwrap();
         assert_eq!(items.len(), 5);
-        assert_eq!(items[4], Item::ToolResult { id: "c2".into(), output: INTERRUPTED.into(), is_error: true });
-        s.append(&Item::Assistant { text: "done".into() }).unwrap();
+        assert_eq!(
+            items[4],
+            Item::ToolResult {
+                id: "c2".into(),
+                output: INTERRUPTED.into(),
+                is_error: true
+            }
+        );
+        s.append(&Item::Assistant {
+            text: "done".into(),
+        })
+        .unwrap();
 
         // The file is consistent: reloading needs no further repair.
         let (_, _, again) = load(dir, "last", Path::new("/w")).unwrap();
@@ -415,7 +721,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("x.jsonl");
         let header = r#"{"type":"session","id":"abc","created":"2026-01-01T00:00:00Z","cwd":"/w","model":"m"}"#;
-        fs::write(&path, format!("{header}\n{}", serde_json::to_string(&user("hi")).unwrap())).unwrap();
+        fs::write(
+            &path,
+            format!("{header}\n{}", serde_json::to_string(&user("hi")).unwrap()),
+        )
+        .unwrap();
         let (mut s, meta, items) = load(tmp.path(), "abc", Path::new("/w")).unwrap();
         assert_eq!(meta.title, "hi");
         assert_eq!(items, vec![user("hi")]);
@@ -430,8 +740,20 @@ mod tests {
         let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
         s.append(&user("kept")).unwrap();
         drop(s);
-        let path = dir.join(fs::read_dir(dir).unwrap().next().unwrap().unwrap().file_name());
-        OpenOptions::new().append(true).open(&path).unwrap().write_all(&[0xc3]).unwrap();
+        let path = dir.join(
+            fs::read_dir(dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .file_name(),
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0xc3])
+            .unwrap();
         let (_, _, items) = load(dir, "last", Path::new("/w")).unwrap();
         assert_eq!(items, vec![user("kept")]);
     }
@@ -453,7 +775,13 @@ mod tests {
     fn partial_record_is_rolled_back() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("f");
-        let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).unwrap();
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
         f.write_all(b"header\n").unwrap();
         let start = f.stream_position().unwrap();
         f.write_all(b"PARTIAL").unwrap();
@@ -469,8 +797,14 @@ mod tests {
         let dir = tmp.path().join("sessions");
         let mut s = Session::create(&dir, Path::new("/w"), "m").unwrap();
         s.append(&user("hi")).unwrap();
-        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(&s.path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&s.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         drop(s);
         let path = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
         let mut perms = fs::metadata(&path).unwrap().permissions();
@@ -478,6 +812,82 @@ mod tests {
         fs::set_permissions(&path, perms).unwrap();
         let (mut s, _, _) = load(&dir, "last", Path::new("/w")).unwrap();
         s.append(&user("again")).unwrap();
-        assert_eq!(fs::metadata(&s.path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&s.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn a_title_line_overrides_the_first_message_and_is_not_an_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("hello there")).unwrap();
+        s.set_title("Ship the parser").unwrap();
+        s.append(&Item::Assistant {
+            text: "done".into(),
+        })
+        .unwrap();
+        s.set_title("say \"hi\"").unwrap();
+        let raw = fs::read_to_string(&s.path).unwrap();
+        assert!(raw.contains("\"type\":\"title\""));
+        assert_eq!(list(dir).unwrap()[0].title, "say \"hi\"");
+        let (_, meta, items) = load(dir, "last", Path::new("/w")).unwrap();
+        assert_eq!(meta.title, "say \"hi\"");
+        assert_eq!(
+            items,
+            vec![
+                user("hello there"),
+                Item::Assistant {
+                    text: "done".into()
+                }
+            ]
+        );
+        let summary = format_summary(&meta, &items);
+        assert!(summary.contains("title: say \"hi\""));
+        assert!(summary.contains("user: hello there"));
+        assert!(summary.contains("model: m"));
+
+        let id = s.id.clone();
+        s.clear_transcript().unwrap();
+        let metas = list(dir).unwrap();
+        assert_eq!(metas[0].id, id);
+        assert_eq!(metas[0].title, "(untitled)");
+        assert!(load(dir, &id, Path::new("/w")).unwrap().2.is_empty());
+        delete(dir, &id[..8], Path::new("/w")).unwrap();
+        assert!(list(dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn titles_are_trimmed_capped_and_printable() {
+        assert_eq!(
+            validate_title("  Fix the parser  ").unwrap(),
+            "Fix the parser"
+        );
+        assert!(validate_title("  ")
+            .unwrap_err()
+            .to_string()
+            .contains("/rename"));
+        assert!(validate_title("bad\ntitle").is_err());
+        assert!(validate_title(&"a".repeat(MAX_TITLE_BYTES + 1))
+            .unwrap_err()
+            .to_string()
+            .contains("too long"));
+        assert_eq!(
+            validate_title(&"é".repeat(MAX_TITLE_BYTES / 2))
+                .unwrap()
+                .len(),
+            MAX_TITLE_BYTES
+        );
+        assert_eq!(
+            generated_title("\"Fix the parser bug.\"\nextra").unwrap(),
+            "Fix the parser bug"
+        );
+        assert_eq!(
+            generated_title("one two three four five six seven").unwrap(),
+            "one two three four five six"
+        );
+        assert!(generated_title("   ").is_err());
     }
 }
