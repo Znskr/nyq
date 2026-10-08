@@ -17,6 +17,9 @@ pub trait Provider: Send + Sync {
     /// Short provider label for the UI, e.g. "codex" or "openai".
     fn name(&self) -> &str;
     fn model(&self) -> &str;
+    fn endpoint(&self) -> Option<String> { None }
+    fn pricing_provider(&self) -> &str { self.name() }
+
     fn set_model(&mut self, model: String);
     /// Reasoning effort, if the provider supports choosing one (None = auto).
     fn effort(&self) -> Option<&str> {

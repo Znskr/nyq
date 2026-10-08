@@ -374,6 +374,8 @@ impl CodexProvider {
 
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
+    fn endpoint(&self) -> Option<String> { Some(std::env::var("NYQ_CODEX_URL").unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".into())) }
+
     fn set_conversation(&mut self, id: &str) {
         self.session_id = id.to_string();
     }
