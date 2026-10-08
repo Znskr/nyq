@@ -239,6 +239,10 @@ struct Server {
     service: RunningService<RoleClient, ()>,
     tools: usize,
     names: Vec<String>,
+    /// The server offers resources (`resources/list`, `resources/read`).
+    resources: bool,
+    /// Prompts it listed at connect time (offered as `/mcp:<server>:<prompt>`).
+    prompts: Vec<rmcp::model::Prompt>,
 }
 
 pub struct McpManager {
@@ -372,7 +376,13 @@ impl McpManager {
             }));
         }
         let names: Vec<String> = seen.into_keys().collect();
-        self.servers.insert(cfg.name.clone(), Server { service, tools: tools.len(), names });
+        let caps = peer.peer_info().map(|i| i.capabilities.clone()).unwrap_or_default();
+        let resources = caps.resources.is_some();
+        let prompts = match caps.prompts {
+            Some(_) => tokio::time::timeout(CONNECT_TIMEOUT, peer.list_all_prompts()).await.ok().and_then(|r| r.ok()).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        self.servers.insert(cfg.name.clone(), Server { service, tools: tools.len(), names, resources, prompts });
         Ok(tools)
     }
 
@@ -453,6 +463,20 @@ impl McpManager {
     /// (server name, tool count) for connected servers.
     pub fn connected(&self) -> Vec<(String, usize)> {
         self.servers.iter().map(|(n, s)| (n.clone(), s.tools)).collect()
+    }
+
+    /// Connected servers that offer resources, with a handle to each.
+    pub fn resource_servers(&self) -> Vec<(String, Peer<RoleClient>)> {
+        self.servers.iter().filter(|(_, s)| s.resources).map(|(n, s)| (n.clone(), s.service.peer().clone())).collect()
+    }
+
+    /// Every prompt of every connected server, with the server's name.
+    pub fn prompts(&self) -> Vec<(String, rmcp::model::Prompt)> {
+        self.servers.iter().flat_map(|(n, s)| s.prompts.iter().map(move |p| (n.clone(), p.clone()))).collect()
+    }
+
+    pub fn peer(&self, name: &str) -> Option<Peer<RoleClient>> {
+        self.servers.get(name).map(|s| s.service.peer().clone())
     }
 
     pub async fn shutdown(&mut self) {
@@ -813,7 +837,7 @@ fn convert(r: CallToolResult) -> ToolOutput {
     ToolOutput { content, is_error: r.is_error.unwrap_or(false), display: None, images, changed: false, ..ToolOutput::default() }
 }
 
-fn image_from_encoded(data: &str, mime: &str) -> Result<crate::types::Image, String> {
+pub(crate) fn image_from_encoded(data: &str, mime: &str) -> Result<crate::types::Image, String> {
     let compact: String = data.chars().filter(|c| !c.is_whitespace()).collect();
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, compact.as_bytes())
         .map_err(|_| "invalid base64".to_string())?;

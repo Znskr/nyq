@@ -188,7 +188,7 @@ impl Agent {
             if !self.auto_compact(ui, &cancel).await? {
                 return Ok(TurnEnd::Cancelled);
             }
-            let specs = self.tools.specs();
+            let specs = self.tools.advertised();
             let req = Request {
                 system: &self.system,
                 items: &self.items,
@@ -266,7 +266,10 @@ impl Agent {
                     }
                     return Ok(TurnEnd::Cancelled);
                 }
-                let out = self.call_tool(name, arguments, ui, &cancel).await;
+                let mut out = self.call_tool(name, arguments, ui, &cancel).await;
+                // Oversized output is stored; the model gets head, tail and an id.
+                let key = crate::tools::artifacts::session_key(self.session.as_ref().map(|s| s.id.as_str()));
+                out.content = crate::tools::artifacts::spill(&crate::config::home(), &key, id, name, std::mem::take(&mut out.content));
                 // Usage precedes tool execution, so account for the new text
                 // before deciding whether the next step needs compaction.
                 // An estimate is replaced wholesale on the next sync.
@@ -306,6 +309,12 @@ impl Agent {
         ui: &mut dyn Ui,
         cancel: &CancellationToken,
     ) -> ToolOutput {
+        if let Some(out) = self.tools.handle_meta(name, arguments) {
+            let args: Value = serde_json::from_str(arguments).unwrap_or_default();
+            ui.tool_start(name, args["query"].as_str().or(args["name"].as_str()).unwrap_or(""));
+            ui.tool_end(name, &out);
+            return out;
+        }
         let Some(tool) = self.tools.get(name) else {
             return ToolOutput::err(format!("Unknown tool `{name}`."));
         };
@@ -343,6 +352,7 @@ impl Agent {
             approver: ui.approver(),
             permissions: self.permissions.clone(),
             granted: Default::default(),
+            session_id: self.session.as_ref().map(|s| s.id.clone()),
         };
         let summary = tool.summary(&args);
 

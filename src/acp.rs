@@ -398,6 +398,7 @@ async fn open(
     for cfg in &wanted {
         connect_server(&mut mcp, &mut agent, cfg).await;
     }
+    crate::mcp_features::sync(&mut agent, &mcp);
 
     let live = Arc::new(Live {
         id: acp::SessionId::new(agent.session.as_ref().map(|s| s.id.clone()).unwrap_or_default()),

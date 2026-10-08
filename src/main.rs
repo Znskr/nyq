@@ -3,6 +3,7 @@ mod agent;
 mod config;
 mod login;
 mod mcp;
+mod mcp_features;
 mod models;
 mod permissions;
 mod prompt;
@@ -84,6 +85,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tools", "list available tools"),
     ("/skills", "list available skills"),
     ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
+    ("/memory", "saved memories; /memory remove N forgets one"),
+    ("/background", "background processes; /background kill ID|last"),
     ("/permissions", "permission rules and session grants; /permissions reload re-reads them"),
     ("/yolo", "toggle auto-approval of tool calls"),
     ("/usage", "token usage for this conversation"),
@@ -123,7 +126,9 @@ async fn run() -> Result<()> {
         }
         Some(Command::Acp) => {
             let opts = acp::Options { yolo: cli.yolo, sandbox: cli.sandbox, allow_network: cli.allow_network, model: cli.model, provider: cli.provider };
-            return acp::run(opts).await;
+            let result = acp::run(opts).await;
+            tools::background::kill_all();
+            return result;
         }
         None => {}
     }
@@ -186,6 +191,7 @@ async fn run() -> Result<()> {
             ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
         }
         connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
+        mcp_features::sync(&mut agent, &mcp);
         let mut plain = ui::PlainUi::new(cli.yolo);
         let cancel = cancel_on_ctrl_c();
         let (item, _, warning) = tools::image::user_turn(&text, &cwd);
@@ -193,6 +199,7 @@ async fn run() -> Result<()> {
             ui::error(&warning);
         }
         let r = agent.turn(item, &mut plain, cancel).await;
+        tools::background::kill_all();
         mcp.shutdown().await;
         return r.map(|_| ());
     }
@@ -208,6 +215,8 @@ async fn run() -> Result<()> {
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     }
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
+    mcp_features::sync(&mut agent, &mcp);
+    tui.screen().editor.set_mcp_commands(mcp_features::prompt_commands(&mcp));
     agent.tools.add(Box::new(agent::AskUserTool));
     if pick {
         // A prompt given with `-r` waits in the editor until a session is picked.
@@ -251,12 +260,28 @@ async fn run() -> Result<()> {
             shell(cmd, &cwd, &tui).await;
             continue;
         }
-        if line.starts_with('/') {
+        // An MCP prompt's messages become the turn's text.
+        let mut turn_text = line.clone();
+        if line.starts_with("/mcp:") {
+            match mcp_features::prompt_turn(&mcp, &line).await {
+                Ok(t) => turn_text = t,
+                Err(e) => {
+                    ui::error(&format!("{e:#}"));
+                    continue;
+                }
+            }
+        } else if line.starts_with('/') {
             if line.trim() == "/model" {
                 tui.open_models();
                 continue;
             }
-            match slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir, &tui, &skills).await {
+            let result = slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir, &tui, &skills).await;
+            if line.starts_with("/mcp") {
+                // Servers came or went: refresh resource tools and prompt commands.
+                mcp_features::sync(&mut agent, &mcp);
+                tui.screen().editor.set_mcp_commands(mcp_features::prompt_commands(&mcp));
+            }
+            match result {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
@@ -265,7 +290,7 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        let (item, attached, warning) = tools::image::user_turn(&line, &cwd);
+        let (item, attached, warning) = tools::image::user_turn(&turn_text, &cwd);
         tui.screen().print_user(&line);
         if let Some(warning) = warning {
             ui::error(&warning);
@@ -297,6 +322,7 @@ async fn run() -> Result<()> {
         pending.extend(queue_leftovers(leftover));
     }
     drop(tui);
+    tools::background::kill_all();
     mcp.shutdown().await;
     Ok(())
 }
@@ -516,14 +542,20 @@ async fn slash(
             for (c, d) in COMMANDS {
                 ui::info(&format!("  {c:<10} {d}"));
             }
+            for (c, d) in mcp_features::prompt_commands(mcp) {
+                ui::info(&format!("  {c} — {d}"));
+            }
             ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts");
         }
         "/new" | "/clear" => {
             agent.reset(Some(Session::create(sessions_dir, &agent.cwd, agent.provider.model())?));
+            tools::memory::refresh_section(&mut agent.system, &config::home());
             ui::info("Started a new conversation.");
         }
         "/sessions" => ui::list(&session_lines(sessions_dir)?),
         "/skills" => ui::list(&skills::list_lines(skills)),
+        "/memory" => tools::memory::slash(&config::home(), &arg, &mut agent.system),
+        "/background" => tools::background::slash(&arg).await,
         "/undo" if agent.undo.is_empty() => ui::info("  Nothing to undo."),
         "/undo" => match agent.undo.undo() {
             Ok(msg) => {
