@@ -1,4 +1,4 @@
-//! fx-style inline terminal UI. The transcript is printed into the normal
+//! Inline terminal UI. The transcript is printed into the normal
 //! scrollback; below it a pane stays pinned to the bottom with the streaming
 //! line, the running tool group, a status line, queued messages, the input
 //! (always accepting text, even while the agent works), menus, and a footer.
@@ -347,7 +347,7 @@ fn spread(left: &str, right: &str, width: usize) -> String {
     }
 }
 
-/// Key hints like fx: bright key, gray action.
+/// Key hints: bright key, gray action.
 fn hints(pairs: &[(&str, &str)]) -> String {
     pairs
         .iter()
@@ -371,7 +371,7 @@ fn tokens(n: u64) -> String {
     }
 }
 
-/// A label with a moving highlight, fx's "shimmer".
+/// A label with a moving highlight (a "shimmer").
 fn shimmer(label: &str, frame: usize) -> String {
     let n = label.chars().count();
     if n == 0 {
@@ -967,7 +967,7 @@ impl Screen {
         table(lines, self.width.saturating_sub(2), true).into_iter().map(|r| format!("  {r}")).collect()
     }
 
-    /// Markdown line, indented, with fx-style frames around code blocks.
+    /// Markdown line, indented, with framed code blocks.
     fn render_line(&mut self, line: &str) -> String {
         let t = line.trim_start();
         if let Some(lang) = t.strip_prefix("```").or_else(|| t.strip_prefix("~~~")) {
@@ -1486,7 +1486,7 @@ pub struct Tui {
 
 impl Tui {
     pub fn start(footer: Footer, home: PathBuf, commands: Vec<(String, String)>) -> io::Result<Self> {
-        let history_path = home.join("nyq").join("history");
+        let history_path = home.join("history");
         // One JSON string per line (multi-line prompts); plain lines are accepted too.
         let history: Vec<String> = std::fs::read_to_string(&history_path)
             .map(|s| s.lines().filter(|l| !l.is_empty()).map(|l| serde_json::from_str(l).unwrap_or_else(|_| l.to_string())).collect())

@@ -138,7 +138,7 @@ pub fn build(
 
 /// Remember the last picked model so the next launch starts with it.
 pub fn save_last(home: &Path, choice: &ModelChoice, effort: Option<&str>) -> Result<()> {
-    let dir = home.join("nyq");
+    let dir = home.to_path_buf();
     std::fs::create_dir_all(&dir)?;
     let last = crate::config::LastModel {
         provider: choice.provider.clone(),
@@ -179,7 +179,7 @@ mod tests {
         save_last(dir.path(), &choice, Some("low")).unwrap();
         let read = || {
             serde_json::from_slice::<serde_json::Value>(
-                &std::fs::read(dir.path().join("nyq/last-model.json")).unwrap(),
+                &std::fs::read(dir.path().join("last-model.json")).unwrap(),
             )
             .unwrap()
         };
@@ -190,7 +190,7 @@ mod tests {
         save_last(dir.path(), &choice, None).unwrap();
         assert!(read()["effort"].is_null());
         assert_eq!(
-            std::fs::read_dir(dir.path().join("nyq")).unwrap().count(),
+            std::fs::read_dir(dir.path()).unwrap().count(),
             1
         );
         let invalid = ModelChoice {

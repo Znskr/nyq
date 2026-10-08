@@ -694,7 +694,7 @@ pub fn canonical_endpoint(transport: &Transport) -> Result<String> {
 /// escaped, and names that would exceed 180 characters are rejected.
 pub fn credential_path(home: &Path, name: &str, endpoint: &str) -> Result<PathBuf> {
     let file = encode_ident(&format!("{name}\n{endpoint}"))?;
-    Ok(home.join("nyq").join("mcp-auth").join(format!("{file}.json")))
+    Ok(home.join("mcp-auth").join(format!("{file}.json")))
 }
 
 fn encode_ident(key: &str) -> Result<String> {

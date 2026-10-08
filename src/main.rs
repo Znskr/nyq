@@ -107,7 +107,7 @@ fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let home = config::home();
-    let sessions_dir = home.join("nyq").join("sessions");
+    let sessions_dir = home.join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
 
     match cli.command {

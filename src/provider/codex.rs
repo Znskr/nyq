@@ -82,7 +82,7 @@ pub async fn client_version() -> String {
 /// The newest codex CLI version published on npm, cached for a day under the
 /// nyq home so listing models stays fast and works offline.
 async fn latest_published() -> Option<String> {
-    let cache = crate::config::home().join("nyq").join("codex-version");
+    let cache = crate::config::home().join("codex-version");
     let fresh = std::fs::metadata(&cache)
         .and_then(|m| m.modified())
         .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < std::time::Duration::from_secs(86_400)));
