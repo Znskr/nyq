@@ -218,6 +218,8 @@ pub struct ToolCtx {
     pub granted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// The conversation's id; scopes stored tool results (`read_tool_result`).
     pub session_id: Option<String>,
+    /// The session's hooks; subagents run its tool hooks for their calls.
+    pub hooks: std::sync::Arc<crate::hooks::Hooks>,
 }
 
 #[derive(Clone, Debug, Default)]
