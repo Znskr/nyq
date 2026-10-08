@@ -742,6 +742,7 @@ impl Screen {
                         if (c.provider.as_str(), c.model.as_str()) == current { "current".to_string() } else { String::new() },
                         c.context_window.map(|n| format!("{} ctx", tokens(n))).unwrap_or_default(),
                         if c.efforts.is_empty() { String::new() } else { format!("effort {}", c.efforts.join("/")) },
+                        c.price.clone().unwrap_or_default(),
                     ]
                     .into_iter()
                     .filter(|s| !s.is_empty())
@@ -2309,8 +2310,7 @@ mod tests {
             choices: vec![ModelChoice {
                 provider: "openai".into(),
                 model: "evil\u{1b}]52;c;eA==\u{7}model".into(),
-                context_window: None,
-                efforts: Vec::new(),
+                ..Default::default()
             }],
             tabs: vec!["All".into()],
             tab: 0,

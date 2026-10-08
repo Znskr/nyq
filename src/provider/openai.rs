@@ -10,11 +10,37 @@ use serde_json::{json, Value};
 use super::{sse, EventSink, Provider};
 use crate::types::{Item, Request, Response, StreamEvent, Usage};
 
+#[derive(Clone)]
 pub struct OpenAiProvider {
     pub label: String,
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
+    /// Reasoning effort (None = the endpoint's default).
+    pub effort: Option<String>,
+    pub effort_style: EffortStyle,
+    /// Extra request headers (client identification, conversation id).
+    pub headers: Vec<(String, String)>,
+    /// Assistant-message field that carries reasoning back to models with
+    /// interleaved thinking (e.g. `reasoning_content`); None drops it.
+    pub reasoning_field: Option<String>,
+}
+
+/// How a chat-completions endpoint takes a reasoning effort.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EffortStyle {
+    /// `"reasoning_effort": "high"` (OpenAI and most compatible servers).
+    #[default]
+    ReasoningEffort,
+    /// `"reasoning": {"effort": "high"}` (Vercel AI Gateway).
+    ReasoningObject,
+}
+
+/// A model reported by `GET {base}/models`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    pub id: String,
+    pub context_window: Option<u64>,
 }
 
 impl OpenAiProvider {
@@ -33,10 +59,20 @@ impl OpenAiProvider {
             base_url,
             api_key,
             model,
+            effort: None,
+            effort_style: EffortStyle::default(),
+            headers: Vec::new(),
+            reasoning_field: None,
         }
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
+        Ok(self.list_models_detailed().await?.into_iter().map(|m| m.id).collect())
+    }
+
+    /// Models from `GET {base}/models`, without embedding/image/video models
+    /// where the endpoint says what a model is (Vercel's `type`).
+    pub async fn list_models_detailed(&self) -> Result<Vec<Listed>> {
         #[derive(serde::Deserialize)]
         struct Catalog {
             data: Vec<Model>,
@@ -44,6 +80,10 @@ impl OpenAiProvider {
         #[derive(serde::Deserialize)]
         struct Model {
             id: String,
+            #[serde(default, rename = "type")]
+            kind: Option<String>,
+            #[serde(default)]
+            context_window: Option<u64>,
         }
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
@@ -53,15 +93,29 @@ impl OpenAiProvider {
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
+        for (k, v) in &self.headers {
+            request = request.header(k, v);
+        }
         let catalog: Catalog = sse::checked(request.send().await?).await?.json().await?;
-        Ok(catalog.data.into_iter().map(|m| m.id).collect())
+        Ok(catalog
+            .data
+            .into_iter()
+            .filter(|m| m.kind.as_deref().is_none_or(|k| matches!(k, "language" | "chat" | "model")))
+            .map(|m| Listed { id: m.id, context_window: m.context_window })
+            .collect())
     }
 
     fn body(&self, req: Request<'_>) -> Value {
         let mut messages = vec![json!({"role":"system", "content":req.system})];
         let mut assistant: Option<Value> = None;
         for item in req.items {
-            if matches!(item, Item::Reasoning { .. }) {
+            if let Item::Reasoning { summary, .. } = item {
+                if let Some(field) = self.reasoning_field.as_deref().filter(|_| !summary.is_empty()) {
+                    let message = assistant.get_or_insert_with(|| json!({"role":"assistant","content":null}));
+                    let mut text = message[field].as_str().unwrap_or_default().to_owned();
+                    text.push_str(summary);
+                    message[field] = json!(text);
+                }
                 continue;
             }
             if !matches!(item, Item::Assistant { .. } | Item::ToolCall { .. }) {
@@ -116,6 +170,12 @@ impl OpenAiProvider {
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools.iter().map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})).collect::<Vec<_>>());
         }
+        if let Some(effort) = &self.effort {
+            match self.effort_style {
+                EffortStyle::ReasoningEffort => body["reasoning_effort"] = json!(effort),
+                EffortStyle::ReasoningObject => body["reasoning"] = json!({"effort": effort}),
+            }
+        }
         body
     }
 }
@@ -132,7 +192,13 @@ struct Call {
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
     fn fork(&self) -> Box<dyn Provider> {
-        Box::new(Self::with_label(self.label.clone(), self.base_url.clone(), self.api_key.clone(), self.model.clone()))
+        Box::new(self.clone())
+    }
+    fn effort(&self) -> Option<&str> {
+        self.effort.as_deref()
+    }
+    fn set_effort(&mut self, effort: Option<String>) {
+        self.effort = effort.filter(|e| e != "auto");
     }
     fn name(&self) -> &str {
         &self.label
@@ -154,6 +220,9 @@ impl Provider for OpenAiProvider {
             .json(&self.body(req));
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
+        }
+        for (k, v) in &self.headers {
+            request = request.header(k, v);
         }
         let mut events = sse::checked(request.send().await?)
             .await?
@@ -377,6 +446,43 @@ mod tests {
             })
             .get("tools")
             .is_none());
+    }
+
+    #[test]
+    fn effort_and_interleaved_reasoning() {
+        let mut provider = OpenAiProvider::new("unused".into(), None, "test".into());
+        let items = vec![
+            Item::user("q"),
+            Item::Reasoning { id: None, summary: "plan".into(), encrypted: None },
+            Item::ToolCall { id: "a".into(), name: "one".into(), arguments: "{}".into() },
+        ];
+        let req = || Request { system: "", items: &items, tools: &[] };
+        let body = provider.body(req());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body["messages"][2].get("reasoning_content").is_none());
+        provider.set_effort(Some("high".into()));
+        provider.reasoning_field = Some("reasoning_content".into());
+        let body = provider.body(req());
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["messages"][2]["reasoning_content"], "plan");
+        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "a");
+        provider.effort_style = EffortStyle::ReasoningObject;
+        assert_eq!(provider.body(req())["reasoning"], json!({"effort":"high"}));
+    }
+
+    #[tokio::test]
+    async fn listed_models_skip_non_language() {
+        let (url, _requests, task) = server(vec![(
+            200,
+            json!({"data":[{"id":"a","type":"language","context_window":1000},{"id":"e","type":"embedding"},{"id":"b"}]}).to_string(),
+        )])
+        .await;
+        let provider = OpenAiProvider::new(url, None, "a".into());
+        assert_eq!(
+            provider.list_models_detailed().await.unwrap(),
+            vec![Listed { id: "a".into(), context_window: Some(1000) }, Listed { id: "b".into(), context_window: None }]
+        );
+        task.await.unwrap();
     }
 
     #[tokio::test]
