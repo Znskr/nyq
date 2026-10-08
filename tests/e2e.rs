@@ -363,3 +363,40 @@ fn oversized_compaction_warns_and_continues() {
     let next = seen[2]["messages"].to_string();
     assert!(!next.contains("Summarize this conversation"), "{next}");
 }
+
+#[test]
+#[cfg(unix)]
+fn print_mode_runs_user_hooks_but_not_untrusted_project_hooks() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let log = home.path().join("events.log");
+    let l = log.display();
+    let hooks = json!({"hooks": [
+        {"event": "SessionStart", "command": format!("echo start >> {l}")},
+        {"event": "UserPromptSubmit", "command": "echo 'HOOK CONTEXT: branch main'"},
+        {"event": "PreToolUse", "matcher": "write_*", "command": "echo '{\"decision\":\"block\",\"reason\":\"read-only today\"}'"},
+        {"event": "PostToolUse", "command": format!("echo post >> {l}")},
+        {"event": "Stop", "command": format!("echo stop >> {l}; echo stop-stderr >&2")},
+    ]});
+    std::fs::write(home.path().join("hooks.json"), hooks.to_string()).unwrap();
+    std::fs::create_dir_all(work.path().join(".nyq")).unwrap();
+    let project = json!({"hooks": [{"event": "SessionStart", "command": format!("echo project >> {l}")}]});
+    std::fs::write(work.path().join(".nyq/hooks.json"), project.to_string()).unwrap();
+
+    let (url, seen) = fake_server(vec![
+        vec![tool_call("write_file", json!({"path": "x.txt", "content": "x"}))],
+        vec![delta(json!({"content": "Okay."}))],
+    ]);
+    let out = print_command(work.path(), home.path(), &url).arg("write x").output().unwrap();
+    assert_success(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not trusted"), "{stderr}");
+    assert!(stderr.contains("stop-stderr"), "{stderr}");
+    assert!(!work.path().join("x.txt").exists());
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "start\nstop\n");
+    let seen = seen.lock().unwrap();
+    let first = seen[0]["messages"].to_string();
+    assert!(first.contains("HOOK CONTEXT: branch main"), "{first}");
+    let second = seen[1]["messages"].to_string();
+    assert!(second.contains("read-only today"), "{second}");
+}
