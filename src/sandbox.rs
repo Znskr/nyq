@@ -110,7 +110,8 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 /// Resolve Git Bash without selecting the WSL launcher under Windows.
 #[cfg(any(windows, test))]
 fn windows_bash(paths: impl Iterator<Item = PathBuf>, system_root: Option<&Path>) -> Option<PathBuf> {
-    paths.filter_map(|dir| std::fs::canonicalize(dir.join("bash.exe")).ok()).find(|p| {
+    // Empty or relative PATH entries resolve against the workspace; never run a planted bash.exe.
+    paths.filter(|dir| dir.is_absolute()).filter_map(|dir| std::fs::canonicalize(dir.join("bash.exe")).ok()).find(|p| {
         let under_system = system_root.is_some_and(|root| {
             let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
             p.to_string_lossy().to_lowercase().starts_with(&format!("{}{}", root.to_string_lossy().to_lowercase(), std::path::MAIN_SEPARATOR))
@@ -191,7 +192,7 @@ fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<St
 
 #[cfg(target_os = "macos")]
 fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<String>> {
-    let mut v = vec!["/usr/bin/sandbox-exec".to_string(), "-p".into(), seatbelt_profile(&writable_roots(policy, cwd), policy.network, cwd)];
+    let mut v = vec!["/usr/bin/sandbox-exec".to_string(), "-p".into(), seatbelt_profile(&writable_roots(policy, cwd), policy.network)];
     v.extend(argv);
     Ok(v)
 }
@@ -203,7 +204,7 @@ fn wrap(_policy: &Policy, _cwd: &Path, _argv: Vec<String>) -> anyhow::Result<Vec
 
 /// A macOS Seatbelt (SBPL) profile allowing writes only under `roots`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn seatbelt_profile(roots: &[PathBuf], network: bool, cwd: &Path) -> String {
+fn seatbelt_profile(roots: &[PathBuf], network: bool) -> String {
     let quote = |p: &Path| format!("\"{}\"", p.display().to_string().replace('\\', "\\\\").replace('"', "\\\""));
     let mut s = String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
     for r in roots {
@@ -211,8 +212,6 @@ fn seatbelt_profile(roots: &[PathBuf], network: bool, cwd: &Path) -> String {
         s.push_str(&format!(" ({kind} {})", quote(r)));
     }
     s.push_str(")\n");
-    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    s.push_str(&format!("(deny file-write* (subpath {}))\n", quote(&cwd.join(".git"))));
     if !network {
         // `(deny network*)` includes unix sockets. Re-allowing them was an
         // escape through host daemons such as the Docker socket.
@@ -257,7 +256,8 @@ pub fn describe(policy: &Policy) -> String {
         return format!("sandbox: {mode} · {net}{git} (landlock v{abi})");
     }
     let engine = if cfg!(target_os = "macos") { "seatbelt" } else { "unavailable" };
-    format!("sandbox: {mode} · {net} ({engine})")
+    let git = if policy.mode == Mode::WorkspaceWrite && cfg!(target_os = "macos") { "; .git remains writable" } else { "" };
+    format!("sandbox: {mode} · {net}{git} ({engine})")
 }
 
 /// Apply the policy encoded in `args` to this process, then exec the command.
@@ -394,6 +394,8 @@ mod tests {
         std::fs::write(git.join("bash.exe"), "").unwrap();
         assert_eq!(windows_bash(vec![system_bin.clone(), git.clone()].into_iter(), Some(&system)), Some(git.join("bash.exe").canonicalize().unwrap()));
         assert!(windows_bash(vec![system_bin].into_iter(), Some(&system)).is_none());
+        // A relative or empty PATH entry (resolving into the workspace) is never used.
+        assert!(windows_bash(vec![PathBuf::new(), PathBuf::from("rel")].into_iter(), None).is_none());
     }
 
     #[cfg(windows)]
@@ -408,14 +410,13 @@ mod tests {
 
     #[test]
     fn seatbelt_profile_escapes_and_denies() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false, Path::new("/workspace"));
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false);
         assert!(p.contains("(deny file-write*)"));
-        let git = Path::new("/workspace").join(".git").display().to_string().replace('\\', "\\\\");
-        assert!(p.contains(&format!("(deny file-write* (subpath \"{git}\"))")));
+        assert!(!p.contains(".git"), "git must stay usable inside the sandbox");
         assert!(p.contains(r#""/tmp/a\"b""#));
         assert!(p.contains("(deny network*)"));
         assert!(!p.contains("unix-socket"));
-        assert!(!seatbelt_profile(&[], true, Path::new("/workspace")).contains("deny network"));
+        assert!(!seatbelt_profile(&[], true).contains("deny network"));
     }
 
     #[test]
