@@ -1110,37 +1110,11 @@ impl Screen {
 
     /// Copy text to the clipboard: a native tool when one is available, and
     /// always the OSC 52 terminal escape (works over SSH in most terminals).
-    pub fn copy(&mut self, text: &str) -> &'static str {
+    pub fn copy_osc52(&mut self, text: &str) {
         use base64::Engine;
         let osc = format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text));
         let _ = self.out.write_all(osc.as_bytes());
         let _ = self.out.flush();
-        let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
-            &[("pbcopy", &[])]
-        } else if cfg!(windows) {
-            &[("clip.exe", &[])]
-        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
-        } else {
-            &[("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])]
-        };
-        for (cmd, args) in tools {
-            let child = std::process::Command::new(cmd)
-                .args(*args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            if let Ok(mut child) = child {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&clipboard_bytes(text, *cmd == "clip.exe"));
-                }
-                if child.wait().is_ok_and(|s| s.success()) {
-                    return cmd;
-                }
-            }
-        }
-        "terminal (OSC 52)"
     }
 
     /// Open the model switcher; `models` arrive later via `set_models`.
@@ -1432,6 +1406,38 @@ fn clipboard_bytes(text: &str, windows_clip: bool) -> Vec<u8> {
     }
 }
 
+/// Copy with a native clipboard tool, if one is installed. Blocking; call it
+/// without holding the screen lock. Returns the tool used.
+pub fn copy_native(text: &str) -> Option<&'static str> {
+    let tools: &[(&'static str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        &[("clip.exe", &[])]
+    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
+    } else {
+        &[("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])]
+    };
+    for (cmd, args) in tools {
+        let Ok(mut child) = std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&clipboard_bytes(text, *cmd == "clip.exe"));
+        }
+        if child.wait().is_ok_and(|s| s.success()) {
+            return Some(cmd);
+        }
+    }
+    None
+}
+
 #[cfg(any(windows, test))]
 /// Windows has no bracketed paste: a paste arrives as a burst of key events.
 /// Enter or Tab inside a burst (several keys under 10ms apart) is text, not
@@ -1439,12 +1445,13 @@ fn clipboard_bytes(text: &str, windows_clip: bool) -> Vec<u8> {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn paste_key(key: KeyEvent, previous: Option<Instant>, now: Instant, streak: usize) -> Option<&'static str> {
     let fast = previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10));
-    if !fast || streak < 3 || !key.modifiers.is_empty() {
+    if !fast || streak < 3 || !(key.modifiers - KeyModifiers::CONTROL).is_empty() {
         return None;
     }
     match key.code {
+        // A pasted bare LF may arrive as Ctrl+Enter.
         KeyCode::Enter => Some("\n"),
-        KeyCode::Tab => Some("\t"),
+        KeyCode::Tab if key.modifiers.is_empty() => Some("\t"),
         _ => None,
     }
 }
