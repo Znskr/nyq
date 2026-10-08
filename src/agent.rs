@@ -802,7 +802,12 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
         };
         let in_git = git_component(Path::new(path))
             || resolved.ancestors().take_while(|a| a.starts_with(cwd)).any(|a| link_into_git(a.to_path_buf()))
-            || resolved.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_some_and(|real| git_component(&real));
+            || resolved.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_some_and(|real| {
+                // Only what lies below the workspace counts; a workspace that
+                // itself sits under a directory named `.git` is fine.
+                let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                git_component(real.strip_prefix(&root).unwrap_or(&real))
+            });
         return allowed.contains(tool) && !path.is_empty() && !in_git && inside(cwd, path);
     }
     if tool == "subagent" {
