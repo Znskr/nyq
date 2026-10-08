@@ -59,6 +59,10 @@ const DISPLAY_CHARS: usize = 2000;
 /// Open a regular file. Directories and devices are rejected before any byte
 /// is copied (so `/dev/zero` cannot grow without bound).
 fn open_regular(path: &Path) -> Result<fs::File, ToolOutput> {
+    // Windows refuses to open a directory at all, so name the problem first.
+    if fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+        return Err(ToolOutput::err(format!("read_file: {} is a directory (use list_dir).", display_path(path))));
+    }
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
