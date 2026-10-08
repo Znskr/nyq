@@ -448,12 +448,12 @@ async fn run() -> Result<()> {
         Some(Command::Pr { publish, draft, base, context }) => {
             let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
             let opts = github::Options { context: context.join(" "), publish, draft, base };
-            return github::run(&cwd, provider.as_ref(), github::Workflow::PullRequest, opts).await;
+            return github::run(&cwd, &home, provider.as_ref(), github::Workflow::PullRequest, opts).await;
         }
         Some(Command::Issue { publish, context }) => {
             let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
             let opts = github::Options { context: context.join(" "), publish, ..Default::default() };
-            return github::run(&cwd, provider.as_ref(), github::Workflow::Issue, opts).await;
+            return github::run(&cwd, &home, provider.as_ref(), github::Workflow::Issue, opts).await;
         }
         _ => {}
     }
@@ -488,6 +488,7 @@ async fn run() -> Result<()> {
     }
     let mut agent = Agent {
         session: Some(Session::create(&sessions_dir, &cwd, provider.model())?),
+        usage_session_id: None,
         provider,
         tools: Registry::builtin(),
         system: String::new(),
@@ -1049,7 +1050,22 @@ async fn resume_session(
     sessions_dir: &std::path::Path,
     which: &str,
 ) -> Result<()> {
-    let (s, meta, items) = session::load(sessions_dir, which, &agent.cwd)?;
+    // The open session holds the file lock. Drop it before reopening, including
+    // when the target is this same session, and put it back if that fails.
+    let previous = agent.session.take();
+    let restore_id = previous.as_ref().map(|s| s.id.clone());
+    drop(previous);
+    let (s, meta, items) = match session::load(sessions_dir, which, &agent.cwd) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            if let Some(id) = restore_id {
+                if let Ok((s, _, _)) = session::load(sessions_dir, &id, &agent.cwd) {
+                    agent.session = Some(s);
+                }
+            }
+            return Err(e);
+        }
+    };
     agent.reset(Some(s));
     ui::replay(&items);
     agent.items = items;

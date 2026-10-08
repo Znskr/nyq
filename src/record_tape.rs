@@ -59,7 +59,7 @@ impl Capture {
             "timestamp":chrono::Utc::now().timestamp(),"title":format!("nyq session {session}")});
         crate::session::write_private(&path, format!("{header}\n").as_bytes())?;
         let file = OpenOptions::new().append(true).open(&path)?;
-        *ACTIVE.lock().unwrap() = Some(Tape {
+        *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Tape {
             file,
             start: Instant::now(),
             size,
@@ -71,7 +71,7 @@ impl Capture {
 }
 impl Drop for Capture {
     fn drop(&mut self) {
-        if let Some(mut tape) = ACTIVE.lock().unwrap().take() {
+        if let Some(mut tape) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take() {
             if let Some(error) = &tape.failure {
                 eprintln!("nyq: terminal tape recording failed: {error}");
             }
@@ -95,7 +95,7 @@ pub fn stdout() -> Output {
 }
 impl Write for Output {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut active = ACTIVE.lock().unwrap();
+        let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         let n = io::stdout().write(bytes)?;
         if let Some(tape) = active.as_mut() {
             if tape.failure.is_none() {

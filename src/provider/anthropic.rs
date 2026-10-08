@@ -139,6 +139,7 @@ pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSi
     let mut usage = Usage::default();
     let mut saw_usage = false;
     let mut completed = false;
+    let mut truncated = false;
     while let Some(event) = events.next().await {
         let event = event?;
         let data: Value = serde_json::from_str(&event.data)?;
@@ -192,6 +193,8 @@ pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSi
                 }
                 match data["delta"]["stop_reason"].as_str() {
                     None | Some("end_turn" | "tool_use" | "stop_sequence" | "pause_turn" | "refusal") => {}
+                    // The output cap is a finished reply, not a protocol failure.
+                    Some("max_tokens") => truncated = true,
                     Some(other) => anyhow::bail!("{label} stream stopped early: stop_reason {other}"),
                 }
             }
@@ -214,7 +217,7 @@ pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSi
             Block::Tool { id, name, json } => Some(Item::ToolCall { id, name, arguments: if json.trim().is_empty() { "{}".into() } else { json } }),
         })
         .collect();
-    Ok(Response { items, usage: saw_usage.then_some(usage) })
+    Ok(Response { items, usage: saw_usage.then_some(usage), truncated })
 }
 
 #[async_trait::async_trait]
@@ -366,16 +369,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_tokens_keeps_the_partial_reply() {
+        let body = events(&[
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let (url, _requests, task) = server(vec![(200, body)]).await;
+        let p = provider(url);
+        let response = p.stream(Request { system: "", items: &[], tools: &[] }, &mut |_| {}).await.unwrap();
+        assert!(response.truncated);
+        assert_eq!(response.items, vec![Item::Assistant { text: "partial".into() }]);
+        assert_eq!(response.usage.map(|u| u.output_tokens), Some(8));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn errors() {
         let (url, _requests, task) = server(vec![
             (200, events(&[json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})])),
-            (200, events(&[json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"}})])),
+            (200, events(&[json!({"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"}})])),
             (200, events(&[json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"partial"}})])),
             (401, "bad key".into()),
         ])
         .await;
         let p = provider(url);
-        for expected in ["Overloaded", "max_tokens", "before message_stop", "401"] {
+        for expected in ["Overloaded", "model_context_window_exceeded", "before message_stop", "401"] {
             let err = p.stream(Request { system: "", items: &[], tools: &[] }, &mut |_| {}).await.unwrap_err();
             assert!(format!("{err:#}").contains(expected), "{err:#}");
         }

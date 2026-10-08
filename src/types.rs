@@ -111,4 +111,6 @@ pub struct Request<'a> {
 pub struct Response {
     pub items: Vec<Item>,
     pub usage: Option<Usage>,
+    /// The model hit its output limit. `items` is the partial reply and is kept.
+    pub truncated: bool,
 }

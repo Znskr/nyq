@@ -265,6 +265,11 @@ impl Provider for OpenAiProvider {
             if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
                 match reason.as_str() {
                     Some("stop" | "tool_calls" | "function_call") => completed = true,
+                    // `length` means the output cap was hit; keep the text already streamed.
+                    Some("length") => {
+                        completed = true;
+                        response.truncated = true;
+                    }
                     Some(other) => anyhow::bail!("OpenAI stream stopped early: finish_reason {other}"),
                     None => anyhow::bail!("OpenAI stream stopped early: finish_reason {reason}"),
                 }
@@ -601,7 +606,11 @@ mod tests {
         for reason in ["length", "content_filter", "tool_calls", "function_call"] {
             let body = events(&[json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason": reason}]})]);
             let result = one_stream(body).await;
-            if reason == "tool_calls" || reason == "function_call" {
+            if reason == "length" {
+                let response = result.expect("length");
+                assert!(response.truncated);
+                assert_eq!(response.items, vec![Item::Assistant { text: "hi".into() }]);
+            } else if reason == "tool_calls" || reason == "function_call" {
                 assert!(result.is_ok(), "{reason}: {result:?}");
             } else {
                 let err = result.unwrap_err().to_string();

@@ -163,6 +163,11 @@ impl Tool for Memory {
         }
     }
 
+    fn needs_approval(&self, args: &Value) -> bool {
+        // Listing is read-only. Adding or removing a fact changes every later session.
+        !matches!(args.get("action").and_then(Value::as_str), Some("list"))
+    }
+
     fn summary(&self, args: &Value) -> String {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
         match args.get("fact").and_then(Value::as_str) {
@@ -253,5 +258,15 @@ mod tests {
         refresh_section(&mut system, home.path());
         assert!(!system.contains("# Memory"), "{system}");
         assert!(system.starts_with("base prompt\n\n# Skills"));
+    }
+
+    #[test]
+    fn mutations_need_approval_and_listing_does_not() {
+        let tool = Memory;
+        assert!(!tool.needs_approval(&json!({"action": "list"})));
+        for action in ["add", "save", "remove", "forget", "nope", ""] {
+            assert!(tool.needs_approval(&json!({"action": action})), "{action}");
+        }
+        assert!(tool.needs_approval(&json!({})));
     }
 }

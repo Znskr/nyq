@@ -500,6 +500,14 @@ fn call_keys(tool: &str, args: &Value) -> Vec<String> {
                 keys.push(format!("web_fetch:{url}"));
             }
         }
+        // Resource tools are not named `mcp__<server>__…`, but server-wide
+        // rules (`mcp__docs__*`, `mcp__*`) still cover the server they name.
+        "mcp_list_resources" | "mcp_read_resource" => {
+            if let Some(server) = args.get("server").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                keys.push(format!("{}{tool}", crate::mcp::tool_prefix(server)));
+            }
+            keys.push(format!("mcp__{tool}"));
+        }
         _ => {}
     }
     keys
@@ -1140,6 +1148,43 @@ mod tests {
         assert!(p.save_allow("x").is_err());
         assert_eq!(std::fs::read_to_string(&p.path).unwrap(), "{oops");
         assert!(Permissions::default().save_allow("x").is_err());
+    }
+
+    #[test]
+    fn mcp_resource_tools_follow_server_rules() {
+        let cwd = Path::new(".");
+        let args = json!({"server": "docs", "uri": "mem://notes"});
+        let denied = perms(&[], &[], &["mcp__docs__*"]);
+        let decide = |p: &Permissions, tool: &str, args: &Value, mode: Mode| {
+            p.decide(&HashSet::new(), tool, args, cwd, true, mode)
+        };
+        assert!(matches!(
+            decide(&denied, "mcp_read_resource", &args, Mode::Yolo),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            decide(&denied, "mcp_list_resources", &json!({"server": "docs"}), Mode::Yolo),
+            Decision::Deny(_)
+        ));
+        let blanket = perms(&[], &[], &["mcp__*"]);
+        assert!(matches!(
+            decide(&blanket, "mcp_list_resources", &json!({}), Mode::Yolo),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            decide(&blanket, "mcp_read_resource", &args, Mode::Ask),
+            Decision::Deny(_)
+        ));
+        let allowed = perms(&["mcp__docs__*"], &[], &[]);
+        assert_eq!(
+            decide(&allowed, "mcp_read_resource", &args, Mode::Ask),
+            Decision::Run
+        );
+        // A different server is not covered by the docs rule.
+        assert_eq!(
+            decide(&denied, "mcp_read_resource", &json!({"server": "other"}), Mode::Yolo),
+            Decision::Run
+        );
     }
 
     #[test]

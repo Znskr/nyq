@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -128,7 +128,7 @@ pub fn recover(dir: &Path, which: &str, cwd: &Path) -> Result<(String, usize, us
         bail!("No readable items found; source unchanged");
     }
     write_private(&recovered.path, payload.as_bytes())?;
-    Ok((recovered.id, kept, skipped))
+    Ok((recovered.id.clone(), kept, skipped))
 }
 
 /// Upgrade the header atomically; refuse malformed bodies rather than losing data.
@@ -293,6 +293,7 @@ impl Session {
             fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("securing {}", self.path.display()))?;
         }
+        lock_session(&file, &self.path)?;
         self.file = Some(file);
         Ok(())
     }
@@ -306,6 +307,8 @@ impl Session {
     }
 
     /// Replace the file with its header, keeping the session id and settings.
+    /// The new header is written by rename, then the file is reopened for append,
+    /// so a crash cannot leave a zero-length session.
     pub fn clear_transcript(&mut self) -> Result<()> {
         self.queued.clear();
         let header = self.header_line()?;
@@ -313,16 +316,12 @@ impl Session {
             self.pending_header = Some(header);
             return Ok(());
         }
+        let mut bytes = header.into_bytes();
+        bytes.push(b'\n');
+        // Drop the locked handle so the replacement can be opened.
+        self.file.take();
+        write_private(&self.path, &bytes).with_context(|| format!("clearing session {}", self.id))?;
         self.ensure_file()?;
-        let file = self.file.as_mut().expect("file opened above");
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("clearing session {}", self.id))?;
-        file.set_len(0)
-            .with_context(|| format!("clearing session {}", self.id))?;
-        file.write_all(header.as_bytes())
-            .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.flush())
-            .with_context(|| format!("clearing session {}", self.id))?;
         self.pending_header = None;
         Ok(())
     }
@@ -347,6 +346,47 @@ impl Session {
             bail!("session {} is missing its header", self.id);
         }
         Ok(line)
+    }
+}
+
+/// Exclusive lock for the life of the open session file. A second process
+/// that already holds it is refused instead of interleaving appends or
+/// trimming the file out from under a live turn.
+///
+/// Releasing the previous handle and locking the new one can overlap for a
+/// moment (the old descriptor is closed on another thread, or `close` has not
+/// dropped the lock yet), so a busy lock is retried briefly. A session that
+/// is actually still open stays locked for much longer than this.
+fn lock_session(file: &File, path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing {}", path.display()))?;
+    }
+    let mut tries = 0u32;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tries += 1;
+                if tries == 20 {
+                    bail!("{} is already open in another nyq process", path.display());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.as_ref() {
+            let _ = file.unlock();
+        }
     }
 }
 
@@ -513,7 +553,7 @@ pub fn find(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
         bail!("No saved sessions in {}", dir.display());
     }
     if which == "last" {
-        return all.into_iter().find(|m| m.cwd == cwd).ok_or_else(|| {
+        return all.into_iter().find(|m| same_cwd(&m.cwd, cwd)).ok_or_else(|| {
             anyhow::anyhow!("No saved conversation in this directory (use -r to pick one)")
         });
     }
@@ -552,7 +592,34 @@ pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
     fs::remove_file(&meta.path).with_context(|| format!("deleting {}", meta.path.display()))?;
     // Its named subagents go with it.
     let _ = fs::remove_dir_all(crate::subagents::store_dir(&meta.path));
+    if let Some(home) = dir.parent() {
+        crate::tools::artifacts::remove_session(home, &meta.id);
+    }
     Ok(meta)
+}
+
+/// Whether two working directories are the same place. Canonical paths match
+/// through symlinks; Windows and macOS also ignore ASCII case.
+fn same_cwd(saved: &Path, current: &Path) -> bool {
+    if saved == current {
+        return true;
+    }
+    let left = fs::canonicalize(saved).unwrap_or_else(|_| saved.to_path_buf());
+    let right = fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+    if left == right {
+        return true;
+    }
+    case_fold_eq(&left, &right)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn case_fold_eq(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn case_fold_eq(_: &Path, _: &Path) -> bool {
+    false
 }
 
 pub fn format_summary(meta: &Meta, items: &[Item]) -> String {
@@ -634,16 +701,25 @@ fn read_stored_items(path: &Path) -> Result<Vec<Item>> {
 pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<Item>)> {
     let meta = find(dir, which, cwd)?;
 
-    let data = fs::read(&meta.path).with_context(|| format!("reading {}", meta.path.display()))?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&meta.path)
+        .with_context(|| format!("opening {}", meta.path.display()))?;
+    lock_session(&file, &meta.path)?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .with_context(|| format!("reading {}", meta.path.display()))?;
     let (mut items, good) = read_items(&data, &meta.path)?;
     if good < data.len() || !data[..good].ends_with(b"\n") {
         // Drop a half-written final record (including a torn UTF-8 byte) and
-        // make sure appends start on a fresh line.
-        let mut f = OpenOptions::new().write(true).open(&meta.path)?;
-        f.set_len(good as u64)?;
+        // make sure appends start on a fresh line. The lock is already held.
+        file.set_len(good as u64)
+            .with_context(|| format!("repairing {}", meta.path.display()))?;
         if good == 0 || !data[..good].ends_with(b"\n") {
-            f.seek(SeekFrom::End(0))?;
-            f.write_all(b"\n")?;
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+            file.flush()?;
         }
     }
     let mut session = Session {
@@ -651,7 +727,7 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         path: meta.path.clone(),
         pending_header: None,
         queued: Vec::new(),
-        file: None,
+        file: Some(file),
     };
     for item in repairs(&items) {
         session.append(&item)?;
@@ -762,7 +838,9 @@ mod tests {
         let metas = list(&dir).unwrap();
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].title, "hello there");
-        let (_, meta, items) = load(&dir, &s.id, Path::new("/w")).unwrap();
+        let id = s.id.clone();
+        drop(s);
+        let (_, meta, items) = load(&dir, &id, Path::new("/w")).unwrap();
         assert_eq!(meta.cwd, Path::new("/w"));
         assert_eq!(
             items,
@@ -863,6 +941,7 @@ mod tests {
         .unwrap();
 
         // The file is consistent: reloading needs no further repair.
+        drop(s);
         let (_, _, again) = load(dir, "last", Path::new("/w")).unwrap();
         assert_eq!(again.len(), 6);
         assert_eq!(again[4], items[4]);
@@ -883,6 +962,7 @@ mod tests {
         assert_eq!(meta.title, "hi");
         assert_eq!(items, vec![user("hi")]);
         s.append(&user("again")).unwrap();
+        drop(s);
         assert_eq!(load(tmp.path(), "abc", Path::new("/w")).unwrap().2.len(), 2);
     }
 
@@ -920,6 +1000,7 @@ mod tests {
         assert!(s.append(&user("one")).is_err());
         fs::remove_file(&blocker).unwrap();
         s.append(&user("two")).unwrap();
+        drop(s);
         let (_, _, items) = load(&blocker, "last", Path::new("/w")).unwrap();
         assert_eq!(items, vec![user("one"), user("two")]);
     }
@@ -986,7 +1067,8 @@ mod tests {
         let raw = fs::read_to_string(&s.path).unwrap();
         assert!(raw.contains("\"type\":\"title\""));
         assert_eq!(list(dir).unwrap()[0].title, "say \"hi\"");
-        let (_, meta, items) = load(dir, "last", Path::new("/w")).unwrap();
+        drop(s);
+        let (mut s, meta, items) = load(dir, "last", Path::new("/w")).unwrap();
         assert_eq!(meta.title, "say \"hi\"");
         assert_eq!(
             items,
@@ -1004,9 +1086,13 @@ mod tests {
 
         let id = s.id.clone();
         s.clear_transcript().unwrap();
+        let raw = fs::read(&s.path).unwrap();
+        assert!(!raw.is_empty());
+        assert!(raw.starts_with(b"{"), "a crash window must not leave an empty file");
         let metas = list(dir).unwrap();
         assert_eq!(metas[0].id, id);
         assert_eq!(metas[0].title, "(untitled)");
+        drop(s);
         assert!(load(dir, &id, Path::new("/w")).unwrap().2.is_empty());
         delete(dir, &id[..8], Path::new("/w")).unwrap();
         assert!(list(dir).unwrap().is_empty());
@@ -1097,5 +1183,59 @@ mod tests {
             "one two three four five six"
         );
         assert!(generated_title("   ").is_err());
+    }
+
+    #[test]
+    fn a_second_open_is_refused_until_the_first_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("hi")).unwrap();
+        match load(dir, "last", Path::new("/w")) {
+            Err(e) => assert!(e.to_string().contains("already open"), "{e}"),
+            Ok(_) => panic!("a second open of the same session should be refused"),
+        }
+        let id = s.id.clone();
+        drop(s);
+        assert_eq!(load(dir, &id, Path::new("/w")).unwrap().2, vec![user("hi")]);
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let mut s = Session::create(&sessions, Path::new("/w"), "m").unwrap();
+        s.append(&user("hi")).unwrap();
+        let big = "x".repeat(crate::tools::artifacts::SPILL_AT + 8);
+        let _ = crate::tools::artifacts::spill(tmp.path(), &s.id, "c", "bash", big);
+        let id = s.id.clone();
+        assert!(tmp.path().join("artifacts").join(&id).is_dir());
+        drop(s);
+        delete(&sessions, &id, Path::new("/w")).unwrap();
+        assert!(!tmp.path().join("artifacts").join(&id).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn last_matches_a_directory_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("proj");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut s = Session::create(tmp.path(), &link, "m").unwrap();
+        s.append(&user("via link")).unwrap();
+        drop(s);
+        assert_eq!(find(tmp.path(), "last", &real).unwrap().title, "via link");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn last_ignores_ascii_case_when_the_path_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upper = tmp.path().join("NoSuch");
+        let lower = tmp.path().join("nosuch");
+        assert!(same_cwd(&upper, &lower));
     }
 }

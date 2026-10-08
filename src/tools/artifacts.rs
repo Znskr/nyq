@@ -36,6 +36,15 @@ fn dir(home: &Path, key: &str) -> PathBuf {
     home.join("artifacts").join(key)
 }
 
+/// Delete one session's spilled tool results. A missing directory is fine.
+pub(crate) fn remove_session(home: &Path, session_id: &str) {
+    let key = safe(session_id);
+    if key.is_empty() {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(dir(home, &key));
+}
+
 fn floor(s: &str, mut i: usize) -> usize {
     i = i.min(s.len());
     while !s.is_char_boundary(i) {
@@ -226,5 +235,13 @@ mod tests {
         assert!(read(h, "other-session", &id, 0, 10, None).unwrap_err().contains("no stored tool result"));
         // The reader's own output is never stored again.
         assert_eq!(spill(h, "s1", "c", TOOL, full.clone()), full);
+
+        let _ = spill(h, "s2", "other", "bash", full);
+        remove_session(h, "s1");
+        assert!(!h.join("artifacts/s1").exists());
+        assert!(h.join("artifacts/s2").exists());
+        remove_session(h, "../../etc");
+        assert!(h.join("artifacts/s2").exists());
+        assert!(h.exists());
     }
 }
