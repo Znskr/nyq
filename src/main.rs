@@ -1,8 +1,10 @@
+mod acp;
 mod agent;
 mod config;
 mod login;
 mod mcp;
 mod models;
+mod permissions;
 mod prompt;
 mod provider;
 mod sandbox;
@@ -36,19 +38,19 @@ struct Cli {
     #[arg(short, long)]
     print: bool,
     /// Model id (overrides config).
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     model: Option<String>,
     /// Provider: codex or openai.
-    #[arg(long)]
+    #[arg(long, global = true)]
     provider: Option<String>,
     /// Run tools without asking for approval.
-    #[arg(long)]
+    #[arg(long, global = true)]
     yolo: bool,
     /// Confine shell commands the model runs [default: workspace-write where supported].
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     sandbox: Option<sandbox::Mode>,
     /// Allow network access from sandboxed shell commands.
-    #[arg(long)]
+    #[arg(long, global = true)]
     allow_network: bool,
     /// Continue the most recent conversation in this directory.
     #[arg(short = 'c', long = "continue")]
@@ -66,6 +68,8 @@ enum Command {
     Sessions,
     /// Sign in with your ChatGPT subscription (Codex models).
     Login,
+    /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
+    Acp,
 }
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -80,6 +84,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tools", "list available tools"),
     ("/skills", "list available skills"),
     ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
+    ("/permissions", "permission rules and session grants; /permissions reload re-reads them"),
     ("/yolo", "toggle auto-approval of tool calls"),
     ("/usage", "token usage for this conversation"),
     ("/exit", "quit (also Ctrl-D)"),
@@ -116,6 +121,10 @@ async fn run() -> Result<()> {
             println!("{msg}");
             return Ok(());
         }
+        Some(Command::Acp) => {
+            let opts = acp::Options { yolo: cli.yolo, sandbox: cli.sandbox, allow_network: cli.allow_network, model: cli.model, provider: cli.provider };
+            return acp::run(opts).await;
+        }
         None => {}
     }
 
@@ -130,6 +139,7 @@ async fn run() -> Result<()> {
         cwd: cwd.clone(),
         yolo: cli.yolo,
         allowed: HashSet::new(),
+        permissions: std::sync::Arc::new(load_permissions(&home, &cwd)),
         usage: Usage::default(),
         context_window: 0,
         context_tokens: 0,
@@ -289,6 +299,15 @@ async fn run() -> Result<()> {
     drop(tui);
     mcp.shutdown().await;
     Ok(())
+}
+
+/// Read permissions.json (and the project's), reporting problems once.
+fn load_permissions(home: &Path, cwd: &Path) -> permissions::Permissions {
+    let (perms, warnings) = permissions::Permissions::load(home, cwd);
+    for w in &warnings {
+        ui::error(w);
+    }
+    perms
 }
 
 fn sandbox_label(policy: &sandbox::Policy) -> String {
@@ -606,13 +625,26 @@ async fn slash(
                 }
                 for s in servers {
                     let state = match connected.iter().find(|(n, _)| n == &s.name) {
-                        Some((_, n)) => format!("connected · {n} tools"),
+                        Some((_, n)) => {
+                            let (action, specific) = agent.permissions.server_default(&mcp::tool_prefix(&s.name));
+                            let more = if specific { " + tool rules" } else { "" };
+                            format!("connected · {n} tools · {}{more}", action.as_str())
+                        }
                         None => "not connected".into(),
                     };
                     let scope = if s.scope == Scope::Project { "project" } else { "profile" };
                     ui::info(&format!("  {:<20} {scope:<8} {state}", s.name));
                 }
             }
+        },
+        "/permissions" => match arg.first().copied() {
+            Some("reload") => {
+                agent.permissions = std::sync::Arc::new(load_permissions(&config::home(), &agent.cwd));
+                ui::info("Reloaded permission rules.");
+                ui::list(&agent.permissions.lines(&agent.allowed));
+            }
+            None => ui::list(&agent.permissions.lines(&agent.allowed)),
+            Some(other) => ui::error(&format!("unknown /permissions argument `{other}` (try /permissions or /permissions reload)")),
         },
         "/yolo" => {
             agent.yolo = !agent.yolo;

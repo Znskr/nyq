@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::permissions::Decision;
 use crate::provider::Provider;
 use crate::session::Session;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
@@ -32,6 +33,9 @@ pub enum Approval {
     /// Approve calls matching this call's rule (see [`grant_rule`]) for the
     /// rest of the session; like `Yes` when the call can't be scoped.
     Always,
+    /// Like `Always`, and also append the rule to permissions.json `allow`.
+    /// Only offered when the request has a `save_rule`.
+    AlwaysSave,
     No,
 }
 
@@ -43,6 +47,9 @@ pub struct ApprovalRequest<'a> {
     /// What "always" would allow, e.g. "`cargo test …`"; None when the call
     /// can't be scoped to a rule (then "always" approves just this once).
     pub rule: Option<String>,
+    /// The raw rule "always, and save" would write to permissions.json
+    /// (e.g. `bash:cargo test`); None when saving isn't offered.
+    pub save_rule: Option<String>,
 }
 
 /// Everything the loop needs from a frontend.
@@ -134,6 +141,8 @@ pub struct Agent {
     pub yolo: bool,
     /// Rules granted with "always" in this session (see [`grant_rule`]).
     pub allowed: HashSet<String>,
+    /// Persistent allow/ask/deny rules (see `crate::permissions`).
+    pub permissions: std::sync::Arc<crate::permissions::Permissions>,
     pub usage: Usage,
     /// Model context window in tokens; drives automatic compaction.
     pub context_window: u64,
@@ -328,17 +337,37 @@ impl Agent {
             provider: Some(std::sync::Arc::from(self.provider.fork())),
             yolo: self.yolo,
             allowed: self.allowed.clone(),
+            approver: ui.approver(),
+            permissions: self.permissions.clone(),
+            granted: Default::default(),
         };
         let summary = tool.summary(&args);
 
-        if tool.needs_approval_for(&args, &self.cwd) && !self.yolo && !is_allowed(&self.allowed, name, &args, &self.cwd) {
+        let needs_approval = tool.needs_approval_for(&args, &self.cwd);
+        let forced = match self.permissions.decide(&self.allowed, name, &args, &self.cwd, needs_approval, self.yolo) {
+            Decision::Run => None,
+            Decision::Deny(rule) => {
+                ui.tool_start(name, &summary);
+                let out = ToolOutput::err(format!(
+                    "This call was blocked by permissions.json rule `{rule}` and did not run. \
+                     Do not retry it; find another way or ask the user."
+                ));
+                ui.tool_end(name, &out);
+                return out;
+            }
+            Decision::Ask { forced } => Some(forced),
+        };
+        if let Some(forced) = forced {
             let preview = tool.preview(&args, &ctx);
-            let rule = grant_rule(name, &args);
+            // A call that an `ask` rule forces can't be covered by a grant.
+            let rule = if forced.is_some() { None } else { grant_rule(name, &args) };
+            let save_rule = rule.clone().filter(|_| crate::permissions::saveable(name, &args, &self.cwd));
             let req = ApprovalRequest {
                 tool: name,
                 summary: &summary,
                 preview: preview.as_deref(),
                 rule: rule.as_deref().map(rule_label),
+                save_rule: save_rule.clone(),
             };
             let decision = tokio::select! {
                 biased;
@@ -355,6 +384,15 @@ impl Agent {
                 Approval::Yes => {}
                 Approval::Always => {
                     self.allowed.extend(rule);
+                }
+                Approval::AlwaysSave => {
+                    self.allowed.extend(rule);
+                    if let Some(r) = save_rule {
+                        match std::sync::Arc::make_mut(&mut self.permissions).save_allow(&r) {
+                            Ok(()) => ui.notice(&format!("Saved `{r}` to the allow list in permissions.json.")),
+                            Err(e) => ui.notice(&format!("Could not save `{r}` to permissions.json: {e:#}")),
+                        }
+                    }
                 }
                 Approval::No => {
                     let out = ToolOutput::err(
@@ -381,6 +419,8 @@ impl Agent {
             self.undo.discard_last();
         }
         self.undo.append(std::mem::take(&mut out.undo));
+        // "Always" answers given for a subagent's calls belong to this session.
+        self.allowed.extend(ctx.granted.lock().unwrap_or_else(|e| e.into_inner()).drain(..));
         ui.tool_end(name, &out);
         out
     }
@@ -623,7 +663,7 @@ fn is_flag(w: &str) -> bool {
 }
 
 /// Last path component, so `./sh` and `bin/bash` match wrappers by name.
-fn program_base(program: &str) -> &str {
+pub(crate) fn program_base(program: &str) -> &str {
     program.rsplit(['/', '\\']).next().unwrap_or(program)
 }
 
@@ -715,15 +755,16 @@ pub fn bash_matches(prefix: &str, cmd: &str) -> bool {
     !want.is_empty() && !has_control(cmd) && cmd.split_whitespace().take(want.len()).eq(want.iter().copied())
 }
 
-fn is_file_tool(tool: &str) -> bool {
+pub(crate) fn is_file_tool(tool: &str) -> bool {
     matches!(tool, "write_file" | "edit_file")
 }
 
-/// The rule "always" would grant for this call, as stored in `Agent::allowed`.
-fn subagent_mode(args: &Value) -> &'static str {
+/// A subagent call's mode: `general` or (by default) `explore`.
+pub(crate) fn subagent_mode(args: &Value) -> &'static str {
     if args.get("mode").and_then(Value::as_str) == Some("general") { "general" } else { "explore" }
 }
 
+/// The rule "always" would grant for this call, as stored in `Agent::allowed`.
 pub fn grant_rule(tool: &str, args: &Value) -> Option<String> {
     if tool == "bash" {
         let cmd = args.get("command").and_then(Value::as_str)?;
@@ -788,6 +829,37 @@ pub(crate) fn inside(root: &Path, path: &str) -> bool {
     full.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_none_or(|real| real.starts_with(&canon))
 }
 
+/// Whether a grant for a file tool may cover writing `path`: non-empty,
+/// inside the workspace, and nowhere under (or linked into) `.git`.
+pub(crate) fn file_grant_ok(path: &str, cwd: &Path) -> bool {
+    // Hooks and config under .git run later with full permissions: always ask.
+    let git_component = |p: &Path| p.components().any(|c| {
+        c.as_os_str().to_str().is_some_and(|s| s.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"))
+    });
+    let resolved = cwd.join(path);
+    // Follow links by hand too: canonicalize fails on a dangling link
+    // (e.g. `notes.txt -> .git/commondir`), which would otherwise slip by.
+    let link_into_git = |mut p: PathBuf| {
+        for _ in 0..8 {
+            let Ok(target) = std::fs::read_link(&p) else { return false };
+            if git_component(&target) {
+                return true;
+            }
+            p = p.parent().map_or(target.clone(), |dir| dir.join(&target));
+        }
+        true // too many hops: treat as suspicious
+    };
+    let in_git = git_component(Path::new(path))
+        || resolved.ancestors().take_while(|a| a.starts_with(cwd)).any(|a| link_into_git(a.to_path_buf()))
+        || resolved.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_some_and(|real| {
+            // Only what lies below the workspace counts; a workspace that
+            // itself sits under a directory named `.git` is fine.
+            let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            git_component(real.strip_prefix(&root).unwrap_or(&real))
+        });
+    !path.is_empty() && !in_git && inside(cwd, path)
+}
+
 /// Whether a granted rule covers this call.
 pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Path) -> bool {
     if tool == "bash" {
@@ -796,32 +868,7 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
     }
     if is_file_tool(tool) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-        // Hooks and config under .git run later with full permissions: always ask.
-        let git_component = |p: &Path| p.components().any(|c| {
-            c.as_os_str().to_str().is_some_and(|s| s.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"))
-        });
-        let resolved = cwd.join(path);
-        // Follow links by hand too: canonicalize fails on a dangling link
-        // (e.g. `notes.txt -> .git/commondir`), which would otherwise slip by.
-        let link_into_git = |mut p: PathBuf| {
-            for _ in 0..8 {
-                let Ok(target) = std::fs::read_link(&p) else { return false };
-                if git_component(&target) {
-                    return true;
-                }
-                p = p.parent().map_or(target.clone(), |dir| dir.join(&target));
-            }
-            true // too many hops: treat as suspicious
-        };
-        let in_git = git_component(Path::new(path))
-            || resolved.ancestors().take_while(|a| a.starts_with(cwd)).any(|a| link_into_git(a.to_path_buf()))
-            || resolved.ancestors().find_map(|a| std::fs::canonicalize(a).ok()).is_some_and(|real| {
-                // Only what lies below the workspace counts; a workspace that
-                // itself sits under a directory named `.git` is fine.
-                let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-                git_component(real.strip_prefix(&root).unwrap_or(&real))
-            });
-        return allowed.contains(tool) && !path.is_empty() && !in_git && inside(cwd, path);
+        return allowed.contains(tool) && file_grant_ok(path, cwd);
     }
     if tool == "subagent" {
         return allowed.contains(&format!("subagent:{}", subagent_mode(args)));
@@ -924,6 +971,7 @@ mod tests {
             cwd: PathBuf::from("."),
             yolo: true,
             allowed: HashSet::new(),
+            permissions: Default::default(),
             usage: Usage::default(),
             context_window: 1000,
             context_tokens: 900,
@@ -1395,6 +1443,119 @@ mod tests {
         let mut dropped = script(false);
         dropped.turn(Item::user("go"), &mut QuietUi, CancellationToken::new()).await.unwrap();
         assert_eq!(dropped.undo.len(), 0);
+    }
+
+    /// An MCP-like tool that asks by default and counts its runs.
+    struct CountTool(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for CountTool {
+        fn spec(&self) -> crate::types::ToolSpec {
+            crate::types::ToolSpec { name: "mcp__wiki__ask".into(), description: String::new(), parameters: serde_json::json!({}) }
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            true
+        }
+        fn summary(&self, _: &Value) -> String {
+            "q".into()
+        }
+        async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ToolOutput::ok("answer")
+        }
+    }
+
+    /// Answers approvals with `answer`, recording (rule, save_rule) per request.
+    struct ScriptUi {
+        answer: Approval,
+        asked: Vec<(Option<String>, Option<String>)>,
+    }
+    #[async_trait::async_trait]
+    impl Ui for ScriptUi {
+        fn stream(&mut self, _: &StreamEvent) {}
+        fn end_message(&mut self) {}
+        fn tool_start(&mut self, _: &str, _: &str) {}
+        fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
+        async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
+            self.asked.push((req.rule.clone(), req.save_rule.clone()));
+            self.answer
+        }
+    }
+
+    fn calling_agent(runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>, calls: usize) -> Agent {
+        let mut script = Vec::new();
+        for i in 0..calls {
+            script.push(Response {
+                items: vec![Item::ToolCall { id: i.to_string(), name: "mcp__wiki__ask".into(), arguments: "{}".into() }],
+                usage: None,
+            });
+        }
+        script.push(Response { items: vec![Item::Assistant { text: "done".into() }], usage: None });
+        let mut agent = agent(Response::default(), None);
+        agent.yolo = false;
+        agent.context_window = 0;
+        agent.tools.add(Box::new(CountTool(runs.clone())));
+        agent.provider = Box::new(ScriptedTurns { left: std::sync::Arc::new(std::sync::Mutex::new(script)) });
+        agent
+    }
+
+    fn results(agent: &Agent) -> Vec<String> {
+        agent.items.iter().filter_map(|i| match i { Item::ToolResult { output, .. } => Some(output.clone()), _ => None }).collect()
+    }
+
+    #[tokio::test]
+    async fn always_save_grants_and_writes_permissions_json() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let home = tempfile::tempdir().unwrap();
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut agent = calling_agent(&runs, 2);
+        agent.permissions = std::sync::Arc::new(crate::permissions::Permissions::load(home.path(), home.path()).0);
+        let mut ui = ScriptUi { answer: Approval::AlwaysSave, asked: Vec::new() };
+        agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        // Asked once; the second call rides on the grant.
+        assert_eq!(ui.asked, vec![(Some("`mcp__wiki__ask`".into()), Some("mcp__wiki__ask".into()))]);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(agent.allowed.contains("mcp__wiki__ask"));
+        assert_eq!(agent.permissions.allow, ["mcp__wiki__ask"]);
+        let (reloaded, _) = crate::permissions::Permissions::load(home.path(), home.path());
+        assert_eq!(reloaded.allow, ["mcp__wiki__ask"]);
+    }
+
+    #[tokio::test]
+    async fn deny_and_ask_rules_shape_the_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rules = |allow: &[&str], ask: &[&str], deny: &[&str]| {
+            let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect();
+            std::sync::Arc::new(crate::permissions::Permissions { allow: v(allow), ask: v(ask), deny: v(deny), ..Default::default() })
+        };
+        // deny: never asks or runs, even with --yolo.
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut agent = calling_agent(&runs, 1);
+        agent.yolo = true;
+        agent.permissions = rules(&["mcp__*"], &[], &["mcp__wiki__*"]);
+        let mut ui = ScriptUi { answer: Approval::Yes, asked: Vec::new() };
+        agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        assert!(ui.asked.is_empty());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert!(results(&agent)[0].contains("blocked by permissions.json rule `deny mcp__wiki__*`"), "{:?}", results(&agent));
+
+        // ask: asks every time despite a session grant, and offers no "always".
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut agent = calling_agent(&runs, 2);
+        agent.allowed.insert("mcp__wiki__ask".into());
+        agent.permissions = rules(&["mcp__*"], &["mcp__wiki__ask"], &[]);
+        let mut ui = ScriptUi { answer: Approval::Always, asked: Vec::new() };
+        agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        assert_eq!(ui.asked, vec![(None, None), (None, None)]);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        // allow: runs without asking.
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut agent = calling_agent(&runs, 1);
+        agent.permissions = rules(&["mcp__wiki__*"], &[], &[]);
+        let mut ui = ScriptUi { answer: Approval::No, asked: Vec::new() };
+        agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        assert!(ui.asked.is_empty());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::io::{self, IsTerminal, Write};
 use nu_ansi_term::{Color, Style};
 use serde_json::Value;
 
-use crate::agent::{Approval, ApprovalRequest, Ui};
+use crate::agent::{Approval, ApprovalRequest, Approver, Ui};
 use crate::tools::ToolOutput;
 use crate::types::{Item, StreamEvent};
 use render::{dim, one_line, paint, sanitize_text};
@@ -66,6 +66,30 @@ impl Ui for PlainUi {
             return Approval::Yes;
         }
         eprintln!("● {}  {} — denied (use --yolo to allow)", req.tool, one_line(req.summary, 120));
+        Approval::No
+    }
+    fn approver(&self) -> Option<std::sync::Arc<dyn Approver>> {
+        Some(std::sync::Arc::new(PlainApprover { yolo: self.yolo }))
+    }
+}
+
+/// Print mode has nobody to ask: allow with --yolo, otherwise deny and say so.
+struct PlainApprover {
+    yolo: bool,
+}
+
+#[async_trait::async_trait]
+impl Approver for PlainApprover {
+    async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval {
+        if self.yolo {
+            return Approval::Yes;
+        }
+        eprintln!(
+            "● {} · {}  {} — denied (use --yolo to allow)",
+            one_line(origin, 60),
+            req.tool,
+            one_line(req.summary, 120)
+        );
         Approval::No
     }
 }
