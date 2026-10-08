@@ -534,6 +534,12 @@ async fn run() -> Result<()> {
     let interactive = !print
         && std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // A yolo saved from the settings menu never carries over to print mode or
+    // piped input: scripts get mutations only when they ask on the command line.
+    if !interactive && agent.permission_mode.is_yolo() && cli.permission_mode.is_none() && !cli.yolo {
+        agent.permission_mode = permissions::Mode::Ask;
+        eprintln!("note: the saved yolo permission mode does not apply here; pass --yolo to allow changes");
+    }
     anyhow::ensure!(!cli.record || interactive, "--record requires an interactive terminal");
     let _capture = if cli.record {
         Some(record_tape::Capture::start(&home, &agent.session.as_ref().expect("session").id)?)
