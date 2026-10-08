@@ -489,6 +489,14 @@ mod tests {
 
     const MS: Duration = Duration::from_millis(1);
 
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(MS).await;
+        }
+    }
+
     #[tokio::test]
     async fn a_newer_release_is_installed_and_the_loop_stops() {
         let (src, checks, installs) = fake(&[None, Some("0.0.1"), Some("v999.0.0"), Some("v1000.0.0")], true);
@@ -505,11 +513,10 @@ mod tests {
         let (src, checks, installs) = fake(&[Some("999.0.0"), Some("999.0.0")], false);
         let u = Arc::new(Upgrader::default());
         let task = tokio::spawn(u.clone().run(src, MS, Duration::from_millis(20)));
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(u.state(), State::Failed);
+        // Poll rather than sleep a fixed time: Windows timers tick ~15ms.
+        wait_until("failed", || u.state() == State::Failed).await;
         assert_eq!(u.status_label(), "upgrade failed");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(checks.load(Ordering::SeqCst) >= 2 && installs.load(Ordering::SeqCst) >= 2);
+        wait_until("a second attempt", || checks.load(Ordering::SeqCst) >= 2 && installs.load(Ordering::SeqCst) >= 2).await;
         u.stop();
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
     }
@@ -519,8 +526,7 @@ mod tests {
         let (src, checks, _) = fake(&[Some(upgrade::CURRENT)], true);
         let u = Arc::new(Upgrader::default());
         let task = tokio::spawn(u.clone().run(src, MS, Duration::from_secs(3600)));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(u.state(), State::Waiting);
+        wait_until("waiting", || u.state() == State::Waiting).await;
         assert_eq!(checks.load(Ordering::SeqCst), 1);
         u.stop();
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
