@@ -1078,6 +1078,15 @@ impl Screen {
         self.redraw();
     }
 
+    /// End a non-agent busy period (`!cmd`, `/compact`, `/mcp login`): text
+    /// typed meanwhile goes back to the input instead of waiting in a queue
+    /// that only agent turns drain.
+    pub fn idle(&mut self) {
+        self.set_busy(None, None);
+        self.dequeue();
+        self.redraw();
+    }
+
     pub fn is_busy(&self) -> bool {
         self.busy.is_some()
     }
