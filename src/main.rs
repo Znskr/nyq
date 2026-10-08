@@ -1,6 +1,7 @@
 mod acp;
 mod agent;
 mod config;
+mod hooks;
 mod login;
 mod mcp;
 mod models;
@@ -18,7 +19,7 @@ mod ui;
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 
@@ -85,6 +86,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/skills", "list available skills"),
     ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
     ("/permissions", "permission rules and session grants; /permissions reload re-reads them"),
+    ("/hooks", "list hooks and trust state; /hooks trust trusts the project's hooks"),
     ("/yolo", "toggle auto-approval of tool calls"),
     ("/usage", "token usage for this conversation"),
     ("/exit", "quit (also Ctrl-D)"),
@@ -130,6 +132,10 @@ async fn run() -> Result<()> {
 
     let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
     let sandbox = std::sync::Arc::new(sandbox_policy(&cli)?);
+    let (hooks, hook_warnings) = hooks::Hooks::load(&home, &cwd);
+    for w in &hook_warnings {
+        ui::error(w);
+    }
     let mut agent = Agent {
         session: Some(Session::create(&sessions_dir, &cwd, provider.model())?),
         provider,
@@ -146,6 +152,7 @@ async fn run() -> Result<()> {
         context_estimated: false,
         suppress_auto_compact: false,
         submitted: 0,
+        hooks: std::sync::Arc::new(hooks),
         sandbox,
         undo: Default::default(),
     };
@@ -186,8 +193,13 @@ async fn run() -> Result<()> {
             ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
         }
         connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
+        hooks::session_start(&agent, if resumed.is_some() { "resume" } else { "startup" }).await;
         let mut plain = ui::PlainUi::new(cli.yolo);
         let cancel = cancel_on_ctrl_c();
+        if let Some(msg) = hooks::prompt_submit(&mut agent, &text, &cancel).await {
+            mcp.shutdown().await;
+            bail!("{msg}");
+        }
         let (item, _, warning) = tools::image::user_turn(&text, &cwd);
         if let Some(warning) = warning {
             ui::error(&warning);
@@ -208,6 +220,7 @@ async fn run() -> Result<()> {
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     }
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
+    hooks::session_start(&agent, if resumed.is_some() { "resume" } else { "startup" }).await;
     agent.tools.add(Box::new(agent::AskUserTool));
     if pick {
         // A prompt given with `-r` waits in the editor until a session is picked.
@@ -231,7 +244,7 @@ async fn run() -> Result<()> {
                     continue;
                 }
                 Some(UiCommand::Resume(id)) => {
-                    if let Err(e) = resume_session(&mut agent, &sessions_dir, &id) {
+                    if let Err(e) = resume_session(&mut agent, &sessions_dir, &id).await {
                         ui::error(&format!("{e:#}"));
                     }
                     continue;
@@ -265,8 +278,12 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        let (item, attached, warning) = tools::image::user_turn(&line, &cwd);
         tui.screen().print_user(&line);
+        if let Some(msg) = hooks::prompt_submit(&mut agent, &line, &CancellationToken::new()).await {
+            ui::error(&msg);
+            continue;
+        }
+        let (item, attached, warning) = tools::image::user_turn(&line, &cwd);
         if let Some(warning) = warning {
             ui::error(&warning);
         } else if !attached.is_empty() {
@@ -472,13 +489,14 @@ fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
 }
 
 /// Switch to a saved session (`id`, id prefix or `last`), replaying it.
-fn resume_session(agent: &mut Agent, sessions_dir: &std::path::Path, which: &str) -> Result<()> {
+async fn resume_session(agent: &mut Agent, sessions_dir: &std::path::Path, which: &str) -> Result<()> {
     let (s, meta, items) = session::load(sessions_dir, which, &agent.cwd)?;
     agent.reset(Some(s));
     ui::replay(&items);
     agent.items = items;
     agent.adopt_transcript();
     ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+    hooks::session_start(agent, "resume").await;
     Ok(())
 }
 
@@ -521,6 +539,7 @@ async fn slash(
         "/new" | "/clear" => {
             agent.reset(Some(Session::create(sessions_dir, &agent.cwd, agent.provider.model())?));
             ui::info("Started a new conversation.");
+            hooks::session_start(agent, "new").await;
         }
         "/sessions" => ui::list(&session_lines(sessions_dir)?),
         "/skills" => ui::list(&skills::list_lines(skills)),
@@ -564,7 +583,7 @@ async fn slash(
             }
         }
         "/resume" => match arg.first() {
-            Some(which) => resume_session(agent, sessions_dir, which)?,
+            Some(which) => resume_session(agent, sessions_dir, which).await?,
             None => open_sessions(tui, sessions_dir, agent)?,
         },
         "/model" => match arg.first() {
@@ -646,6 +665,7 @@ async fn slash(
             None => ui::list(&agent.permissions.lines(&agent.allowed)),
             Some(other) => ui::error(&format!("unknown /permissions argument `{other}` (try /permissions or /permissions reload)")),
         },
+        "/hooks" => hooks::command(agent, arg.first().copied()),
         "/yolo" => {
             agent.yolo = !agent.yolo;
             ui::info(if agent.yolo { "Auto-approve on: tools run without asking." } else { "Auto-approve off." });

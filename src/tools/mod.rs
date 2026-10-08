@@ -212,6 +212,8 @@ pub struct ToolCtx {
     /// Rules granted with "always" while this call ran (a subagent's calls);
     /// the loop adds them to its session grants afterwards.
     pub granted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The session's hooks; subagents run its tool hooks for their calls.
+    pub hooks: std::sync::Arc<crate::hooks::Hooks>,
 }
 
 #[derive(Clone, Debug, Default)]

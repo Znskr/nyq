@@ -348,6 +348,11 @@ async fn open(
     for w in warnings {
         eprintln!("nyq: {w}");
     }
+    let (hooks, warnings) = crate::hooks::Hooks::load(&state.home, &cwd);
+    for w in warnings {
+        eprintln!("nyq: {w}");
+    }
+    let source = if items.is_empty() { "startup" } else { "resume" };
     let model = format!("{}:{}", provider.name(), provider.model());
     let mut agent = Agent {
         session: Some(session),
@@ -365,6 +370,7 @@ async fn open(
         context_estimated: false,
         suppress_auto_compact: false,
         submitted: 0,
+        hooks: Arc::new(hooks),
         sandbox,
         undo: Default::default(),
     };
@@ -398,6 +404,7 @@ async fn open(
     for cfg in &wanted {
         connect_server(&mut mcp, &mut agent, cfg).await;
     }
+    crate::hooks::session_start(&agent, source).await;
 
     let live = Arc::new(Live {
         id: acp::SessionId::new(agent.session.as_ref().map(|s| s.id.clone()).unwrap_or_default()),
@@ -606,7 +613,19 @@ async fn prompt(
         inner.agent.yolo = live.yolo.load(Ordering::Relaxed);
         let perms = Arc::new(Asker { cx: cx.clone(), session: live.id.clone(), cwd: live.cwd.clone(), yolo: live.yolo.clone() });
         let mut ui = AcpUi::new(perms, inner.agent.context_window);
-        let result = if token.is_cancelled() { Ok(TurnEnd::Cancelled) } else { inner.agent.turn(item, &mut ui, token.clone()).await };
+        let blocked = if token.is_cancelled() {
+            None
+        } else {
+            crate::hooks::prompt_submit(&mut inner.agent, &prompt_text(&req.prompt), &token).await
+        };
+        let result = if token.is_cancelled() {
+            Ok(TurnEnd::Cancelled)
+        } else if let Some(msg) = blocked {
+            ui.notify(acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(msg.into())));
+            Ok(TurnEnd::Done)
+        } else {
+            inner.agent.turn(item, &mut ui, token.clone()).await
+        };
         let (used, size) = (inner.agent.context_tokens, inner.agent.context_window);
         if size > 0 {
             ui.notify(acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(used, size)));
@@ -621,6 +640,17 @@ async fn prompt(
         Err(_) if token.is_cancelled() => Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)),
         Err(e) => Err(anyhow_error(e)),
     }
+}
+
+/// The typed text of a prompt, for UserPromptSubmit hooks.
+fn prompt_text(blocks: &[acp::ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            acp::ContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One user message from ACP content blocks. Text and links stay inline;
