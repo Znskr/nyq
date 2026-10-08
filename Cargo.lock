@@ -1285,6 +1285,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "similar",
  "tempfile",
  "tokio",

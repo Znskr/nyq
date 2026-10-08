@@ -266,8 +266,7 @@ mod tests {
     fn byte_limit_and_unavailable_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large");
-        let file = File::create(&path).unwrap();
-        file.set_len(MAX_BYTES as u64).unwrap();
+        File::create(&path).unwrap().set_len(MAX_BYTES as u64).unwrap();
         let mut log = UndoLog::default();
         log.snapshot(dir.path(), Mode::WorkspaceWrite, "edit_file", &json!({"path": "large"}));
         fs::write(&path, "small").unwrap();
