@@ -49,6 +49,15 @@ pub fn system(cwd: &Path, sandbox: &crate::sandbox::Policy) -> String {
     if cwd.join(".git").exists() {
         s.push_str("\n- The workspace is a git repository.");
     }
+    if !sandbox.writable.is_empty() {
+        s.push_str(
+            "\n\nAdditional workspace directories (writable, and inside the workspace for file tools). \
+Relative paths still resolve from the working directory. Project instructions are read only from the working directory.\n",
+        );
+        for dir in &sandbox.writable {
+            s.push_str(&format!("- {}\n", dir.display()));
+        }
+    }
     for name in INSTRUCTION_FILES {
         let path = cwd.join(name);
         if let Ok(text) = crate::tools::read_rooted_text(cwd, &path) {
@@ -69,12 +78,25 @@ mod tests {
     #[test]
     fn system_prompt_follows_the_sandbox() {
         let dir = tempfile::tempdir().unwrap();
-        let off = system(dir.path(), &Policy { mode: Mode::Off, ..Policy::default() });
+        let off = system(
+            dir.path(),
+            &Policy {
+                mode: Mode::Off,
+                ..Policy::default()
+            },
+        );
         assert!(off.contains("sandbox: off"));
         assert!(off.contains("Avoid destructive commands"));
         assert!(!off.contains("without a sandbox"));
 
-        let ro = system(dir.path(), &Policy { mode: Mode::ReadOnly, network: false, ..Policy::default() });
+        let ro = system(
+            dir.path(),
+            &Policy {
+                mode: Mode::ReadOnly,
+                network: false,
+                ..Policy::default()
+            },
+        );
         assert!(ro.contains("read-only"), "{ro}");
         assert!(ro.contains("temporary directories remain writable"), "{ro}");
         assert!(ro.contains("write_file and edit_file are refused"), "{ro}");
@@ -84,6 +106,21 @@ mod tests {
         assert!(ww.contains("workspace-write"), "{ww}");
         assert!(ww.contains("only inside the workspace"));
         assert!(!ww.contains("without a sandbox"));
+
+        let extra = tempfile::tempdir().unwrap();
+        let listed = system(
+            dir.path(),
+            &Policy {
+                writable: vec![extra.path().to_path_buf()],
+                ..Policy::default()
+            },
+        );
+        assert!(listed.contains(extra.path().to_str().unwrap()), "{listed}");
+        assert!(
+            listed.contains("Additional workspace directories"),
+            "{listed}"
+        );
+        assert!(listed.contains("Relative paths still resolve"), "{listed}");
     }
 
     #[test]
@@ -98,7 +135,11 @@ mod tests {
             let outside = tempfile::tempdir().unwrap();
             std::fs::write(outside.path().join("secret"), "SECRET_TOKEN_9f3a").unwrap();
             let linked = tempfile::tempdir().unwrap();
-            std::os::unix::fs::symlink(outside.path().join("secret"), linked.path().join("AGENTS.md")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("secret"),
+                linked.path().join("AGENTS.md"),
+            )
+            .unwrap();
             let text = system(linked.path(), &Policy::default());
             assert!(!text.contains("SECRET_TOKEN_9f3a"), "{text}");
             if std::path::Path::new("/dev/zero").exists() {
