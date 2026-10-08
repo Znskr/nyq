@@ -131,6 +131,11 @@ struct Call {
 
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
+    fn endpoint(&self) -> Option<String> { Some(format!("{}/models", self.base_url.trim_end_matches('/'))) }
+    fn pricing_provider(&self) -> &str {
+        if reqwest::Url::parse(&self.base_url).ok().and_then(|u| u.host_str().map(str::to_owned)).is_some_and(|h| h == "opencode.ai" || h.ends_with(".opencode.ai")) { "opencode" } else { self.name() }
+    }
+
     fn fork(&self) -> Box<dyn Provider> {
         Box::new(Self::with_label(self.label.clone(), self.base_url.clone(), self.api_key.clone(), self.model.clone()))
     }
