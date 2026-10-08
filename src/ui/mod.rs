@@ -1,12 +1,13 @@
 //! Terminal frontends: the interactive pi-style TUI (`tui`) and a plain
 //! renderer for `--print` and piped input.
 
+pub mod clipboard;
 pub mod editor;
+pub mod mode_menu;
 mod render;
 pub mod settings;
 pub mod statusline;
 pub mod transcript;
-pub mod clipboard;
 pub mod tui;
 
 use std::io::{self, IsTerminal, Write};
@@ -32,7 +33,10 @@ pub struct PlainUi {
 
 impl PlainUi {
     pub fn new(yolo: bool) -> Self {
-        Self { yolo, at_line_start: true }
+        Self {
+            yolo,
+            at_line_start: true,
+        }
     }
 }
 
@@ -69,7 +73,11 @@ impl Ui for PlainUi {
         if self.yolo {
             return Approval::Yes;
         }
-        eprintln!("● {}  {} — denied (use --yolo to allow)", req.tool, one_line(req.summary, 120));
+        eprintln!(
+            "● {}  {} — denied (use --yolo to allow)",
+            req.tool,
+            one_line(req.summary, 120)
+        );
         Approval::No
     }
     fn approver(&self) -> Option<std::sync::Arc<dyn Approver>> {
@@ -127,8 +135,12 @@ pub fn replay(items: &[Item]) {
         match item {
             Item::User { text, .. } => s.print_user(text),
             Item::Assistant { text } => s.print_markdown(text),
-            Item::ToolCall { name, arguments, .. } => s.print_tool(name, &args_digest(arguments), None),
-            Item::ToolResult { output, is_error, .. } => s.log.tool_end(output, None, *is_error),
+            Item::ToolCall {
+                name, arguments, ..
+            } => s.print_tool(name, &args_digest(arguments), None),
+            Item::ToolResult {
+                output, is_error, ..
+            } => s.log.tool_end(output, None, *is_error),
             Item::Compaction { .. } => s.print_info("  (earlier conversation compacted)", dim()),
             _ => {}
         }
@@ -138,23 +150,47 @@ pub fn replay(items: &[Item]) {
 fn banner_text(version: &str) -> String {
     format!(
         "{} {}",
-        paint(true, Style::new().bold().fg(Color::Rgb(238, 238, 238)), "𝒏yq"),
-        paint(true, Style::new().fg(Color::Rgb(138, 138, 138)), &format!("v{} · Run /help for commands · ctrl+l models · ctrl+d quit", sanitize_text(version)))
+        paint(
+            true,
+            Style::new().bold().fg(Color::Rgb(238, 238, 238)),
+            "𝒏yq"
+        ),
+        paint(
+            true,
+            Style::new().fg(Color::Rgb(138, 138, 138)),
+            &format!(
+                "v{} · Run /help for commands · ctrl+l models · ctrl+d quit",
+                sanitize_text(version)
+            )
+        )
     )
 }
 
 pub fn banner(version: &str) {
     let text = banner_text(version);
     match tui::active() {
-        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_styled_info(&text, Style::new()),
-        None => eprintln!("{}", if color_err() { text } else { sanitize_text(&text) }),
+        Some(screen) => screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .print_styled_info(&text, Style::new()),
+        None => eprintln!(
+            "{}",
+            if color_err() {
+                text
+            } else {
+                sanitize_text(&text)
+            }
+        ),
     }
 }
 
 /// A listing whose rows are cut to the terminal width.
 pub fn list(lines: &[String]) {
     match tui::active() {
-        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_list(lines),
+        Some(screen) => screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .print_list(lines),
         None => lines.iter().for_each(|l| eprintln!("{}", sanitize_text(l))),
     }
 }
@@ -162,7 +198,10 @@ pub fn list(lines: &[String]) {
 pub fn info(msg: &str) {
     let msg = sanitize_text(msg);
     match tui::active() {
-        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_info(&msg, Style::new()),
+        Some(screen) => screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .print_info(&msg, Style::new()),
         None => eprintln!("{msg}"),
     }
 }
@@ -171,7 +210,10 @@ pub fn error(msg: &str) {
     let msg = sanitize_text(msg);
     let style = Style::new().fg(Color::Red);
     match tui::active() {
-        Some(screen) => screen.lock().unwrap_or_else(|e| e.into_inner()).print_error(&msg),
+        Some(screen) => screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .print_error(&msg),
         None => eprintln!("{}", paint(color_err(), style, &format!("error: {msg}"))),
     }
 }
@@ -190,7 +232,10 @@ mod tests {
 
     #[test]
     fn digest_prefers_meaningful_keys() {
-        assert_eq!(args_digest(r#"{"timeout":5,"command":"cargo test"}"#), "cargo test");
+        assert_eq!(
+            args_digest(r#"{"timeout":5,"command":"cargo test"}"#),
+            "cargo test"
+        );
         assert_eq!(args_digest(r#"{"x":{"y":1},"name":"hi"}"#), "hi");
         assert_eq!(args_digest("not json"), "not json");
     }
