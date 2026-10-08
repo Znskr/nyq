@@ -54,6 +54,8 @@ pub enum Command {
     Setting(crate::settings::Id, String),
     /// A mode picked in the `/permissions` menu (`ask`, `auto`, or `yolo`).
     SetPermissionMode(String),
+    /// Ctrl+G: relaunch the installed upgrade on this conversation.
+    ApplyUpgrade,
     Exit,
 }
 
@@ -269,6 +271,8 @@ pub struct Screen {
     /// A one-off hint shown in the status area until the next key.
     hint: Option<String>,
     home: PathBuf,
+    /// The background auto-upgrade, when it runs in this session.
+    pub upgrader: Option<Arc<crate::auto_upgrade::Upgrader>>,
 }
 
 static SCREEN: Mutex<Option<Arc<Mutex<Screen>>>> = Mutex::new(None);
@@ -550,6 +554,7 @@ impl Screen {
             history,
             hint: None,
             home,
+            upgrader: None,
         }
     }
 
@@ -900,12 +905,67 @@ impl Screen {
             return clip_width(&left, self.width);
         }
         let right = super::statusline::right(f, self.width).join(" · ");
-        let room = self.width.saturating_sub(visible_width(&left) + 4);
-        let right = paint(fg(FAINT), &truncate(&sanitize_text(&right), room));
+        let mut room = self.width.saturating_sub(visible_width(&left) + 4);
+        let upgrade = self.upgrade_label();
+        let upgrade = if upgrade.is_empty() {
+            String::new()
+        } else {
+            let label = truncate(&upgrade, room);
+            room = room.saturating_sub(label.chars().count() + 3);
+            let color = if label.starts_with("upgrading") { GRAY } else { YELLOW };
+            let sep = if right.is_empty() || room == 0 { "" } else { " · " };
+            format!("{}{}", paint(fg(color), &label), paint(fg(FAINT), sep))
+        };
+        let right = format!("{upgrade}{}", paint(fg(FAINT), &truncate(&sanitize_text(&right), room)));
         if left.is_empty() {
             return right;
         }
         spread(&left, &right, self.width)
+    }
+
+    /// The auto-upgrade status for the status line (empty: nothing to show).
+    fn upgrade_label(&self) -> String {
+        match &self.upgrader {
+            Some(u) if crate::auto_upgrade::enabled(crate::settings::current().auto_upgrade) => u.status_label(),
+            _ => String::new(),
+        }
+    }
+
+    /// What Ctrl+G must know about the screen to decide whether to relaunch.
+    pub fn upgrade_facts(&self) -> crate::auto_upgrade::ApplyFacts {
+        let enabled = self.upgrader.is_some() && crate::auto_upgrade::enabled(crate::settings::current().auto_upgrade);
+        crate::auto_upgrade::ApplyFacts {
+            busy: self.is_busy(),
+            queued: !self.queue.is_empty(),
+            question: self.question.is_some(),
+            approval: self.approval.is_some(),
+            secret: self.secret.is_some(),
+            session_picker: self.sessions.is_some(),
+            menu: self.menu.is_some() || self.settings.is_some() || self.modes.is_some(),
+            transcript: self.viewer.is_some(),
+            draft: !self.editor.is_empty(),
+            attachments: !self.attachments.is_empty(),
+            enabled,
+            state: self.upgrader.as_ref().map(|u| u.state()),
+        }
+    }
+
+    /// Replace the one-off hint in the status area.
+    pub fn set_hint(&mut self, hint: Option<String>) {
+        self.hint = hint;
+        self.redraw();
+    }
+
+    /// Ctrl+G: ask the app loop to relaunch, or say why it can't now.
+    fn request_upgrade(&mut self, commands: &mpsc::UnboundedSender<Command>) {
+        match crate::auto_upgrade::apply_refusal(&self.upgrade_facts()) {
+            Some(notice) => self.hint = Some(notice.to_string()),
+            None => {
+                self.hint = Some("Reloading nyq…".into());
+                let _ = commands.send(Command::ApplyUpgrade);
+            }
+        }
+        self.redraw();
     }
 
     /// The slash-command or model menu under the input. Returns false if none.
@@ -1771,6 +1831,15 @@ impl Screen {
                     if id == Id::Sandbox {
                         self.hint = Some("The default sandbox applies from the next start.".into());
                     }
+                    if id == Id::AutoUpgrade {
+                        if value == "off" {
+                            if let Some(u) = &self.upgrader {
+                                u.stop();
+                            }
+                        } else {
+                            self.hint = Some("Auto-upgrade starts with the next session.".into());
+                        }
+                    }
                 } else {
                     // Session settings belong to the app loop; show them at once.
                     match id {
@@ -1954,6 +2023,12 @@ impl Screen {
     }
 
     fn on_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        if key.code == KeyCode::Char('g')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return self.request_upgrade(commands);
+        }
         if let Some(mut a) = self.approval.take() {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT);
@@ -2376,8 +2451,11 @@ impl Tui {
                 loop {
                     tick.tick().await;
                     let mut s = lock(&screen);
+                    let upgrade_changed = s.upgrader.as_ref().is_some_and(|u| u.take_render_dirty());
                     if s.busy.is_some() && s.approval.is_none() {
                         s.frame += 1;
+                        s.redraw();
+                    } else if upgrade_changed {
                         s.redraw();
                     }
                 }

@@ -1,6 +1,7 @@
 mod account;
 mod acp;
 mod agent;
+mod auto_upgrade;
 mod catalog;
 mod classifier;
 mod commands;
@@ -318,6 +319,8 @@ fn main() {
 }
 
 async fn run() -> Result<()> {
+    // Kept for relaunching after an auto-upgrade (Ctrl+G).
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
     let home = config::home();
     let sessions_dir = home.join("sessions");
@@ -612,7 +615,10 @@ async fn run() -> Result<()> {
     sync_footer(&tui, &agent, None);
     ui::banner(env!("CARGO_PKG_VERSION"));
     ui::info(&sandbox::describe(&agent.sandbox));
-    upgrade::startup_hint(&home);
+    let exe = upgrade::current_exe().ok();
+    let upgrader = auto_upgrade::should_start(settings::current().auto_upgrade, exe.as_deref())
+        .then(|| auto_upgrade::Upgrader::start(&home));
+    tui.screen().upgrader = upgrader.clone();
     if let Some(meta) = &resumed {
         ui::replay(&agent.items);
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
@@ -644,6 +650,8 @@ async fn run() -> Result<()> {
         .collect();
     // The model's catalog entry, once picked in the switcher (for its efforts).
     let mut current: Option<models::ModelChoice> = None;
+    // Set by Ctrl+G once an installed upgrade can take over this conversation.
+    let mut relaunch = None;
 
     loop {
         sync_footer(&tui, &agent, current.as_ref());
@@ -674,6 +682,17 @@ async fn run() -> Result<()> {
                     commands::set_permission_mode(&home, &mut agent, &mode);
                     continue;
                 }
+                Some(UiCommand::ApplyUpgrade) => match prepare_relaunch(&tui, &mut agent, &raw_args, &cwd) {
+                    Ok(r) => {
+                        relaunch = Some(r);
+                        break;
+                    }
+                    Err(notice) => {
+                        tui.screen().set_hint(None);
+                        ui::error(&notice);
+                        continue;
+                    }
+                },
                 Some(UiCommand::Exit) | None => break,
             },
         };
@@ -803,9 +822,59 @@ async fn run() -> Result<()> {
         pending.extend(queue_leftovers(leftover));
     }
     drop(tui);
+    if let Some(u) = &upgrader {
+        u.stop();
+    }
     tools::background::kill_all();
     mcp.shutdown().await;
+    if let Some(r) = relaunch {
+        // Close the session (and its lock) and the tape before handing over.
+        let resume = agent.session.take().filter(|s| s.is_saved()).map(|s| s.id.clone());
+        drop(_capture);
+        let e = auto_upgrade::relaunch(&r);
+        ui::error(&format!(
+            "upgrade installed, but relaunch failed: {e}; {}",
+            auto_upgrade::manual_hint(resume.as_deref())
+        ));
+    }
     Ok(())
+}
+
+/// Ctrl+G: check that the conversation can be handed to the upgraded binary
+/// and build its command line. Errors are notices; the session keeps running.
+fn prepare_relaunch(
+    tui: &Tui,
+    agent: &mut Agent,
+    args: &[std::ffi::OsString],
+    cwd: &Path,
+) -> std::result::Result<auto_upgrade::Relaunch, String> {
+    if let Some(notice) = auto_upgrade::apply_refusal(&tui.screen().upgrade_facts()) {
+        return Err(notice.to_string());
+    }
+    let resume = match agent.session.as_mut() {
+        Some(s) => {
+            s.flush().map_err(|e| {
+                format!("upgrade paused because this conversation is not safely resumable: {e:#}")
+            })?;
+            s.is_saved().then(|| s.id.clone())
+        }
+        None => None,
+    };
+    let manual = auto_upgrade::manual_hint(resume.as_deref());
+    let exe = upgrade::current_exe().map_err(|e| {
+        format!("upgrade installed, but the executable path could not be resolved: {e:#}; {manual}")
+    })?;
+    if !exe.is_file() {
+        return Err(format!(
+            "upgrade installed, but relaunch could not be prepared: {} is missing; {manual}",
+            exe.display()
+        ));
+    }
+    Ok(auto_upgrade::Relaunch {
+        exe,
+        args: auto_upgrade::relaunch_args(args, resume.as_deref()),
+        cwd: cwd.to_path_buf(),
+    })
 }
 
 /// Read permissions.json (and the project's), reporting problems once.
@@ -1114,7 +1183,7 @@ async fn slash(
             for (c, d) in mcp_features::prompt_commands(mcp) {
                 ui::info(&format!("  {c} — {d}"));
             }
-            ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts\n  Ctrl+O transcript · Ctrl+V paste an image · prompt templates: see /alias");
+            ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts\n  Ctrl+O transcript · Ctrl+V paste an image · Ctrl+G reload into a ready upgrade · prompt templates: see /alias");
         }
         "/new" | "/clear" => {
             commands::fresh(agent, sessions_dir)?;
@@ -1424,6 +1493,23 @@ mod tests {
             Some(Command::Mcp { action: mcp_cli::McpCommand::Trust { action: Some(mcp_cli::TrustAction::Approve { .. }) } })
         ));
         assert!(Cli::try_parse_from(["nyq", "session", "delete"]).is_err());
+    }
+
+    #[test]
+    fn relaunch_knows_every_option_that_takes_a_value() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        for arg in cmd.get_arguments().filter(|a| !a.is_positional()) {
+            let long = format!("--{}", arg.get_long().unwrap_or_default());
+            let takes = arg.get_action().takes_values();
+            if long == "--resume" {
+                continue;
+            }
+            assert_eq!(auto_upgrade::VALUE_LONG.contains(&long.as_str()), takes, "{long}");
+            if let Some(short) = arg.get_short() {
+                assert_eq!(auto_upgrade::VALUE_SHORT.contains(&short), takes, "-{short}");
+            }
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! `nyq upgrade`: find the newest GitHub release on the selected channel,
 //! download the archive for this platform, verify it against the release's
-//! SHA256SUMS and atomically replace the running executable. Also a daily,
-//! non-blocking "update available" hint for interactive sessions.
+//! SHA256SUMS and atomically replace the running executable. The same steps
+//! back the background auto-upgrade of interactive sessions (`auto_upgrade`).
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const REPO: &str = "sharqlabs/nyq";
-const CURRENT: &str = env!("CARGO_PKG_VERSION");
-const DAY: i64 = 24 * 60 * 60;
+pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const STATE_FILE: &str = "update.json";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -28,7 +27,7 @@ pub enum Channel {
 }
 
 impl Channel {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Channel::Stable => "stable",
             Channel::Latest => "latest",
@@ -182,7 +181,7 @@ pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- network
 
-struct Github {
+pub(crate) struct Github {
     client: reqwest::Client,
     token: Option<String>,
 }
@@ -198,7 +197,7 @@ fn gh_token() -> Option<String> {
 }
 
 impl Github {
-    fn new(timeout: Duration) -> Result<Github> {
+    pub(crate) fn new(timeout: Duration) -> Result<Github> {
         let client = reqwest::Client::builder()
             .user_agent(crate::config::USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
@@ -217,7 +216,7 @@ impl Github {
 
     /// The release list; a private repository answers 404 without a token, so
     /// retry once with `gh auth token`.
-    async fn releases(&mut self) -> Result<Vec<Release>> {
+    pub(crate) async fn releases(&mut self) -> Result<Vec<Release>> {
         let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=30");
         let mut resp = self.get(&url, "application/vnd.github+json").await.context("contacting GitHub")?;
         if matches!(resp.status().as_u16(), 401 | 403 | 404) && self.token.is_none() {
@@ -259,8 +258,6 @@ struct State {
     checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    hinted_at: Option<i64>,
 }
 
 fn load(home: &Path) -> State {
@@ -275,8 +272,13 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// The release channel saved by `nyq upgrade --channel` (default: stable).
+pub fn saved_channel(home: &Path) -> Channel {
+    load(home).channel.unwrap_or_default()
+}
+
 /// Remember the result of a release check.
-fn record_check(home: &Path, latest: Option<&str>) {
+pub(crate) fn record_check(home: &Path, latest: Option<&str>) {
     let mut state = load(home);
     state.checked_at = Some(now());
     if let Some(latest) = latest {
@@ -288,7 +290,7 @@ fn record_check(home: &Path, latest: Option<&str>) {
 // ---------------------------------------------------------------- install
 
 /// The path of the running executable, with symlinks resolved.
-fn current_exe() -> Result<PathBuf> {
+pub(crate) fn current_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("could not determine the path of the running binary")?;
     let exe = match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
         Some(stripped) => PathBuf::from(stripped),
@@ -380,6 +382,48 @@ fn extract(archive: &Path, dest: &Path) -> Result<()> {
 
 // ---------------------------------------------------------------- commands
 
+/// The release archive name for this platform, if nyq ships one.
+pub(crate) fn platform_archive() -> Option<String> {
+    target_for(std::env::consts::OS, std::env::consts::ARCH).map(archive_name)
+}
+
+/// The newest release on `channel` and its version (without the `v`).
+pub(crate) async fn newest(gh: &mut Github, channel: Channel) -> Result<(Release, String)> {
+    let release = pick_release(gh.releases().await?, channel)
+        .with_context(|| format!("{REPO} has no {} release yet", channel.label()))?;
+    let latest = release.tag_name.trim_start_matches('v').to_string();
+    Ok((release, latest))
+}
+
+/// Download the archive `name` of `release` and verify it against the
+/// release's SHA256SUMS.
+pub(crate) async fn download_verified(gh: &Github, release: &Release, name: &str) -> Result<Vec<u8>> {
+    let asset = release.asset(name).with_context(|| format!("release {} has no asset named {name}", release.tag_name))?;
+    let sums = release
+        .asset("SHA256SUMS")
+        .with_context(|| format!("release {} has no SHA256SUMS: refusing to install without checksum verification", release.tag_name))?;
+    let sums = String::from_utf8_lossy(&gh.download(sums).await?).into_owned();
+    let expected = checksum_for(&sums, name).with_context(|| format!("SHA256SUMS has no entry for {name}"))?;
+    let bytes = gh.download(asset).await?;
+    verify_sha256(&bytes, &expected)?;
+    Ok(bytes)
+}
+
+/// Unpack a verified archive and install its `nyq` over `exe`, after checking
+/// that it runs and reports `version`. Blocking (runs `tar` and the binary).
+pub(crate) fn install_archive(bytes: &[u8], name: &str, version: &str, exe: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(aside_path(exe)); // left over from a previous Windows upgrade
+    let tmp = TempDir(std::env::temp_dir().join(format!("nyq-upgrade-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&tmp.0)?;
+    let archive = tmp.0.join(name);
+    std::fs::write(&archive, bytes)?;
+    let unpacked = tmp.0.join("unpacked");
+    std::fs::create_dir_all(&unpacked)?;
+    extract(&archive, &unpacked)?;
+    let new_bin = find_binary(&unpacked).with_context(|| format!("{name} does not contain a nyq binary"))?;
+    replace_exe(&new_bin, exe, |staged| check_binary(staged, version))
+}
+
 /// `nyq upgrade [--channel stable|latest] [--check]`.
 pub async fn run(home: &Path, channel: Option<Channel>, check: bool) -> Result<()> {
     let mut state = load(home);
@@ -388,14 +432,11 @@ pub async fn run(home: &Path, channel: Option<Channel>, check: bool) -> Result<(
         save(home, &state)?;
     }
     let channel = state.channel.unwrap_or_default();
-    let target = target_for(std::env::consts::OS, std::env::consts::ARCH)
-        .context("no prebuilt nyq release exists for this platform; build from source instead")?;
+    let name = platform_archive().context("no prebuilt nyq release exists for this platform; build from source instead")?;
 
     eprintln!("Checking for updates ({} channel)...", channel.label());
     let mut gh = Github::new(Duration::from_secs(300))?;
-    let release = pick_release(gh.releases().await?, channel)
-        .with_context(|| format!("{REPO} has no {} release yet", channel.label()))?;
-    let latest = release.tag_name.trim_start_matches('v').to_string();
+    let (release, latest) = newest(&mut gh, channel).await?;
     record_check(home, Some(&latest));
     if !is_newer(&latest, CURRENT) {
         println!("nyq {CURRENT} is up to date ({} channel).", channel.label());
@@ -406,61 +447,12 @@ pub async fn run(home: &Path, channel: Option<Channel>, check: bool) -> Result<(
         return Ok(());
     }
 
-    let name = archive_name(target);
-    let asset = release.asset(&name).with_context(|| format!("release {} has no asset named {name}", release.tag_name))?;
-    let sums = release
-        .asset("SHA256SUMS")
-        .with_context(|| format!("release {} has no SHA256SUMS: refusing to install without checksum verification", release.tag_name))?;
-
     let exe = current_exe()?;
-    let _ = std::fs::remove_file(aside_path(&exe)); // left over from a previous Windows upgrade
     eprintln!("Downloading {name} ({})...", release.tag_name);
-    let sums = String::from_utf8_lossy(&gh.download(sums).await?).into_owned();
-    let expected = checksum_for(&sums, &name).with_context(|| format!("SHA256SUMS has no entry for {name}"))?;
-    let bytes = gh.download(asset).await?;
-    verify_sha256(&bytes, &expected)?;
-
-    let tmp = TempDir(std::env::temp_dir().join(format!("nyq-upgrade-{}", uuid::Uuid::new_v4())));
-    std::fs::create_dir_all(&tmp.0)?;
-    let archive = tmp.0.join(&name);
-    std::fs::write(&archive, &bytes)?;
-    let unpacked = tmp.0.join("unpacked");
-    std::fs::create_dir_all(&unpacked)?;
-    extract(&archive, &unpacked)?;
-    let new_bin = find_binary(&unpacked).with_context(|| format!("{name} does not contain a nyq binary"))?;
-    replace_exe(&new_bin, &exe, |staged| check_binary(staged, &latest))?;
+    let bytes = download_verified(&gh, &release, &name).await?;
+    install_archive(&bytes, &name, &latest, &exe)?;
     println!("Upgraded nyq {CURRENT} -> {latest} ({}).", exe.display());
     Ok(())
-}
-
-/// At interactive startup: show a cached "update available" line at most once a
-/// day, and refresh the cache in the background at most once a day. Never installs.
-pub fn startup_hint(home: &Path) {
-    if cfg!(debug_assertions) || std::env::var_os("NYQ_NO_UPDATE_CHECK").is_some() {
-        return;
-    }
-    let mut state = load(home);
-    let now = now();
-    if let Some(latest) = state.latest.as_deref().filter(|l| is_newer(l, CURRENT)) {
-        if state.hinted_at.is_none_or(|t| now - t >= DAY) {
-            crate::ui::info(&format!("Update available: nyq {CURRENT} -> {latest} · run `nyq upgrade`"));
-            state.hinted_at = Some(now);
-            let _ = save(home, &state);
-        }
-    }
-    if state.checked_at.is_none_or(|t| now - t >= DAY) {
-        let channel = state.channel.unwrap_or_default();
-        let home = home.to_path_buf();
-        tokio::spawn(async move {
-            let latest = async {
-                let mut gh = Github::new(Duration::from_secs(10)).ok()?;
-                let release = pick_release(gh.releases().await.ok()?, channel)?;
-                Some(release.tag_name.trim_start_matches('v').to_string())
-            }
-            .await;
-            record_check(&home, latest.as_deref());
-        });
-    }
 }
 
 #[cfg(test)]
