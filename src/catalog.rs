@@ -197,6 +197,7 @@ pub async fn refresh(home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::provider::sse::tests::server;
     use serde_json::json;
 
@@ -230,10 +231,13 @@ mod tests {
         assert_eq!(ModelMeta::default().protocol(), Protocol::Chat);
     }
 
+    // Points HOME at a temp dir to fake the OpenCode CLI's cache; Windows
+    // resolves the home directory without HOME.
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // Serializes env-var mutation.
     async fn cache_freshness_and_fallback() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap();
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");

@@ -2136,7 +2136,7 @@ mod tests {
         assert_eq!(editor.handle_key(enter, true), Action::Submit("a\\\nb\n".into()));
         assert!(text_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT), '@'));
         let bytes = clipboard_bytes("€🙂", true);
-        let units: Vec<u16> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
         assert_eq!(units[0], 0xfeff);
         assert_eq!(String::from_utf16(&units[1..]).unwrap(), "€🙂");
     }

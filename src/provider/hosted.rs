@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn key_precedence() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let keys = ["HOME", "XDG_DATA_HOME", "OPENCODE_API_KEY", "XAI_API_KEY"];
         let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
         let user = tempfile::tempdir().unwrap();

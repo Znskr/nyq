@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn reads_refuse_credential_files() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap();
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("NYQ_HOME");
         let old_auth = std::env::var_os("NYQ_CODEX_AUTH");

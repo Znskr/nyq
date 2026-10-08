@@ -1153,13 +1153,13 @@ fn lexical(base: &Path, path: &str) -> Option<PathBuf> {
 
 /// Whether `full` stays inside `root`, including through symlinks on the existing prefix.
 fn covers(root: &Path, full: &Path) -> bool {
-    if !full.starts_with(root) {
-        return false;
-    }
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    full.ancestors()
-        .find_map(|a| std::fs::canonicalize(a).ok())
-        .is_none_or(|real| real.starts_with(&canon))
+    // Resolve the existing prefix (symlinks, and spellings such as macOS's
+    // /var vs /private/var), keep the not-yet-existing tail, then compare.
+    match full.ancestors().find_map(|a| std::fs::canonicalize(a).ok().map(|real| (a, real))) {
+        Some((existing, real)) => real.join(full.strip_prefix(existing).unwrap_or(Path::new(""))).starts_with(&canon),
+        None => full.starts_with(root),
+    }
 }
 
 /// Whether `path` (relative to `root` or absolute) stays inside `root`, after
