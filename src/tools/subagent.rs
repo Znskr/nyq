@@ -22,7 +22,13 @@ const CLEANUP: Duration = Duration::from_secs(5);
 const MAX_REPORT: usize = 20_000;
 /// Tools an explore subagent may use (those present in the builtins).
 const READ_ONLY: &[&str] = &[
-    "read_file", "list_dir", "glob", "grep", "view_image", "web_fetch", "web_search",
+    "read_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "view_image",
+    "web_fetch",
+    "web_search",
 ];
 
 const DESCRIPTION: &str = "\
@@ -73,7 +79,11 @@ fn label(args: &Value) -> &str {
     args.get("description")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| args.get("task").and_then(Value::as_str).and_then(|t| t.lines().next()))
+        .or_else(|| {
+            args.get("task")
+                .and_then(Value::as_str)
+                .and_then(|t| t.lines().next())
+        })
         .unwrap_or("")
         .trim()
 }
@@ -83,9 +93,17 @@ fn child_tools(general: bool) -> Registry {
     let mut tools = Registry::builtin();
     let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
     let keep: Vec<&str> = if general {
-        names.iter().map(String::as_str).filter(|n| *n != NAME).collect()
+        names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| *n != NAME)
+            .collect()
     } else {
-        READ_ONLY.iter().copied().filter(|n| names.iter().any(|m| m == n)).collect()
+        READ_ONLY
+            .iter()
+            .copied()
+            .filter(|n| names.iter().any(|m| m == n))
+            .collect()
     };
     for name in &names {
         // remove_prefix is the only removal API; don't let it take a kept tool.
@@ -190,11 +208,17 @@ fn child(ctx: &ToolCtx, general: bool, persistent: bool, items: Vec<Item>) -> Re
         items,
         session: None,
         cwd: ctx.cwd.clone(),
-        // Inherit the parent's yolo flag, "always" grants and rules.
+        // Inherit the parent's mode, "always" grants and rules.
         // Calls that still need approval are forwarded to the parent's
         // approver, or denied when there is none: approving this call
-        // does not auto-approve them.
-        yolo: ctx.yolo,
+        // does not auto-approve them. A yolo flag set on the context
+        // wins so older callers that only set `yolo` still skip prompts.
+        permission_mode: if ctx.yolo {
+            crate::permissions::Mode::Yolo
+        } else {
+            ctx.permission_mode
+        },
+        review_cache: std::sync::Arc::clone(&ctx.review_cache),
         allowed: ctx.allowed.clone(),
         permissions: ctx.permissions.clone(),
         usage: Usage::default(),
@@ -421,12 +445,20 @@ fn truncate(s: &str, max: usize) -> String {
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n[… report truncated, {} more bytes]", &s[..end], s.len() - end)
+    format!(
+        "{}\n[… report truncated, {} more bytes]",
+        &s[..end],
+        s.len() - end
+    )
 }
 
 fn one_line(s: &str) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() > 60 { format!("{}…", s.chars().take(59).collect::<String>()) } else { s }
+    if s.chars().count() > 60 {
+        format!("{}…", s.chars().take(59).collect::<String>())
+    } else {
+        s
+    }
 }
 
 /// Headless UI for the child agent: records tool calls and updates its live
@@ -509,11 +541,22 @@ mod tests {
     }
 
     fn resp(items: Vec<Item>) -> Response {
-        Response { items, usage: Some(Usage { input_tokens: 100, output_tokens: 10, cached_tokens: 0 }) }
+        Response {
+            items,
+            usage: Some(Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cached_tokens: 0,
+            }),
+        }
     }
 
     fn ctx(fake: &Fake, dir: &std::path::Path) -> ToolCtx {
-        ToolCtx { cwd: dir.to_path_buf(), provider: Some(Arc::new(fake.clone())), ..ToolCtx::default() }
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            provider: Some(Arc::new(fake.clone())),
+            ..ToolCtx::default()
+        }
     }
 
     #[tokio::test]
@@ -522,20 +565,39 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let fake = Fake::default();
         *fake.script.lock().unwrap() = vec![
-            resp(vec![Item::ToolCall { id: "1".into(), name: "read_file".into(), arguments: r#"{"path":"a.txt"}"#.into() }]),
-            resp(vec![Item::Assistant { text: "Found hello in a.txt:1".into() }]),
+            resp(vec![Item::ToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.txt"}"#.into(),
+            }]),
+            resp(vec![Item::Assistant {
+                text: "Found hello in a.txt:1".into(),
+            }]),
         ];
-        let out = Subagent.run(json!({"task": "look at a.txt", "description": "read a"}), &ctx(&fake, dir.path())).await;
+        let out = Subagent
+            .run(
+                json!({"task": "look at a.txt", "description": "read a"}),
+                &ctx(&fake, dir.path()),
+            )
+            .await;
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.starts_with("Found hello in a.txt:1"));
-        assert!(out.content.contains("(subagent used 1 tool calls, ↑200 ↓20 tokens)"), "{}", out.content);
+        assert!(
+            out.content
+                .contains("(subagent used 1 tool calls, ↑200 ↓20 tokens)"),
+            "{}",
+            out.content
+        );
         assert!(out.display.unwrap().contains("read_file a.txt"));
 
         let seen = fake.seen_tools.lock().unwrap();
         let tools = &seen[0];
         assert!(tools.contains(&"read_file".to_string()) && tools.contains(&"grep".to_string()));
         for banned in ["write_file", "edit_file", "bash", "subagent"] {
-            assert!(!tools.contains(&banned.to_string()), "explore offered {banned}");
+            assert!(
+                !tools.contains(&banned.to_string()),
+                "explore offered {banned}"
+            );
         }
     }
 
@@ -543,7 +605,11 @@ mod tests {
     fn general_mode_needs_approval_and_has_write_tools() {
         assert!(!Subagent.needs_approval(&json!({"task": "x"})));
         assert!(Subagent.needs_approval(&json!({"task": "x", "mode": "general"})));
-        let names: Vec<String> = child_tools(true).specs().into_iter().map(|s| s.name).collect();
+        let names: Vec<String> = child_tools(true)
+            .specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         assert!(names.contains(&"bash".to_string()) && names.contains(&"write_file".to_string()));
         assert!(!names.contains(&"subagent".to_string()));
         assert_eq!(Subagent.summary(&json!({"task": "first\nsecond"})), "first");
@@ -553,7 +619,10 @@ mod tests {
                 &ToolCtx::default(),
             )
             .unwrap();
-        assert!(preview.contains("rm -rf /") && preview.contains("mode: general"), "{preview}");
+        assert!(
+            preview.contains("rm -rf /") && preview.contains("mode: general"),
+            "{preview}"
+        );
         assert_eq!(
             Subagent.summary(&json!({"task": "rm -rf /", "description": "check the test names", "mode": "general"})),
             "check the test names (general)"
@@ -570,10 +639,15 @@ mod tests {
                 name: "write_file".into(),
                 arguments: r#"{"path":"out.txt","content":"x"}"#.into(),
             }]),
-            resp(vec![Item::Assistant { text: "done".into() }]),
+            resp(vec![Item::Assistant {
+                text: "done".into(),
+            }]),
         ];
         let out = Subagent
-            .run(json!({"task": "write out.txt", "mode": "general"}), &ctx(&fake, dir.path()))
+            .run(
+                json!({"task": "write out.txt", "mode": "general"}),
+                &ctx(&fake, dir.path()),
+            )
             .await;
         assert!(!out.is_error, "{}", out.content);
         assert!(!dir.path().join("out.txt").exists());
@@ -584,23 +658,30 @@ mod tests {
     async fn general_subagent_inherits_yolo_and_grants() {
         let dir = tempfile::tempdir().unwrap();
         let write = || {
-            resp(vec![
-                Item::ToolCall {
-                    id: "1".into(),
-                    name: "write_file".into(),
-                    arguments: r#"{"path":"out.txt","content":"x"}"#.into(),
-                },
-            ])
+            resp(vec![Item::ToolCall {
+                id: "1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"out.txt","content":"x"}"#.into(),
+            }])
         };
-        let done = || resp(vec![Item::Assistant { text: "wrote".into() }]);
+        let done = || {
+            resp(vec![Item::Assistant {
+                text: "wrote".into(),
+            }])
+        };
 
         let fake = Fake::default();
         *fake.script.lock().unwrap() = vec![write(), done()];
         let mut c = ctx(&fake, dir.path());
         c.yolo = true;
-        let out = Subagent.run(json!({"task": "write", "mode": "general"}), &c).await;
+        let out = Subagent
+            .run(json!({"task": "write", "mode": "general"}), &c)
+            .await;
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+            "x"
+        );
         let mut parent_undo = crate::undo::UndoLog::default();
         parent_undo.append(out.undo);
         assert_eq!(parent_undo.len(), 1);
@@ -611,9 +692,14 @@ mod tests {
         *fake.script.lock().unwrap() = vec![write(), done()];
         let mut c = ctx(&fake, dir.path());
         c.allowed.insert("write_file".into());
-        let out = Subagent.run(json!({"task": "write", "mode": "general"}), &c).await;
+        let out = Subagent
+            .run(json!({"task": "write", "mode": "general"}), &c)
+            .await;
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+            "x"
+        );
     }
 
     /// Answers every request with `answer` and records what it was asked.
@@ -625,7 +711,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Approver for FakeApprover {
         async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval {
-            self.asked.lock().unwrap().push((origin.to_string(), req.summary.to_string(), req.save_rule.clone()));
+            self.asked.lock().unwrap().push((
+                origin.to_string(),
+                req.summary.to_string(),
+                req.save_rule.clone(),
+            ));
             self.answer
         }
     }
@@ -634,7 +724,13 @@ mod tests {
     async fn run_touch(
         answer: Approval,
         permissions: crate::permissions::Permissions,
-    ) -> (tempfile::TempDir, ToolOutput, Arc<FakeApprover>, Fake, Vec<String>) {
+    ) -> (
+        tempfile::TempDir,
+        ToolOutput,
+        Arc<FakeApprover>,
+        Fake,
+        Vec<String>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let fake = Fake::default();
         *fake.script.lock().unwrap() = vec![
@@ -643,15 +739,26 @@ mod tests {
                 name: "bash".into(),
                 arguments: r#"{"command":"touch ran.txt"}"#.into(),
             }]),
-            resp(vec![Item::Assistant { text: "finished".into() }]),
+            resp(vec![Item::Assistant {
+                text: "finished".into(),
+            }]),
         ];
-        let approver = Arc::new(FakeApprover { answer, asked: Mutex::new(Vec::new()) });
+        let approver = Arc::new(FakeApprover {
+            answer,
+            asked: Mutex::new(Vec::new()),
+        });
         let mut c = ctx(&fake, dir.path());
-        c.sandbox = Arc::new(crate::sandbox::Policy { mode: crate::sandbox::Mode::Off, ..Default::default() });
+        c.sandbox = Arc::new(crate::sandbox::Policy {
+            mode: crate::sandbox::Mode::Off,
+            ..Default::default()
+        });
         c.approver = Some(approver.clone());
         c.permissions = Arc::new(permissions);
         let out = Subagent
-            .run(json!({"task": "touch it", "description": "Touch a file", "mode": "general"}), &c)
+            .run(
+                json!({"task": "touch it", "description": "Touch a file", "mode": "general"}),
+                &c,
+            )
             .await;
         let granted = c.granted.lock().unwrap().clone();
         (dir, out, approver, fake, granted)
@@ -684,34 +791,50 @@ mod tests {
 
     #[tokio::test]
     async fn deny_rules_block_child_calls_without_asking() {
-        let perms = crate::permissions::Permissions { deny: vec!["bash:touch".into()], ..Default::default() };
+        let perms = crate::permissions::Permissions {
+            deny: vec!["bash:touch".into()],
+            ..Default::default()
+        };
         let (dir, out, approver, fake, _) = run_touch(Approval::Yes, perms).await;
         assert!(!out.is_error, "{}", out.content);
         assert!(!dir.path().join("ran.txt").exists());
         assert!(approver.asked.lock().unwrap().is_empty());
         let results = fake.seen_results.lock().unwrap();
-        assert!(results.iter().any(|r| r.contains("blocked by permissions.json rule `deny bash:touch`")), "{results:?}");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.contains("blocked by permissions.json rule `deny bash:touch`")),
+            "{results:?}"
+        );
     }
 
     #[tokio::test]
     async fn subagent_without_provider_errors() {
-        let out = Subagent.run(json!({"task": "x"}), &ToolCtx::default()).await;
+        let out = Subagent
+            .run(json!({"task": "x"}), &ToolCtx::default())
+            .await;
         assert!(out.is_error);
     }
 
     #[tokio::test]
     async fn subagent_honors_cancellation() {
         let dir = tempfile::tempdir().unwrap();
-        let fake = Fake { hang: true, ..Fake::default() };
+        let fake = Fake {
+            hang: true,
+            ..Fake::default()
+        };
         let ctx = ctx(&fake, dir.path());
         let cancel = ctx.cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             cancel.cancel();
         });
-        let out = tokio::time::timeout(Duration::from_secs(5), Subagent.run(json!({"task": "x"}), &ctx))
-            .await
-            .expect("subagent did not stop on cancel");
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            Subagent.run(json!({"task": "x"}), &ctx),
+        )
+        .await
+        .expect("subagent did not stop on cancel");
         assert!(out.is_error && out.content.contains("cancelled"));
     }
 
@@ -723,7 +846,14 @@ mod tests {
             token.cancelled().await;
             Ok(TurnEnd::Cancelled)
         };
-        let err = match drive_turn(turn, Duration::from_millis(30), Duration::from_secs(2), cancel).await {
+        let err = match drive_turn(
+            turn,
+            Duration::from_millis(30),
+            Duration::from_secs(2),
+            cancel,
+        )
+        .await
+        {
             Err(err) => err,
             Ok(_) => panic!("expected a timeout"),
         };

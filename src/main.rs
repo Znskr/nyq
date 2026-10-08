@@ -2,14 +2,13 @@ mod account;
 mod acp;
 mod agent;
 mod catalog;
+mod classifier;
 mod commands;
 mod config;
 mod diagnostics;
 mod doctor;
 mod github;
 mod hooks;
-mod pricing;
-mod usage;
 mod login;
 mod mcp;
 mod mcp_cli;
@@ -17,6 +16,7 @@ mod mcp_features;
 mod models;
 mod notify;
 mod permissions;
+mod pricing;
 mod prompt;
 mod provider;
 mod sandbox;
@@ -32,6 +32,7 @@ mod types;
 mod ui;
 mod undo;
 mod upgrade;
+mod usage;
 mod workspace;
 
 use std::collections::HashSet;
@@ -72,6 +73,9 @@ struct Cli {
     /// Run tools without asking for approval.
     #[arg(long, global = true)]
     yolo: bool,
+    /// Permission mode: ask (default), auto, or yolo. Overrides --yolo and settings.
+    #[arg(long, global = true, value_name = "MODE")]
+    permission_mode: Option<String>,
     /// Confine shell commands the model runs [default: workspace-write where supported].
     #[arg(long, value_enum, global = true)]
     sandbox: Option<sandbox::Mode>,
@@ -116,9 +120,21 @@ enum Command {
         action: Option<WorkspaceCommand>,
     },
     /// Summarize recorded usage (default: 30 days).
-    Usage { #[arg(long, value_enum, default_value = "30d")] period: usage::Period },
+    Usage {
+        #[arg(long, value_enum, default_value = "30d")]
+        period: usage::Period,
+    },
     /// Show configuration and runtime status without contacting providers.
-    Status { #[arg(long)] json: bool },
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the permission mode and persistent rules.
+    Permissions {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check authentication, endpoint, sandbox and local environment health.
     Doctor,
     /// List the same provider model catalog as the interactive picker.
@@ -176,8 +192,6 @@ enum Command {
     /// Show the AI Gateway credit balance.
     #[command(alias = "balance")]
     Credits { #[arg(long)] json: bool },
-    /// Show the permission mode and rules.
-    Permissions { #[arg(long)] json: bool },
     /// Manage MCP servers and project trust without opening the interactive shell.
     Mcp {
         #[command(subcommand)]
@@ -259,12 +273,31 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/credits", "AI Gateway credit balance (also /balance)"),
     ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME] · /mcp trust …"),
     ("/memory", "saved memories; /memory remove N forgets one"),
-    ("/background", "background processes; /background kill ID|last"),
-    ("/permissions", "permission rules and session grants; /permissions reload re-reads them"),
-    ("/hooks", "list hooks and trust state; /hooks trust trusts the project's hooks"),
-    ("/yolo", "toggle auto-approval of tool calls"),
+    (
+        "/background",
+        "background processes; /background kill ID|last",
+    ),
+    (
+        "/permissions",
+        "permission mode and rules: /permissions [ask|auto|yolo|rules|reload]",
+    ),
+    (
+        "/allowlist",
+        "trusted commands, tools and URLs: /allowlist [remove N | remove command|tool|url PATTERN]",
+    ),
+    (
+        "/hooks",
+        "list hooks and trust state; /hooks trust trusts the project's hooks",
+    ),
+    (
+        "/yolo",
+        "toggle yolo mode (never ask; deny rules still block)",
+    ),
     ("/usage", "profile usage totals: /usage [24h|7d|30d]"),
-    ("/stats", "session turns, requests, tokens, tools and duration"),
+    (
+        "/stats",
+        "session turns, requests, tokens, tools and duration",
+    ),
     ("/status", "configuration and runtime status"),
     ("/version", "show nyq version"),
     ("/exit", "quit (also Ctrl-D)"),
@@ -294,6 +327,14 @@ async fn run() -> Result<()> {
     if let Some(w) = settings_warning {
         ui::error(&w);
     }
+    let (permission_mode, mode_warning) = permissions::resolve_mode(
+        cli.permission_mode.as_deref(),
+        cli.yolo,
+        &settings::current().permission_mode,
+    )?;
+    if let Some(w) = &mode_warning {
+        ui::error(w);
+    }
 
     match &cli.command {
         Some(Command::Replay { tape, speed }) => return record_tape::replay(tape, *speed).await,
@@ -308,15 +349,28 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Usage { period }) => return usage::show(&home, *period),
-        Some(Command::Models) => { doctor::models(&home).await; return Ok(()); }
+        Some(Command::Models) => {
+            doctor::models(&home).await;
+            return Ok(());
+        }
         Some(Command::Status { json }) => {
-            let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref()).ok();
-            let policy = sandbox::Policy { mode: cli.sandbox.unwrap_or_default(), network: cli.allow_network, writable: extra_dirs(&home, &cwd, &cli) };
+            let provider =
+                config::provider(&home, cli.provider.as_deref(), cli.model.as_deref()).ok();
+            let policy = sandbox::Policy {
+                mode: cli.sandbox.unwrap_or_default(),
+                network: cli.allow_network,
+                writable: extra_dirs(&home, &cwd, &cli),
+            };
             return doctor::cli_status(&home, &cwd, provider.as_deref(), &policy, *json);
         }
         Some(Command::Doctor) => {
-            let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref()).ok();
-            let policy = sandbox::Policy { mode: cli.sandbox.unwrap_or_default(), network: cli.allow_network, writable: extra_dirs(&home, &cwd, &cli) };
+            let provider =
+                config::provider(&home, cli.provider.as_deref(), cli.model.as_deref()).ok();
+            let policy = sandbox::Policy {
+                mode: cli.sandbox.unwrap_or_default(),
+                network: cli.allow_network,
+                writable: extra_dirs(&home, &cwd, &cli),
+            };
             return doctor::doctor(&home, &cwd, provider.as_deref(), &policy).await;
         }
         Some(Command::Session {
@@ -344,7 +398,9 @@ async fn run() -> Result<()> {
         Some(Command::Setup) => return account::cli_setup(&home).await,
         Some(Command::Teams) => return account::cli_teams(&home),
         Some(Command::Credits { json }) => return account::cli_credits(&home, *json).await,
-        Some(Command::Permissions { json }) => return account::cli_permissions(&home, &cwd, *json),
+        Some(Command::Permissions { json }) => {
+            return account::cli_permissions(&home, &cwd, permission_mode, *json)
+        }
         _ => {}
     }
     match cli.command {
@@ -359,7 +415,9 @@ async fn run() -> Result<()> {
                 }
                 None => {
                     login::login(&home, |url| {
-                        eprintln!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}");
+                        eprintln!(
+                            "Opening your browser to sign in. If it doesn't open, visit:\n  {url}"
+                        );
                         login::open_browser(url);
                     })
                     .await?
@@ -375,7 +433,8 @@ async fn run() -> Result<()> {
         Some(Command::Mcp { action }) => return mcp_cli::run(&home, &cwd, action).await,
         Some(Command::Acp) => {
             let opts = acp::Options {
-                yolo: cli.yolo,
+                yolo: permission_mode.is_yolo(),
+                permission_mode,
                 sandbox: cli.sandbox,
                 allow_network: cli.allow_network,
                 model: cli.model,
@@ -434,11 +493,12 @@ async fn run() -> Result<()> {
         system: String::new(),
         items: Vec::new(),
         cwd: cwd.clone(),
-        yolo: cli.yolo,
+        permission_mode,
+        review_cache: Default::default(),
         allowed: HashSet::new(),
         permissions: std::sync::Arc::new(load_permissions(&home, &cwd)),
         usage: Usage::default(),
-            stats: Default::default(),
+        stats: Default::default(),
         context_window: 0,
         context_tokens: 0,
         context_estimated: false,
@@ -478,7 +538,7 @@ async fn run() -> Result<()> {
     let _capture = if cli.record {
         Some(record_tape::Capture::start(&home, &agent.session.as_ref().expect("session").id)?)
     } else { None };
-    commands::apply_startup(&home, &mut agent, interactive);
+    commands::apply_startup(&home, &mut agent);
     if !interactive {
         anyhow::ensure!(
             !pick,
@@ -493,8 +553,16 @@ async fn run() -> Result<()> {
         }
         connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
         mcp_features::sync(&mut agent, &mcp);
-        hooks::session_start(&agent, if resumed.is_some() { "resume" } else { "startup" }).await;
-        let mut plain = ui::PlainUi::new(cli.yolo);
+        hooks::session_start(
+            &agent,
+            if resumed.is_some() {
+                "resume"
+            } else {
+                "startup"
+            },
+        )
+        .await;
+        let mut plain = ui::PlainUi::new(permission_mode.is_yolo());
         let cancel = cancel_on_ctrl_c();
         if let Some(msg) = hooks::prompt_submit(&mut agent, &text, &cancel).await {
             mcp.shutdown().await;
@@ -515,13 +583,23 @@ async fn run() -> Result<()> {
         sandbox: sandbox_label(&agent.sandbox),
         ..Footer::default()
     };
-    let reserved: Vec<&str> = COMMANDS.iter().chain(commands::COMMANDS).map(|(c, _)| &c[1..]).chain(["quit", "q", "clear", "img"]).collect();
+    let reserved: Vec<&str> = COMMANDS
+        .iter()
+        .chain(commands::COMMANDS)
+        .map(|(c, _)| &c[1..])
+        .chain(["quit", "q", "clear", "img"])
+        .collect();
     let templates = templates::discover(&home, &cwd, &reserved);
     let commands = COMMANDS
         .iter()
         .chain(commands::COMMANDS)
         .map(|(c, d)| (c.to_string(), d.to_string()))
-        .chain(templates.iter().map(|t| (format!("/{}", t.name), format!("{} ({})", t.description, t.scope))))
+        .chain(templates.iter().map(|t| {
+            (
+                format!("/{}", t.name),
+                format!("{} ({})", t.description, t.scope),
+            )
+        }))
         .collect();
     let mut tui = Tui::start(footer, home.clone(), commands)?;
     sync_footer(&tui, &agent, None);
@@ -534,8 +612,18 @@ async fn run() -> Result<()> {
     }
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
     mcp_features::sync(&mut agent, &mcp);
-    tui.screen().editor.set_mcp_commands(mcp_features::prompt_commands(&mcp));
-    hooks::session_start(&agent, if resumed.is_some() { "resume" } else { "startup" }).await;
+    tui.screen()
+        .editor
+        .set_mcp_commands(mcp_features::prompt_commands(&mcp));
+    hooks::session_start(
+        &agent,
+        if resumed.is_some() {
+            "resume"
+        } else {
+            "startup"
+        },
+    )
+    .await;
     agent.tools.add(Box::new(agent::AskUserTool));
     if pick {
         // A prompt given with `-r` waits in the editor until a session is picked.
@@ -575,6 +663,10 @@ async fn run() -> Result<()> {
                     commands::apply_setting(&home, &mut agent, current.as_ref(), id, &value);
                     continue;
                 }
+                Some(UiCommand::SetPermissionMode(mode)) => {
+                    commands::set_permission_mode(&home, &mut agent, &mode);
+                    continue;
+                }
                 Some(UiCommand::Exit) | None => break,
             },
         };
@@ -609,7 +701,12 @@ async fn run() -> Result<()> {
             let cmd = line.split_whitespace().next().unwrap_or("");
             if commands::handles(cmd) {
                 let args: Vec<&str> = line.split_whitespace().skip(1).collect();
-                let ctx = commands::Ctx { agent: &mut agent, tui: &tui, home: &home, templates: &templates };
+                let ctx = commands::Ctx {
+                    agent: &mut agent,
+                    tui: &tui,
+                    home: &home,
+                    templates: &templates,
+                };
                 if let Err(e) = commands::run(cmd, &args, ctx).await {
                     ui::error(&format!("{e:#}"));
                 }
@@ -629,7 +726,9 @@ async fn run() -> Result<()> {
             if line.starts_with("/mcp") {
                 // Servers came or went: refresh resource tools and prompt commands.
                 mcp_features::sync(&mut agent, &mcp);
-                tui.screen().editor.set_mcp_commands(mcp_features::prompt_commands(&mcp));
+                tui.screen()
+                    .editor
+                    .set_mcp_commands(mcp_features::prompt_commands(&mcp));
             }
             match result {
                 Ok(true) => continue,
@@ -643,7 +742,9 @@ async fn run() -> Result<()> {
         tui.screen().print_user(&line);
         // UserPromptSubmit sees the text the model gets (templates and MCP
         // prompts expanded); a blocked prompt keeps its pending attachments.
-        if let Some(msg) = hooks::prompt_submit(&mut agent, &turn_text, &CancellationToken::new()).await {
+        if let Some(msg) =
+            hooks::prompt_submit(&mut agent, &turn_text, &CancellationToken::new()).await
+        {
             ui::error(&msg);
             continue;
         }
@@ -668,7 +769,10 @@ async fn run() -> Result<()> {
             .turn(item, &mut tui.ui(cwd.clone()), cancel.clone())
             .await;
         if !matches!(result, Ok(TurnEnd::Cancelled)) {
-            notify::notify(&notify::Event::TurnEnd { secs: started.elapsed().as_secs(), failed: result.is_err() });
+            notify::notify(&notify::Event::TurnEnd {
+                secs: started.elapsed().as_secs(),
+                failed: result.is_err(),
+            });
         }
         let leftover = {
             let mut s = tui.screen();
@@ -756,7 +860,9 @@ fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::Mode
 /// Shift+Tab: auto → each supported effort → auto.
 fn cycle_effort(home: &std::path::Path, agent: &mut Agent, current: Option<&models::ModelChoice>) {
     let efforts: Vec<String> = match current {
-        Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => c.efforts.clone(),
+        Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => {
+            c.efforts.clone()
+        }
         _ => agent.provider.efforts(),
     };
     if efforts.is_empty() {
@@ -783,7 +889,7 @@ fn sync_footer(tui: &Tui, agent: &Agent, current: Option<&models::ModelChoice>) 
     s.footer.provider = agent.provider.name().to_string();
     s.footer.model = agent.provider.model().to_string();
     s.footer.effort = agent.provider.effort().map(str::to_string);
-    s.footer.yolo = agent.yolo;
+    s.footer.permission_mode = agent.permission_mode.as_str().to_string();
     s.footer.usage = agent.usage;
     s.footer.context_tokens = agent.context_tokens;
     s.footer.context_window = agent.context_window;
@@ -794,7 +900,9 @@ fn sync_footer(tui: &Tui, agent: &Agent, current: Option<&models::ModelChoice>) 
 /// supports it (falling back to off with a warning when it doesn't).
 fn sandbox_policy(cli: &Cli) -> Result<sandbox::Policy> {
     let mut policy = sandbox::Policy {
-        mode: cli.sandbox.unwrap_or_else(|| settings::sandbox_mode(&settings::current())),
+        mode: cli
+            .sandbox
+            .unwrap_or_else(|| settings::sandbox_mode(&settings::current())),
         network: cli.allow_network,
         writable: Vec::new(),
     };
@@ -930,7 +1038,11 @@ fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
 }
 
 /// Switch to a saved session (`id`, id prefix or `last`), replaying it.
-async fn resume_session(agent: &mut Agent, sessions_dir: &std::path::Path, which: &str) -> Result<()> {
+async fn resume_session(
+    agent: &mut Agent,
+    sessions_dir: &std::path::Path,
+    which: &str,
+) -> Result<()> {
     let (s, meta, items) = session::load(sessions_dir, which, &agent.cwd)?;
     agent.reset(Some(s));
     ui::replay(&items);
@@ -1157,28 +1269,11 @@ async fn slash(
                 }
             }
         }
-        "/permissions" => match arg.first().copied() {
-            Some("reload") => {
-                agent.permissions =
-                    std::sync::Arc::new(load_permissions(&config::home(), &agent.cwd));
-                ui::info("Reloaded permission rules.");
-                ui::list(&agent.permissions.lines(&agent.allowed));
-            }
-            None => ui::list(&agent.permissions.lines(&agent.allowed)),
-            Some(other) => ui::error(&format!(
-                "unknown /permissions argument `{other}` (try /permissions or /permissions reload)"
-            )),
-        },
+        "/permissions" => commands::permissions(agent, tui, &config::home(), &arg),
+        "/allowlist" => commands::allowlist(agent, &arg),
         "/hooks" => hooks::command(agent, arg.first().copied()),
         "/login" | "/logout" | "/setup" | "/credits" | "/balance" => account::slash(cmd, &arg, agent, tui).await?,
-        "/yolo" => {
-            agent.yolo = !agent.yolo;
-            ui::info(if agent.yolo {
-                "Auto-approve on: tools run without asking."
-            } else {
-                "Auto-approve off."
-            });
-        }
+        "/yolo" => commands::toggle_yolo(&config::home(), agent),
         "/usage" => usage::show(&config::home(), usage::Period::parse(arg.first().copied().unwrap_or("30d"))?)?,
         "/stats" => agent.stats.show(agent.usage),
         "/status" => doctor::show_agent_status(agent, mcp, servers, skills.len())?,
@@ -1233,6 +1328,16 @@ mod tests {
         assert_eq!(parse(&["nyq", "--resume=abc", "hello"]).prompt, ["hello"]);
         assert_eq!(parse(&["nyq", "hi"]).resume, None);
         assert!(parse(&["nyq", "-c"]).continue_last);
+        assert_eq!(
+            parse(&["nyq", "--permission-mode", "auto"])
+                .permission_mode
+                .as_deref(),
+            Some("auto")
+        );
+        assert!(matches!(
+            parse(&["nyq", "permissions", "--json"]).command,
+            Some(Command::Permissions { json: true })
+        ));
         let ask = parse(&["nyq", "ask", "hello", "world"]);
         match ask.command {
             Some(Command::Ask { prompt }) => assert_eq!(prompt, ["hello", "world"]),

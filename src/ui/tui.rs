@@ -20,10 +20,11 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::{Action, Editor};
-use super::statusline::{tilde, tokens};
 use super::render::{
-    diff, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells, truncate, visible_width, Markdown,
+    diff, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells, truncate,
+    visible_width, Markdown,
 };
+use super::statusline::{tilde, tokens};
 use crate::agent::{Approval, ApprovalRequest, Approver, Ui};
 use crate::models::ModelChoice;
 use crate::session::Meta;
@@ -50,6 +51,8 @@ pub enum Command {
     CycleEffort,
     /// A session setting changed in the settings menu (effort, fast, permission).
     Setting(crate::settings::Id, String),
+    /// A mode picked in the `/permissions` menu (`ask`, `auto`, or `yolo`).
+    SetPermissionMode(String),
     Exit,
 }
 
@@ -72,7 +75,8 @@ pub struct Footer {
     pub model: String,
     pub effort: Option<String>,
     pub sandbox: String,
-    pub yolo: bool,
+    /// `ask`, `auto`, or `yolo`. Empty hides the segment.
+    pub permission_mode: String,
     pub usage: Usage,
     pub context_tokens: u64,
     pub context_window: u64,
@@ -167,7 +171,9 @@ impl ModelMenu {
         self.choices
             .iter()
             .filter(|c| tab == "All" || &c.provider == tab)
-            .filter(|c| f.is_empty() || c.model.to_lowercase().contains(&f) || c.provider.contains(&f))
+            .filter(|c| {
+                f.is_empty() || c.model.to_lowercase().contains(&f) || c.provider.contains(&f)
+            })
             .collect()
     }
 }
@@ -184,7 +190,12 @@ impl SessionMenu {
         let f = self.filter.to_lowercase();
         self.sessions
             .iter()
-            .filter(|m| f.is_empty() || m.title.to_lowercase().contains(&f) || m.cwd.to_string_lossy().to_lowercase().contains(&f) || m.id.starts_with(&f))
+            .filter(|m| {
+                f.is_empty()
+                    || m.title.to_lowercase().contains(&f)
+                    || m.cwd.to_string_lossy().to_lowercase().contains(&f)
+                    || m.id.starts_with(&f)
+            })
             .collect()
     }
 }
@@ -198,7 +209,10 @@ fn ago(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) 
         3600..=86_399 => format!("{}h ago", secs / 3600),
         86_400..=604_799 => format!("{}d ago", secs / 86_400),
         604_800..=2_591_999 => format!("{}w ago", secs / 604_800),
-        _ => then.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string(),
+        _ => then
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string(),
     }
 }
 
@@ -237,6 +251,7 @@ pub struct Screen {
     menu: Option<ModelMenu>,
     sessions: Option<SessionMenu>,
     settings: Option<super::settings::SettingsMenu>,
+    modes: Option<super::mode_menu::ModeMenu>,
     /// Everything shown so far, for the transcript viewer.
     pub log: super::transcript::Log,
     viewer: Option<super::transcript::Viewer>,
@@ -282,7 +297,11 @@ fn paint(style: Style, s: &str) -> String {
 /// Cut a possibly-styled row to `width` columns, keeping escape sequences.
 fn clip_width(s: &str, width: usize) -> String {
     if width == 0 || visible_width(s) <= width {
-        return if width == 0 { String::new() } else { s.to_string() };
+        return if width == 0 {
+            String::new()
+        } else {
+            s.to_string()
+        };
     }
     let limit = width - 1;
     let mut out = String::new();
@@ -334,8 +353,12 @@ fn is_slash_command(text: &str) -> bool {
 }
 
 fn take_steer_texts(queue: &mut Vec<(Queued, String)>) -> Vec<String> {
-    let end = queue.iter().position(|(_, t)| is_slash_command(t)).unwrap_or(queue.len());
-    let (steer, rest): (Vec<_>, Vec<_>) = queue.drain(..end).partition(|(k, _)| *k == Queued::Steer);
+    let end = queue
+        .iter()
+        .position(|(_, t)| is_slash_command(t))
+        .unwrap_or(queue.len());
+    let (steer, rest): (Vec<_>, Vec<_>) =
+        queue.drain(..end).partition(|(k, _)| *k == Queued::Steer);
     queue.splice(..0, rest);
     steer.into_iter().map(|(_, t)| t).collect()
 }
@@ -366,7 +389,11 @@ fn approval_rows(a: &PendingApproval, width: usize) -> Vec<String> {
         return a.lines.clone();
     }
     let width = width.saturating_sub(2).max(1);
-    a.lines.iter().flat_map(|line| wrap(line, width)).map(|line| paint(fg(GRAY), &format!("  {line}"))).collect()
+    a.lines
+        .iter()
+        .flat_map(|line| wrap(line, width))
+        .map(|line| paint(fg(GRAY), &format!("  {line}")))
+        .collect()
 }
 
 fn rule(width: usize) -> String {
@@ -391,7 +418,6 @@ fn hints(pairs: &[(&str, &str)]) -> String {
         .collect::<Vec<_>>()
         .join("     ")
 }
-
 
 /// A label with a moving highlight (a "shimmer").
 fn shimmer(label: &str, frame: usize) -> String {
@@ -433,7 +459,10 @@ fn describe_tool(tool: &str, summary: &str) -> (String, String) {
             Some((server, t)) => format!("{server}.{t}"),
             None => tool.to_string(),
         };
-        return ("Called".into(), format!("{name} {}", one_line(summary, 200)));
+        return (
+            "Called".into(),
+            format!("{name} {}", one_line(summary, 200)),
+        );
     }
     (verb.into(), one_line(summary, 400))
 }
@@ -449,15 +478,30 @@ fn tool_kind(tool: &str) -> &'static str {
 
 /// "+3 / -1" from a unified diff.
 fn diff_stat(d: &str) -> String {
-    let add = d.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
-    let del = d.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+    let add = d
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .count();
+    let del = d
+        .lines()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .count();
     format!("+{add} / -{del}")
 }
 
 /// One collapsed line for a reasoning block.
 fn thinking_summary(text: &str, secs: u64, width: usize) -> String {
-    let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").trim_matches('*');
-    let head = if secs > 0 { format!("• Thought for {secs}s") } else { "• Thought".to_string() };
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_matches('*');
+    let head = if secs > 0 {
+        format!("• Thought for {secs}s")
+    } else {
+        "• Thought".to_string()
+    };
     let rest = width.saturating_sub(head.chars().count() + 3);
     if first.is_empty() || rest < 8 {
         head
@@ -493,6 +537,7 @@ impl Screen {
             menu: None,
             sessions: None,
             settings: None,
+            modes: None,
             log: Default::default(),
             viewer: None,
             deferred: Vec::new(),
@@ -513,7 +558,11 @@ impl Screen {
         if self.cursor_row > 0 {
             let _ = queue!(self.out, cursor::MoveUp(self.cursor_row as u16));
         }
-        let _ = queue!(self.out, cursor::MoveToColumn(0), terminal::Clear(terminal::ClearType::FromCursorDown));
+        let _ = queue!(
+            self.out,
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        );
         self.pane_rows = 0;
         self.cursor_row = 0;
     }
@@ -530,21 +579,47 @@ impl Screen {
                 Status::Running if live => fg(MID),
                 _ => fg(GRAY),
             };
-            let note = if t.note.is_empty() { String::new() } else { format!(" {}", t.note) };
+            let note = if t.note.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", t.note)
+            };
             let used = visible_width(lead) + t.verb.chars().count() + note.chars().count() + 1;
             let target = truncate(&t.target, w.saturating_sub(used));
-            let verb = if t.status == Status::Running && live { shimmer(&t.verb, self.frame) } else { paint(verb_style, &t.verb) };
-            format!("{lead}{verb} {}{}", paint(fg(GRAY), &target), paint(fg(GRAY), &note))
+            let verb = if t.status == Status::Running && live {
+                shimmer(&t.verb, self.frame)
+            } else {
+                paint(verb_style, &t.verb)
+            };
+            format!(
+                "{lead}{verb} {}{}",
+                paint(fg(GRAY), &target),
+                paint(fg(GRAY), &note)
+            )
         };
         let detail = |t: &ToolRow, rows: &mut Vec<String>, bar: &str| {
-            let style = if t.status == Status::Failed { fg(RED) } else { fg(FAINT) };
+            let style = if t.status == Status::Failed {
+                fg(RED)
+            } else {
+                fg(FAINT)
+            };
             for d in &t.detail {
-                rows.push(format!("{}{}", paint(fg(FAINT), bar), paint(style, &truncate(d, w.saturating_sub(4)))));
+                rows.push(format!(
+                    "{}{}",
+                    paint(fg(FAINT), bar),
+                    paint(style, &truncate(d, w.saturating_sub(4)))
+                ));
             }
         };
         if n == 1 {
             let t = &self.tools[0];
-            rows.push(row_text(t, &format!("{} ", paint(fg(BRIGHT), "●"))).replacen(&paint(fg(GRAY), &t.verb), &paint(fg(BRIGHT), &t.verb), 1));
+            rows.push(
+                row_text(t, &format!("{} ", paint(fg(BRIGHT), "●"))).replacen(
+                    &paint(fg(GRAY), &t.verb),
+                    &paint(fg(BRIGHT), &t.verb),
+                    1,
+                ),
+            );
             detail(t, rows, "  │ ");
             return;
         }
@@ -568,10 +643,17 @@ impl Screen {
                 (k, c) => format!("{c} {k}"),
             })
             .collect();
-        rows.push(format!("{} {}", paint(fg(BRIGHT), "●"), paint(fg(GRAY), &format!("{n} tool calls · {}", parts.join(" · ")))));
+        rows.push(format!(
+            "{} {}",
+            paint(fg(BRIGHT), "●"),
+            paint(fg(GRAY), &format!("{n} tool calls · {}", parts.join(" · ")))
+        ));
         for (i, t) in self.tools.iter().enumerate() {
             let last = i + 1 == n;
-            rows.push(row_text(t, &paint(fg(GRAY), if last { "└ " } else { "├ " })));
+            rows.push(row_text(
+                t,
+                &paint(fg(GRAY), if last { "└ " } else { "├ " }),
+            ));
             detail(t, rows, if last { "  │ " } else { "│ │ " });
         }
     }
@@ -585,10 +667,17 @@ impl Screen {
                 // A table still streaming shows laid out at the current width.
                 match self.table.len() {
                     0 => {}
-                    1 => rows.extend(wrap(&self.table[0], w.saturating_sub(2)).into_iter().map(|r| format!("  {r}"))),
+                    1 => rows.extend(
+                        wrap(&self.table[0], w.saturating_sub(2))
+                            .into_iter()
+                            .map(|r| format!("  {r}")),
+                    ),
                     _ => rows.extend(self.table_rows(&self.table)),
                 }
-                for r in wrap(&self.live, w.saturating_sub(2)).into_iter().filter(|_| !self.live.is_empty()) {
+                for r in wrap(&self.live, w.saturating_sub(2))
+                    .into_iter()
+                    .filter(|_| !self.live.is_empty())
+                {
                     rows.push(format!("  {r}"));
                 }
             }
@@ -609,8 +698,17 @@ impl Screen {
             let suffix = format!(" ({secs}s · esc to interrupt)");
             let label = truncate(label, w.saturating_sub(suffix.chars().count() + 4).max(1));
             let detail = if self.live_block == Block::Reasoning {
-                let last = self.live.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-                truncate(last, w.saturating_sub(label.chars().count() + suffix.chars().count() + 4))
+                let last = self
+                    .live
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim();
+                truncate(
+                    last,
+                    w.saturating_sub(label.chars().count() + suffix.chars().count() + 4),
+                )
             } else {
                 String::new()
             };
@@ -633,23 +731,41 @@ impl Screen {
                 Queued::FollowUp => " (follow-up)",
             };
             let text = truncate(&one_line(text, w), w.saturating_sub(tag.len() + 3));
-            rows.push(format!("{} {}{}", paint(fg(FAINT), "┃"), paint(fg(GRAY), &text), paint(fg(FAINT), tag)));
+            rows.push(format!(
+                "{} {}{}",
+                paint(fg(FAINT), "┃"),
+                paint(fg(GRAY), &text),
+                paint(fg(FAINT), tag)
+            ));
         }
         if !rows.is_empty() {
             rows.push(String::new());
         }
 
         if !self.attachments.is_empty() && self.approval.is_none() {
-            let names: Vec<String> = self.attachments.iter().enumerate().map(|(i, a)| format!("[Image #{}] {}", i + 1, a.label)).collect();
+            let names: Vec<String> = self
+                .attachments
+                .iter()
+                .enumerate()
+                .map(|(i, a)| format!("[Image #{}] {}", i + 1, a.label))
+                .collect();
             let text = truncate(&sanitize_text(&names.join(" · ")), w.saturating_sub(4));
-            rows.push(format!("{} {}", paint(fg(GRAY), "▣"), paint(fg(MID), &text)));
+            rows.push(format!(
+                "{} {}",
+                paint(fg(GRAY), "▣"),
+                paint(fg(MID), &text)
+            ));
         }
 
         // Input, or the approval prompt in its place.
         let (cursor_row, cursor_col);
         if let Some(a) = &self.approval {
             if let Some(origin) = &a.origin {
-                rows.push(format!("{} {}", paint(fg(YELLOW), "┃"), paint(fg(GRAY), &truncate(origin, w.saturating_sub(3)))));
+                rows.push(format!(
+                    "{} {}",
+                    paint(fg(YELLOW), "┃"),
+                    paint(fg(GRAY), &truncate(origin, w.saturating_sub(3)))
+                ));
             }
             rows.push(format!("{} {}", paint(fg(YELLOW), "┃"), a.title));
             cursor_row = rows.len() - 1;
@@ -663,7 +779,10 @@ impl Screen {
             let more = shown.len().saturating_sub(scroll + MAX_PREVIEW);
             rows.extend(shown.into_iter().skip(scroll).take(MAX_PREVIEW));
             if scroll > 0 || more > 0 {
-                rows.push(paint(fg(GRAY), &format!("  … {scroll} above, {more} below")));
+                rows.push(paint(
+                    fg(GRAY),
+                    &format!("  … {scroll} above, {more} below"),
+                ));
             }
             if !a.lines.is_empty() {
                 rows.push(String::new());
@@ -672,12 +791,19 @@ impl Screen {
                 Some(r) => format!("Always allow {r}"),
                 None => "Always: can't be scoped to a rule here, approves once".into(),
             };
-            let save = a.save_rule.as_ref().map(|r| format!("Always, and save `{r}` to permissions.json"));
+            let save = a
+                .save_rule
+                .as_ref()
+                .map(|r| format!("Always, and save `{r}` to permissions.json"));
             let mut choices = vec![("y", "Yes, once"), ("a", always.as_str())];
             choices.extend(save.as_deref().map(|t| ("s", t)));
             choices.push(("n", "No, tell nyq what to do instead"));
             for (key, text) in choices {
-                rows.push(format!("{}  {}", paint(fg(BRIGHT), key), paint(fg(MID), &truncate(text, w.saturating_sub(3)))));
+                rows.push(format!(
+                    "{}  {}",
+                    paint(fg(BRIGHT), key),
+                    paint(fg(MID), &truncate(text, w.saturating_sub(3)))
+                ));
             }
             rows.push(rule(w));
             let mut keys = vec![("y", "Once"), ("a", "Always")];
@@ -714,9 +840,20 @@ impl Screen {
                 rows.push(String::new());
                 for (i, o) in q.options.iter().enumerate() {
                     let sel = i == q.selected;
-                    let lead = if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() };
+                    let lead = if sel {
+                        paint(fg(BRIGHT), "› ")
+                    } else {
+                        "  ".into()
+                    };
                     let text = one_line(&format!("{}. {o}", i + 1), w.saturating_sub(2).max(1));
-                    rows.push(format!("{lead}{}", if sel { paint(fg(BRIGHT).bold(), &text) } else { paint(fg(MID), &text) }));
+                    rows.push(format!(
+                        "{lead}{}",
+                        if sel {
+                            paint(fg(BRIGHT).bold(), &text)
+                        } else {
+                            paint(fg(MID), &text)
+                        }
+                    ));
                 }
                 rows.push(rule(w));
                 rows.push(if q.menu.is_some() {
@@ -749,7 +886,12 @@ impl Screen {
         let left = match super::statusline::left(f) {
             Some(text) => {
                 let (effort, rest) = text.split_once(" · ").unwrap_or((&text, ""));
-                format!("{} {} {}", paint(fg(MID), effort), paint(fg(GRAY), "·"), paint(fg(GRAY), &sanitize_text(rest)))
+                format!(
+                    "{} {} {}",
+                    paint(fg(MID), effort),
+                    paint(fg(GRAY), "·"),
+                    paint(fg(GRAY), &sanitize_text(rest))
+                )
             }
             None => String::new(),
         };
@@ -768,85 +910,214 @@ impl Screen {
     /// The slash-command or model menu under the input. Returns false if none.
     fn menu_rows(&self, rows: &mut Vec<String>) -> bool {
         let w = self.width;
-        let (header, items, selected, keys): (String, Vec<MenuItem>, usize, Vec<(&str, &str)>) = if let Some(m) = &self.menu {
-            let visible = m.visible();
-            let tabs: Vec<String> = m
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| if i == m.tab { paint(fg(BRIGHT), &format!("[{t}]")) } else { paint(fg(GRAY), t) })
-                .collect();
-            let prefix = format!(
-                "{} {}  {}  ",
-                paint(fg(BRIGHT).bold(), "Models"),
-                paint(fg(GRAY), &visible.len().to_string()),
-                tabs.join(" ")
-            );
-            let filter_text = if m.filter.is_empty() { "Type to filter" } else { m.filter.as_str() };
-            let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
-            let current = (self.footer.provider.as_str(), self.footer.model.as_str());
-            let items = visible
-                .iter()
-                .map(|c| MenuItem {
-                    label: sanitize_text(&c.model),
-                    detail: [
-                        if (c.provider.as_str(), c.model.as_str()) == current { "current".to_string() } else { String::new() },
-                        c.context_window.map(|n| format!("{} ctx", tokens(n))).unwrap_or_default(),
-                        if c.efforts.is_empty() { String::new() } else { format!("effort {}", c.efforts.join("/")) },
-                        c.price.clone().unwrap_or_default(),
-                    ]
+        let (header, items, selected, keys): (String, Vec<MenuItem>, usize, Vec<(&str, &str)>) =
+            if let Some(m) = &self.menu {
+                let visible = m.visible();
+                let tabs: Vec<String> = m
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        if i == m.tab {
+                            paint(fg(BRIGHT), &format!("[{t}]"))
+                        } else {
+                            paint(fg(GRAY), t)
+                        }
+                    })
+                    .collect();
+                let prefix = format!(
+                    "{} {}  {}  ",
+                    paint(fg(BRIGHT).bold(), "Models"),
+                    paint(fg(GRAY), &visible.len().to_string()),
+                    tabs.join(" ")
+                );
+                let filter_text = if m.filter.is_empty() {
+                    "Type to filter"
+                } else {
+                    m.filter.as_str()
+                };
+                let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
+                let current = (self.footer.provider.as_str(), self.footer.model.as_str());
+                let items = visible
+                    .iter()
+                    .map(|c| MenuItem {
+                        label: sanitize_text(&c.model),
+                        detail: [
+                            if (c.provider.as_str(), c.model.as_str()) == current {
+                                "current".to_string()
+                            } else {
+                                String::new()
+                            },
+                            c.context_window
+                                .map(|n| format!("{} ctx", tokens(n)))
+                                .unwrap_or_default(),
+                            if c.efforts.is_empty() {
+                                String::new()
+                            } else {
+                                format!("effort {}", c.efforts.join("/"))
+                            },
+                            c.price.clone().unwrap_or_default(),
+                        ]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                        tag: c.provider.clone(),
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    m.selected,
+                    vec![
+                        ("↑↓", "Navigate"),
+                        ("Tab", "Provider"),
+                        ("Enter", "Use"),
+                        ("Esc", "Close"),
+                    ],
+                )
+            } else if let Some(m) = &self.settings {
+                let s = crate::settings::current();
+                let live = self.live();
+                let items = m.items(&s, &live);
+                let tabs: Vec<String> = crate::settings::Category::ALL
+                    .iter()
+                    .map(|c| {
+                        if *c == m.category {
+                            paint(fg(BRIGHT), &format!("[{}]", c.label()))
+                        } else {
+                            paint(fg(GRAY), c.label())
+                        }
+                    })
+                    .collect();
+                let prefix = format!(
+                    "{} {}  {}  ",
+                    paint(fg(BRIGHT).bold(), "Settings"),
+                    paint(fg(GRAY), &items.len().to_string()),
+                    tabs.join(" ")
+                );
+                let filter_text = if m.filter.is_empty() {
+                    "Type to filter"
+                } else {
+                    m.filter.as_str()
+                };
+                let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
+                let items = items
+                    .iter()
+                    .map(|spec| MenuItem {
+                        label: spec.label.to_string(),
+                        detail: sanitize_text(&crate::settings::value(spec.id, &s, &live)),
+                        tag: spec.description.to_string(),
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    m.selected,
+                    vec![
+                        ("↑↓", "Navigate"),
+                        ("Tab", "Category"),
+                        ("Enter", "Change"),
+                        ("Esc", "Close"),
+                    ],
+                )
+            } else if let Some(m) = &self.modes {
+                let visible = m.rows();
+                let prefix = format!(
+                    "{} {}  ",
+                    paint(fg(BRIGHT).bold(), "Permissions"),
+                    paint(fg(GRAY), &visible.len().to_string())
+                );
+                let filter_text = if m.filter.is_empty() {
+                    "Type to filter"
+                } else {
+                    m.filter.as_str()
+                };
+                let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
+                let current = self.footer.permission_mode.as_str();
+                let items = visible
+                    .iter()
+                    .map(|row| MenuItem {
+                        label: row.label.to_string(),
+                        detail: row.detail.to_string(),
+                        tag: if row.id == current {
+                            "current".into()
+                        } else {
+                            String::new()
+                        },
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    m.selected,
+                    vec![("↑↓", "Navigate"), ("Enter", "Use"), ("Esc", "Close")],
+                )
+            } else if let Some(m) = &self.sessions {
+                let visible = m.visible();
+                let prefix = format!(
+                    "{} {}  ",
+                    paint(fg(BRIGHT).bold(), "Sessions"),
+                    paint(fg(GRAY), &visible.len().to_string())
+                );
+                let filter_text = if m.filter.is_empty() {
+                    "Type to filter"
+                } else {
+                    m.filter.as_str()
+                };
+                let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
+                let now = chrono::Utc::now();
+                let items = visible
+                    .iter()
+                    .map(|m| MenuItem {
+                        label: one_line(&m.title, 200),
+                        detail: String::new(),
+                        tag: one_line(
+                            &format!(
+                                "{} · {}",
+                                ago(m.created, now),
+                                tilde(&m.cwd.display().to_string())
+                            ),
+                            200,
+                        ),
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    m.selected,
+                    vec![("↑↓", "Navigate"), ("Enter", "Resume"), ("Esc", "Close")],
+                )
+            } else {
+                let s = self.editor.suggestions();
+                if s.is_empty() || self.approval.is_some() {
+                    return false;
+                }
+                let header = format!(
+                    "{} {}",
+                    paint(fg(BRIGHT).bold(), "Commands"),
+                    paint(fg(GRAY), &s.len().to_string())
+                );
+                let items = s
                     .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                    tag: c.provider.clone(),
-                })
-                .collect();
-            (header, items, m.selected, vec![("↑↓", "Navigate"), ("Tab", "Provider"), ("Enter", "Use"), ("Esc", "Close")])
-        } else if let Some(m) = &self.settings {
-            let s = crate::settings::current();
-            let live = self.live();
-            let items = m.items(&s, &live);
-            let tabs: Vec<String> = crate::settings::Category::ALL
-                .iter()
-                .map(|c| if *c == m.category { paint(fg(BRIGHT), &format!("[{}]", c.label())) } else { paint(fg(GRAY), c.label()) })
-                .collect();
-            let prefix = format!("{} {}  {}  ", paint(fg(BRIGHT).bold(), "Settings"), paint(fg(GRAY), &items.len().to_string()), tabs.join(" "));
-            let filter_text = if m.filter.is_empty() { "Type to filter" } else { m.filter.as_str() };
-            let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
-            let items = items
-                .iter()
-                .map(|spec| MenuItem {
-                    label: spec.label.to_string(),
-                    detail: sanitize_text(&crate::settings::value(spec.id, &s, &live)),
-                    tag: spec.description.to_string(),
-                })
-                .collect();
-            (header, items, m.selected, vec![("↑↓", "Navigate"), ("Tab", "Category"), ("Enter", "Change"), ("Esc", "Close")])
-        } else if let Some(m) = &self.sessions {
-            let visible = m.visible();
-            let prefix = format!("{} {}  ", paint(fg(BRIGHT).bold(), "Sessions"), paint(fg(GRAY), &visible.len().to_string()));
-            let filter_text = if m.filter.is_empty() { "Type to filter" } else { m.filter.as_str() };
-            let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
-            let now = chrono::Utc::now();
-            let items = visible
-                .iter()
-                .map(|m| MenuItem {
-                    label: one_line(&m.title, 200),
-                    detail: String::new(),
-                    tag: one_line(&format!("{} · {}", ago(m.created, now), tilde(&m.cwd.display().to_string())), 200),
-                })
-                .collect();
-            (header, items, m.selected, vec![("↑↓", "Navigate"), ("Enter", "Resume"), ("Esc", "Close")])
-        } else {
-            let s = self.editor.suggestions();
-            if s.is_empty() || self.approval.is_some() {
-                return false;
-            }
-            let header = format!("{} {}", paint(fg(BRIGHT).bold(), "Commands"), paint(fg(GRAY), &s.len().to_string()));
-            let items = s.into_iter().map(|(c, d)| MenuItem { label: c, detail: d, tag: String::new() }).collect();
-            (header, items, self.slash_selected, vec![("↑↓", "Navigate"), ("Enter", "Use"), ("Tab", "Complete"), ("Esc", "Close")])
-        };
+                    .map(|(c, d)| MenuItem {
+                        label: c,
+                        detail: d,
+                        tag: String::new(),
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    self.slash_selected,
+                    vec![
+                        ("↑↓", "Navigate"),
+                        ("Enter", "Use"),
+                        ("Tab", "Complete"),
+                        ("Esc", "Close"),
+                    ],
+                )
+            };
         rows.push(rule(w));
         rows.push(header);
         rows.push(String::new());
@@ -857,33 +1128,68 @@ impl Screen {
                 rows.push(paint(fg(GRAY), "  No models found."));
             }
             for warn in &m.warnings {
-                rows.push(paint(fg(YELLOW), &format!("  {}", one_line(warn, w.saturating_sub(2).max(1)))));
+                rows.push(paint(
+                    fg(YELLOW),
+                    &format!("  {}", one_line(warn, w.saturating_sub(2).max(1))),
+                ));
             }
         }
         if self.settings.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No matching settings."));
+        }
+        if self.modes.is_some() && items.is_empty() {
+            rows.push(paint(fg(GRAY), "  No matching modes."));
         }
         if self.sessions.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No saved sessions found."));
         }
         let selected = selected.min(items.len().saturating_sub(1));
         let start = selected.saturating_sub(MENU_ROWS - 1);
-        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0).min(32) + 3;
+        let label_w = items
+            .iter()
+            .map(|i| i.label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(32)
+            + 3;
         for (i, item) in items.iter().enumerate().skip(start).take(MENU_ROWS) {
             let sel = i == selected;
-            let lead = if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() };
+            let lead = if sel {
+                paint(fg(BRIGHT), "› ")
+            } else {
+                "  ".into()
+            };
             // Rows without a detail column give the label all the room left of the tag.
             let tag_w = visible_width(&item.tag);
-            let label_w = if item.detail.is_empty() { w.saturating_sub(tag_w + 6).max(1) } else { label_w.max(1) };
+            let label_w = if item.detail.is_empty() {
+                w.saturating_sub(tag_w + 6).max(1)
+            } else {
+                label_w.max(1)
+            };
             let label = truncate(&item.label, label_w - 1);
-            let label = if item.detail.is_empty() { label } else { format!("{label:<label_w$}") };
-            let label = if sel { paint(fg(BRIGHT).bold(), &label) } else { paint(fg(MID), &label) };
+            let label = if item.detail.is_empty() {
+                label
+            } else {
+                format!("{label:<label_w$}")
+            };
+            let label = if sel {
+                paint(fg(BRIGHT).bold(), &label)
+            } else {
+                paint(fg(MID), &label)
+            };
             let room = w.saturating_sub(label_w + 4 + tag_w);
-            let left = format!("{lead}{label}{}", paint(fg(GRAY), &truncate(&item.detail, room)));
+            let left = format!(
+                "{lead}{label}{}",
+                paint(fg(GRAY), &truncate(&item.detail, room))
+            );
             rows.push(spread(&left, &paint(fg(GRAY), &item.tag), w));
         }
         rows.push(rule(w));
-        let range = if items.is_empty() { String::new() } else { format!("{}–{}", start + 1, (start + MENU_ROWS).min(items.len())) };
+        let range = if items.is_empty() {
+            String::new()
+        } else {
+            format!("{}–{}", start + 1, (start + MENU_ROWS).min(items.len()))
+        };
         rows.push(spread(&hints(&keys), &paint(fg(GRAY), &range), w));
         true
     }
@@ -901,7 +1207,11 @@ impl Screen {
         if up > 0 {
             let _ = queue!(self.out, cursor::MoveUp(up as u16));
         }
-        let _ = queue!(self.out, cursor::MoveToColumn(col as u16), terminal::EndSynchronizedUpdate);
+        let _ = queue!(
+            self.out,
+            cursor::MoveToColumn(col as u16),
+            terminal::EndSynchronizedUpdate
+        );
         let _ = self.out.flush();
         self.pane_rows = rows.len();
         self.cursor_row = row;
@@ -932,7 +1242,8 @@ impl Screen {
 
     /// Start a new block, separated from the previous one by a blank line.
     fn begin(&mut self, block: Block) -> Vec<String> {
-        let gap = self.last_block != Block::None && (self.last_block != block || block == Block::User);
+        let gap =
+            self.last_block != Block::None && (self.last_block != block || block == Block::User);
         self.last_block = block;
         if gap {
             vec![String::new()]
@@ -973,7 +1284,11 @@ impl Screen {
         self.flush_all();
         let mut rows = self.begin(Block::Info);
         for (i, l) in text.lines().enumerate() {
-            let lead = if i == 0 { paint(fg(RED), "● ") } else { "  ".into() };
+            let lead = if i == 0 {
+                paint(fg(RED), "● ")
+            } else {
+                "  ".into()
+            };
             rows.push(format!("{lead}{}", paint(fg(MID), l)));
         }
         self.emit(&rows);
@@ -987,7 +1302,11 @@ impl Screen {
         let mut rows = self.begin(Block::User);
         for line in text.trim().lines() {
             for r in wrap(line, w.saturating_sub(2)) {
-                rows.push(format!("{} {}", paint(fg(BRIGHT), "┃"), paint(Style::new().bold(), &r)));
+                rows.push(format!(
+                    "{} {}",
+                    paint(fg(BRIGHT), "┃"),
+                    paint(Style::new().bold(), &r)
+                ));
             }
         }
         self.emit(&rows);
@@ -1028,7 +1347,11 @@ impl Screen {
     fn md_line(&mut self, line: &str, out: &mut Vec<String>) {
         if self.fence.is_none() {
             match self.table.len() {
-                1 if is_table_sep(line) && table_cells(line).len() == table_cells(&self.table[0]).len() => return self.table.push(line.into()),
+                1 if is_table_sep(line)
+                    && table_cells(line).len() == table_cells(&self.table[0]).len() =>
+                {
+                    return self.table.push(line.into())
+                }
                 n if n >= 2 && line.contains('|') => return self.table.push(line.into()),
                 _ => self.flush_table(out),
             }
@@ -1053,7 +1376,10 @@ impl Screen {
     }
 
     fn table_rows(&self, lines: &[String]) -> Vec<String> {
-        table(lines, self.width.saturating_sub(2), true).into_iter().map(|r| format!("  {r}")).collect()
+        table(lines, self.width.saturating_sub(2), true)
+            .into_iter()
+            .map(|r| format!("  {r}"))
+            .collect()
     }
 
     /// Markdown line, indented, with framed code blocks.
@@ -1063,9 +1389,18 @@ impl Screen {
             return if self.fence.take().is_some() {
                 format!("  {}", paint(fg(FAINT), &"─".repeat(34)))
             } else {
-                let lang = if lang.trim().is_empty() { "code" } else { lang.trim() };
+                let lang = if lang.trim().is_empty() {
+                    "code"
+                } else {
+                    lang.trim()
+                };
                 self.fence = Some(lang.to_string());
-                format!("  {} {} {}", paint(fg(FAINT), "─"), paint(fg(GRAY), lang), paint(fg(FAINT), &"─".repeat(32usize.saturating_sub(lang.len()))))
+                format!(
+                    "  {} {} {}",
+                    paint(fg(FAINT), "─"),
+                    paint(fg(GRAY), lang),
+                    paint(fg(FAINT), &"─".repeat(32usize.saturating_sub(lang.len())))
+                )
             };
         }
         if self.fence.is_some() {
@@ -1114,8 +1449,14 @@ impl Screen {
         let text = std::mem::take(&mut self.live);
         let mut rows = self.begin(block);
         if block == Block::Reasoning {
-            let secs = self.thinking_since.take().map_or(0, |t| t.elapsed().as_secs());
-            rows.push(paint(fg(GRAY).italic(), &thinking_summary(&text, secs, self.width)));
+            let secs = self
+                .thinking_since
+                .take()
+                .map_or(0, |t| t.elapsed().as_secs());
+            rows.push(paint(
+                fg(GRAY).italic(),
+                &thinking_summary(&text, secs, self.width),
+            ));
         } else {
             if !text.is_empty() {
                 self.md_line(&text, &mut rows);
@@ -1145,19 +1486,43 @@ impl Screen {
         self.flush_live();
         self.log.tool_start(tool, summary);
         let (verb, target) = describe_tool(tool, summary);
-        self.tools.push(ToolRow { tool: tool.into(), verb, target, note: String::new(), detail: Vec::new(), status: Status::Running });
+        self.tools.push(ToolRow {
+            tool: tool.into(),
+            verb,
+            target,
+            note: String::new(),
+            detail: Vec::new(),
+            status: Status::Running,
+        });
         self.set_label(&format!("Running {}", tool.replace('_', " ")));
         self.redraw();
     }
 
     fn tool_end(&mut self, output: &ToolOutput) {
-        self.log.tool_end(&output.content, output.display.as_deref(), output.is_error);
-        let Some(t) = self.tools.iter_mut().rev().find(|t| t.status == Status::Running) else { return };
-        t.status = if output.is_error { Status::Failed } else { Status::Ok };
+        self.log
+            .tool_end(&output.content, output.display.as_deref(), output.is_error);
+        let Some(t) = self
+            .tools
+            .iter_mut()
+            .rev()
+            .find(|t| t.status == Status::Running)
+        else {
+            return;
+        };
+        t.status = if output.is_error {
+            Status::Failed
+        } else {
+            Status::Ok
+        };
         if let Some(d) = output.display.as_deref().filter(|d| looks_like_diff(d)) {
             t.note = diff_stat(d);
         }
-        let lines: Vec<&str> = output.content.trim_end().lines().filter(|l| !l.trim().is_empty()).collect();
+        let lines: Vec<&str> = output
+            .content
+            .trim_end()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
         if output.is_error {
             t.detail = lines.iter().take(3).map(|l| sanitize_text(l)).collect();
         } else if t.tool == "bash" && !lines.is_empty() {
@@ -1165,7 +1530,8 @@ impl Screen {
             if skip > 0 {
                 t.detail.push(format!("… {skip} lines more"));
             }
-            t.detail.extend(lines[skip..].iter().map(|l| sanitize_text(l)));
+            t.detail
+                .extend(lines[skip..].iter().map(|l| sanitize_text(l)));
         }
         self.set_label("Working");
         self.redraw();
@@ -1220,14 +1586,28 @@ impl Screen {
     /// always the OSC 52 terminal escape (works over SSH in most terminals).
     pub fn copy_osc52(&mut self, text: &str) {
         use base64::Engine;
-        let osc = format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text));
+        let osc = format!(
+            "\x1b]52;c;{}\x07",
+            base64::engine::general_purpose::STANDARD.encode(text)
+        );
         let _ = self.out.write_all(osc.as_bytes());
         let _ = self.out.flush();
     }
 
     /// Open the model switcher; `models` arrive later via `set_models`.
     pub fn open_models(&mut self) {
-        self.menu = Some(ModelMenu { choices: Vec::new(), tabs: vec!["All".into()], tab: 0, filter: String::new(), selected: 0, loading: true, warnings: Vec::new() });
+        self.sessions = None;
+        self.settings = None;
+        self.modes = None;
+        self.menu = Some(ModelMenu {
+            choices: Vec::new(),
+            tabs: vec!["All".into()],
+            tab: 0,
+            filter: String::new(),
+            selected: 0,
+            loading: true,
+            warnings: Vec::new(),
+        });
         self.redraw();
     }
 
@@ -1239,7 +1619,10 @@ impl Screen {
                 tabs.push(c.provider.clone());
             }
         }
-        m.selected = choices.iter().position(|c| c.provider == self.footer.provider && c.model == self.footer.model).unwrap_or(0);
+        m.selected = choices
+            .iter()
+            .position(|c| c.provider == self.footer.provider && c.model == self.footer.model)
+            .unwrap_or(0);
         m.choices = choices;
         m.tabs = tabs;
         m.warnings = warnings;
@@ -1249,7 +1632,14 @@ impl Screen {
 
     /// Open the session picker over `all` (as from `session::list`).
     pub fn open_sessions(&mut self, all: Vec<Meta>, cwd: &std::path::Path, current: Option<&str>) {
-        self.sessions = Some(SessionMenu { sessions: order_sessions(all, cwd, current), filter: String::new(), selected: 0 });
+        self.menu = None;
+        self.settings = None;
+        self.modes = None;
+        self.sessions = Some(SessionMenu {
+            sessions: order_sessions(all, cwd, current),
+            filter: String::new(),
+            selected: 0,
+        });
         self.redraw();
     }
 
@@ -1258,9 +1648,22 @@ impl Screen {
         let count = m.visible().len();
         match key.code {
             KeyCode::Esc => self.sessions = None,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => self.sessions = None,
-            KeyCode::Up => m.selected = m.selected.checked_sub(1).unwrap_or(count.saturating_sub(1)),
-            KeyCode::Down => m.selected = if count == 0 { 0 } else { (m.selected + 1) % count },
+            KeyCode::Char('c')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.sessions = None
+            }
+            KeyCode::Up => {
+                m.selected = m.selected.checked_sub(1).unwrap_or(count.saturating_sub(1))
+            }
+            KeyCode::Down => {
+                m.selected = if count == 0 {
+                    0
+                } else {
+                    (m.selected + 1) % count
+                }
+            }
             KeyCode::Backspace => {
                 m.filter.pop();
                 m.selected = 0;
@@ -1284,12 +1687,20 @@ impl Screen {
     fn live(&self) -> crate::settings::Live {
         let f = &self.footer;
         crate::settings::Live {
-            model: if f.provider.is_empty() { f.model.clone() } else { format!("{} · {}", f.provider, f.model) },
+            model: if f.provider.is_empty() {
+                f.model.clone()
+            } else {
+                format!("{} · {}", f.provider, f.model)
+            },
             effort: f.effort.clone(),
             efforts: f.efforts.clone(),
             fast: f.fast,
             fast_supported: f.fast_supported,
-            yolo: f.yolo,
+            permission_mode: if f.permission_mode.is_empty() {
+                "ask".into()
+            } else {
+                f.permission_mode.clone()
+            },
         }
     }
 
@@ -1297,7 +1708,39 @@ impl Screen {
     pub fn open_settings(&mut self, category: crate::settings::Category) {
         self.menu = None;
         self.sessions = None;
+        self.modes = None;
         self.settings = Some(super::settings::SettingsMenu::new(category));
+        self.redraw();
+    }
+
+    /// Open the permission-mode switcher.
+    pub fn open_permission_modes(&mut self) {
+        self.menu = None;
+        self.sessions = None;
+        self.settings = None;
+        self.modes = Some(super::mode_menu::ModeMenu::new());
+        self.redraw();
+    }
+
+    fn on_modes_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        use super::mode_menu::Action;
+        let Some(m) = &mut self.modes else { return };
+        match m.on_key(key) {
+            Action::None => {}
+            Action::Close => self.modes = None,
+            Action::Select(id) => {
+                self.modes = None;
+                if id == "rules" {
+                    let _ = commands.send(Command::Submit("/permissions rules".into()));
+                } else {
+                    if self.is_busy() {
+                        self.hint = Some("Applies when the current task finishes.".into());
+                    }
+                    self.footer.permission_mode = id.to_string();
+                    let _ = commands.send(Command::SetPermissionMode(id.to_string()));
+                }
+            }
+        }
         self.redraw();
     }
 
@@ -1330,9 +1773,11 @@ impl Screen {
                 } else {
                     // Session settings belong to the app loop; show them at once.
                     match id {
-                        Id::Effort => self.footer.effort = Some(value.clone()).filter(|v| v != "auto"),
+                        Id::Effort => {
+                            self.footer.effort = Some(value.clone()).filter(|v| v != "auto")
+                        }
                         Id::Fast => self.footer.fast = value == "on",
-                        Id::Permission => self.footer.yolo = value == "yolo",
+                        Id::Permission => self.footer.permission_mode = value.clone(),
                         _ => {}
                     }
                     if self.is_busy() {
@@ -1349,7 +1794,10 @@ impl Screen {
     pub fn attach(&mut self, image: crate::types::Image, label: &str) {
         let label = sanitize_text(label);
         self.attachments.push(Attachment { label, image });
-        self.hint = Some(format!("Attached [Image #{}] · /images lists or removes attachments", self.attachments.len()));
+        self.hint = Some(format!(
+            "Attached [Image #{}] · /images lists or removes attachments",
+            self.attachments.len()
+        ));
         self.redraw();
     }
 
@@ -1363,7 +1811,11 @@ impl Screen {
         self.clear_pane();
         let _ = self.out.flush();
         let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide);
-        self.viewer = Some(super::transcript::Viewer::new(&self.log, self.width, self.height));
+        self.viewer = Some(super::transcript::Viewer::new(
+            &self.log,
+            self.width,
+            self.height,
+        ));
         self.draw_viewer(true);
     }
 
@@ -1389,9 +1841,17 @@ impl Screen {
             return;
         }
         let frame = v.frame();
-        let _ = queue!(self.out, terminal::BeginSynchronizedUpdate, cursor::MoveTo(0, 0));
+        let _ = queue!(
+            self.out,
+            terminal::BeginSynchronizedUpdate,
+            cursor::MoveTo(0, 0)
+        );
         for (i, row) in frame.iter().enumerate() {
-            let _ = queue!(self.out, cursor::MoveTo(0, i as u16), terminal::Clear(terminal::ClearType::CurrentLine));
+            let _ = queue!(
+                self.out,
+                cursor::MoveTo(0, i as u16),
+                terminal::Clear(terminal::ClearType::CurrentLine)
+            );
             let _ = self.out.write_all(row.as_bytes());
         }
         let _ = queue!(self.out, terminal::EndSynchronizedUpdate);
@@ -1443,8 +1903,16 @@ impl Screen {
         let count = m.visible().len();
         match key.code {
             KeyCode::Esc => self.menu = None,
-            KeyCode::Up => m.selected = m.selected.checked_sub(1).unwrap_or(count.saturating_sub(1)),
-            KeyCode::Down => m.selected = if count == 0 { 0 } else { (m.selected + 1) % count },
+            KeyCode::Up => {
+                m.selected = m.selected.checked_sub(1).unwrap_or(count.saturating_sub(1))
+            }
+            KeyCode::Down => {
+                m.selected = if count == 0 {
+                    0
+                } else {
+                    (m.selected + 1) % count
+                }
+            }
             KeyCode::Tab => {
                 m.tab = (m.tab + 1) % m.tabs.len();
                 m.selected = 0;
@@ -1463,7 +1931,12 @@ impl Screen {
                     self.menu = None;
                 }
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => self.menu = None,
+            KeyCode::Char('c')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.menu = None
+            }
             KeyCode::Char(ch) if text_key(key, ch) => {
                 m.filter.push(ch);
                 m.selected = 0;
@@ -1475,7 +1948,8 @@ impl Screen {
 
     fn on_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
         if let Some(mut a) = self.approval.take() {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
             if key.code == KeyCode::Esc
                 || (ctrl && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('c')))
             {
@@ -1502,7 +1976,9 @@ impl Screen {
             let answer = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Approval::Yes),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(Approval::Always),
-                KeyCode::Char('s') | KeyCode::Char('S') if a.save_rule.is_some() => Some(Approval::AlwaysSave),
+                KeyCode::Char('s') | KeyCode::Char('S') if a.save_rule.is_some() => {
+                    Some(Approval::AlwaysSave)
+                }
                 KeyCode::Char('n') | KeyCode::Char('N') => Some(Approval::No),
                 _ => None,
             };
@@ -1527,11 +2003,15 @@ impl Screen {
         if self.settings.is_some() {
             return self.on_settings_key(key, commands);
         }
+        if self.modes.is_some() {
+            return self.on_modes_key(key, commands);
+        }
         if self.sessions.is_some() {
             return self.on_sessions_key(key, commands);
         }
         if self.question.is_some() {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
             let interrupt = key.code == KeyCode::Esc
                 || (ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')));
             if interrupt {
@@ -1572,7 +2052,8 @@ impl Screen {
             }
             return self.redraw();
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
         if ctrl && key.code == KeyCode::Char('o') {
             return self.open_transcript();
         }
@@ -1594,7 +2075,10 @@ impl Screen {
         if !suggestions.is_empty() {
             match key.code {
                 KeyCode::Up => {
-                    self.slash_selected = self.slash_selected.checked_sub(1).unwrap_or(suggestions.len() - 1);
+                    self.slash_selected = self
+                        .slash_selected
+                        .checked_sub(1)
+                        .unwrap_or(suggestions.len() - 1);
                     return self.redraw();
                 }
                 KeyCode::Down => {
@@ -1602,7 +2086,9 @@ impl Screen {
                     return self.redraw();
                 }
                 KeyCode::Enter if key.modifiers.is_empty() => {
-                    let cmd = suggestions[self.slash_selected.min(suggestions.len() - 1)].0.clone();
+                    let cmd = suggestions[self.slash_selected.min(suggestions.len() - 1)]
+                        .0
+                        .clone();
                     self.editor.set_text("");
                     self.slash_selected = 0;
                     self.remember(&cmd);
@@ -1615,7 +2101,9 @@ impl Screen {
                     return self.redraw();
                 }
                 KeyCode::Tab => {
-                    let cmd = suggestions[self.slash_selected.min(suggestions.len() - 1)].0.clone();
+                    let cmd = suggestions[self.slash_selected.min(suggestions.len() - 1)]
+                        .0
+                        .clone();
                     self.editor.set_text(&format!("{cmd} "));
                     self.slash_selected = 0;
                     return self.redraw();
@@ -1669,7 +2157,9 @@ impl Screen {
             }
             Action::Dequeue => self.dequeue(),
         }
-        self.slash_selected = self.slash_selected.min(self.editor.suggestions().len().saturating_sub(1));
+        self.slash_selected = self
+            .slash_selected
+            .min(self.editor.suggestions().len().saturating_sub(1));
         self.redraw();
     }
 }
@@ -1681,7 +2171,10 @@ fn text_key(key: KeyEvent, ch: char) -> bool {
 
 fn clipboard_bytes(text: &str, windows_clip: bool) -> Vec<u8> {
     if windows_clip {
-        std::iter::once(0xfeffu16).chain(text.encode_utf16()).flat_map(u16::to_le_bytes).collect()
+        std::iter::once(0xfeffu16)
+            .chain(text.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect()
     } else {
         text.as_bytes().to_vec()
     }
@@ -1697,7 +2190,10 @@ pub fn copy_native(text: &str) -> Option<&'static str> {
     } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
     } else {
-        &[("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])]
+        &[
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
     };
     for (cmd, args) in tools {
         let Ok(mut child) = std::process::Command::new(cmd)
@@ -1724,7 +2220,12 @@ pub fn copy_native(text: &str) -> Option<&'static str> {
 /// Enter or Tab inside a burst (several keys under 10ms apart) is text, not
 /// a command. Requiring a streak keeps a real Enter after a brief UI stall.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn paste_key(key: KeyEvent, previous: Option<Instant>, now: Instant, streak: usize) -> Option<&'static str> {
+fn paste_key(
+    key: KeyEvent,
+    previous: Option<Instant>,
+    now: Instant,
+    streak: usize,
+) -> Option<&'static str> {
     let fast = previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10));
     if !fast || streak < 3 || !(key.modifiers - KeyModifiers::CONTROL).is_empty() {
         return None;
@@ -1749,13 +2250,27 @@ pub struct Tui {
 }
 
 impl Tui {
-    pub fn start(footer: Footer, home: PathBuf, commands: Vec<(String, String)>) -> io::Result<Self> {
+    pub fn start(
+        footer: Footer,
+        home: PathBuf,
+        commands: Vec<(String, String)>,
+    ) -> io::Result<Self> {
         let history_path = home.join("history");
         // One JSON string per line (multi-line prompts); plain lines are accepted too.
         let history: Vec<String> = std::fs::read_to_string(&history_path)
-            .map(|s| s.lines().filter(|l| !l.is_empty()).map(|l| serde_json::from_str(l).unwrap_or_else(|_| l.to_string())).collect())
+            .map(|s| {
+                s.lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| serde_json::from_str(l).unwrap_or_else(|_| l.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
-        let screen = Arc::new(Mutex::new(Screen::new(footer, Editor::new(history.clone(), commands), history, home)));
+        let screen = Arc::new(Mutex::new(Screen::new(
+            footer,
+            Editor::new(history.clone(), commands),
+            history,
+            home,
+        )));
         terminal::enable_raw_mode()?;
         let mut setup = TerminalSetup::arm();
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -1763,7 +2278,10 @@ impl Tui {
         execute!(out, crossterm::event::EnableBracketedPaste)?;
         setup.bracketed = true;
         if enhanced {
-            execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+            execute!(
+                out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
             setup.enhanced = true;
         }
         let prev = std::panic::take_hook();
@@ -1790,7 +2308,7 @@ impl Tui {
                                 let now = Instant::now();
                                 let pasted = paste_key(k, previous, now, streak);
                                 streak = if previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10)) { streak + 1 } else { 0 };
-                                if let Some(text) = pasted.filter(|_| s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() && s.secret.is_none()) {
+                                if let Some(text) = pasted.filter(|_| s.approval.is_none() && s.menu.is_none() && s.modes.is_none() && s.sessions.is_none() && s.secret.is_none()) {
                                     s.editor.paste(text);
                                     s.redraw();
                                     previous = Some(Instant::now());
@@ -1801,7 +2319,10 @@ impl Tui {
                             if std::mem::take(&mut s.clipboard_request) {
                                 let screen = screen.clone();
                                 tokio::spawn(async move {
-                                    let result = tokio::task::spawn_blocking(super::clipboard::read_image).await.unwrap_or_else(|e| Err(e.to_string()));
+                                    let result =
+                                        tokio::task::spawn_blocking(super::clipboard::read_image)
+                                            .await
+                                            .unwrap_or_else(|e| Err(e.to_string()));
                                     let mut s = lock(&screen);
                                     s.hint = None;
                                     match result {
@@ -1814,7 +2335,11 @@ impl Tui {
                             // Exclude rendering time when measuring the pause between keys.
                             #[cfg(windows)]
                             {
-                                previous = matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab).then_some(Instant::now());
+                                previous = matches!(
+                                    k.code,
+                                    KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab
+                                )
+                                .then_some(Instant::now());
                             }
                         }
                         Event::Paste(text) => {
@@ -1851,7 +2376,13 @@ impl Tui {
             })
         };
         setup.disarm();
-        Ok(Tui { screen, commands: rx, tasks: vec![input, ticker], enhanced, history_path })
+        Ok(Tui {
+            screen,
+            commands: rx,
+            tasks: vec![input, ticker],
+            enhanced,
+            history_path,
+        })
     }
 
     pub fn screen(&self) -> MutexGuard<'_, Screen> {
@@ -1915,7 +2446,10 @@ impl Tui {
 
     /// The `agent::Ui` for one run.
     pub fn ui(&self, cwd: PathBuf) -> TuiUi {
-        TuiUi { screen: self.screen.clone(), cwd }
+        TuiUi {
+            screen: self.screen.clone(),
+            cwd,
+        }
     }
 }
 
@@ -1931,9 +2465,15 @@ impl Drop for Tui {
             s.clear_pane();
             let _ = s.out.flush();
             let skip = s.history.len().saturating_sub(1000);
-            let history: Vec<String> = s.history[skip..].iter().map(|h| serde_json::to_string(h).unwrap_or_default()).collect();
+            let history: Vec<String> = s.history[skip..]
+                .iter()
+                .map(|h| serde_json::to_string(h).unwrap_or_default())
+                .collect();
             if crate::settings::current().prompt_history {
-                let _ = crate::session::write_private(&self.history_path, (history.join("\n") + "\n").as_bytes());
+                let _ = crate::session::write_private(
+                    &self.history_path,
+                    (history.join("\n") + "\n").as_bytes(),
+                );
             }
         }
         *SCREEN.lock().unwrap() = None;
@@ -1954,7 +2494,11 @@ struct TerminalSetup {
 
 impl TerminalSetup {
     fn arm() -> Self {
-        Self { armed: true, bracketed: false, enhanced: false }
+        Self {
+            armed: true,
+            bracketed: false,
+            enhanced: false,
+        }
     }
 
     fn disarm(&mut self) {
@@ -1999,7 +2543,11 @@ impl Drop for ClearQuestion {
 
 /// Show the approval pane on `screen` and wait for the answer. `origin`
 /// names who asks when it isn't the main agent (shown above the title).
-async fn approve_on(screen: &Arc<Mutex<Screen>>, origin: Option<&str>, req: &ApprovalRequest<'_>) -> Approval {
+async fn approve_on(
+    screen: &Arc<Mutex<Screen>>,
+    origin: Option<&str>,
+    req: &ApprovalRequest<'_>,
+) -> Approval {
     let (tool, summary, preview) = (req.tool, req.summary, req.preview);
     let (tx, rx) = oneshot::channel();
     {
@@ -2007,19 +2555,33 @@ async fn approve_on(screen: &Arc<Mutex<Screen>>, origin: Option<&str>, req: &App
         s.flush_live();
         let w = s.width;
         let (verb, target) = describe_tool(tool, summary);
-        let title = format!("{} {}", paint(fg(BRIGHT), &verb), paint(fg(GRAY), &one_line(&target, w.saturating_sub(verb.len() + 3).max(1))));
+        let title = format!(
+            "{} {}",
+            paint(fg(BRIGHT), &verb),
+            paint(
+                fg(GRAY),
+                &one_line(&target, w.saturating_sub(verb.len() + 3).max(1))
+            )
+        );
         let mut lines = Vec::new();
         let mut prewrapped = false;
         if let Some(p) = preview {
             let mut p = sanitize_text(p);
             const MAX_PREVIEW_CHARS: usize = 200_000;
             if p.chars().count() > MAX_PREVIEW_CHARS {
-                let cut = p.char_indices().nth(MAX_PREVIEW_CHARS).map(|(i, _)| i).unwrap_or(p.len());
+                let cut = p
+                    .char_indices()
+                    .nth(MAX_PREVIEW_CHARS)
+                    .map(|(i, _)| i)
+                    .unwrap_or(p.len());
                 p.truncate(cut);
                 p.push_str("\n… [preview truncated; the rest is omitted from the display]");
             }
             if looks_like_diff(&p) {
-                lines = diff(&p, true, usize::MAX, w, "  ").lines().map(str::to_string).collect();
+                lines = diff(&p, true, usize::MAX, w, "  ")
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
                 prewrapped = true;
             } else {
                 lines = p.lines().map(str::to_string).collect();
@@ -2038,7 +2600,10 @@ async fn approve_on(screen: &Arc<Mutex<Screen>>, origin: Option<&str>, req: &App
             };
             one_line(&o, 200)
         });
-        crate::notify::notify(&crate::notify::Event::Attention(&format!("Approve: {verb} {}", one_line(&target, 80))));
+        crate::notify::notify(&crate::notify::Event::Attention(&format!(
+            "Approve: {verb} {}",
+            one_line(&target, 80)
+        )));
         s.approval = Some(PendingApproval {
             title,
             lines,
@@ -2110,7 +2675,10 @@ impl Ui for TuiUi {
             StreamEvent::Reasoning(t) => s.stream(Block::Reasoning, t),
             StreamEvent::ToolCallStart { name, .. } => {
                 s.flush_live();
-                s.set_label(&format!("Preparing {}", one_line(&name.replace('_', " "), 80)));
+                s.set_label(&format!(
+                    "Preparing {}",
+                    one_line(&name.replace('_', " "), 80)
+                ));
                 s.redraw();
             }
         }
@@ -2147,7 +2715,9 @@ impl Ui for TuiUi {
     }
 
     fn approver(&self) -> Option<Arc<dyn Approver>> {
-        Some(Arc::new(TuiApprover { screen: Arc::clone(&self.screen) }))
+        Some(Arc::new(TuiApprover {
+            screen: Arc::clone(&self.screen),
+        }))
     }
 
     fn usage(&mut self, usage: &Usage) {
@@ -2168,7 +2738,10 @@ impl Ui for TuiUi {
         {
             let mut s = self.s();
             s.flush_all();
-            crate::notify::notify(&crate::notify::Event::Attention(&format!("Question: {}", one_line(question, 120))));
+            crate::notify::notify(&crate::notify::Event::Attention(&format!(
+                "Question: {}",
+                one_line(question, 120)
+            )));
             s.question = Some(PendingQuestion {
                 question: sanitize_text(question),
                 options: options.iter().map(|o| one_line(o, 200)).collect(),
@@ -2184,7 +2757,15 @@ impl Ui for TuiUi {
         drop(guard);
         let mut s = self.s();
         let shown = answer.clone().unwrap_or_else(|| "(skipped)".into());
-        s.print_info(&format!("{} {}\n  {}", paint(fg(BRIGHT), "?"), paint(fg(MID), question), paint(fg(GRAY), &shown)), Style::new());
+        s.print_info(
+            &format!(
+                "{} {}\n  {}",
+                paint(fg(BRIGHT), "?"),
+                paint(fg(MID), question),
+                paint(fg(GRAY), &shown)
+            ),
+            Style::new(),
+        );
         answer
     }
 
@@ -2224,15 +2805,34 @@ mod tests {
         let now = Instant::now();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        assert_eq!(paste_key(enter, Some(now), now + Duration::from_millis(1), 5), Some("\n"));
-        assert_eq!(paste_key(tab, Some(now), now + Duration::from_millis(1), 5), Some("\t"));
-        assert_eq!(paste_key(enter, Some(now), now + Duration::from_millis(50), 5), None);
+        assert_eq!(
+            paste_key(enter, Some(now), now + Duration::from_millis(1), 5),
+            Some("\n")
+        );
+        assert_eq!(
+            paste_key(tab, Some(now), now + Duration::from_millis(1), 5),
+            Some("\t")
+        );
+        assert_eq!(
+            paste_key(enter, Some(now), now + Duration::from_millis(50), 5),
+            None
+        );
         assert_eq!(paste_key(enter, None, now, 5), None);
         // A couple of keys released together after a stall are not a paste.
-        assert_eq!(paste_key(enter, Some(now), now + Duration::from_millis(1), 1), None);
+        assert_eq!(
+            paste_key(enter, Some(now), now + Duration::from_millis(1), 1),
+            None
+        );
         let mut editor = Editor::default();
         for (i, c) in "a\\\nb\n".chars().enumerate() {
-            let key = KeyEvent::new(if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) }, KeyModifiers::NONE);
+            let key = KeyEvent::new(
+                if c == '\n' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(c)
+                },
+                KeyModifiers::NONE,
+            );
             let time = now + Duration::from_millis(i as u64);
             if let Some(text) = paste_key(key, Some(now), time, 3) {
                 editor.paste(text);
@@ -2241,10 +2841,24 @@ mod tests {
             }
         }
         assert_eq!(editor.text(), "a\\\nb\n");
-        assert_eq!(editor.handle_key(enter, true), Action::Submit("a\\\nb\n".into()));
-        assert!(text_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT), '@'));
+        assert_eq!(
+            editor.handle_key(enter, true),
+            Action::Submit("a\\\nb\n".into())
+        );
+        assert!(text_key(
+            KeyEvent::new(
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ),
+            '@'
+        ));
         let bytes = clipboard_bytes("€🙂", true);
-        let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect();
         assert_eq!(units[0], 0xfeff);
         assert_eq!(String::from_utf16(&units[1..]).unwrap(), "€🙂");
     }
@@ -2265,18 +2879,32 @@ mod tests {
 
     #[test]
     fn thinking_collapses_to_one_line() {
-        assert_eq!(thinking_summary("**Planning**\n\nstep one", 3, 80), "• Thought for 3s · Planning");
+        assert_eq!(
+            thinking_summary("**Planning**\n\nstep one", 3, 80),
+            "• Thought for 3s · Planning"
+        );
         assert_eq!(thinking_summary("", 0, 80), "• Thought");
         assert!(visible_width(&thinking_summary(&"x".repeat(200), 1, 40)) <= 40);
     }
 
     #[test]
     fn tools_read_like_fx() {
-        assert_eq!(describe_tool("read_file", "src/main.rs"), ("Read".into(), "src/main.rs".into()));
-        assert_eq!(describe_tool("bash", "cargo test"), ("Ran".into(), "cargo test".into()));
+        assert_eq!(
+            describe_tool("read_file", "src/main.rs"),
+            ("Read".into(), "src/main.rs".into())
+        );
+        assert_eq!(
+            describe_tool("bash", "cargo test"),
+            ("Ran".into(), "cargo test".into())
+        );
         assert_eq!(describe_tool("mcp__wiki__ask", "{}").0, "Called");
-        assert!(describe_tool("mcp__wiki__ask", "{}").1.starts_with("wiki.ask"));
-        assert_eq!(diff_stat("--- a/x\n+++ b/x\n@@\n-old\n+new\n+more\n"), "+2 / -1");
+        assert!(describe_tool("mcp__wiki__ask", "{}")
+            .1
+            .starts_with("wiki.ask"));
+        assert_eq!(
+            diff_stat("--- a/x\n+++ b/x\n@@\n-old\n+new\n+more\n"),
+            "+2 / -1"
+        );
         assert_eq!(tool_kind("grep"), "read");
     }
 
@@ -2287,7 +2915,12 @@ mod tests {
     }
 
     fn screen() -> Screen {
-        let mut s = Screen::new(Footer::default(), Editor::new(Vec::new(), Vec::new()), Vec::new(), PathBuf::new());
+        let mut s = Screen::new(
+            Footer::default(),
+            Editor::new(Vec::new(), Vec::new()),
+            Vec::new(),
+            PathBuf::new(),
+        );
         s.width = 40;
         s
     }
@@ -2298,14 +2931,26 @@ mod tests {
             s.md_line(l, &mut out);
         }
         s.flush_table(&mut out);
-        out.iter().map(|r| super::super::render::strip_ansi(r)).collect()
+        out.iter()
+            .map(|r| super::super::render::strip_ansi(r))
+            .collect()
     }
 
     #[test]
     fn tables_are_buffered_and_laid_out() {
         let mut s = screen();
         let out = feed(&mut s, "Intro\n| a | bb |\n|---|---|\n| 1 | 2 |\n\nafter");
-        assert_eq!(out, vec!["  Intro", "  a │ bb", "  ──┼───", "  1 │ 2", "  ", "  after"]);
+        assert_eq!(
+            out,
+            vec![
+                "  Intro",
+                "  a │ bb",
+                "  ──┼───",
+                "  1 │ 2",
+                "  ",
+                "  after"
+            ]
+        );
         // While streaming, rows wait until the table ends.
         let mut out = Vec::new();
         for l in ["| x | y |", "|---|---|", "| 1 | 2 |"] {
@@ -2336,11 +2981,20 @@ mod tests {
 
     #[test]
     fn session_picker_orders_and_filters() {
-        let all = vec![meta("a", "/other", 1), meta("b", "/here", 5), meta("cur", "/here", 0), meta("c", "/here", 2)];
+        let all = vec![
+            meta("a", "/other", 1),
+            meta("b", "/here", 5),
+            meta("cur", "/here", 0),
+            meta("c", "/here", 2),
+        ];
         let ordered = order_sessions(all, std::path::Path::new("/here"), Some("cur"));
         let ids: Vec<&str> = ordered.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["c", "b", "a"]);
-        let mut m = SessionMenu { sessions: ordered, filter: "other".into(), selected: 0 };
+        let mut m = SessionMenu {
+            sessions: ordered,
+            filter: "other".into(),
+            selected: 0,
+        };
         assert_eq!(m.visible().len(), 1);
         m.filter = "TITLE B".into();
         assert_eq!(m.visible()[0].id, "b");
@@ -2369,7 +3023,10 @@ mod tests {
             (Queued::Steer, "/model gpt".into()),
             (Queued::Steer, "  /model x".into()),
         ];
-        assert_eq!(take_steer_texts(&mut queue), vec!["look at main".to_string()]);
+        assert_eq!(
+            take_steer_texts(&mut queue),
+            vec!["look at main".to_string()]
+        );
         assert_eq!(
             queue,
             vec![
@@ -2391,7 +3048,10 @@ mod tests {
         assert!(take_follow_up_text(&mut queue).is_none());
         assert_eq!(queue.len(), 2);
         queue.remove(0);
-        assert_eq!(take_follow_up_text(&mut queue).as_deref(), Some("next prompt"));
+        assert_eq!(
+            take_follow_up_text(&mut queue).as_deref(),
+            Some("next prompt")
+        );
         let mut joined = vec![
             (Queued::FollowUp, "one".into()),
             (Queued::FollowUp, "two".into()),
@@ -2426,7 +3086,10 @@ mod tests {
         let mut s = screen();
         s.width = 30;
         s.height = 40;
-        s.busy = Some(("Running an extremely long tool name that must not wrap".into(), Instant::now()));
+        s.busy = Some((
+            "Running an extremely long tool name that must not wrap".into(),
+            Instant::now(),
+        ));
         let (tx, _rx) = oneshot::channel();
         s.approval = Some(PendingApproval {
             title: "Approve".into(),
@@ -2469,7 +3132,11 @@ mod tests {
         };
         s.tools = vec![row("a.rs", ""), row("src/lib.rs", "+1")];
         let (rows, _, _) = s.pane();
-        assert!(rows.iter().any(|r| super::super::render::strip_ansi(r).contains("src/lib.rs")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| super::super::render::strip_ansi(r).contains("src/lib.rs")),
+            "{rows:?}"
+        );
         assert!(rows.iter().all(|r| visible_width(r) <= 24), "{rows:?}");
     }
 
@@ -2479,7 +3146,16 @@ mod tests {
         let cancel = CancellationToken::new();
         s.cancel = Some(cancel.clone());
         let (tx, mut rx) = oneshot::channel();
-        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, save_rule: None, origin: None, reply: tx });
+        s.approval = Some(PendingApproval {
+            title: "t".into(),
+            lines: Vec::new(),
+            prewrapped: false,
+            scroll: 0,
+            rule: None,
+            save_rule: None,
+            origin: None,
+            reply: tx,
+        });
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &cmd_tx);
         assert_eq!(rx.try_recv().unwrap(), Approval::No);
@@ -2487,8 +3163,20 @@ mod tests {
         assert!(s.approval.is_none());
 
         let (tx, mut rx) = oneshot::channel();
-        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, save_rule: None, origin: None, reply: tx });
-        s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &cmd_tx);
+        s.approval = Some(PendingApproval {
+            title: "t".into(),
+            lines: Vec::new(),
+            prewrapped: false,
+            scroll: 0,
+            rule: None,
+            save_rule: None,
+            origin: None,
+            reply: tx,
+        });
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        );
         assert_eq!(rx.try_recv().unwrap(), Approval::No);
         assert!(matches!(cmd_rx.try_recv().unwrap(), Command::Exit));
     }
@@ -2512,16 +3200,28 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         s.approval = Some(pending(None, tx));
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        assert!(text.contains("subagent · Count files") && !text.contains("save"), "{text}");
-        s.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &cmd_tx);
+        assert!(
+            text.contains("subagent · Count files") && !text.contains("save"),
+            "{text}"
+        );
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &cmd_tx,
+        );
         assert!(rx.try_recv().is_err() && s.approval.is_some());
         s.approval = None;
 
         let (tx, mut rx) = oneshot::channel();
         s.approval = Some(pending(Some("mcp__wiki__ask"), tx));
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        assert!(text.contains("Always, and save `mcp__wiki__ask` to permissions.json"), "{text}");
-        s.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &cmd_tx);
+        assert!(
+            text.contains("Always, and save `mcp__wiki__ask` to permissions.json"),
+            "{text}"
+        );
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &cmd_tx,
+        );
         assert_eq!(rx.try_recv().unwrap(), Approval::AlwaysSave);
         assert!(s.approval.is_none());
     }
@@ -2529,7 +3229,10 @@ mod tests {
     #[test]
     fn dropping_ask_clears_the_question() {
         let screen = Arc::new(Mutex::new(screen()));
-        let mut ui = TuiUi { screen: Arc::clone(&screen), cwd: PathBuf::new() };
+        let mut ui = TuiUi {
+            screen: Arc::clone(&screen),
+            cwd: PathBuf::new(),
+        };
         let options = vec!["a".to_string()];
         let mut fut = Box::pin(Ui::ask(&mut ui, "pick", &options));
         let waker = std::task::Waker::noop();
@@ -2570,7 +3273,10 @@ mod tests {
             menu: None,
             reply: tx,
         });
-        s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &cmd_tx);
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        );
         assert!(rx.try_recv().unwrap().is_none());
         assert!(cancel.is_cancelled());
         assert!(cmd_rx.try_recv().is_err());
@@ -2583,7 +3289,10 @@ mod tests {
             menu: None,
             reply: tx,
         });
-        s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &cmd_tx);
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        );
         assert!(matches!(cmd_rx.try_recv().unwrap(), Command::Exit));
     }
 
@@ -2593,7 +3302,16 @@ mod tests {
         {
             let mut s = lock(&screen);
             let (tx, _rx) = oneshot::channel();
-            s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, save_rule: None, origin: None, reply: tx });
+            s.approval = Some(PendingApproval {
+                title: "t".into(),
+                lines: Vec::new(),
+                prewrapped: false,
+                scroll: 0,
+                rule: None,
+                save_rule: None,
+                origin: None,
+                reply: tx,
+            });
         }
         drop(ClearApproval(Arc::clone(&screen)));
         assert!(lock(&screen).approval.is_none());
@@ -2626,7 +3344,11 @@ mod tests {
         s.footer.sandbox = "workspace-write".into();
         s.footer.cwd = "/home/someone/very/long".into();
         let line = s.footer_line();
-        assert!(visible_width(&line) <= 20, "{} {line:?}", visible_width(&line));
+        assert!(
+            visible_width(&line) <= 20,
+            "{} {line:?}",
+            visible_width(&line)
+        );
         assert!(line.contains("\x1b[0m"), "{line:?}");
         assert!(!line.contains("[31m"), "{line:?}");
     }
@@ -2652,6 +3374,10 @@ mod tests {
         let (rows, _, _) = s.pane();
         let joined = rows.join("\n");
         assert!(!joined.contains("]52"), "{joined}");
-        assert!(rows.iter().any(|r| super::super::render::strip_ansi(r).contains("evilmodel")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| super::super::render::strip_ansi(r).contains("evilmodel")),
+            "{rows:?}"
+        );
     }
 }
