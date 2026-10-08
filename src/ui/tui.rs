@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::{Action, Editor};
+use super::statusline::{tilde, tokens};
 use super::render::{
     diff, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells, truncate, visible_width, Markdown,
 };
@@ -47,7 +48,15 @@ pub enum Command {
     Resume(String),
     /// Shift+Tab: next reasoning effort.
     CycleEffort,
+    /// A session setting changed in the settings menu (effort, fast, permission).
+    Setting(crate::settings::Id, String),
     Exit,
+}
+
+/// An image waiting to be sent with the next message.
+pub struct Attachment {
+    pub label: String,
+    pub image: crate::types::Image,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,6 +76,13 @@ pub struct Footer {
     pub usage: Usage,
     pub context_tokens: u64,
     pub context_window: u64,
+    /// Codex fast mode is on.
+    pub fast: bool,
+    pub branch: Option<String>,
+    pub segments: crate::settings::StatusLine,
+    /// Efforts the current model supports, for the settings menu.
+    pub efforts: Vec<String>,
+    pub fast_supported: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -210,6 +226,16 @@ pub struct Screen {
     tools: Vec<ToolRow>,
     menu: Option<ModelMenu>,
     sessions: Option<SessionMenu>,
+    settings: Option<super::settings::SettingsMenu>,
+    /// Everything shown so far, for the transcript viewer.
+    pub log: super::transcript::Log,
+    viewer: Option<super::transcript::Viewer>,
+    /// Scrollback rows held while the viewer covers the screen.
+    deferred: Vec<String>,
+    /// Images for the next message.
+    pub attachments: Vec<Attachment>,
+    /// Ctrl+V asked for a clipboard image (read by the input task).
+    clipboard_request: bool,
     slash_selected: usize,
     pub footer: Footer,
     cancel: Option<CancellationToken>,
@@ -356,20 +382,6 @@ fn hints(pairs: &[(&str, &str)]) -> String {
         .join("     ")
 }
 
-fn tilde(path: &str) -> String {
-    match dirs::home_dir().map(|h| h.display().to_string()) {
-        Some(h) if !h.is_empty() && (path == h || path.starts_with(&format!("{h}/"))) => format!("~{}", &path[h.len()..]),
-        _ => path.to_string(),
-    }
-}
-
-fn tokens(n: u64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1000..=999_999 => format!("{:.1}k", n as f64 / 1000.0).replace(".0k", "k"),
-        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
-    }
-}
 
 /// A label with a moving highlight (a "shimmer").
 fn shimmer(label: &str, frame: usize) -> String {
@@ -469,6 +481,12 @@ impl Screen {
             tools: Vec::new(),
             menu: None,
             sessions: None,
+            settings: None,
+            log: Default::default(),
+            viewer: None,
+            deferred: Vec::new(),
+            attachments: Vec::new(),
+            clipboard_request: false,
             slash_selected: 0,
             footer,
             cancel: None,
@@ -603,6 +621,12 @@ impl Screen {
             rows.push(String::new());
         }
 
+        if !self.attachments.is_empty() && self.approval.is_none() {
+            let names: Vec<String> = self.attachments.iter().enumerate().map(|(i, a)| format!("[Image #{}] {}", i + 1, a.label)).collect();
+            let text = truncate(&sanitize_text(&names.join(" · ")), w.saturating_sub(4));
+            rows.push(format!("{} {}", paint(fg(GRAY), "▣"), paint(fg(MID), &text)));
+        }
+
         // Input, or the approval prompt in its place.
         let (cursor_row, cursor_col);
         if let Some(a) = &self.approval {
@@ -690,28 +714,23 @@ impl Screen {
 
     fn footer_line(&self) -> String {
         let f = &self.footer;
-        let effort = f.effort.as_deref().unwrap_or("auto");
-        let model = sanitize_text(&f.model);
-        let left = format!("{} {} {}", paint(fg(MID), effort), paint(fg(GRAY), "·"), paint(fg(GRAY), &model));
+        let left = match super::statusline::left(f) {
+            Some(text) => {
+                let (effort, rest) = text.split_once(" · ").unwrap_or((&text, ""));
+                format!("{} {} {}", paint(fg(MID), effort), paint(fg(GRAY), "·"), paint(fg(GRAY), &sanitize_text(rest)))
+            }
+            None => String::new(),
+        };
         if visible_width(&left) > self.width {
             return clip_width(&left, self.width);
         }
-        let mut right = vec![f.provider.clone()];
-        if f.context_window > 0 && f.context_tokens > 0 {
-            right.push(format!("{:.0}% of {}", f.context_tokens as f64 * 100.0 / f.context_window as f64, tokens(f.context_window)));
-        }
-        if f.usage.input_tokens + f.usage.output_tokens > 0 {
-            right.push(format!("↑{} ↓{}", tokens(f.usage.input_tokens), tokens(f.usage.output_tokens)));
-        }
-        right.push(f.sandbox.clone());
-        if f.yolo {
-            right.push("yolo".into());
-        }
-        right.push(one_line(&tilde(&f.cwd), self.width.max(1)));
-        let mut right = right.join(" · ");
+        let right = super::statusline::right(f, self.width).join(" · ");
         let room = self.width.saturating_sub(visible_width(&left) + 4);
-        right = truncate(&right, room);
-        spread(&left, &paint(fg(FAINT), &right), self.width)
+        let right = paint(fg(FAINT), &truncate(&sanitize_text(&right), room));
+        if left.is_empty() {
+            return right;
+        }
+        spread(&left, &right, self.width)
     }
 
     /// The slash-command or model menu under the input. Returns false if none.
@@ -751,6 +770,26 @@ impl Screen {
                 })
                 .collect();
             (header, items, m.selected, vec![("↑↓", "Navigate"), ("Tab", "Provider"), ("Enter", "Use"), ("Esc", "Close")])
+        } else if let Some(m) = &self.settings {
+            let s = crate::settings::current();
+            let live = self.live();
+            let items = m.items(&s, &live);
+            let tabs: Vec<String> = crate::settings::Category::ALL
+                .iter()
+                .map(|c| if *c == m.category { paint(fg(BRIGHT), &format!("[{}]", c.label())) } else { paint(fg(GRAY), c.label()) })
+                .collect();
+            let prefix = format!("{} {}  {}  ", paint(fg(BRIGHT).bold(), "Settings"), paint(fg(GRAY), &items.len().to_string()), tabs.join(" "));
+            let filter_text = if m.filter.is_empty() { "Type to filter" } else { m.filter.as_str() };
+            let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
+            let items = items
+                .iter()
+                .map(|spec| MenuItem {
+                    label: spec.label.to_string(),
+                    detail: sanitize_text(&crate::settings::value(spec.id, &s, &live)),
+                    tag: spec.description.to_string(),
+                })
+                .collect();
+            (header, items, m.selected, vec![("↑↓", "Navigate"), ("Tab", "Category"), ("Enter", "Change"), ("Esc", "Close")])
         } else if let Some(m) = &self.sessions {
             let visible = m.visible();
             let prefix = format!("{} {}  ", paint(fg(BRIGHT).bold(), "Sessions"), paint(fg(GRAY), &visible.len().to_string()));
@@ -787,6 +826,9 @@ impl Screen {
             for warn in &m.warnings {
                 rows.push(paint(fg(YELLOW), &format!("  {}", one_line(warn, w.saturating_sub(2).max(1)))));
             }
+        }
+        if self.settings.is_some() && items.is_empty() {
+            rows.push(paint(fg(GRAY), "  No matching settings."));
         }
         if self.sessions.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No saved sessions found."));
@@ -833,12 +875,20 @@ impl Screen {
     }
 
     pub fn redraw(&mut self) {
+        if self.viewer.is_some() {
+            // The viewer covers the screen; it follows new output.
+            return self.draw_viewer(false);
+        }
         self.clear_pane();
         self.draw_pane();
     }
 
     /// Print finished rows into the scrollback above the pane.
     fn emit(&mut self, rows: &[String]) {
+        if self.viewer.is_some() {
+            self.deferred.extend_from_slice(rows);
+            return self.draw_viewer(false);
+        }
         self.clear_pane();
         for r in rows {
             let _ = self.out.write_all(r.as_bytes());
@@ -862,6 +912,7 @@ impl Screen {
 
     pub fn print_info(&mut self, text: &str, style: Style) {
         let text = sanitize_text(text);
+        self.log.info(&super::render::strip_ansi(&text));
         self.print_styled_info(&text, style);
     }
 
@@ -874,6 +925,7 @@ impl Screen {
 
     /// Rows that should each stay on one screen line (listings).
     pub fn print_list(&mut self, lines: &[String]) {
+        self.log.info(&sanitize_text(&lines.join("\n")));
         let w = self.width;
         let rows: Vec<String> = lines.iter().map(|l| list_row(l, w)).collect();
         self.flush_all();
@@ -884,6 +936,7 @@ impl Screen {
 
     pub fn print_error(&mut self, text: &str) {
         let text = sanitize_text(text);
+        self.log.info(&format!("error: {text}"));
         self.flush_all();
         let mut rows = self.begin(Block::Info);
         for (i, l) in text.lines().enumerate() {
@@ -895,6 +948,7 @@ impl Screen {
 
     pub fn print_user(&mut self, text: &str) {
         let text = sanitize_text(text);
+        self.log.user(&text);
         self.flush_all();
         let w = self.width;
         let mut rows = self.begin(Block::User);
@@ -908,6 +962,8 @@ impl Screen {
 
     pub fn print_markdown(&mut self, text: &str) {
         let text = sanitize_text(text);
+        self.log.text(&text, false);
+        self.log.end_message();
         self.flush_all();
         let mut rows = self.begin(Block::Text);
         self.md = Markdown::default();
@@ -987,6 +1043,7 @@ impl Screen {
 
     fn stream(&mut self, block: Block, text: &str) {
         let text = sanitize_text(text);
+        self.log.text(&text, block == Block::Reasoning);
         if self.live_block != block {
             self.flush_live();
             self.flush_tools();
@@ -1053,6 +1110,7 @@ impl Screen {
 
     fn tool_start(&mut self, tool: &str, summary: &str) {
         self.flush_live();
+        self.log.tool_start(tool, summary);
         let (verb, target) = describe_tool(tool, summary);
         self.tools.push(ToolRow { tool: tool.into(), verb, target, note: String::new(), detail: Vec::new(), status: Status::Running });
         self.set_label(&format!("Running {}", tool.replace('_', " ")));
@@ -1060,6 +1118,7 @@ impl Screen {
     }
 
     fn tool_end(&mut self, output: &ToolOutput) {
+        self.log.tool_end(&output.content, output.display.as_deref(), output.is_error);
         let Some(t) = self.tools.iter_mut().rev().find(|t| t.status == Status::Running) else { return };
         t.status = if output.is_error { Status::Failed } else { Status::Ok };
         if let Some(d) = output.display.as_deref().filter(|d| looks_like_diff(d)) {
@@ -1188,6 +1247,132 @@ impl Screen {
         self.redraw();
     }
 
+    /// Session state for the settings menu.
+    fn live(&self) -> crate::settings::Live {
+        let f = &self.footer;
+        crate::settings::Live {
+            model: if f.provider.is_empty() { f.model.clone() } else { format!("{} · {}", f.provider, f.model) },
+            effort: f.effort.clone(),
+            efforts: f.efforts.clone(),
+            fast: f.fast,
+            fast_supported: f.fast_supported,
+            yolo: f.yolo,
+        }
+    }
+
+    /// Open the settings menu on `category`.
+    pub fn open_settings(&mut self, category: crate::settings::Category) {
+        self.menu = None;
+        self.sessions = None;
+        self.settings = Some(super::settings::SettingsMenu::new(category));
+        self.redraw();
+    }
+
+    fn on_settings_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        use super::settings::MenuAction;
+        use crate::settings::Id;
+        let current = crate::settings::current();
+        let live = self.live();
+        let Some(m) = &mut self.settings else { return };
+        match m.on_key(key, &current, &live) {
+            MenuAction::None => {}
+            MenuAction::Close => self.settings = None,
+            MenuAction::OpenModels => {
+                self.settings = None;
+                let _ = commands.send(Command::Submit("/model".into()));
+            }
+            MenuAction::Change(id, value) => {
+                let mut next = current.clone();
+                if crate::settings::apply(id, &value, &mut next) {
+                    match crate::settings::update(&self.home, |s| *s = next.clone()) {
+                        Ok(saved) => {
+                            self.footer.segments = saved.statusline;
+                            crate::agent::set_auto_compact_percent(saved.auto_compact);
+                        }
+                        Err(e) => self.hint = Some(format!("Could not save settings: {e:#}")),
+                    }
+                    if id == Id::Sandbox {
+                        self.hint = Some("The default sandbox applies from the next start.".into());
+                    }
+                } else {
+                    // Session settings belong to the app loop; show them at once.
+                    match id {
+                        Id::Effort => self.footer.effort = Some(value.clone()).filter(|v| v != "auto"),
+                        Id::Fast => self.footer.fast = value == "on",
+                        Id::Permission => self.footer.yolo = value == "yolo",
+                        _ => {}
+                    }
+                    if self.is_busy() {
+                        self.hint = Some("Applies when the current task finishes.".into());
+                    }
+                    let _ = commands.send(Command::Setting(id, value));
+                }
+            }
+        }
+        self.redraw();
+    }
+
+    /// Add an image to the next message.
+    pub fn attach(&mut self, image: crate::types::Image, label: &str) {
+        let label = sanitize_text(label);
+        self.attachments.push(Attachment { label, image });
+        self.hint = Some(format!("Attached [Image #{}] · /images lists or removes attachments", self.attachments.len()));
+        self.redraw();
+    }
+
+    // ------------------------------------------------------- transcript viewer
+
+    pub fn open_transcript(&mut self) {
+        if self.viewer.is_some() {
+            return;
+        }
+        // Commit what is on screen so the viewer and the scrollback agree.
+        self.clear_pane();
+        let _ = self.out.flush();
+        let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide);
+        self.viewer = Some(super::transcript::Viewer::new(&self.log, self.width, self.height));
+        self.draw_viewer(true);
+    }
+
+    /// Leave the viewer and restore the inline UI with anything printed meanwhile.
+    pub fn close_transcript(&mut self) {
+        if self.viewer.take().is_none() {
+            return;
+        }
+        let _ = execute!(self.out, terminal::LeaveAlternateScreen, cursor::Show);
+        self.pane_rows = 0;
+        self.cursor_row = 0;
+        let rows = std::mem::take(&mut self.deferred);
+        if rows.is_empty() {
+            self.draw_pane();
+        } else {
+            self.emit(&rows);
+        }
+    }
+
+    fn draw_viewer(&mut self, force: bool) {
+        let Some(v) = &mut self.viewer else { return };
+        if !v.refresh(&self.log, self.width, self.height) && !force {
+            return;
+        }
+        let frame = v.frame();
+        let _ = queue!(self.out, terminal::BeginSynchronizedUpdate, cursor::MoveTo(0, 0));
+        for (i, row) in frame.iter().enumerate() {
+            let _ = queue!(self.out, cursor::MoveTo(0, i as u16), terminal::Clear(terminal::ClearType::CurrentLine));
+            let _ = self.out.write_all(row.as_bytes());
+        }
+        let _ = queue!(self.out, terminal::EndSynchronizedUpdate);
+        let _ = self.out.flush();
+    }
+
+    fn on_viewer_key(&mut self, key: KeyEvent) {
+        let Some(v) = &mut self.viewer else { return };
+        match v.on_key(key) {
+            super::transcript::Action::Close => self.close_transcript(),
+            super::transcript::Action::Stay => self.draw_viewer(true),
+        }
+    }
+
     fn remember(&mut self, text: &str) {
         self.editor.push_history(text);
         if self.history.last().map(String::as_str) != Some(text) {
@@ -1272,8 +1457,14 @@ impl Screen {
             self.redraw();
             return;
         }
+        if self.viewer.is_some() {
+            return self.on_viewer_key(key);
+        }
         if self.menu.is_some() {
             return self.on_menu_key(key, commands);
+        }
+        if self.settings.is_some() {
+            return self.on_settings_key(key, commands);
         }
         if self.sessions.is_some() {
             return self.on_sessions_key(key, commands);
@@ -1317,6 +1508,14 @@ impl Screen {
             return self.redraw();
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl && key.code == KeyCode::Char('o') {
+            return self.open_transcript();
+        }
+        if ctrl && key.code == KeyCode::Char('v') {
+            self.clipboard_request = true;
+            self.hint = Some("Reading the clipboard…".into());
+            return self.redraw();
+        }
         if ctrl && key.code == KeyCode::Char('l') {
             let _ = commands.send(Command::Submit("/model".into()));
             return;
@@ -1534,6 +1733,19 @@ impl Tui {
                                 }
                             }
                             s.on_key(k, &tx);
+                            if std::mem::take(&mut s.clipboard_request) {
+                                let screen = screen.clone();
+                                tokio::spawn(async move {
+                                    let result = tokio::task::spawn_blocking(super::clipboard::read_image).await.unwrap_or_else(|e| Err(e.to_string()));
+                                    let mut s = lock(&screen);
+                                    s.hint = None;
+                                    match result {
+                                        Ok(image) => s.attach(image, "clipboard"),
+                                        Err(e) => s.hint = Some(e),
+                                    }
+                                    s.redraw();
+                                });
+                            }
                             // Exclude rendering time when measuring the pause between keys.
                             #[cfg(windows)]
                             {
@@ -1606,12 +1818,15 @@ impl Drop for Tui {
         }
         {
             let mut s = lock(&self.screen);
+            s.close_transcript();
             s.flush_all();
             s.clear_pane();
             let _ = s.out.flush();
             let skip = s.history.len().saturating_sub(1000);
             let history: Vec<String> = s.history[skip..].iter().map(|h| serde_json::to_string(h).unwrap_or_default()).collect();
-            let _ = crate::session::write_private(&self.history_path, (history.join("\n") + "\n").as_bytes());
+            if crate::settings::current().prompt_history {
+                let _ = crate::session::write_private(&self.history_path, (history.join("\n") + "\n").as_bytes());
+            }
         }
         *SCREEN.lock().unwrap() = None;
         if self.enhanced {
@@ -1715,6 +1930,7 @@ async fn approve_on(screen: &Arc<Mutex<Screen>>, origin: Option<&str>, req: &App
             };
             one_line(&o, 200)
         });
+        crate::notify::notify(&crate::notify::Event::Attention(&format!("Approve: {verb} {}", one_line(&target, 80))));
         s.approval = Some(PendingApproval {
             title,
             lines,
@@ -1794,6 +2010,7 @@ impl Ui for TuiUi {
 
     fn end_message(&mut self) {
         let mut s = self.s();
+        s.log.end_message();
         s.flush_live();
         s.set_label("Working");
         s.redraw();
@@ -1843,6 +2060,7 @@ impl Ui for TuiUi {
         {
             let mut s = self.s();
             s.flush_all();
+            crate::notify::notify(&crate::notify::Event::Attention(&format!("Question: {}", one_line(question, 120))));
             s.question = Some(PendingQuestion {
                 question: sanitize_text(question),
                 options: options.iter().map(|o| one_line(o, 200)).collect(),

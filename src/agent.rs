@@ -17,8 +17,21 @@ use crate::types::{Item, Request, StreamEvent, Usage};
 /// Upper bound on model round-trips per user turn.
 const MAX_STEPS: usize = 100;
 
-/// Compact automatically once a request uses this share of the context window.
-const AUTO_COMPACT_AT: f64 = 0.8;
+/// Compact automatically once a request uses this share of the context
+/// window (percent, from settings; 0 turns automatic compaction off).
+static AUTO_COMPACT_PERCENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(80);
+
+pub fn set_auto_compact_percent(percent: u8) {
+    AUTO_COMPACT_PERCENT.store(percent.min(100), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The compaction threshold as a fraction; above 1 (never reached) when off.
+fn auto_compact_at() -> f64 {
+    match AUTO_COMPACT_PERCENT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => f64::INFINITY,
+        p => f64::from(p) / 100.0,
+    }
+}
 
 const COMPACT_PROMPT: &str = "\
 Summarize this conversation so far so that work can continue from the summary alone; \
@@ -498,7 +511,7 @@ impl Agent {
             });
         self.context_estimated = false;
         self.suppress_auto_compact = self.context_window > 0
-            && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT;
+            && self.context_tokens as f64 >= self.context_window as f64 * auto_compact_at();
         if let Some(u) = response.usage {
             self.usage.input_tokens += u.input_tokens;
             self.usage.output_tokens += u.output_tokens;
@@ -544,7 +557,7 @@ impl Agent {
         if self.suppress_auto_compact
             || self.submitted == 0
             || self.context_window == 0
-            || (self.context_tokens as f64) < (self.context_window as f64) * AUTO_COMPACT_AT
+            || (self.context_tokens as f64) < (self.context_window as f64) * auto_compact_at()
         {
             return Ok(true);
         }
@@ -577,7 +590,7 @@ impl Agent {
             self.push(item);
         }
         self.submitted = kept;
-        if self.context_window > 0 && self.context_tokens as f64 >= self.context_window as f64 * AUTO_COMPACT_AT {
+        if self.context_window > 0 && self.context_tokens as f64 >= self.context_window as f64 * auto_compact_at() {
             self.suppress_auto_compact = true;
             ui.notice(
                 "Still over the automatic compaction limit after compacting (the system prompt alone may exceed it). Automatic compaction is off for the rest of this session.",

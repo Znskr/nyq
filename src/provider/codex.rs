@@ -16,6 +16,8 @@ pub struct CodexProvider {
     pub auth_path: PathBuf,
     pub model: String,
     pub effort: Option<String>,
+    /// Request the `priority` service tier (fast mode).
+    pub fast: bool,
     auth: Arc<Mutex<Option<Auth>>>,
     session_id: String,
     client: reqwest::Client,
@@ -134,12 +136,37 @@ pub fn jwt_exp_ms(token: &str) -> Option<i64> {
         .and_then(|s| s.checked_mul(1000))
 }
 
+/// Models the catalog listed with a `fast` speed tier; None until the
+/// catalog has been fetched in this process.
+static FAST_MODELS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+fn remember_fast_models(models: Vec<String>) {
+    let mut known = FAST_MODELS.lock().unwrap_or_else(|e| e.into_inner());
+    let list = known.get_or_insert_with(Vec::new);
+    for m in models {
+        if !list.contains(&m) {
+            list.push(m);
+        }
+    }
+}
+
+/// Whether the model catalog has been fetched (so fast-mode support is known).
+pub fn fast_models_known() -> bool {
+    FAST_MODELS.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// Whether `model` offers fast mode (false until the catalog is known).
+pub fn supports_fast(model: &str) -> bool {
+    FAST_MODELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.iter().any(|s| s == model))
+}
+
 impl CodexProvider {
     pub fn new(auth_path: PathBuf, model: String, effort: Option<String>) -> Self {
         Self {
             auth_path,
             model,
             effort,
+            fast: false,
             auth: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4().to_string(),
             client: reqwest::Client::new(),
@@ -161,6 +188,8 @@ impl CodexProvider {
             #[serde(default)]
             supported_reasoning_levels: Vec<Level>,
             context_window: Option<u64>,
+            #[serde(default)]
+            additional_speed_tiers: Vec<String>,
         }
         #[derive(Deserialize)]
         struct Level {
@@ -189,6 +218,7 @@ impl CodexProvider {
             .models
             .retain(|m| m.visibility == "list" && m.supported_in_api != Some(false));
         catalog.models.sort_by_key(|m| m.priority);
+        remember_fast_models(catalog.models.iter().filter(|m| m.additional_speed_tiers.iter().any(|t| t == "fast")).map(|m| m.slug.clone()).collect());
         Ok(catalog
             .models
             .into_iter()
@@ -225,6 +255,10 @@ impl CodexProvider {
         if let Some(effort) = &self.effort {
             body["reasoning"] =
                 json!({"effort":if effort == "minimal" { "low" } else { effort },"summary":"auto"});
+        }
+        // Codex exposes fast mode as the priority service tier.
+        if self.fast && self.supports_fast() {
+            body["service_tier"] = json!("priority");
         }
         body
     }
@@ -398,6 +432,7 @@ impl Provider for CodexProvider {
             auth_path: self.auth_path.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            fast: self.fast,
             auth: Arc::clone(&self.auth),
             session_id: uuid::Uuid::new_v4().to_string(),
             client: self.client.clone(),
@@ -418,6 +453,15 @@ impl Provider for CodexProvider {
     }
     fn set_effort(&mut self, effort: Option<String>) {
         self.effort = effort.filter(|e| e != "auto");
+    }
+    fn fast(&self) -> bool {
+        self.fast && self.supports_fast()
+    }
+    fn set_fast(&mut self, fast: bool) {
+        self.fast = fast;
+    }
+    fn supports_fast(&self) -> bool {
+        supports_fast(&self.model)
     }
 
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
@@ -662,6 +706,27 @@ mod tests {
             })
             .get("reasoning")
             .is_none());
+    }
+
+    #[test]
+    fn fast_mode_requests_priority_tier() {
+        let empty = || Request { system: "", items: &[], tools: &[] };
+        let mut provider = CodexProvider::new(PathBuf::new(), "fast-capable-test".into(), None);
+        provider.set_fast(true);
+        // Unknown support: no tier is requested.
+        if !supports_fast("fast-capable-test") {
+            assert!(provider.body(empty()).get("service_tier").is_none());
+        }
+        remember_fast_models(vec!["fast-capable-test".into()]);
+        assert!(fast_models_known() && provider.supports_fast() && provider.fast());
+        assert_eq!(provider.body(empty())["service_tier"], "priority");
+        assert!(provider.fork().fast());
+        provider.set_fast(false);
+        assert!(provider.body(empty()).get("service_tier").is_none());
+        provider.set_fast(true);
+        provider.set_model("slow-only-test".into());
+        assert!(!provider.fast());
+        assert!(provider.body(empty()).get("service_tier").is_none());
     }
 
     fn completed() -> Value {

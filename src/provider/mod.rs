@@ -20,6 +20,15 @@ pub trait Provider: Send + Sync {
         None
     }
     fn set_effort(&mut self, _effort: Option<String>) {}
+    /// Fast mode (Codex: the `priority` service tier).
+    fn fast(&self) -> bool {
+        false
+    }
+    fn set_fast(&mut self, _fast: bool) {}
+    /// Whether the current model offers fast mode.
+    fn supports_fast(&self) -> bool {
+        false
+    }
     /// A stable id for the current conversation, sent where the backend uses
     /// one for routing and prompt caching (Codex `session_id`,
     /// OpenCode Go `x-opencode-session`).
