@@ -1269,7 +1269,12 @@ mod tests {
             acp::ContentBlock::Image(acp::ImageContent::new("aGk=", "image/png")),
         ];
         let Item::User { text, images } = user_item(&blocks, cwd) else { panic!() };
-        assert!(text.starts_with("look at @/work/src/main.rs@/work/lib.rs"), "{text}");
+        // `file:///work/...` is a local path only on Unix; Windows keeps the link.
+        if cfg!(unix) {
+            assert!(text.starts_with("look at @/work/src/main.rs@/work/lib.rs"), "{text}");
+        } else {
+            assert!(text.starts_with("look at ") && text.contains("file:///work/src/main.rs"), "{text}");
+        }
         assert!(text.contains("<context ref=\"file:///work/lib.rs\">\nfn main() {}\n</context>"), "{text}");
         assert_eq!(images, vec![Image { media_type: "image/png".into(), data: "aGk=".into() }]);
     }
