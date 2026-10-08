@@ -568,7 +568,7 @@ async fn run() -> Result<()> {
             },
         )
         .await;
-        let mut plain = ui::PlainUi::new(permission_mode.is_yolo());
+        let mut plain = ui::PlainUi::new(agent.permission_mode.is_yolo());
         let cancel = cancel_on_ctrl_c();
         if let Some(msg) = hooks::prompt_submit(&mut agent, &text, &cancel).await {
             mcp.shutdown().await;
