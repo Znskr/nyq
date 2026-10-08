@@ -140,7 +140,8 @@ impl Tool for Subagent {
         let cancel = ctx.cancel.child_token();
         let result = drive_turn(agent.turn(Item::user(task), &mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await;
         let display = Some(ui.display());
-        let fail = |msg: String| ToolOutput { display: display.clone(), ..ToolOutput::err(msg) };
+        let undo = std::mem::take(&mut agent.undo);
+        let fail = |msg: String| ToolOutput { display: display.clone(), undo: undo.clone(), ..ToolOutput::err(msg) };
         match result {
             Err(e) if e.to_string().contains("timed out") => {
                 return fail(format!("Subagent timed out after {} minutes.", TIMEOUT.as_secs() / 60));
@@ -165,7 +166,7 @@ impl Tool for Subagent {
             agent.usage.input_tokens,
             agent.usage.output_tokens
         ));
-        ToolOutput { display, ..ToolOutput::ok(content) }
+        ToolOutput { display, undo, ..ToolOutput::ok(content) }
     }
 }
 
@@ -365,7 +366,11 @@ mod tests {
         let out = Subagent.run(json!({"task": "write", "mode": "general"}), &c).await;
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "x");
-        std::fs::remove_file(dir.path().join("out.txt")).unwrap();
+        let mut parent_undo = crate::undo::UndoLog::default();
+        parent_undo.append(out.undo);
+        assert_eq!(parent_undo.len(), 1);
+        parent_undo.undo().unwrap();
+        assert!(!dir.path().join("out.txt").exists());
 
         let fake = Fake::default();
         *fake.script.lock().unwrap() = vec![write(), done()];
