@@ -363,3 +363,73 @@ fn oversized_compaction_warns_and_continues() {
     let next = seen[2]["messages"].to_string();
     assert!(!next.contains("Summarize this conversation"), "{next}");
 }
+
+#[test]
+fn usage_is_logged_and_reported_without_exposing_auth() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("models.json"), r#"{"openai":{"models":{"priced":{"cost":{"input":2,"output":8,"cache_read":0.5}}}}}"#).unwrap();
+    let (url, _) = fake_server(vec![vec![
+        delta(json!({"content":"Done."})),
+        json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":40}}}),
+    ]]);
+    let mut cmd = print_command(work.path(), home.path(), &url);
+    let out = cmd.env("NYQ_MODEL", "priced").arg("hello").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let log = std::fs::read_to_string(home.path().join("usage.jsonl")).unwrap();
+    assert_eq!(log.lines().count(), 1);
+    let r: Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!((r["input"].as_u64(), r["cached"].as_u64(), r["output"].as_u64()), (Some(100),Some(40),Some(20)));
+    assert_eq!(r["provider"], "openai");
+    assert_eq!(r["model"], "priced");
+    assert!(!r["session"].as_str().unwrap().is_empty());
+    assert!((r["cost_usd"].as_f64().unwrap() - 0.0003).abs() < 1e-12);
+    let report = Command::new(env!("CARGO_BIN_EXE_nyq")).args(["usage", "--period", "24h"])
+        .env("HOME", home.path()).env("NYQ_HOME", home.path()).output().unwrap();
+    assert!(report.status.success());
+    let text = String::from_utf8_lossy(&report.stderr);
+    assert!(text.contains("openai/priced: 1 requests"), "{text}");
+    assert!(text.contains("$0.000300"), "{text}");
+    let out = Command::new(env!("CARGO_BIN_EXE_nyq")).args(["status", "--json", "--provider", "openai"])
+        .env("HOME", home.path()).env("NYQ_HOME", home.path()).env("NYQ_BASE_URL", &url)
+        .env("NYQ_MODEL", "priced").env("NYQ_API_KEY", "must-never-appear").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("must-never-appear"));
+    let status: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(status["model"], "priced");
+    assert!(status["auth_sources"].as_array().unwrap().contains(&json!("NYQ_API_KEY")));
+}
+
+#[test]
+fn usage_status_and_doctor_commands_work_without_model_requests() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let record = json!({"ts":chrono::Utc::now(),"session":"s","provider":"openai","model":"priced","input":100,"cached":40,"output":20,"cost_usd":0.0003});
+    std::fs::write(home.path().join("usage.jsonl"), format!("{record}\n")).unwrap();
+    let command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nyq"));
+        cmd.current_dir(work.path()).env("HOME", home.path()).env("NYQ_HOME", home.path())
+            .env_remove("NYQ_PROVIDER").env_remove("NYQ_MODEL").env_remove("NYQ_BASE_URL").env_remove("NYQ_API_KEY")
+            .env("NYQ_CODEX_AUTH", home.path().join("missing.json"));
+        cmd
+    };
+    let report = command().args(["usage", "--period", "24h"]).output().unwrap();
+    assert!(report.status.success());
+    assert!(String::from_utf8_lossy(&report.stderr).contains("openai/priced: 1 requests"));
+    let status = command().args(["status", "--json", "--provider", "openai"])
+        .env("NYQ_BASE_URL", "http://127.0.0.1:1/v1").env("NYQ_MODEL", "priced")
+        .env("NYQ_API_KEY", "must-never-appear").output().unwrap();
+    assert!(status.status.success());
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(!text.contains("must-never-appear"));
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["model"], "priced");
+    assert!(v["auth_sources"].as_array().unwrap().contains(&json!("NYQ_API_KEY")));
+    let doctor = command().args(["doctor", "--sandbox", "off"]).output().unwrap();
+    assert!(!doctor.status.success());
+    let text = String::from_utf8_lossy(&doctor.stderr);
+    assert!(text.contains("✗ auth:"));
+    assert!(text.contains("run nyq login"));
+    assert!(text.contains("✓ profile:"));
+}

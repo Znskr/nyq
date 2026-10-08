@@ -1,6 +1,9 @@
 mod acp;
 mod agent;
 mod config;
+mod doctor;
+mod pricing;
+mod usage;
 mod login;
 mod mcp;
 mod models;
@@ -66,6 +69,14 @@ struct Cli {
 enum Command {
     /// List saved conversations.
     Sessions,
+    /// Summarize recorded usage (default: 30 days).
+    Usage { #[arg(long, value_enum, default_value = "30d")] period: usage::Period },
+    /// Show configuration and runtime status without contacting providers.
+    Status { #[arg(long)] json: bool },
+    /// Check authentication, endpoint, sandbox and local environment health.
+    Doctor,
+    /// List the same provider model catalog as the interactive picker.
+    Models,
     /// Sign in with your ChatGPT subscription (Codex models).
     Login,
     /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
@@ -86,7 +97,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
     ("/permissions", "permission rules and session grants; /permissions reload re-reads them"),
     ("/yolo", "toggle auto-approval of tool calls"),
-    ("/usage", "token usage for this conversation"),
+    ("/usage", "profile usage totals: /usage [24h|7d|30d]"),
+    ("/stats", "session turns, requests, tokens, tools and duration"),
+    ("/status", "configuration and runtime status"),
+    ("/version", "show nyq version"),
     ("/exit", "quit (also Ctrl-D)"),
 ];
 
@@ -110,6 +124,21 @@ async fn run() -> Result<()> {
     let sessions_dir = home.join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
 
+    match &cli.command {
+        Some(Command::Usage { period }) => return usage::show(&home, *period),
+        Some(Command::Models) => { doctor::models(&home).await; return Ok(()); }
+        Some(Command::Status { json }) => {
+            let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref()).ok();
+            let policy = sandbox::Policy { mode: cli.sandbox.unwrap_or_default(), network: cli.allow_network, writable: Vec::new() };
+            return doctor::cli_status(&home, &cwd, provider.as_deref(), &policy, *json);
+        }
+        Some(Command::Doctor) => {
+            let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref()).ok();
+            let policy = sandbox::Policy { mode: cli.sandbox.unwrap_or_default(), network: cli.allow_network, writable: Vec::new() };
+            return doctor::doctor(&home, &cwd, provider.as_deref(), &policy).await;
+        }
+        _ => {}
+    }
     match cli.command {
         Some(Command::Sessions) => return list_sessions(&sessions_dir),
         Some(Command::Login) => {
@@ -125,7 +154,7 @@ async fn run() -> Result<()> {
             let opts = acp::Options { yolo: cli.yolo, sandbox: cli.sandbox, allow_network: cli.allow_network, model: cli.model, provider: cli.provider };
             return acp::run(opts).await;
         }
-        None => {}
+        _ => {}
     }
 
     let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
@@ -141,6 +170,7 @@ async fn run() -> Result<()> {
         allowed: HashSet::new(),
         permissions: std::sync::Arc::new(load_permissions(&home, &cwd)),
         usage: Usage::default(),
+            stats: Default::default(),
         context_window: 0,
         context_tokens: 0,
         context_estimated: false,
@@ -650,10 +680,10 @@ async fn slash(
             agent.yolo = !agent.yolo;
             ui::info(if agent.yolo { "Auto-approve on: tools run without asking." } else { "Auto-approve off." });
         }
-        "/usage" => {
-            let u = agent.usage;
-            ui::info(&format!("input {} (cached {}) · output {}", u.input_tokens, u.cached_tokens, u.output_tokens));
-        }
+        "/usage" => usage::show(&config::home(), usage::Period::parse(arg.first().copied().unwrap_or("30d"))?)?,
+        "/stats" => agent.stats.show(agent.usage),
+        "/status" => doctor::show_agent_status(agent, mcp, servers, skills.len())?,
+        "/version" => doctor::version(),
         other => ui::error(&format!("unknown command {other} (try /help)")),
     }
     Ok(true)
