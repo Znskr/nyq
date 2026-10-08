@@ -472,12 +472,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(home.join("auth.json")).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        // The OpenCode CLI's login wins over nyq's, per service id.
-        let cli = user.path().join(".local/share/opencode");
-        std::fs::create_dir_all(&cli).unwrap();
-        std::fs::write(cli.join("auth.json"), r#"{"opencode-go":{"type":"api","key":"cli-go"},"opencode":{"type":"api","key":"cli-zen"}}"#).unwrap();
-        assert_eq!(api_key(home, Service::OpencodeGo).as_deref(), Some("cli-go"));
-        assert_eq!(api_key(home, Service::Opencode).as_deref(), Some("cli-zen"));
+        // The OpenCode CLI's login wins over nyq's, per service id. (Found via
+        // HOME, which Windows does not use to locate the home directory.)
+        #[cfg(unix)]
+        {
+            let cli = user.path().join(".local/share/opencode");
+            std::fs::create_dir_all(&cli).unwrap();
+            std::fs::write(cli.join("auth.json"), r#"{"opencode-go":{"type":"api","key":"cli-go"},"opencode":{"type":"api","key":"cli-zen"}}"#).unwrap();
+            assert_eq!(api_key(home, Service::OpencodeGo).as_deref(), Some("cli-go"));
+            assert_eq!(api_key(home, Service::Opencode).as_deref(), Some("cli-zen"));
+        }
         // XDG_DATA_HOME is checked first.
         let xdg = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(xdg.path().join("opencode")).unwrap();
