@@ -1,3 +1,4 @@
+mod account;
 mod acp;
 mod agent;
 mod catalog;
@@ -11,6 +12,7 @@ mod pricing;
 mod usage;
 mod login;
 mod mcp;
+mod mcp_cli;
 mod mcp_features;
 mod models;
 mod notify;
@@ -159,6 +161,22 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Choose the default provider (codex, opencode-go, opencode, xai, vercel, openai, ollama).
+    Provider { name: Option<String> },
+    /// Show sign-in status per provider and the default; on a terminal, set them up.
+    Setup,
+    /// Choose the Vercel team used by AI Gateway (not available with API keys).
+    Teams,
+    /// Show the AI Gateway credit balance.
+    #[command(alias = "balance")]
+    Credits { #[arg(long)] json: bool },
+    /// Show the permission mode and rules.
+    Permissions { #[arg(long)] json: bool },
+    /// Manage MCP servers and project trust without opening the interactive shell.
+    Mcp {
+        #[command(subcommand)]
+        action: mcp_cli::McpCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -225,7 +243,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tools", "list available tools"),
     ("/skills", "skills: /skills [list|install SOURCE [--project]|remove NAME|info NAME|create NAME|path]"),
     ("/agents", "named subagents: /agents [list|show NAME|stop NAME|delete NAME]"),
-    ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
+    ("/login", "sign in: ChatGPT in the browser, or an API key (hidden input)"),
+    ("/logout", "remove nyq's stored sign-in: /logout [provider]"),
+    ("/setup", "connections, default provider, credential source, AI Gateway"),
+    ("/credits", "AI Gateway credit balance (also /balance)"),
+    ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME] · /mcp trust …"),
     ("/memory", "saved memories; /memory remove N forgets one"),
     ("/background", "background processes; /background kill ID|last"),
     ("/permissions", "permission rules and session grants; /permissions reload re-reads them"),
@@ -297,6 +319,11 @@ async fn run() -> Result<()> {
             };
             return workspace::run_cli(&home, &cwd, request);
         }
+        Some(Command::Provider { name }) => return account::cli_provider(&home, name.as_deref()),
+        Some(Command::Setup) => return account::cli_setup(&home).await,
+        Some(Command::Teams) => return account::cli_teams(&home),
+        Some(Command::Credits { json }) => return account::cli_credits(&home, *json).await,
+        Some(Command::Permissions { json }) => return account::cli_permissions(&home, &cwd, *json),
         _ => {}
     }
     match cli.command {
@@ -324,6 +351,7 @@ async fn run() -> Result<()> {
             println!("{}", login::logout(&home, &provider)?);
             return Ok(());
         }
+        Some(Command::Mcp { action }) => return mcp_cli::run(&home, &cwd, action).await,
         Some(Command::Acp) => {
             let opts = acp::Options {
                 yolo: cli.yolo,
@@ -778,18 +806,23 @@ async fn connect_profile_servers(
     servers: &[ServerConfig],
     quiet: bool,
 ) {
-    for cfg in servers.iter().filter(|s| s.scope == Scope::Profile) {
+    // Project servers connect too once trusted (`nyq mcp trust`), unless a
+    // profile server has the same name.
+    let trusted = mcp_cli::trusted_project(&config::home(), &agent.cwd);
+    let profile = |name: &str| servers.iter().any(|s| s.scope == Scope::Profile && s.name == name);
+    let starts = |s: &ServerConfig| s.scope == Scope::Profile || (trusted.contains(&s.name) && !profile(&s.name));
+    for cfg in servers.iter().filter(|s| starts(s)) {
         connect(mcp, agent, cfg, quiet).await;
     }
     if !quiet {
         let project: Vec<_> = servers
             .iter()
-            .filter(|s| s.scope == Scope::Project)
+            .filter(|s| !starts(s))
             .map(|s| s.name.as_str())
             .collect();
         if !project.is_empty() {
             ui::info(&format!(
-                "Project MCP servers in .mcp.json: {} (connect with /mcp connect NAME)",
+                "Project MCP servers in .mcp.json: {} (connect with /mcp connect NAME, or trust with /mcp trust approve NAME)",
                 project.join(", ")
             ));
         }
@@ -1026,6 +1059,7 @@ async fn slash(
         }
         "/mcp" => {
             match (arg.first().copied(), arg.get(1).copied()) {
+                (Some("trust"), _) => ui::list(&mcp_cli::trust_slash(&config::home(), &agent.cwd, &arg[1..])?),
                 (Some("connect"), Some(name)) => {
                     let cfg = servers
                         .iter()
@@ -1111,6 +1145,7 @@ async fn slash(
             )),
         },
         "/hooks" => hooks::command(agent, arg.first().copied()),
+        "/login" | "/logout" | "/setup" | "/credits" | "/balance" => account::slash(cmd, &arg, agent, tui).await?,
         "/yolo" => {
             agent.yolo = !agent.yolo;
             ui::info(if agent.yolo {
@@ -1224,6 +1259,18 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["nyq", "workspace", "add"]).is_err());
+        assert!(matches!(parse(&["nyq", "balance", "--json"]).command, Some(Command::Credits { json: true })));
+        assert!(matches!(parse(&["nyq", "provider", "xai"]).command, Some(Command::Provider { name: Some(n) }) if n == "xai"));
+        match parse(&["nyq", "mcp", "add", "fs", "--env", "A=1", "--", "npx", "-y", "srv"]).command {
+            Some(Command::Mcp { action: mcp_cli::McpCommand::Add { name, env, command, .. } }) => {
+                assert_eq!((name.as_str(), env, command), ("fs", vec!["A=1".to_string()], vec!["npx".to_string(), "-y".into(), "srv".into()]));
+            }
+            _ => panic!("mcp add did not parse"),
+        }
+        assert!(matches!(
+            parse(&["nyq", "mcp", "trust", "approve", "x"]).command,
+            Some(Command::Mcp { action: mcp_cli::McpCommand::Trust { action: Some(mcp_cli::TrustAction::Approve { .. }) } })
+        ));
         assert!(Cli::try_parse_from(["nyq", "session", "delete"]).is_err());
     }
 

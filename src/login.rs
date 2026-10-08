@@ -293,14 +293,23 @@ fn open_browser_windows(url: &str) {
 /// `nyq login <service>`: read an API key from the terminal (hidden) or
 /// stdin and store it in `<home>/auth.json`.
 pub fn login_key(home: &Path, service: Service) -> Result<String> {
-    let site = match service {
+    eprintln!("Paste your {} API key from {} and press Enter:", service.title(), key_site(service));
+    let key = read_secret()?;
+    store_key(home, service, &key)
+}
+
+/// Where to get an API key for `service`.
+pub fn key_site(service: Service) -> &'static str {
+    match service {
         Service::OpencodeGo | Service::Opencode => "https://opencode.ai/auth",
         Service::Xai => "https://console.x.ai",
         Service::Vercel => "https://vercel.com/dashboard (AI Gateway → API Keys)",
-    };
-    eprintln!("Paste your {} API key from {site} and press Enter:", service.title());
-    let key = read_secret()?;
-    hosted::save_key(home, service, &key)?;
+    }
+}
+
+/// Save `key` for `service`, noting when an environment key takes precedence.
+pub fn store_key(home: &Path, service: Service, key: &str) -> Result<String> {
+    hosted::save_key(home, service, key)?;
     let mut msg = format!("Saved your {} key in {}.", service.title(), home.join("auth.json").display());
     if hosted::api_key(home, service).as_deref() != Some(key.trim()) {
         let other = if service.key_env() == "OPENCODE_API_KEY" { "OPENCODE_API_KEY or the OpenCode CLI's login" } else { service.key_env() };
