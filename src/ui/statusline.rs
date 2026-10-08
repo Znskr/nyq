@@ -16,7 +16,9 @@ pub fn tokens(n: u64) -> String {
 
 pub fn tilde(path: &str) -> String {
     match dirs::home_dir().map(|h| h.display().to_string()) {
-        Some(h) if !h.is_empty() && (path == h || path.starts_with(&format!("{h}/"))) => format!("~{}", &path[h.len()..]),
+        Some(h) if !h.is_empty() && (path == h || path.starts_with(&format!("{h}/"))) => {
+            format!("~{}", &path[h.len()..])
+        }
         _ => path.to_string(),
     }
 }
@@ -43,17 +45,25 @@ pub fn right(f: &Footer, width: usize) -> Vec<String> {
         out.push(f.provider.clone());
     }
     if on(Segment::Context) && f.context_window > 0 && f.context_tokens > 0 {
-        out.push(format!("{:.0}% of {}", f.context_tokens as f64 * 100.0 / f.context_window as f64, tokens(f.context_window)));
+        out.push(format!(
+            "{:.0}% of {}",
+            f.context_tokens as f64 * 100.0 / f.context_window as f64,
+            tokens(f.context_window)
+        ));
     }
     if on(Segment::Tokens) && f.usage.input_tokens + f.usage.output_tokens > 0 {
-        out.push(format!("↑{} ↓{}", tokens(f.usage.input_tokens), tokens(f.usage.output_tokens)));
+        out.push(format!(
+            "↑{} ↓{}",
+            tokens(f.usage.input_tokens),
+            tokens(f.usage.output_tokens)
+        ));
     }
     if on(Segment::Sandbox) {
         if !f.sandbox.is_empty() {
             out.push(f.sandbox.clone());
         }
-        if f.yolo {
-            out.push("yolo".into());
+        if !f.permission_mode.is_empty() {
+            out.push(f.permission_mode.clone());
         }
     }
     if on(Segment::Folder) && !f.cwd.is_empty() {
@@ -109,8 +119,12 @@ mod tests {
             model: "gpt-6-sol".into(),
             effort: Some("high".into()),
             sandbox: "sandboxed".into(),
-            yolo: true,
-            usage: Usage { input_tokens: 1200, output_tokens: 300, cached_tokens: 0 },
+            permission_mode: "yolo".into(),
+            usage: Usage {
+                input_tokens: 1200,
+                output_tokens: 300,
+                cached_tokens: 0,
+            },
             context_tokens: 27_200,
             context_window: 272_000,
             fast: true,
@@ -124,8 +138,24 @@ mod tests {
     fn segments_render_and_hide() {
         let mut f = footer();
         assert_eq!(left(&f).unwrap(), "high · gpt-6-sol · fast");
-        assert_eq!(right(&f, 80), ["codex", "10% of 272k", "↑1.2k ↓300", "sandboxed", "yolo", "/work/nyq", "⎇ main"]);
-        for seg in [Segment::Provider, Segment::Tokens, Segment::Sandbox, Segment::Branch] {
+        assert_eq!(
+            right(&f, 80),
+            [
+                "codex",
+                "10% of 272k",
+                "↑1.2k ↓300",
+                "sandboxed",
+                "yolo",
+                "/work/nyq",
+                "⎇ main"
+            ]
+        );
+        for seg in [
+            Segment::Provider,
+            Segment::Tokens,
+            Segment::Sandbox,
+            Segment::Branch,
+        ] {
             f.segments.set(seg, false);
         }
         assert_eq!(right(&f, 80), ["10% of 272k", "/work/nyq"]);
@@ -138,18 +168,35 @@ mod tests {
 
     #[test]
     fn git_heads() {
-        assert_eq!(branch_from_head("ref: refs/heads/feature/x\n").as_deref(), Some("feature/x"));
-        assert_eq!(branch_from_head("0123456789abcdef0123456789abcdef01234567").as_deref(), Some("0123456"));
+        assert_eq!(
+            branch_from_head("ref: refs/heads/feature/x\n").as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(
+            branch_from_head("0123456789abcdef0123456789abcdef01234567").as_deref(),
+            Some("0123456")
+        );
         assert_eq!(branch_from_head("garbage"), None);
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("repo/.git")).unwrap();
         std::fs::write(dir.path().join("repo/.git/HEAD"), "ref: refs/heads/dev\n").unwrap();
         std::fs::create_dir_all(dir.path().join("repo/src/deep")).unwrap();
-        assert_eq!(git_branch(&dir.path().join("repo/src/deep")).as_deref(), Some("dev"));
+        assert_eq!(
+            git_branch(&dir.path().join("repo/src/deep")).as_deref(),
+            Some("dev")
+        );
         std::fs::create_dir_all(dir.path().join("wt")).unwrap();
         std::fs::create_dir_all(dir.path().join("repo/.git/worktrees/wt")).unwrap();
-        std::fs::write(dir.path().join("repo/.git/worktrees/wt/HEAD"), "ref: refs/heads/topic\n").unwrap();
-        std::fs::write(dir.path().join("wt/.git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
+        std::fs::write(
+            dir.path().join("repo/.git/worktrees/wt/HEAD"),
+            "ref: refs/heads/topic\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("wt/.git"),
+            "gitdir: ../repo/.git/worktrees/wt\n",
+        )
+        .unwrap();
         assert_eq!(git_branch(&dir.path().join("wt")).as_deref(), Some("topic"));
     }
 }

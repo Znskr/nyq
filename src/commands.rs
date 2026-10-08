@@ -39,8 +39,12 @@ pub fn handles(cmd: &str) -> bool {
 /// Efforts the current model supports.
 pub fn efforts(agent: &Agent, current: Option<&ModelChoice>) -> Vec<String> {
     match current {
-        Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => c.efforts.clone(),
-        _ if agent.provider.name() == "codex" => ["low", "medium", "high", "xhigh"].map(String::from).to_vec(),
+        Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => {
+            c.efforts.clone()
+        }
+        _ if agent.provider.name() == "codex" => ["low", "medium", "high", "xhigh"]
+            .map(String::from)
+            .to_vec(),
         _ => Vec::new(),
     }
 }
@@ -49,19 +53,17 @@ pub fn efforts(agent: &Agent, current: Option<&ModelChoice>) -> Vec<String> {
 pub fn sync_footer(footer: &mut ui::tui::Footer, agent: &Agent, current: Option<&ModelChoice>) {
     let codex = agent.provider.name() == "codex";
     footer.fast = agent.provider.fast();
-    footer.fast_supported = agent.provider.supports_fast() || (codex && !crate::provider::codex::fast_models_known());
+    footer.fast_supported =
+        agent.provider.supports_fast() || (codex && !crate::provider::codex::fast_models_known());
     footer.efforts = efforts(agent, current);
     footer.branch = ui::statusline::git_branch(&agent.cwd);
     footer.segments = settings::current().statusline;
 }
 
 /// Apply the settings in effect at startup to the agent.
-pub fn apply_startup(home: &Path, agent: &mut Agent, interactive: bool) {
+pub fn apply_startup(home: &Path, agent: &mut Agent) {
     let s = settings::current();
     crate::agent::set_auto_compact_percent(s.auto_compact);
-    if interactive && s.permission_mode == "yolo" {
-        agent.yolo = true;
-    }
     if s.fast_mode {
         agent.provider.set_fast(true);
         learn_fast_models_in_background(home, agent);
@@ -72,7 +74,11 @@ fn learn_fast_models_in_background(home: &Path, agent: &Agent) {
     if agent.provider.name() == "codex" && !crate::provider::codex::fast_models_known() {
         let home = home.to_path_buf();
         tokio::spawn(async move {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), crate::models::list(&home)).await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                crate::models::list(&home),
+            )
+            .await;
         });
     }
 }
@@ -84,24 +90,110 @@ fn save(home: &Path, f: impl FnOnce(&mut settings::Settings)) {
 }
 
 /// A session setting changed in the settings menu.
-pub fn apply_setting(home: &Path, agent: &mut Agent, current: Option<&ModelChoice>, id: Id, value: &str) {
+pub fn apply_setting(
+    home: &Path,
+    agent: &mut Agent,
+    current: Option<&ModelChoice>,
+    id: Id,
+    value: &str,
+) {
     match id {
         Id::Effort => {
             let effort = Some(value.to_string()).filter(|v| v != "auto");
             agent.provider.set_effort(effort.clone());
-            if let Some(c) = current.filter(|c| c.provider == agent.provider.name() && c.model == agent.provider.model()) {
+            if let Some(c) = current.filter(|c| {
+                c.provider == agent.provider.name() && c.model == agent.provider.model()
+            }) {
                 let _ = crate::models::save_last(home, c, effort.as_deref());
             }
             save(home, |s| s.effort = effort);
         }
         Id::Fast => set_fast(home, agent, value == "on"),
-        Id::Permission => {
-            agent.yolo = value == "yolo";
-            save(home, |s| s.permission_mode = value.into());
-            ui::info(if agent.yolo { "  Permission mode: yolo (tools run without asking)." } else { "  Permission mode: ask." });
-        }
+        Id::Permission => set_permission_mode(home, agent, value),
         _ => {}
     }
+}
+
+fn apply_mode(home: &Path, agent: &mut Agent, mode: crate::permissions::Mode) {
+    agent.permission_mode = mode;
+    save(home, |s| s.permission_mode = mode.as_str().into());
+    ui::info(&format!(
+        "  Permission mode: {} ({}).",
+        mode.as_str(),
+        mode.summary()
+    ));
+}
+
+/// Set the session permission mode and save it.
+pub fn set_permission_mode(home: &Path, agent: &mut Agent, raw: &str) {
+    match crate::permissions::Mode::parse(raw) {
+        Some(mode) => apply_mode(home, agent, mode),
+        None => ui::error(&format!(
+            "unknown permission mode `{raw}` (ask, auto or yolo)"
+        )),
+    }
+}
+
+/// `/permissions`: open the mode menu, switch mode, list rules, or reload.
+pub fn permissions(agent: &mut Agent, tui: &Tui, home: &Path, args: &[&str]) {
+    match args {
+        [] => tui.screen().open_permission_modes(),
+        ["reload"] => {
+            let (perms, warnings) = crate::permissions::Permissions::load(home, &agent.cwd);
+            for warning in &warnings {
+                ui::error(warning);
+            }
+            agent.permissions = std::sync::Arc::new(perms);
+            ui::info("Reloaded permission rules.");
+            list_rules(agent);
+        }
+        ["rules"] => list_rules(agent),
+        [name] => match crate::permissions::Mode::parse(name) {
+            Some(mode) => apply_mode(home, agent, mode),
+            None => ui::error(&format!(
+                "unknown /permissions argument `{name}` (ask, auto, yolo, rules, or reload)"
+            )),
+        },
+        _ => ui::error("usage: /permissions [ask|auto|yolo|rules|reload]"),
+    }
+}
+
+fn list_rules(agent: &Agent) {
+    let mut lines = vec![format!(
+        "mode: {} ({})",
+        agent.permission_mode.as_str(),
+        agent.permission_mode.summary()
+    )];
+    lines.extend(agent.permissions.lines(&agent.allowed));
+    ui::list(&lines);
+}
+
+/// `/allowlist`: list or remove trusted commands, tools and URLs.
+pub fn allowlist(agent: &mut Agent, args: &[&str]) {
+    match args.first().copied() {
+        None => ui::list(&crate::permissions::allowlist_lines(
+            &agent.permissions,
+            &agent.allowed,
+        )),
+        Some("remove") => {
+            let perms = std::sync::Arc::make_mut(&mut agent.permissions);
+            match crate::permissions::allowlist_remove(perms, &mut agent.allowed, &args[1..]) {
+                Ok(msg) => ui::info(&format!("  {msg}")),
+                Err(e) => ui::error(&e),
+            }
+        }
+        Some(_) => ui::error("usage: /allowlist [remove N | remove command|tool|url PATTERN]"),
+    }
+}
+
+/// `/yolo`: switch between yolo and ask, and save the choice.
+pub fn toggle_yolo(home: &Path, agent: &mut Agent) {
+    let next = if agent.permission_mode.is_yolo() {
+        crate::permissions::Mode::Ask
+    } else {
+        crate::permissions::Mode::Yolo
+    };
+    apply_mode(home, agent, next);
 }
 
 fn set_fast(home: &Path, agent: &mut Agent, on: bool) {
@@ -111,7 +203,11 @@ fn set_fast(home: &Path, agent: &mut Agent, on: bool) {
     }
     agent.provider.set_fast(on);
     save(home, |s| s.fast_mode = on);
-    ui::info(if on { "  Fast mode on: priority processing, which uses more of your plan's usage." } else { "  Fast mode off." });
+    ui::info(if on {
+        "  Fast mode on: priority processing, which uses more of your plan's usage."
+    } else {
+        "  Fast mode off."
+    });
 }
 
 /// Context for running a command.
@@ -123,7 +219,12 @@ pub struct Ctx<'a> {
 }
 
 pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
-    let Ctx { agent, tui, home, templates } = ctx;
+    let Ctx {
+        agent,
+        tui,
+        home,
+        templates,
+    } = ctx;
     match cmd {
         "/settings" => tui.screen().open_settings(Category::All),
         "/statusline" if args.is_empty() => tui.screen().open_settings(Category::StatusLine),
@@ -140,7 +241,20 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                 s.statusline.set(*seg, !s.statusline.get(*seg));
             }
             let saved = settings::update(home, |x| x.statusline = s.statusline)?;
-            let shown: Vec<String> = changes.iter().map(|seg| format!("{} {}", seg.key(), if saved.statusline.get(*seg) { "on" } else { "off" })).collect();
+            let shown: Vec<String> = changes
+                .iter()
+                .map(|seg| {
+                    format!(
+                        "{} {}",
+                        seg.key(),
+                        if saved.statusline.get(*seg) {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    )
+                })
+                .collect();
             ui::info(&format!("  Status line: {}", shown.join(", ")));
         }
         "/sound" => {
@@ -195,7 +309,8 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
             }
             if !crate::provider::codex::fast_models_known() {
                 let cancel = tokio_util::sync::CancellationToken::new();
-                tui.screen().set_busy(Some("Checking the model catalog"), Some(cancel.clone()));
+                tui.screen()
+                    .set_busy(Some("Checking the model catalog"), Some(cancel.clone()));
                 tokio::select! {
                     _ = tokio::time::timeout(std::time::Duration::from_secs(8), crate::models::list(home)) => {}
                     _ = cancel.cancelled() => {}
@@ -213,7 +328,10 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                 None => agent.cwd.join(raw),
             };
             let image = crate::tools::image::load(&path)?;
-            let label = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw.to_string());
+            let label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| raw.to_string());
             ui::info(&format!("  attached image: {label}"));
             tui.screen().attach(image, &label);
         }
@@ -229,7 +347,15 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                         .attachments
                         .iter()
                         .enumerate()
-                        .map(|(i, a)| format!("[Image #{}] {}  {} · {} KB", i + 1, a.label, a.image.media_type, a.image.data.len() * 3 / 4 / 1024))
+                        .map(|(i, a)| {
+                            format!(
+                                "[Image #{}] {}  {} · {} KB",
+                                i + 1,
+                                a.label,
+                                a.image.media_type,
+                                a.image.data.len() * 3 / 4 / 1024
+                            )
+                        })
                         .collect();
                     drop(s);
                     ui::list(&lines);
@@ -242,8 +368,14 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                     ui::info("  cleared pending images");
                 }
                 ["remove" | "rm", n] => {
-                    let i = n.trim_start_matches('#').parse::<usize>().ok().filter(|i| (1..=s.attachments.len()).contains(i));
-                    let Some(i) = i else { anyhow::bail!("no pending image #{n}") };
+                    let i = n
+                        .trim_start_matches('#')
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|i| (1..=s.attachments.len()).contains(i));
+                    let Some(i) = i else {
+                        anyhow::bail!("no pending image #{n}")
+                    };
                     let a = s.attachments.remove(i - 1);
                     s.redraw();
                     drop(s);
@@ -266,7 +398,9 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
         "/alias" => match args.first() {
             Some(name) => {
                 let name = name.trim_start_matches('/');
-                let t = templates.iter().find(|t| t.name == name).ok_or_else(|| anyhow::anyhow!("no prompt template named `{name}` (see /alias)"))?;
+                let t = templates.iter().find(|t| t.name == name).ok_or_else(|| {
+                    anyhow::anyhow!("no prompt template named `{name}` (see /alias)")
+                })?;
                 let mut lines = vec![format!("/{} · {} · {}", t.name, t.scope, t.path.display())];
                 lines.extend(t.body.lines().map(str::to_string));
                 ui::list(&lines);
@@ -275,7 +409,10 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
         },
         "/feedback" => {
             crate::login::open_browser(crate::diagnostics::FEEDBACK_URL);
-            ui::info(&format!("  Opened {} (if your browser didn't open, visit it yourself).", crate::diagnostics::FEEDBACK_URL));
+            ui::info(&format!(
+                "  Opened {} (if your browser didn't open, visit it yourself).",
+                crate::diagnostics::FEEDBACK_URL
+            ));
         }
         "/trace" => {
             let sandbox = tui.screen().footer.sandbox.clone();
@@ -285,7 +422,8 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                 effort: agent.provider.effort(),
                 fast: agent.provider.fast(),
                 sandbox: &sandbox,
-                yolo: agent.yolo,
+                yolo: agent.permission_mode.is_yolo(),
+                permission_mode: agent.permission_mode.as_str(),
                 session_id: agent.session.as_ref().map(|s| s.id.as_str()),
                 context_tokens: agent.context_tokens,
                 context_window: agent.context_window,
@@ -297,9 +435,17 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
             tui.screen().copy_osc52(&text);
             let copied = {
                 let text = text.clone();
-                tokio::time::timeout(std::time::Duration::from_secs(3), tokio::task::spawn_blocking(move || ui::tui::copy_native(&text))).await
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::task::spawn_blocking(move || ui::tui::copy_native(&text)),
+                )
+                .await
             };
-            let via = if matches!(copied, Ok(Ok(Some(_)))) { "path copied" } else { "path copied via the terminal" };
+            let via = if matches!(copied, Ok(Ok(Some(_)))) {
+                "path copied"
+            } else {
+                "path copied via the terminal"
+            };
             ui::info(&format!("  Wrote a diagnostic trace to {text} ({via}). Secrets are redacted; read it before sharing."));
         }
         other => anyhow::bail!("unknown command {other}"),
