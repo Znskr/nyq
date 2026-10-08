@@ -470,3 +470,26 @@ fn print_mode_runs_user_hooks_but_not_untrusted_project_hooks() {
     let second = seen[1]["messages"].to_string();
     assert!(second.contains("read-only today"), "{second}");
 }
+
+#[test]
+fn print_mode_ignores_a_saved_yolo_mode() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("settings.json"), r#"{"permission_mode":"yolo"}"#).unwrap();
+    let write_call = delta(json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+        "function": {"name": "write_file", "arguments": "{\"path\":\"x.txt\",\"content\":\"x\"}"}}]}));
+    let (url, _seen) = fake_server(vec![vec![write_call], vec![delta(json!({"content": "Okay."}))]]);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
+        .args(["-p", "--sandbox", "off", "--provider", "openai", "write x"])
+        .current_dir(work.path())
+        .env("NYQ_HOME", home.path())
+        .env("HOME", home.path())
+        .env("NYQ_BASE_URL", &url)
+        .env("NYQ_MODEL", "fake-model")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("saved yolo permission mode does not apply"));
+    assert!(!work.path().join("x.txt").exists(), "a saved yolo must not let print mode write files");
+}
