@@ -399,6 +399,8 @@ pub fn print_summary(dir: &Path, which: &str, cwd: &Path) -> Result<()> {
 pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
     let meta = find(dir, which, cwd)?;
     fs::remove_file(&meta.path).with_context(|| format!("deleting {}", meta.path.display()))?;
+    // Its named subagents go with it.
+    let _ = fs::remove_dir_all(crate::subagents::store_dir(&meta.path));
     Ok(meta)
 }
 
@@ -548,7 +550,7 @@ fn read_items(data: &[u8], path: &Path) -> Result<(Vec<Item>, usize)> {
 
 /// Synthetic results for trailing tool calls that never got one, so the next
 /// request to the model is well-formed.
-fn repairs(items: &[Item]) -> Vec<Item> {
+pub(crate) fn repairs(items: &[Item]) -> Vec<Item> {
     let tail_start = items
         .iter()
         .rposition(|i| !matches!(i, Item::ToolCall { .. } | Item::ToolResult { .. }))
