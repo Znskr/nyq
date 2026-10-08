@@ -3,21 +3,58 @@
 //! Profile directory: `$NYQ_HOME`, else `~/.nyq`.
 //!
 //! Provider resolution, first match wins:
-//! 1. `--provider` flag or `NYQ_PROVIDER` (`codex` | `openai`)
+//! 1. `--provider` flag or `NYQ_PROVIDER` (`codex` | `openai` | `ollama` |
+//!    `opencode-go` | `opencode` | `xai` | `vercel`)
 //! 2. `NYQ_BASE_URL` set → `openai`
 //! 3. last-model.json (unless explicit model/provider flags or env are set)
 //! 4. `settings.json` `"provider"`
 //! 5. a ChatGPT login present (codex CLI or `chatgpt-auth.json`) → `codex`
 //! 6. `model.json` present → `openai`
+//! 7. an API key for a hosted service (OpenCode Go, OpenCode Zen, xAI,
+//!    Vercel AI Gateway) → that service
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{codex::CodexProvider, openai::OpenAiProvider, Provider};
+use crate::provider::{
+    codex::CodexProvider,
+    hosted::{HostedProvider, Service},
+    openai::OpenAiProvider,
+    Provider,
+};
 
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-6-sol";
+
+/// Client identification sent to hosted model APIs.
+pub const USER_AGENT: &str = concat!("nyq/", env!("CARGO_PKG_VERSION"));
+
+/// Atomically replace `path` with `bytes`, readable only by the user (0600).
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".nyq-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        crate::tools::safeio::rename_over(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.with_context(|| format!("writing {}", path.display()))
+}
 
 pub fn home() -> PathBuf {
     if let Some(h) = std::env::var_os("NYQ_HOME") {
@@ -152,8 +189,7 @@ pub fn provider(
                 &crate::models::ModelChoice {
                     provider: last.provider,
                     model: last.model,
-                    context_window: None,
-                    efforts: Vec::new(),
+                    ..Default::default()
                 },
                 last.effort,
             );
@@ -166,7 +202,13 @@ pub fn provider(
         .or_else(|| env("NYQ_BASE_URL").map(|_| "openai".into()))
         .or_else(|| settings.provider.clone())
         .or_else(|| auth_path.exists().then(|| "codex".into()))
-        .or_else(|| model_file.base_url.as_ref().map(|_| "openai".into()));
+        .or_else(|| model_file.base_url.as_ref().map(|_| "openai".into()))
+        .or_else(|| {
+            Service::ALL
+                .into_iter()
+                .find(|s| crate::provider::hosted::api_key(home, *s).is_some())
+                .map(|s| s.id().into())
+        });
 
     match kind.as_deref() {
         Some("codex") => {
@@ -200,10 +242,20 @@ pub fn provider(
                 .context("ollama provider needs a model: --model or NYQ_MODEL")?;
             Ok(Box::new(OpenAiProvider::with_label("ollama".into(), ollama_url(), None, model)))
         }
-        Some(other) => bail!("unknown provider `{other}` (expected codex, ollama or openai)"),
+        Some(other) => {
+            let service = Service::parse(other).with_context(|| {
+                format!("unknown provider `{other}` (expected codex, ollama, openai, opencode-go, opencode, xai or vercel)")
+            })?;
+            let model = model_flag
+                .map(str::to_string)
+                .or_else(|| env("NYQ_MODEL"))
+                .or_else(|| settings.models.get(service.id()).cloned())
+                .unwrap_or_else(|| service.default_model().into());
+            let effort = settings.effort.filter(|e| e != "auto");
+            Ok(Box::new(HostedProvider::configured(home, service, model, effort)?))
+        }
         None => bail!(
-            "no model configured.\n  • ChatGPT subscription: put chatgpt-auth.json in {}\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]",
-            home.display()
+            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • OpenCode Go/Zen, xAI or Vercel AI Gateway: run `nyq login opencode-go|opencode|xai|vercel` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
         ),
     }
 }
@@ -286,8 +338,7 @@ mod tests {
         let choice = crate::models::ModelChoice {
             provider: "ollama".into(),
             model: "local".into(),
-            context_window: None,
-            efforts: vec![],
+            ..Default::default()
         };
         crate::models::save_last(&home(), &choice, Some("high")).unwrap();
         let last: LastModel = read_json(&dir.path().join("last-model.json")).unwrap();

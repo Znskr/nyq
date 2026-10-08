@@ -1,5 +1,6 @@
 mod acp;
 mod agent;
+mod catalog;
 mod config;
 mod login;
 mod mcp;
@@ -40,7 +41,7 @@ struct Cli {
     /// Model id (overrides config).
     #[arg(short, long, global = true)]
     model: Option<String>,
-    /// Provider: codex or openai.
+    /// Provider: codex, openai, ollama, opencode-go, opencode, xai or vercel.
     #[arg(long, global = true)]
     provider: Option<String>,
     /// Run tools without asking for approval.
@@ -66,8 +67,17 @@ struct Cli {
 enum Command {
     /// List saved conversations.
     Sessions,
-    /// Sign in with your ChatGPT subscription (Codex models).
-    Login,
+    /// Sign in: ChatGPT subscription (default, Codex models), or store an API
+    /// key for opencode-go, opencode, xai or vercel.
+    Login {
+        /// codex (default), opencode-go, opencode, xai or vercel.
+        provider: Option<String>,
+    },
+    /// Remove nyq's stored login for a provider.
+    Logout {
+        /// codex, opencode-go, opencode, xai or vercel.
+        provider: String,
+    },
     /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
     Acp,
 }
@@ -112,13 +122,27 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Some(Command::Sessions) => return list_sessions(&sessions_dir),
-        Some(Command::Login) => {
-            let msg = login::login(&home, |url| {
-                eprintln!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}");
-                login::open_browser(url);
-            })
-            .await?;
+        Some(Command::Login { provider }) => {
+            let msg = match provider.as_deref().filter(|p| *p != "codex") {
+                Some(name) => {
+                    let service = provider::hosted::Service::parse(name).with_context(|| {
+                        format!("unknown provider `{name}` (expected codex, opencode-go, opencode, xai or vercel)")
+                    })?;
+                    login::login_key(&home, service)?
+                }
+                None => {
+                    login::login(&home, |url| {
+                        eprintln!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}");
+                        login::open_browser(url);
+                    })
+                    .await?
+                }
+            };
             println!("{msg}");
+            return Ok(());
+        }
+        Some(Command::Logout { provider }) => {
+            println!("{}", login::logout(&home, &provider)?);
             return Ok(());
         }
         Some(Command::Acp) => {
@@ -149,7 +173,7 @@ async fn run() -> Result<()> {
         sandbox,
         undo: Default::default(),
     };
-    agent.context_window = config::context_window_for(agent.provider.name(), None);
+    agent.context_window = config::context_window_for(agent.provider.name(), agent.provider.context_window());
     let skills = skills::discover(&home, &cwd);
     if !skills.is_empty() {
         agent.system.push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
@@ -338,8 +362,7 @@ fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::Mode
 fn cycle_effort(home: &std::path::Path, agent: &mut Agent, current: Option<&models::ModelChoice>) {
     let efforts: Vec<String> = match current {
         Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => c.efforts.clone(),
-        _ if agent.provider.name() == "codex" => ["low", "medium", "high", "xhigh"].map(String::from).to_vec(),
-        _ => Vec::new(),
+        _ => agent.provider.efforts(),
     };
     if efforts.is_empty() {
         ui::info("  This model has no adjustable reasoning effort.");
