@@ -19,7 +19,9 @@ mod provider;
 mod sandbox;
 mod session;
 mod settings;
+mod skill_install;
 mod skills;
+mod subagents;
 mod templates;
 mod tools;
 mod types;
@@ -188,7 +190,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the last answer to the clipboard"),
     ("/undo", "revert the last file change nyq made"),
     ("/tools", "list available tools"),
-    ("/skills", "list available skills"),
+    ("/skills", "skills: /skills [list|install SOURCE [--project]|remove NAME|info NAME|create NAME|path]"),
+    ("/agents", "named subagents: /agents [list|show NAME|stop NAME|delete NAME]"),
     ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
     ("/memory", "saved memories; /memory remove N forgets one"),
     ("/background", "background processes; /background kill ID|last"),
@@ -353,11 +356,9 @@ async fn run() -> Result<()> {
         undo: Default::default(),
     };
     agent.context_window = config::context_window_for(agent.provider.name(), agent.provider.context_window());
-    let skills = skills::discover(&home, &cwd);
+    let mut skills = skills::discover(&home, &cwd);
     commands::sync_prompt(&mut agent, &skills);
-    if !skills.is_empty() {
-        agent.tools.add(skills::tool(skills.clone()));
-    }
+    skills::register(&mut agent.tools, skills.clone(), &home, &cwd);
 
     // `-r` without an id opens the session picker once the TUI is up.
     let pick = resume.as_deref() == Some("");
@@ -523,7 +524,7 @@ async fn run() -> Result<()> {
                 &servers,
                 &sessions_dir,
                 &tui,
-                &skills,
+                &mut skills,
                 &mut ws,
             )
             .await;
@@ -861,7 +862,7 @@ async fn slash(
     servers: &[ServerConfig],
     sessions_dir: &std::path::Path,
     tui: &Tui,
-    skills: &[skills::Skill],
+    skills: &mut Vec<skills::Skill>,
     ws: &mut workspace::Runtime,
 ) -> Result<bool> {
     let mut parts = line.split_whitespace();
@@ -894,7 +895,8 @@ async fn slash(
         }
         "/workspace" => commands::workspace_cmd(agent, skills, ws, &arg.join(" "))?,
         "/sessions" => ui::list(&session_lines(sessions_dir)?),
-        "/skills" => ui::list(&skills::list_lines(skills)),
+        "/skills" => skill_install::command(agent, tui, skills, &arg).await?,
+        "/agents" => ui::list(&subagents::command(agent.session.as_ref().map(|s| s.path.as_path()), &arg)?),
         "/memory" => tools::memory::slash(&config::home(), &arg, &mut agent.system),
         "/background" => tools::background::slash(&arg).await,
         "/undo" if agent.undo.is_empty() => ui::info("  Nothing to undo."),

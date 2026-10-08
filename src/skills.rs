@@ -48,7 +48,12 @@ fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<(PathBuf, Pat
 
 /// Discover skills for a session. `home` is the nyq profile dir (~/.nyq).
 pub fn discover(home: &Path, cwd: &Path) -> Vec<Skill> {
-    discover_in(&roots(home, dirs::home_dir().as_deref(), cwd))
+    discover_with(home, dirs::home_dir().as_deref(), cwd)
+}
+
+/// [`discover`] with an explicit user home (None skips the user's other tools' skills).
+pub(crate) fn discover_with(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<Skill> {
+    discover_in(&roots(home, user_home, cwd))
 }
 
 fn discover_in(roots: &[(PathBuf, PathBuf, &'static str)]) -> Vec<Skill> {
@@ -78,6 +83,17 @@ fn discover_in(roots: &[(PathBuf, PathBuf, &'static str)]) -> Vec<Skill> {
 struct Meta {
     name: Option<String>,
     description: Option<String>,
+}
+
+/// SKILL.md's `name` (if any) and body; an error when frontmatter is opened
+/// but never closed.
+pub(crate) fn front_matter(text: &str) -> Result<(Option<String>, &str), String> {
+    let mut lines = text.strip_prefix('\u{feff}').unwrap_or(text).lines();
+    if lines.next().map(str::trim_end) == Some("---") && !lines.any(|l| l.trim_end() == "---") {
+        return Err("frontmatter is missing its closing `---`".into());
+    }
+    let (meta, body) = split_frontmatter(text);
+    Ok((meta.name, body))
 }
 
 /// Split SKILL.md into its frontmatter fields and the body after it.
@@ -228,20 +244,35 @@ pub fn list_lines(skills: &[Skill]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 pub fn tool(skills: Vec<Skill>) -> Box<dyn Tool> {
-    Box::new(SkillTool { skills })
+    Box::new(SkillTool { skills, reload: None })
+}
+
+/// Add the `skill` tool (which also finds skills installed after it was
+/// made, by looking again in the skill roots) and `install_skill`.
+pub fn register(tools: &mut crate::tools::Registry, skills: Vec<Skill>, home: &Path, cwd: &Path) {
+    tools.remove_names(&["skill".to_string(), "install_skill".to_string()]);
+    tools.add(Box::new(SkillTool { skills, reload: Some((home.to_path_buf(), cwd.to_path_buf())) }));
+    tools.add(Box::new(crate::skill_install::InstallSkill { home: home.to_path_buf() }));
 }
 
 struct SkillTool {
     skills: Vec<Skill>,
+    reload: Option<(PathBuf, PathBuf)>,
+}
+
+fn find_in<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
+    skills.iter().find(|s| s.name == name).or_else(|| skills.iter().find(|s| s.name.eq_ignore_ascii_case(name)))
 }
 
 impl SkillTool {
-    fn find(&self, name: &str) -> Option<&Skill> {
-        self.skills
-            .iter()
-            .find(|s| s.name == name)
-            .or_else(|| self.skills.iter().find(|s| s.name.eq_ignore_ascii_case(name)))
+    fn find(&self, name: &str) -> Option<Skill> {
+        if let Some(s) = find_in(&self.skills, name) {
+            return Some(s.clone());
+        }
+        let (home, cwd) = self.reload.as_ref()?;
+        find_in(&discover(home, cwd), name).cloned()
     }
 
     fn unknown(&self, name: &str) -> String {
@@ -282,7 +313,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 /// Files in a skill directory (relative, sorted), excluding SKILL.md and
 /// hidden entries. Returns at most `max` plus the total count.
-fn skill_files(dir: &Path, max: usize) -> (Vec<String>, usize) {
+pub(crate) fn skill_files(dir: &Path, max: usize) -> (Vec<String>, usize) {
     fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for entry in entries.flatten() {

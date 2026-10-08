@@ -1,6 +1,9 @@
 //! `subagent`: delegate a self-contained task to a fresh agent with its own
-//! context; only its final report comes back to the parent model.
+//! context; only its final report comes back to the parent model. With a
+//! `name`, the subagent persists for the session (see `crate::subagents`):
+//! later calls with that name send it follow-up messages.
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -9,6 +12,7 @@ use super::{Registry, Tool, ToolCtx, ToolOutput};
 use std::sync::Arc;
 
 use crate::agent::{Agent, Approval, ApprovalRequest, Approver, TurnEnd, Ui};
+use crate::subagents::{self, LiveGuard, Record, Status};
 use crate::types::{Item, StreamEvent, ToolSpec, Usage};
 
 const NAME: &str = "subagent";
@@ -29,6 +33,11 @@ independent subagent calls can run in parallel. The subagent sees NOTHING of thi
 so `task` must contain complete instructions: the goal, relevant paths and names, constraints, \
 and what to report back. Modes: \"explore\" (default) gets read-only tools (read, list, glob, \
 grep, view images) and needs no approval; \"general\" may also edit files and run commands. \
+Without `name` the subagent is one-shot. Give a `name` to keep it for this session: the first \
+call creates it, and later calls with the same name send `task` to it as a follow-up message, \
+with everything it already learned still in its context. `action` manages named subagents: \
+\"list\", \"inspect\" (status and recent transcript), \"stop\", and \"resume\" (reopen a stopped \
+one, or finish an interrupted message). \
 Don't use it for a quick lookup you can do with one or two direct tool calls.";
 
 const PREAMBLE: &str = "\
@@ -37,14 +46,26 @@ conversation, only this task. Work on it autonomously with your tools; you canno
 questions. When done, finish with a concise report of your findings, including file paths and \
 line numbers where relevant. The report is all the delegating agent will see.";
 
+const PERSISTENT: &str = "\
+The delegating agent may send you follow-up messages later; keep what you learn in mind and \
+answer each message with a self-contained report.";
+
 pub fn register(r: &mut Registry) {
     r.add(Box::new(Subagent));
 }
 
 struct Subagent;
 
+fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+}
+
 fn is_general(args: &Value) -> bool {
     args.get("mode").and_then(Value::as_str) == Some("general")
+}
+
+fn action(args: &Value) -> &str {
+    str_arg(args, "action").unwrap_or("run")
 }
 
 /// The short label: `description`, else the task's first line.
@@ -84,22 +105,31 @@ impl Tool for Subagent {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "Complete, self-contained instructions. The subagent sees nothing else."},
+                    "task": {"type": "string", "description": "Complete, self-contained instructions (or, for an existing named subagent, the follow-up message). The subagent sees nothing else."},
                     "description": {"type": "string", "description": "Short 3-6 word label for the task, shown to the user."},
-                    "mode": {"type": "string", "enum": ["explore", "general"], "description": "explore (default): read-only tools. general: may also edit files and run commands."}
-                },
-                "required": ["task"]
+                    "mode": {"type": "string", "enum": ["explore", "general"], "description": "explore (default): read-only tools. general: may also edit files and run commands. Fixed when a named subagent is created."},
+                    "name": {"type": "string", "description": "Keep the subagent under this name (letters, digits, - and _) so later calls can send it follow-ups."},
+                    "action": {"type": "string", "enum": ["run", "list", "inspect", "stop", "resume"], "description": "run (default): run `task`. list: named subagents. inspect/stop/resume: act on `name`."}
+                }
             }),
         }
     }
 
     fn needs_approval(&self, args: &Value) -> bool {
-        is_general(args)
+        is_general(args) && action(args) == "run"
     }
 
     fn summary(&self, args: &Value) -> String {
         let label = label(args);
-        if is_general(args) { format!("{label} (general)") } else { label.to_string() }
+        let name = str_arg(args, "name");
+        match (action(args), name) {
+            ("run", None) if is_general(args) => format!("{label} (general)"),
+            ("run", None) => label.to_string(),
+            ("run", Some(n)) if is_general(args) => format!("{n}: {label} (general)"),
+            ("run", Some(n)) => format!("{n}: {label}"),
+            (a, Some(n)) => format!("{a} {n}"),
+            (a, None) => a.to_string(),
+        }
     }
 
     fn handles_cancel(&self) -> bool {
@@ -109,81 +139,259 @@ impl Tool for Subagent {
     fn preview(&self, args: &Value, _: &ToolCtx) -> Option<String> {
         let task = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty())?;
         let mode = if is_general(args) { "general" } else { "explore" };
-        Some(format!("mode: {mode}\n{task}"))
+        let name = str_arg(args, "name").map(|n| format!(" · name: {n}")).unwrap_or_default();
+        Some(format!("mode: {mode}{name}\n{task}"))
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
-        let Some(task) = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) else {
-            return ToolOutput::err("Missing required argument `task`.");
-        };
-        let Some(provider) = &ctx.provider else {
-            return ToolOutput::err("Subagents are unavailable: no model provider in this context.");
-        };
-        let provider = provider.fork();
-        let context_window = crate::config::context_window_for(provider.name(), None);
-        let mut agent = Agent {
-            provider,
-            tools: child_tools(is_general(&args)),
-            system: format!("{}\n\n{PREAMBLE}", crate::prompt::system(&ctx.cwd, &ctx.sandbox)),
-            items: Vec::new(),
-            session: None,
-            cwd: ctx.cwd.clone(),
-            // Inherit the parent's yolo flag, "always" grants and rules.
-            // Calls that still need approval are forwarded to the parent's
-            // approver, or denied when there is none: approving this call
-            // does not auto-approve them.
-            yolo: ctx.yolo,
-            allowed: ctx.allowed.clone(),
-            permissions: ctx.permissions.clone(),
-            usage: Usage::default(),
-            stats: Default::default(),
-            context_window,
-            context_tokens: 0,
-            context_estimated: false,
-            suppress_auto_compact: false,
-            submitted: 0,
-            // The parent's tool hooks also vet the subagent's calls.
-            hooks: std::sync::Arc::new(ctx.hooks.for_subagent()),
-            sandbox: ctx.sandbox.clone(),
-            undo: Default::default(),
-        };
-        let origin = format!("subagent: {}", one_line(label(&args)));
-        let mut ui = Collector { calls: Vec::new(), approver: ctx.approver.clone(), origin };
-        let cancel = ctx.cancel.child_token();
-        let result = drive_turn(agent.turn(Item::user(task), &mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await;
-        let display = Some(ui.display());
-        let undo = std::mem::take(&mut agent.undo);
-        ctx.granted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .extend(agent.allowed.difference(&ctx.allowed).cloned());
-        let fail = |msg: String| ToolOutput { display: display.clone(), undo: undo.clone(), ..ToolOutput::err(msg) };
-        match result {
-            Err(e) if e.to_string().contains("timed out") => {
-                return fail(format!("Subagent timed out after {} minutes.", TIMEOUT.as_secs() / 60));
+        let name = str_arg(&args, "name");
+        let dir = ctx.subagent_dir.as_deref();
+        match (action(&args), name, dir) {
+            ("run", None, _) => one_shot(&args, ctx).await,
+            ("list", _, Some(dir)) => ToolOutput::ok(subagents::list_lines(dir).join("\n")),
+            ("list", _, None) | (_, Some(_), None) => {
+                ToolOutput::err("Named subagents are unavailable here: they are kept with a saved session.")
             }
-            Err(e) => return fail(format!("Subagent failed: {e:#}")),
-            Ok(TurnEnd::Cancelled) => return fail("Subagent cancelled.".into()),
-            Ok(TurnEnd::Done) => {}
+            (_, None, _) => ToolOutput::err("This action needs the subagent's `name`."),
+            (_, Some(n), _) if !subagents::valid_name(n) => ToolOutput::err(format!(
+                "Invalid subagent name `{n}`: use letters, digits, '-' and '_' (at most {} characters).",
+                subagents::MAX_NAME
+            )),
+            ("run", Some(n), Some(dir)) => named_run(&args, n, dir, ctx).await,
+            ("inspect", Some(n), Some(dir)) => match subagents::show_lines(dir, n, 20) {
+                Ok(lines) => ToolOutput::ok(lines.join("\n")),
+                Err(e) => ToolOutput::err(format!("{e:#}")),
+            },
+            ("stop", Some(n), Some(dir)) => match subagents::stop(dir, n) {
+                Ok(msg) => ToolOutput::ok(msg),
+                Err(e) => ToolOutput::err(format!("{e:#}")),
+            },
+            ("resume", Some(n), Some(dir)) => resume(n, dir, ctx).await,
+            (other, _, _) => ToolOutput::err(format!("Unknown action `{other}` (run, list, inspect, stop, resume).")),
         }
-        let report = agent
-            .items
-            .iter()
-            .rev()
-            .find_map(|i| match i {
-                Item::Assistant { text } if !text.trim().is_empty() => Some(text.trim()),
-                _ => None,
-            })
-            .unwrap_or("(the subagent produced no report)");
-        let mut content = truncate(report, MAX_REPORT);
-        content.push_str(&format!(
-            "\n\n(subagent used {} tool calls, ↑{} ↓{} tokens)",
-            ui.calls.len(),
-            agent.usage.input_tokens,
-            agent.usage.output_tokens
-        ));
-        ToolOutput { display, undo, ..ToolOutput::ok(content) }
     }
+}
+
+/// A child agent with `items` as its transcript.
+fn child(ctx: &ToolCtx, general: bool, persistent: bool, items: Vec<Item>) -> Result<Agent, ToolOutput> {
+    let Some(provider) = &ctx.provider else {
+        return Err(ToolOutput::err("Subagents are unavailable: no model provider in this context."));
+    };
+    let provider = provider.fork();
+    let context_window = crate::config::context_window_for(provider.name(), None);
+    let mut system = format!("{}\n\n{PREAMBLE}", crate::prompt::system(&ctx.cwd, &ctx.sandbox));
+    if persistent {
+        system.push_str(&format!("\n\n{PERSISTENT}"));
+    }
+    Ok(Agent {
+        provider,
+        tools: child_tools(general),
+        system,
+        items,
+        session: None,
+        cwd: ctx.cwd.clone(),
+        // Inherit the parent's yolo flag, "always" grants and rules.
+        // Calls that still need approval are forwarded to the parent's
+        // approver, or denied when there is none: approving this call
+        // does not auto-approve them.
+        yolo: ctx.yolo,
+        allowed: ctx.allowed.clone(),
+        permissions: ctx.permissions.clone(),
+        usage: Usage::default(),
+        stats: Default::default(),
+        context_window,
+        context_tokens: 0,
+        context_estimated: false,
+        suppress_auto_compact: false,
+        submitted: 0,
+        // The parent's tool hooks also vet the subagent's calls.
+        hooks: std::sync::Arc::new(ctx.hooks.for_subagent()),
+        sandbox: ctx.sandbox.clone(),
+        undo: Default::default(),
+    })
+}
+
+/// How a child's turn went.
+struct Outcome {
+    result: anyhow::Result<TurnEnd>,
+    calls: Vec<(String, String)>,
+    undo: crate::undo::UndoLog,
+    /// Cancelled by a `stop` (not by the parent or a timeout).
+    stopped: bool,
+}
+
+/// Run one turn of `agent` (a new message, or a continuation when `input` is
+/// None), with a live progress line and approvals forwarded to the parent.
+async fn drive_child(
+    agent: &mut Agent,
+    input: Option<Item>,
+    ctx: &ToolCtx,
+    origin: String,
+    live: LiveGuard,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Outcome {
+    let mut ui = Collector { calls: Vec::new(), approver: ctx.approver.clone(), origin, live };
+    let result = match input {
+        Some(item) => drive_turn(agent.turn(item, &mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await,
+        None => drive_turn(agent.continue_turn(&mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await,
+    };
+    ctx.granted
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(agent.allowed.difference(&ctx.allowed).cloned());
+    Outcome { result, calls: std::mem::take(&mut ui.calls), undo: std::mem::take(&mut agent.undo), stopped: ui.live.stopped() }
+}
+
+fn display(calls: &[(String, String)]) -> String {
+    if calls.is_empty() {
+        return "(no tool calls)".into();
+    }
+    calls.iter().map(|(name, summary)| format!("{name} {summary}").trim_end().to_string()).collect::<Vec<_>>().join("\n")
+}
+
+/// The tool output for a finished turn: the report or the failure.
+fn report(outcome: Outcome, agent: &Agent, footer: String) -> ToolOutput {
+    let display = Some(display(&outcome.calls));
+    let undo = outcome.undo;
+    let fail = |msg: String| ToolOutput { display: display.clone(), undo: undo.clone(), ..ToolOutput::err(msg) };
+    match outcome.result {
+        Err(e) if e.to_string().contains("timed out") => {
+            return fail(format!("Subagent timed out after {} minutes{footer}.", TIMEOUT.as_secs() / 60));
+        }
+        Err(e) => return fail(format!("Subagent failed: {e:#}{footer}")),
+        Ok(TurnEnd::Cancelled) => return fail(format!("Subagent cancelled{footer}.")),
+        Ok(TurnEnd::Done) => {}
+    }
+    let report = agent
+        .items
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            Item::Assistant { text } if !text.trim().is_empty() => Some(text.trim()),
+            _ => None,
+        })
+        .unwrap_or("(the subagent produced no report)");
+    let mut content = truncate(report, MAX_REPORT);
+    content.push_str(&format!(
+        "\n\n(subagent used {} tool calls, ↑{} ↓{} tokens{footer})",
+        outcome.calls.len(),
+        agent.usage.input_tokens,
+        agent.usage.output_tokens
+    ));
+    ToolOutput { display, undo, ..ToolOutput::ok(content) }
+}
+
+async fn one_shot(args: &Value, ctx: &ToolCtx) -> ToolOutput {
+    let Some(task) = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) else {
+        return ToolOutput::err("Missing required argument `task`.");
+    };
+    let mut agent = match child(ctx, is_general(args), false, Vec::new()) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let label = one_line(label(args));
+    let cancel = ctx.cancel.child_token();
+    let Some(live) = LiveGuard::start(None, &label, cancel.clone()) else {
+        return ToolOutput::err("Subagent could not start.");
+    };
+    let outcome = drive_child(&mut agent, Some(Item::user(task)), ctx, format!("subagent: {label}"), live, cancel).await;
+    report(outcome, &agent, String::new())
+}
+
+/// Create the named subagent `name`, or send it a follow-up message.
+async fn named_run(args: &Value, name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
+    let Some(task) = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) else {
+        return ToolOutput::err("Missing required argument `task` (the message for the subagent).");
+    };
+    let record = match subagents::load(dir, name) {
+        Ok(Some(r)) if r.status == Status::Stopped => {
+            return ToolOutput::err(format!(
+                "Subagent `{name}` is stopped; call subagent with action \"resume\" and name \"{name}\" to reopen it."
+            ));
+        }
+        Ok(Some(r)) => r,
+        Ok(None) => Record::new(name, if is_general(args) { "general" } else { "explore" }, label(args)),
+        Err(e) => return ToolOutput::err(format!("{e:#}")),
+    };
+    run_named(record, Some(Item::user(task)), dir, ctx).await
+}
+
+/// `resume`: reopen a stopped subagent, and finish a message it was
+/// interrupted in.
+async fn resume(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
+    let mut record = match subagents::load(dir, name) {
+        Ok(Some(r)) => r,
+        Ok(None) => return ToolOutput::err(format!("No subagent named `{name}` in this session.")),
+        Err(e) => return ToolOutput::err(format!("{e:#}")),
+    };
+    if subagents::is_live(&subagents::key(dir, name)) {
+        return ToolOutput::err(format!("Subagent `{name}` is already working."));
+    }
+    let unfinished = record.status != Status::Idle && !matches!(record.items.last(), Some(Item::Assistant { .. }) | None);
+    if !unfinished {
+        if record.status != Status::Idle {
+            record.status = Status::Idle;
+            record.updated = chrono::Utc::now();
+            if let Err(e) = subagents::save(dir, &record) {
+                return ToolOutput::err(format!("{e:#}"));
+            }
+        }
+        let last = record.last_answer().map(|a| format!("\nIts last answer:\n{}", truncate(a, 2_000))).unwrap_or_default();
+        return ToolOutput::ok(format!(
+            "Subagent `{name}` is ready for follow-up messages (call subagent with name \"{name}\" and a task).{last}"
+        ));
+    }
+    run_named(record, None, dir, ctx).await
+}
+
+/// Run a turn of a saved subagent and save it again.
+async fn run_named(mut record: Record, input: Option<Item>, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
+    let name = record.name.clone();
+    let cancel = ctx.cancel.child_token();
+    let live_label = if record.description.is_empty() { name.clone() } else { format!("{name}: {}", one_line(&record.description)) };
+    let Some(live) = LiveGuard::start(Some(subagents::key(dir, &name)), &live_label, cancel.clone()) else {
+        return ToolOutput::err(format!("Subagent `{name}` is still working on an earlier message; wait for it or stop it."));
+    };
+    // A turn cut short earlier may have left calls without results.
+    let mut items = std::mem::take(&mut record.items);
+    let repairs = crate::session::repairs(&items);
+    items.extend(repairs);
+    let mut agent = match child(ctx, record.mode == "general", true, items) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    // Saved as running with the new message, so a crash leaves it resumable.
+    record.items = agent.items.clone();
+    record.items.extend(input.clone());
+    record.status = Status::Running;
+    record.updated = chrono::Utc::now();
+    if let Err(e) = subagents::save(dir, &record) {
+        return ToolOutput::err(format!("{e:#}"));
+    }
+    let outcome = drive_child(&mut agent, input, ctx, format!("subagent {name}"), live, cancel).await;
+    record.status = match &outcome.result {
+        Ok(TurnEnd::Done) => Status::Idle,
+        _ if outcome.stopped => Status::Stopped,
+        _ => Status::Interrupted,
+    };
+    record.items = agent.items.clone();
+    record.turns += 1;
+    record.tool_calls += outcome.calls.len() as u64;
+    record.usage.input_tokens += agent.usage.input_tokens;
+    record.usage.output_tokens += agent.usage.output_tokens;
+    record.usage.cached_tokens += agent.usage.cached_tokens;
+    record.updated = chrono::Utc::now();
+    let saved = subagents::save(dir, &record);
+    let footer = match record.status {
+        Status::Idle => format!("; `{name}` keeps its context: send follow-ups with name \"{name}\""),
+        Status::Stopped => format!("; `{name}` was stopped"),
+        _ => format!("; `{name}` can finish this with action \"resume\""),
+    };
+    let mut out = report(outcome, &agent, footer);
+    if let Err(e) = saved {
+        out.content.push_str(&format!("\n(could not save subagent `{name}`: {e:#})"));
+    }
+    out
 }
 
 async fn drive_turn(
@@ -221,26 +429,15 @@ fn one_line(s: &str) -> String {
     if s.chars().count() > 60 { format!("{}…", s.chars().take(59).collect::<String>()) } else { s }
 }
 
-/// Headless UI for the child agent: records tool calls. Approvals go to the
-/// parent's approver (the user) when there is one; otherwise they are denied.
+/// Headless UI for the child agent: records tool calls and updates its live
+/// line. Approvals go to the parent's approver (the user) when there is one;
+/// otherwise they are denied.
 struct Collector {
     calls: Vec<(String, String)>,
     approver: Option<Arc<dyn Approver>>,
     /// Who is asking, e.g. "subagent: Count files".
     origin: String,
-}
-
-impl Collector {
-    fn display(&self) -> String {
-        if self.calls.is_empty() {
-            return "(no tool calls)".into();
-        }
-        self.calls
-            .iter()
-            .map(|(name, summary)| format!("{name} {summary}").trim_end().to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
+    live: LiveGuard,
 }
 
 #[async_trait::async_trait]
@@ -248,6 +445,7 @@ impl Ui for Collector {
     fn stream(&mut self, _: &StreamEvent) {}
     fn end_message(&mut self) {}
     fn tool_start(&mut self, tool: &str, summary: &str) {
+        self.live.tool(tool, &one_line(summary));
         self.calls.push((tool.to_string(), summary.to_string()));
     }
     fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
@@ -273,6 +471,8 @@ mod tests {
         seen_tools: Arc<Mutex<Vec<Vec<String>>>>,
         /// Tool results the child model was shown.
         seen_results: Arc<Mutex<Vec<String>>>,
+        /// Every request's transcript.
+        requests: Arc<Mutex<Vec<Vec<Item>>>>,
         hang: bool,
     }
 
@@ -290,6 +490,7 @@ mod tests {
         }
         async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> anyhow::Result<Response> {
             self.seen_tools.lock().unwrap().push(req.tools.iter().map(|t| t.name.clone()).collect());
+            self.requests.lock().unwrap().push(req.items.to_vec());
             *self.seen_results.lock().unwrap() = req
                 .items
                 .iter()
@@ -527,5 +728,137 @@ mod tests {
             Ok(_) => panic!("expected a timeout"),
         };
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    fn answer(text: &str) -> Response {
+        resp(vec![Item::Assistant { text: text.into() }])
+    }
+
+    fn named_ctx(fake: &Fake, dir: &std::path::Path, store: &std::path::Path) -> ToolCtx {
+        ToolCtx { subagent_dir: Some(store.to_path_buf()), ..ctx(fake, dir) }
+    }
+
+    fn users(items: &[Item]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                Item::User { text, .. } => Some(text.clone()),
+                Item::Assistant { text } => Some(format!("A:{text}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn named_subagent_keeps_context_across_follow_ups_and_session_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = crate::session::Session::create(&dir.path().join("sessions"), dir.path(), "fake").unwrap();
+        let store = subagents::store_dir(&session.path);
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![answer("the parser is in src/parse.rs"), answer("it has 3 functions")];
+        let c = named_ctx(&fake, dir.path(), &store);
+
+        let out = Subagent.run(json!({"task": "find the parser", "name": "scout", "description": "Find parser"}), &c).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.starts_with("the parser is in src/parse.rs"), "{}", out.content);
+        assert!(out.content.contains("send follow-ups with name \"scout\""), "{}", out.content);
+        let out = Subagent.run(json!({"task": "how many functions?", "name": "scout"}), &c).await;
+        assert!(out.content.starts_with("it has 3 functions"), "{}", out.content);
+        let requests = fake.requests.lock().unwrap().clone();
+        assert_eq!(users(&requests[1]), ["find the parser", "A:the parser is in src/parse.rs", "how many functions?"]);
+
+        let record = subagents::load(&store, "scout").unwrap().unwrap();
+        assert_eq!((record.status, record.turns, record.mode.as_str()), (Status::Idle, 2, "explore"));
+        assert_eq!(record.description, "Find parser");
+        assert_eq!(record.usage.input_tokens, 200);
+
+        // A resumed session (a new process: fresh provider, same store) still has it.
+        let fake2 = Fake::default();
+        *fake2.script.lock().unwrap() = vec![answer("still remember parse.rs")];
+        let out = Subagent.run(json!({"task": "where was it?", "name": "scout"}), &named_ctx(&fake2, dir.path(), &store)).await;
+        assert!(out.content.starts_with("still remember parse.rs"), "{}", out.content);
+        let seen = fake2.requests.lock().unwrap()[0].clone();
+        assert_eq!(users(&seen)[0], "find the parser");
+        assert_eq!(users(&seen).len(), 5);
+
+        let list = Subagent.run(json!({"action": "list"}), &c).await;
+        assert!(list.content.contains("scout") && list.content.contains("idle"), "{}", list.content);
+        let inspect = Subagent.run(json!({"action": "inspect", "name": "scout"}), &c).await;
+        assert!(inspect.content.contains("where was it?"), "{}", inspect.content);
+        assert!(Subagent.run(json!({"action": "inspect"}), &c).await.is_error);
+        assert!(Subagent.run(json!({"task": "x", "name": "../evil"}), &c).await.is_error);
+        assert!(Subagent.run(json!({"task": "x", "name": "a"}), &ctx(&fake, dir.path())).await.is_error, "no session store");
+        assert_eq!(Subagent.summary(&json!({"task": "go", "name": "scout"})), "scout: go");
+        assert_eq!(Subagent.summary(&json!({"action": "stop", "name": "scout"})), "stop scout");
+        assert!(!Subagent.needs_approval(&json!({"action": "stop", "name": "w", "mode": "general"})));
+        assert!(Subagent.needs_approval(&json!({"task": "x", "name": "w", "mode": "general"})));
+    }
+
+    #[tokio::test]
+    async fn interrupted_and_stopped_subagents_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.agents");
+        // A process died mid-message: saved as running, a call without a result.
+        let mut r = Record::new("fixer", "explore", "fix it");
+        r.status = Status::Running;
+        r.items = vec![
+            Item::user("check a.txt"),
+            Item::ToolCall { id: "c1".into(), name: "read_file".into(), arguments: r#"{"path":"a.txt"}"#.into() },
+        ];
+        subagents::save(&store, &r).unwrap();
+        assert_eq!(subagents::load(&store, "fixer").unwrap().unwrap().effective_status(&store), Status::Interrupted);
+
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![answer("a.txt is fine"), answer("ok again")];
+        let c = named_ctx(&fake, dir.path(), &store);
+        let out = Subagent.run(json!({"action": "resume", "name": "fixer"}), &c).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.starts_with("a.txt is fine"), "{}", out.content);
+        let sent = fake.requests.lock().unwrap()[0].clone();
+        assert!(
+            sent.iter().any(|i| matches!(i, Item::ToolResult { id, is_error: true, .. } if id == "c1")),
+            "the dangling call is answered: {sent:?}"
+        );
+        assert_eq!(subagents::load(&store, "fixer").unwrap().unwrap().status, Status::Idle);
+
+        // Stopped: follow-ups are refused until it is resumed.
+        subagents::stop(&store, "fixer").unwrap();
+        let out = Subagent.run(json!({"task": "more", "name": "fixer"}), &c).await;
+        assert!(out.is_error && out.content.contains("is stopped"), "{}", out.content);
+        let out = Subagent.run(json!({"action": "resume", "name": "fixer"}), &c).await;
+        assert!(out.content.contains("ready for follow-up") && out.content.contains("a.txt is fine"), "{}", out.content);
+        let out = Subagent.run(json!({"task": "more", "name": "fixer"}), &c).await;
+        assert!(out.content.starts_with("ok again"), "{}", out.content);
+        assert!(Subagent.run(json!({"action": "resume", "name": "ghost"}), &c).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_working_subagent_cancels_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.agents");
+        let fake = Fake { hang: true, ..Fake::default() };
+        let c = named_ctx(&fake, dir.path(), &store);
+        let task = {
+            let c = c.clone();
+            tokio::spawn(async move { Subagent.run(json!({"task": "spin", "name": "w"}), &c).await })
+        };
+        let key = subagents::key(&store, "w");
+        for _ in 0..200 {
+            if subagents::is_live(&key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(subagents::is_live(&key));
+        let busy = Subagent.run(json!({"task": "again", "name": "w"}), &c).await;
+        assert!(busy.is_error && busy.content.contains("still working"), "{}", busy.content);
+        let stop = Subagent.run(json!({"action": "stop", "name": "w"}), &c).await;
+        assert!(stop.content.contains("Stopping"), "{}", stop.content);
+        let out = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(out.is_error && out.content.contains("was stopped"), "{}", out.content);
+        let record = subagents::load(&store, "w").unwrap().unwrap();
+        assert_eq!(record.status, Status::Stopped);
+        assert_eq!(users(&record.items), ["spin"]);
+        assert!(!subagents::is_live(&key));
     }
 }
