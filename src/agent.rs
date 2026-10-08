@@ -430,6 +430,7 @@ impl Agent {
             granted: Default::default(),
             session_id: self.session.as_ref().map(|s| s.id.clone()),
             hooks: self.hooks.clone(),
+            subagent_dir: self.session.as_ref().map(|s| crate::subagents::store_dir(&s.path)),
         };
         let summary = tool.summary(&args);
 
