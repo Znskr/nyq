@@ -157,6 +157,7 @@ pub struct Agent {
     /// Persistent allow/ask/deny rules (see `crate::permissions`).
     pub permissions: std::sync::Arc<crate::permissions::Permissions>,
     pub usage: Usage,
+    pub stats: crate::usage::Stats,
     /// Model context window in tokens; drives automatic compaction.
     pub context_window: u64,
     /// Latest context size (input plus output), or an estimate after compaction.
@@ -176,7 +177,24 @@ pub struct Agent {
 }
 
 impl Agent {
+    fn account_usage(&mut self, usage: Option<Usage>, ui: &mut dyn Ui) {
+        self.stats.requests += 1;
+        let Some(u) = usage else { return };
+        self.usage.input_tokens += u.input_tokens;
+        self.usage.output_tokens += u.output_tokens;
+        self.usage.cached_tokens += u.cached_tokens;
+        ui.usage(&u);
+        // Permissions are loaded from the active profile, including in ACP and subagents.
+        if let Some(home) = self.permissions.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let session = self.session.as_ref().map_or(self.stats.id.as_str(), |s| s.id.as_str());
+            if let Err(e) = crate::usage::append(home, session, self.provider.name(), self.provider.pricing_provider(), self.provider.model(), u) {
+                crate::ui::error(&format!("could not save usage: {e:#}"));
+            }
+        }
+    }
+
     pub fn push(&mut self, item: Item) {
+        self.stats.item(&item);
         if let Some(s) = &mut self.session {
             if let Err(e) = s.append(&item) {
                 crate::ui::error(&format!("could not save session: {e:#}"));
@@ -219,13 +237,10 @@ impl Agent {
                 return Ok(TurnEnd::Cancelled);
             };
             let response = result?;
+            self.account_usage(response.usage, ui);
             if let Some(u) = response.usage {
-                self.usage.input_tokens += u.input_tokens;
-                self.usage.output_tokens += u.output_tokens;
-                self.usage.cached_tokens += u.cached_tokens;
                 self.context_tokens = u.input_tokens + u.output_tokens;
                 self.context_estimated = false;
-                ui.usage(&u);
             } else {
                 self.context_estimated = true;
             }
@@ -489,6 +504,7 @@ impl Agent {
             _ = cancel.cancelled() => return Ok(false),
             r = self.provider.stream(req, &mut ignore) => r?,
         };
+        self.account_usage(response.usage, ui);
         if cancel.is_cancelled() {
             return Ok(false);
         }
@@ -522,12 +538,6 @@ impl Agent {
         self.context_estimated = false;
         self.suppress_auto_compact = self.context_window > 0
             && self.context_tokens as f64 >= self.context_window as f64 * auto_compact_at();
-        if let Some(u) = response.usage {
-            self.usage.input_tokens += u.input_tokens;
-            self.usage.output_tokens += u.output_tokens;
-            self.usage.cached_tokens += u.cached_tokens;
-            ui.usage(&u);
-        }
         let before = self.items.len();
         self.items.clear();
         self.push(Item::Compaction { summary });
@@ -541,6 +551,7 @@ impl Agent {
         self.items.clear();
         self.session = session;
         self.usage = Usage::default();
+        self.stats = Default::default();
         self.context_tokens = 0;
         self.context_estimated = false;
         self.suppress_auto_compact = false;
@@ -556,6 +567,13 @@ impl Agent {
 
     /// After loading a transcript, estimate its size until the provider reports usage.
     pub(crate) fn adopt_transcript(&mut self) {
+        if let Some(session) = &self.session {
+            match self.stats.restore(session, self.permissions.path.parent()) {
+                Ok(usage) => self.usage = usage,
+                Err(e) => crate::ui::error(&format!("could not restore session stats: {e:#}")),
+            }
+        }
+
         self.context_estimated = true;
         self.context_tokens = estimate_context(&self.system, &self.items);
         self.submitted = self.items.len();
@@ -999,6 +1017,7 @@ mod tests {
             allowed: HashSet::new(),
             permissions: Default::default(),
             usage: Usage::default(),
+            stats: Default::default(),
             context_window: 1000,
             context_tokens: 900,
             context_estimated: false,
@@ -1052,8 +1071,30 @@ mod tests {
         assert!(!agent.compact(&mut QuietUi, &cancel).await.unwrap());
         assert_eq!(agent.items, before);
         assert_eq!(agent.context_tokens, 900);
-        assert_eq!(agent.usage, Usage::default());
+        // A completed response still consumes tokens even when cancellation
+        // prevents adopting its summary.
+        assert_eq!(agent.usage, Usage { input_tokens: 100, output_tokens: 10, cached_tokens: 5 });
+        assert_eq!(agent.stats.requests, 1);
         assert_eq!(std::fs::read(path).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn compaction_logs_usage_once_in_active_profile() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("models.json"), r#"{"fake":{"models":{"fake":{"cost":{"input":2,"output":8,"cache_read":0.5}}}}}"#).unwrap();
+        let usage = Usage { input_tokens: 100, output_tokens: 20, cached_tokens: 40 };
+        let mut agent = agent(Response { items: vec![Item::Assistant { text: "summary".into() }], usage: Some(usage) }, None);
+        agent.permissions = std::sync::Arc::new(crate::permissions::Permissions { path: home.path().join("permissions.json"), ..Default::default() });
+        agent.session = Some(Session::create(&home.path().join("sessions"), &agent.cwd, "fake").unwrap());
+        assert!(agent.compact(&mut QuietUi, &CancellationToken::new()).await.unwrap());
+        let log = std::fs::read_to_string(home.path().join("usage.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        let r: crate::usage::Record = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(r.session, agent.session.as_ref().unwrap().id);
+        assert_eq!((r.input, r.output, r.cached), (100,20,40));
+        assert!((r.cost_usd.unwrap() - 0.0003).abs() < 1e-12);
+        assert_eq!(agent.usage, usage);
+        assert_eq!(agent.stats.requests, 1);
     }
 
     #[tokio::test]

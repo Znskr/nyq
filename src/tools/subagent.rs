@@ -136,6 +136,7 @@ impl Tool for Subagent {
             allowed: ctx.allowed.clone(),
             permissions: ctx.permissions.clone(),
             usage: Usage::default(),
+            stats: Default::default(),
             context_window,
             context_tokens: 0,
             context_estimated: false,
