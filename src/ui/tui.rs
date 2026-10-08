@@ -131,6 +131,15 @@ struct PendingQuestion {
     question: String,
     options: Vec<String>,
     selected: usize,
+    /// A menu (`/setup`, `/login`): shown under this title, no typed answers.
+    menu: Option<String>,
+    reply: oneshot::Sender<Option<String>>,
+}
+
+/// A masked one-line prompt (API keys): never echoed, never in history.
+struct PendingSecret {
+    prompt: String,
+    text: String,
     reply: oneshot::Sender<Option<String>>,
 }
 
@@ -223,6 +232,7 @@ pub struct Screen {
     pub queue: Vec<(Queued, String)>,
     approval: Option<PendingApproval>,
     question: Option<PendingQuestion>,
+    secret: Option<PendingSecret>,
     tools: Vec<ToolRow>,
     menu: Option<ModelMenu>,
     sessions: Option<SessionMenu>,
@@ -478,6 +488,7 @@ impl Screen {
             queue: Vec::new(),
             approval: None,
             question: None,
+            secret: None,
             tools: Vec::new(),
             menu: None,
             sessions: None,
@@ -668,6 +679,16 @@ impl Screen {
             }
             keys.extend([("n", "Deny"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]);
             rows.push(hints(&keys));
+        } else if let Some(sec) = &self.secret {
+            for l in wrap(&sanitize_text(&sec.prompt), w.saturating_sub(2).max(1)) {
+                rows.push(paint(fg(BRIGHT).bold(), &l));
+            }
+            let dots = "•".repeat(sec.text.chars().count().min(w.saturating_sub(3)));
+            cursor_row = rows.len();
+            cursor_col = 2 + dots.chars().count();
+            rows.push(format!("{} {dots}", paint(fg(BRIGHT), "┃")));
+            rows.push(rule(w));
+            rows.push(hints(&[("Enter", "Save"), ("Esc", "Cancel")]));
         } else {
             let view = self.editor.render(w.saturating_sub(2).max(1));
             let top = rows.len();
@@ -678,7 +699,7 @@ impl Screen {
             cursor_col = 2 + view.cursor_col;
             if let Some(q) = &self.question {
                 rows.push(rule(w));
-                rows.push(paint(fg(BRIGHT).bold(), "Question"));
+                rows.push(paint(fg(BRIGHT).bold(), q.menu.as_deref().unwrap_or("Question")));
                 let question = sanitize_text(&q.question);
                 for l in wrap(&question, w.saturating_sub(2).max(1)) {
                     rows.push(paint(fg(MID), &l));
@@ -691,7 +712,11 @@ impl Screen {
                     rows.push(format!("{lead}{}", if sel { paint(fg(BRIGHT).bold(), &text) } else { paint(fg(MID), &text) }));
                 }
                 rows.push(rule(w));
-                rows.push(hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("type", "Own answer"), ("Esc", "Skip")]));
+                rows.push(if q.menu.is_some() {
+                    hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("Esc", "Close")])
+                } else {
+                    hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("type", "Own answer"), ("Esc", "Skip")])
+                });
             } else if !self.menu_rows(&mut rows) {
                 rows.push(String::new());
                 rows.push(self.footer_line());
@@ -1381,6 +1406,31 @@ impl Screen {
         }
     }
 
+    fn on_secret_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(s) = self.secret.take() {
+                    let _ = s.reply.send(Some(s.text));
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('c' | 'd') if key.code == KeyCode::Esc || ctrl => {
+                if let Some(s) = self.secret.take() {
+                    let _ = s.reply.send(None);
+                }
+            }
+            KeyCode::Char('u') if ctrl => self.secret.iter_mut().for_each(|s| s.text.clear()),
+            KeyCode::Backspace => {
+                self.secret.iter_mut().for_each(|s| {
+                    s.text.pop();
+                });
+            }
+            KeyCode::Char(ch) if text_key(key, ch) => self.secret.iter_mut().for_each(|s| s.text.push(ch)),
+            _ => {}
+        }
+        self.redraw();
+    }
+
     fn on_menu_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
         let Some(m) = &mut self.menu else { return };
         let count = m.visible().len();
@@ -1458,6 +1508,9 @@ impl Screen {
             self.redraw();
             return;
         }
+        if self.secret.is_some() {
+            return self.on_secret_key(key);
+        }
         if self.viewer.is_some() {
             return self.on_viewer_key(key);
         }
@@ -1489,19 +1542,23 @@ impl Screen {
         }
         if let Some(q) = &mut self.question {
             let n = q.options.len().max(1);
+            let arrows = self.editor.is_empty() || q.menu.is_some();
             match key.code {
-                KeyCode::Up if self.editor.is_empty() => q.selected = q.selected.checked_sub(1).unwrap_or(n - 1),
-                KeyCode::Down if self.editor.is_empty() => q.selected = (q.selected + 1) % n,
-                KeyCode::Char(d @ '1'..='9') if self.editor.is_empty() && (d as usize - '1' as usize) < q.options.len() => {
+                KeyCode::Up if arrows => q.selected = q.selected.checked_sub(1).unwrap_or(n - 1),
+                KeyCode::Down if arrows => q.selected = (q.selected + 1) % n,
+                KeyCode::Char(d @ '1'..='9') if arrows && (d as usize - '1' as usize) < q.options.len() => {
                     q.selected = d as usize - '1' as usize;
                 }
                 KeyCode::Enter if key.modifiers.is_empty() => {
                     let q = self.question.take().unwrap();
-                    let typed = self.editor.text();
+                    let typed = if q.menu.is_some() { String::new() } else { self.editor.text() };
                     let answer = if typed.trim().is_empty() { q.options.get(q.selected).cloned() } else { Some(typed) };
-                    self.editor.set_text("");
+                    if q.menu.is_none() {
+                        self.editor.set_text("");
+                    }
                     let _ = q.reply.send(answer);
                 }
+                _ if q.menu.is_some() => {}
                 _ => {
                     self.editor.handle_key(key, true);
                 }
@@ -1726,7 +1783,7 @@ impl Tui {
                                 let now = Instant::now();
                                 let pasted = paste_key(k, previous, now, streak);
                                 streak = if previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10)) { streak + 1 } else { 0 };
-                                if let Some(text) = pasted.filter(|_| s.approval.is_none() && s.menu.is_none() && s.sessions.is_none()) {
+                                if let Some(text) = pasted.filter(|_| s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() && s.secret.is_none()) {
                                     s.editor.paste(text);
                                     s.redraw();
                                     previous = Some(Instant::now());
@@ -1754,7 +1811,9 @@ impl Tui {
                             }
                         }
                         Event::Paste(text) => {
-                            if s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() {
+                            if let Some(sec) = &mut s.secret {
+                                sec.text.push_str(text.trim());
+                            } else if s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() {
                                 s.editor.paste(&text);
                             }
                             s.redraw();
@@ -1804,6 +1863,47 @@ impl Tui {
             let (choices, warnings) = crate::models::list(&home).await;
             lock(&screen).set_models(choices, warnings);
         });
+    }
+
+    /// Show a menu titled `title` in the input area; the chosen option's
+    /// index, or None when it is closed with Esc.
+    pub async fn pick(&self, title: &str, prompt: &str, options: &[String]) -> Option<usize> {
+        let shown: Vec<String> = options.iter().map(|o| one_line(o, 200)).collect();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut s = self.screen();
+            s.flush_all();
+            s.question = Some(PendingQuestion {
+                question: sanitize_text(prompt),
+                options: shown.clone(),
+                selected: 0,
+                menu: Some(title.to_string()),
+                reply: tx,
+            });
+            s.redraw();
+        }
+        let guard = ClearQuestion(Arc::clone(&self.screen));
+        let answer = rx.await.ok().flatten();
+        drop(guard);
+        answer.and_then(|a| shown.iter().position(|o| *o == a))
+    }
+
+    /// Ask for a secret (an API key) without echoing it; None if cancelled
+    /// or empty. The text never reaches the editor, history or transcript.
+    pub async fn secret(&self, prompt: &str) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut s = self.screen();
+            s.flush_all();
+            s.secret = Some(PendingSecret { prompt: prompt.to_string(), text: String::new(), reply: tx });
+            s.redraw();
+        }
+        let answer = rx.await.ok().flatten();
+        let mut s = self.screen();
+        if s.secret.take().is_some() || answer.is_some() {
+            s.redraw();
+        }
+        answer.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
     }
 
     /// The `agent::Ui` for one run.
@@ -2066,6 +2166,7 @@ impl Ui for TuiUi {
                 question: sanitize_text(question),
                 options: options.iter().map(|o| one_line(o, 200)).collect(),
                 selected: 0,
+                menu: None,
                 reply: tx,
             });
             s.redraw();
@@ -2302,6 +2403,7 @@ mod tests {
             question: "line\n\x1b]52;c;eA==\x07next".into(),
             options: vec!["ok\nmore".into()],
             selected: 0,
+            menu: None,
             reply: tx,
         });
         let (rows, _, _) = s.pane();
@@ -2441,6 +2543,7 @@ mod tests {
             question: "q".into(),
             options: vec!["a".into()],
             selected: 0,
+            menu: None,
             reply: tx,
         });
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -2457,6 +2560,7 @@ mod tests {
             question: "q".into(),
             options: vec!["a".into()],
             selected: 0,
+            menu: None,
             reply: tx,
         });
         s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &cmd_tx);
@@ -2469,6 +2573,7 @@ mod tests {
             question: "q".into(),
             options: vec!["a".into()],
             selected: 0,
+            menu: None,
             reply: tx,
         });
         s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &cmd_tx);

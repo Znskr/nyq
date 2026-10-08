@@ -137,6 +137,18 @@ pub fn api_key(home: &Path, service: Service) -> Option<String> {
     read_key(&own_auth(home), service.id())
 }
 
+/// Where `service`'s key comes from (same precedence as [`api_key`]): its
+/// environment variable, the OpenCode CLI's login, or nyq's `auth.json`.
+pub fn key_source(home: &Path, service: Service) -> Option<String> {
+    if std::env::var(service.key_env()).ok().is_some_and(|k| !k.trim().is_empty()) {
+        return Some(service.key_env().into());
+    }
+    if service.is_opencode() && opencode_auth_files().iter().any(|f| read_key(f, service.id()).is_some()) {
+        return Some("OpenCode CLI login".into());
+    }
+    read_key(&own_auth(home), service.id()).map(|_| "stored by nyq".into())
+}
+
 fn read_own(home: &Path) -> Result<serde_json::Map<String, Value>> {
     match std::fs::read(own_auth(home)) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("parsing auth.json"),
