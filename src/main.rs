@@ -18,6 +18,7 @@ mod prompt;
 mod provider;
 mod sandbox;
 mod session;
+mod record_tape;
 mod settings;
 mod skills;
 mod templates;
@@ -53,6 +54,9 @@ struct Cli {
     /// Answer the prompt non-interactively and exit (reads stdin if no prompt).
     #[arg(short, long)]
     print: bool,
+    /// Record interactive terminal output under <home>/tapes/<session>.cast.
+    #[arg(long)]
+    record: bool,
     /// Model id (overrides config).
     #[arg(short, long, global = true)]
     model: Option<String>,
@@ -86,6 +90,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Play an asciicast v2 terminal tape.
+    Replay { tape: std::path::PathBuf, #[arg(long, default_value_t = 1.0)] speed: f64 },
     /// List saved conversations.
     Sessions,
     /// Answer one prompt and exit (same as -p). Reads stdin when no prompt is given.
@@ -128,6 +134,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SessionCommand {
+    /// Copy readable items to a new session, skipping broken lines.
+    Recover { which: String },
+    /// Add the current format version to an older session.
+    Migrate { which: String },
     /// Print a transcript summary.
     Show {
         /// Session id, a unique prefix, or `last`.
@@ -228,6 +238,17 @@ async fn run() -> Result<()> {
     }
 
     match &cli.command {
+        Some(Command::Replay { tape, speed }) => return record_tape::replay(tape, *speed).await,
+        Some(Command::Session { action: SessionCommand::Recover { which } }) => {
+            let (id, kept, skipped) = session::recover(&sessions_dir, which, &cwd)?;
+            println!("Recovered {id}: {kept} items, {skipped} broken lines skipped");
+            return Ok(());
+        }
+        Some(Command::Session { action: SessionCommand::Migrate { which } }) => {
+            let changed = session::migrate(&sessions_dir, which, &cwd)?;
+            println!("{}", if changed { "Session migrated" } else { "Session already current" });
+            return Ok(());
+        }
         Some(Command::Usage { period }) => return usage::show(&home, *period),
         Some(Command::Models) => { doctor::models(&home).await; return Ok(()); }
         Some(Command::Status { json }) => {
@@ -380,6 +401,10 @@ async fn run() -> Result<()> {
     let interactive = !print
         && std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    anyhow::ensure!(!cli.record || interactive, "--record requires an interactive terminal");
+    let _capture = if cli.record {
+        Some(record_tape::Capture::start(&home, &agent.session.as_ref().expect("session").id)?)
+    } else { None };
     commands::apply_startup(&home, &mut agent, interactive);
     if !interactive {
         anyhow::ensure!(

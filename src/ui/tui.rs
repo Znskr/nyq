@@ -3,7 +3,7 @@
 //! line, the running tool group, a status line, queued messages, the input
 //! (always accepting text, even while the agent works), menus, and a footer.
 
-use std::io::{self, Stdout, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -202,7 +202,7 @@ fn order_sessions(mut all: Vec<Meta>, cwd: &std::path::Path, current: Option<&st
 }
 
 pub struct Screen {
-    out: Stdout,
+    out: crate::record_tape::Output,
     width: usize,
     height: usize,
     /// Rows of the pane currently on screen and the cursor's row within it.
@@ -460,7 +460,7 @@ impl Screen {
     fn new(footer: Footer, editor: Editor, history: Vec<String>, home: PathBuf) -> Self {
         let (w, h) = terminal::size().unwrap_or((80, 24));
         Screen {
-            out: io::stdout(),
+            out: crate::record_tape::stdout(),
             width: (w as usize).max(1),
             height: (h as usize).max(1),
             pane_rows: 0,
@@ -1695,7 +1695,7 @@ impl Tui {
         terminal::enable_raw_mode()?;
         let mut setup = TerminalSetup::arm();
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
-        let mut out = io::stdout();
+        let mut out = crate::record_tape::stdout();
         execute!(out, crossterm::event::EnableBracketedPaste)?;
         setup.bracketed = true;
         if enhanced {
@@ -1831,7 +1831,7 @@ impl Drop for Tui {
         }
         *SCREEN.lock().unwrap() = None;
         if self.enhanced {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+            let _ = execute!(crate::record_tape::stdout(), PopKeyboardEnhancementFlags);
         }
         restore_terminal();
     }
@@ -1861,18 +1861,18 @@ impl Drop for TerminalSetup {
             return;
         }
         if self.enhanced {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+            let _ = execute!(crate::record_tape::stdout(), PopKeyboardEnhancementFlags);
         }
         if self.bracketed {
-            let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+            let _ = execute!(crate::record_tape::stdout(), crossterm::event::DisableBracketedPaste);
         }
-        let _ = execute!(io::stdout(), cursor::Show);
+        let _ = execute!(crate::record_tape::stdout(), cursor::Show);
         let _ = terminal::disable_raw_mode();
     }
 }
 
 fn restore_terminal() {
-    let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste, cursor::Show);
+    let _ = execute!(crate::record_tape::stdout(), crossterm::event::DisableBracketedPaste, cursor::Show);
     let _ = terminal::disable_raw_mode();
 }
 
