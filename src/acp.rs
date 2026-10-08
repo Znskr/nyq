@@ -360,6 +360,7 @@ async fn open(
         allowed: Default::default(),
         permissions: Arc::new(permissions),
         usage: Usage::default(),
+            stats: Default::default(),
         context_window: 0,
         context_tokens: 0,
         context_estimated: false,
