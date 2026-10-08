@@ -437,7 +437,7 @@ async fn shell(cmd: &str, cwd: &Path, tui: &Tui) {
     let policy = sandbox::Policy { mode: sandbox::Mode::Off, ..Default::default() };
     let output = tools::run_shell(cmd, cwd, &policy, &cancel, None).await;
     let mut screen = tui.screen();
-    screen.set_busy(None, None);
+    screen.idle();
     screen.print_tool("bash", cmd, Some(&output));
 }
 
@@ -531,7 +531,7 @@ async fn slash(
             let cancel = CancellationToken::new();
             tui.screen().set_busy(Some("Compacting"), Some(cancel.clone()));
             let result = agent.compact(&mut tui.ui(agent.cwd.clone()), &cancel).await;
-            tui.screen().set_busy(None, None);
+            tui.screen().idle();
             if !result? {
                 ui::info("Interrupted.");
             }
@@ -573,7 +573,7 @@ async fn slash(
                         mcp::open_browser(url);
                     })
                     .await;
-                tui.screen().set_busy(None, None);
+                tui.screen().idle();
                 let tools = result?;
                 let n = tools.len();
                 install_mcp_tools(agent, name, tools)?;

@@ -783,7 +783,9 @@ pub fn is_allowed(allowed: &HashSet<String>, tool: &str, args: &Value, cwd: &Pat
     }
     if is_file_tool(tool) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-        return allowed.contains(tool) && !path.is_empty() && inside(cwd, path);
+        // Hooks and config under .git run later with full permissions: always ask.
+        let in_git = Path::new(path).components().any(|c| c.as_os_str() == ".git");
+        return allowed.contains(tool) && !path.is_empty() && !in_git && inside(cwd, path);
     }
     if tool == "subagent" {
         return allowed.contains(&format!("subagent:{}", subagent_mode(args)));
@@ -1089,6 +1091,11 @@ mod tests {
         assert_eq!(grant_rule("bash", &json!({"command": "git status -s"})).as_deref(), Some("bash:git status"));
         assert_eq!(grant_rule("bash", &json!({"command": "a; b"})), None);
         assert_eq!(grant_rule("write_file", &json!({"path": "x"})).as_deref(), Some("write_file"));
+        let write: HashSet<String> = ["write_file".into()].into();
+        assert!(is_allowed(&write, "write_file", &json!({"path": "src/x.rs"}), cwd));
+        assert!(!is_allowed(&write, "write_file", &json!({"path": ".git/hooks/pre-commit"}), cwd));
+        assert!(!is_allowed(&write, "edit_file", &json!({"path": "./.git/config"}), cwd));
+        assert!(!is_allowed(&write, "write_file", &json!({"path": "sub/.git/config"}), cwd));
         assert_eq!(grant_rule("mcp__wiki__ask", &json!({})).as_deref(), Some("mcp__wiki__ask"));
         assert_eq!(
             grant_rule("web_fetch", &json!({"url": "https://example.com/a"})).as_deref(),
