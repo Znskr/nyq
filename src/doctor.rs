@@ -112,12 +112,14 @@ struct Check {
     ok: bool,
     detail: String,
     hint: &'static str,
+    /// Informational checks warn (`!`) instead of failing doctor.
+    required: bool,
 }
 impl Check {
     fn line(&self) -> String {
         format!(
             "{} {}: {}{}",
-            if self.ok { "✓" } else { "✗" },
+            if self.ok { "✓" } else if self.required { "✗" } else { "!" },
             self.name,
             self.detail,
             if self.ok || self.hint.is_empty() {
@@ -134,6 +136,7 @@ fn check(name: &'static str, ok: bool, detail: impl Into<String>, hint: &'static
         ok,
         detail: detail.into(),
         hint,
+        required: true,
     }
 }
 fn codex_auth_valid(home: &Path) -> bool {
@@ -299,7 +302,7 @@ pub async fn doctor(
     let terminal = std::io::stdin().is_terminal()
         && std::io::stderr().is_terminal()
         && std::env::var("TERM").map_or(true, |v| v != "dumb");
-    checks.push(check(
+    checks.push(Check { required: false, ..check(
         "terminal",
         terminal,
         if terminal {
@@ -308,9 +311,9 @@ pub async fn doctor(
             "interactive terminal unavailable"
         },
         "run in an interactive terminal with TERM set appropriately; print mode remains available",
-    ));
+    ) });
     ui::list(&checks.iter().map(Check::line).collect::<Vec<_>>());
-    anyhow::ensure!(checks.iter().all(|c| c.ok), "doctor found failing checks");
+    anyhow::ensure!(checks.iter().all(|c| c.ok || !c.required), "doctor found failing checks");
     Ok(())
 }
 pub async fn models(home: &Path) {
