@@ -1,6 +1,5 @@
 //! Estimated token prices, in USD per million tokens. Local catalogs override defaults.
 use crate::types::Usage;
-use serde_json::Value;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug)]
@@ -17,39 +16,24 @@ impl Price {
             / 1_000_000.0
     }
 }
-fn catalog(v: &Value, provider: &str, model: &str) -> Option<Price> {
-    let (provider, model) = model
-        .split_once('/')
-        .filter(|(p, _)| v.get(*p).is_some())
-        .unwrap_or((provider, model));
-    let c = &v[provider]["models"][model]["cost"];
-    let input = c["input"].as_f64()?;
-    let output = c["output"].as_f64()?;
-    let cached = c["cache_read"].as_f64().unwrap_or(input);
-    [input, output, cached]
-        .iter()
-        .all(|n| n.is_finite() && *n >= 0.0)
-        .then_some(Price {
-            input,
-            output,
-            cached,
-        })
+/// A model's price from the models.dev catalog (see `crate::catalog`). A
+/// `provider/model` id (as on aggregators) is looked up under that provider.
+fn from_catalog(home: &Path, provider: &str, model: &str) -> Option<Price> {
+    let lookup = |p: &str, m: &str| {
+        let meta = crate::catalog::load(home, p).remove(m)?;
+        let (input, output) = meta.cost?;
+        let cached = meta.cached_cost.unwrap_or(input);
+        [input, output, cached].iter().all(|n| n.is_finite() && *n >= 0.0).then_some(Price { input, output, cached })
+    };
+    model.split_once('/').and_then(|(p, m)| lookup(p, m)).or_else(|| lookup(provider, model))
 }
+
 pub fn lookup(home: &Path, provider: &str, model: &str) -> Option<Price> {
     if provider == "codex" {
         return None;
     }
-    let cache = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".cache/opencode/models.json");
-    for path in [home.join("models.json"), cache] {
-        if let Some(price) = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| catalog(&v, provider, model))
-        {
-            return Some(price);
-        }
+    if let Some(price) = from_catalog(home, provider, model) {
+        return Some(price);
     }
     if provider != "openai" {
         return None;
@@ -98,9 +82,11 @@ mod tests {
     }
     #[test]
     fn catalog_supports_provider_prefix_and_zero_prices() {
-        let v = serde_json::json!({"opencode":{"models":{"free":{"cost":{"input":0,"output":0}},"paid":{"cost":{"input":2,"output":3,"cache_read":1}}}}});
-        assert_eq!(catalog(&v, "openai", "opencode/paid").unwrap().cached, 1.0);
-        assert_eq!(catalog(&v, "opencode", "free").unwrap().input, 0.0);
-        assert!(catalog(&v, "openai", "unknown").is_none());
+        let home = tempfile::tempdir().unwrap();
+        let doc = serde_json::json!({"opencode":{"models":{"free":{"cost":{"input":0,"output":0}},"paid":{"cost":{"input":2,"output":3,"cache_read":1}}}}});
+        std::fs::write(home.path().join("models.json"), doc.to_string()).unwrap();
+        assert_eq!(from_catalog(home.path(), "openai", "opencode/paid").unwrap().cached, 1.0);
+        assert_eq!(from_catalog(home.path(), "opencode", "free").unwrap().input, 0.0);
+        assert!(from_catalog(home.path(), "openai", "unknown").is_none());
     }
 }
