@@ -207,6 +207,7 @@ fn child(ctx: &ToolCtx, general: bool, persistent: bool, items: Vec<Item>) -> Re
         system,
         items,
         session: None,
+        usage_session_id: ctx.session_id.clone(),
         cwd: ctx.cwd.clone(),
         // Inherit the parent's mode, "always" grants and rules.
         // Calls that still need approval are forwarded to the parent's
@@ -542,6 +543,7 @@ mod tests {
 
     fn resp(items: Vec<Item>) -> Response {
         Response {
+            truncated: false,
             items,
             usage: Some(Usage {
                 input_tokens: 100,

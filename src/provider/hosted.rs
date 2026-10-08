@@ -216,7 +216,10 @@ impl HostedProvider {
         match self.service {
             Service::Xai => Protocol::Responses,
             Service::Vercel => Protocol::Chat,
-            Service::OpencodeGo | Service::Opencode => self.meta().map_or(Protocol::Chat, ModelMeta::protocol),
+            // A missing catalog used to force chat completions for every model.
+            Service::OpencodeGo | Service::Opencode => {
+                self.meta().map_or_else(|| infer_protocol(&self.model), ModelMeta::protocol)
+            }
         }
     }
 
@@ -264,6 +267,18 @@ impl HostedProvider {
                 })
             })
             .collect())
+    }
+}
+
+/// Backstop when models.dev has no row for this id.
+fn infer_protocol(model: &str) -> Protocol {
+    let id = model.to_ascii_lowercase();
+    if id.starts_with("claude") {
+        Protocol::Anthropic
+    } else if id.starts_with("grok") || id.starts_with("gpt") {
+        Protocol::Responses
+    } else {
+        Protocol::Chat
     }
 }
 
@@ -362,6 +377,14 @@ mod tests {
         assert_eq!(p(Service::OpencodeGo, "grok"), Protocol::Responses);
         assert_eq!(p(Service::Opencode, "claude"), Protocol::Anthropic);
         assert_eq!(p(Service::Opencode, "unknown"), Protocol::Chat);
+        let bare = |model: &str| {
+            HostedProvider::new(Service::Opencode, "http://unused".into(), "k".into(), model.into(), None, Arc::new(Models::new())).protocol()
+        };
+        assert_eq!(bare("claude-sonnet-4"), Protocol::Anthropic);
+        assert_eq!(bare("Claude-Opus"), Protocol::Anthropic);
+        assert_eq!(bare("gpt-5.5"), Protocol::Responses);
+        assert_eq!(bare("grok-4"), Protocol::Responses);
+        assert_eq!(bare("glm-5"), Protocol::Chat);
         assert_eq!(p(Service::Xai, "anything"), Protocol::Responses);
         assert_eq!(p(Service::Vercel, "claude"), Protocol::Chat);
         assert_eq!(Service::parse("Grok"), Some(Service::Xai));

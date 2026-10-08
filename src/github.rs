@@ -207,12 +207,28 @@ Keep the title under 72 characters; leave a section brief rather than inventing 
     )
 }
 
-/// Ask the model for a draft (no tools, nothing stored).
-pub async fn ask_model(provider: &dyn Provider, prompt: &str) -> Result<Draft> {
+/// Ask the model for a draft (no tools, nothing stored in the transcript).
+/// Token use is recorded under `usage_id` (`cli-pr` or `cli-issue`).
+pub async fn ask_model(home: &Path, provider: &dyn Provider, prompt: &str, usage_id: &str) -> Result<Draft> {
     let items = [Item::user(prompt)];
     let req = Request { system: SYSTEM, items: &items, tools: &[] };
     let mut ignore = |_: StreamEvent| {};
     let response = provider.stream(req, &mut ignore).await?;
+    if let Some(usage) = response.usage {
+        if let Err(e) = crate::usage::append(
+            home,
+            usage_id,
+            provider.name(),
+            provider.pricing_provider(),
+            provider.model(),
+            usage,
+        ) {
+            eprintln!("nyq: could not save usage: {e:#}");
+        }
+    }
+    if response.truncated {
+        anyhow::bail!("the draft was cut off at the output limit");
+    }
     let text: String = response
         .items
         .iter()
@@ -315,7 +331,7 @@ fn edit(draft: &Draft) -> Result<Draft> {
 }
 
 /// `nyq pr` / `nyq issue`.
-pub async fn run(cwd: &Path, provider: &dyn Provider, workflow: Workflow, opts: Options) -> Result<()> {
+pub async fn run(cwd: &Path, home: &Path, provider: &dyn Provider, workflow: Workflow, opts: Options) -> Result<()> {
     let name = workflow.command();
     let (prompt, branch) = match workflow {
         Workflow::PullRequest => {
@@ -332,7 +348,11 @@ pub async fn run(cwd: &Path, provider: &dyn Provider, workflow: Workflow, opts: 
             (issue_prompt(&snapshot(cwd), &opts.context), None)
         }
     };
-    let mut draft = ask_model(provider, &prompt).await.with_context(|| format!("nyq {name}: drafting failed"))?;
+    let usage_id = match workflow {
+        Workflow::PullRequest => "cli-pr",
+        Workflow::Issue => "cli-issue",
+    };
+    let mut draft = ask_model(home, provider, &prompt, usage_id).await.with_context(|| format!("nyq {name}: drafting failed"))?;
     let tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     loop {
         print!("\n{}", draft.render());
@@ -393,6 +413,57 @@ mod tests {
         let d = parse_draft("```markdown\nFix it\n\n## Summary\nx\n```").unwrap();
         assert_eq!(d, Draft { title: "Fix it".into(), body: "## Summary\nx".into() });
         assert!(parse_draft("Title:\nbody").is_err());
+    }
+
+    #[tokio::test]
+    async fn ask_model_records_usage_and_rejects_a_cut_off_draft() {
+        struct Fake {
+            truncated: bool,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for Fake {
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn model(&self) -> &str {
+                "m"
+            }
+            fn set_model(&mut self, _: String) {}
+            fn fork(&self) -> Box<dyn crate::provider::Provider> {
+                unimplemented!()
+            }
+            async fn stream(
+                &self,
+                _: Request<'_>,
+                _: crate::provider::EventSink<'_>,
+            ) -> Result<crate::types::Response> {
+                Ok(crate::types::Response {
+                    truncated: self.truncated,
+                    items: vec![Item::Assistant {
+                        text: "Title\n\n## Summary\nhello".into(),
+                    }],
+                    usage: Some(crate::types::Usage {
+                        input_tokens: 3,
+                        output_tokens: 4,
+                        cached_tokens: 1,
+                    }),
+                })
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let draft = ask_model(home.path(), &Fake { truncated: false }, "prompt", "cli-pr")
+            .await
+            .unwrap();
+        assert_eq!(draft.title, "Title");
+        let log = std::fs::read_to_string(home.path().join("usage.jsonl")).unwrap();
+        assert!(log.contains("cli-pr"), "{log}");
+        assert!(log.contains("\"input\":3"), "{log}");
+        assert!(log.contains("\"output\":4"), "{log}");
+        let err = ask_model(home.path(), &Fake { truncated: true }, "prompt", "cli-pr")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cut off"), "{err}");
     }
 
     #[test]

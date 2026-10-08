@@ -387,6 +387,28 @@ impl Registry {
         out
     }
 
+    /// `mcp_search_tools` / `mcp_select_tool` while MCP tools are deferred.
+    pub fn is_meta(&self, name: &str) -> bool {
+        (name == mcp_search::SEARCH || name == mcp_search::SELECT)
+            && mcp_search::should_defer(&self.mcp_specs())
+    }
+
+    /// A direct call to an MCP tool whose schema is hidden until it is selected.
+    pub fn deferred_block(&self, name: &str) -> Option<String> {
+        if !mcp_search::is_mcp(name) {
+            return None;
+        }
+        let mcp = self.mcp_specs();
+        if !mcp_search::should_defer(&mcp) || self.selected.contains(name) {
+            return None;
+        }
+        Some(format!(
+            "`{name}` is not callable until you select it. Call {} to find it, then {} with its exact name.",
+            mcp_search::SEARCH,
+            mcp_search::SELECT
+        ))
+    }
+
     /// Run `mcp_search_tools` / `mcp_select_tool` (None for any other call,
     /// or when MCP tools are not being deferred).
     pub fn handle_meta(&mut self, name: &str, arguments: &str) -> Option<ToolOutput> {

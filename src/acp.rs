@@ -396,8 +396,25 @@ async fn load_session(
 ) -> Result<acp::LoadSessionResponse, sdk::Error> {
     check_cwd(&req.cwd)?;
     let id = req.session_id.0.to_string();
-    let (session, meta, items) =
-        session::load(&state.sessions_dir(), &id, &req.cwd).map_err(anyhow_error)?;
+    // The live copy holds the session file lock. Release it before reopening,
+    // and put a handle back if that reopen fails.
+    let held = lock(&state.sessions).get(&id).cloned();
+    let loaded = if let Some(old) = &held {
+        let mut inner = old.inner.lock().await;
+        drop(inner.agent.session.take());
+        match session::load(&state.sessions_dir(), &id, &req.cwd) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                if let Ok((s, _, _)) = session::load(&state.sessions_dir(), &id, &req.cwd) {
+                    inner.agent.session = Some(s);
+                }
+                return Err(anyhow_error(e));
+            }
+        }
+    } else {
+        session::load(&state.sessions_dir(), &id, &req.cwd).map_err(anyhow_error)?
+    };
+    let (session, meta, items) = loaded;
     if meta.id != id {
         return Err(sdk::Error::resource_not_found(Some(id)));
     }
@@ -446,6 +463,7 @@ async fn open(
     let model = format!("{}:{}", provider.name(), provider.model());
     let mut agent = Agent {
         session: Some(session),
+        usage_session_id: None,
         provider,
         tools: Registry::builtin(),
         system: prompt::system(&cwd, &sandbox),
@@ -1409,6 +1427,7 @@ mod tests {
                         }
                     }
                     Ok(Response {
+                        truncated: false,
                         items,
                         usage: Some(Usage {
                             input_tokens: 10,
