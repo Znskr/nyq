@@ -550,7 +550,7 @@ async fn run() -> Result<()> {
         }
         let (mut item, mut attached, warning) = tools::image::user_turn(&turn_text, &cwd);
         // Images added with /image, /paste or ctrl+v go with this message.
-        let extra: Vec<_> = tui.screen().attachments.drain(..).collect();
+        let extra = std::mem::take(&mut tui.screen().attachments);
         if let types::Item::User { images, .. } = &mut item {
             for a in extra {
                 images.push(a.image);
