@@ -70,6 +70,19 @@ pub trait Ui: Send {
     async fn ask(&mut self, _question: &str, _options: &[String]) -> Option<String> {
         None
     }
+    /// A shareable handle that asks the same person (or editor) for approval,
+    /// for work that runs outside this loop — e.g. a subagent's tool calls.
+    /// None means such calls cannot be approved and must be denied.
+    fn approver(&self) -> Option<std::sync::Arc<dyn Approver>> {
+        None
+    }
+}
+
+/// Asks for approval from outside the agent loop (see `Ui::approver`).
+#[async_trait::async_trait]
+pub trait Approver: Send + Sync {
+    /// `origin` names who is asking, e.g. "subagent: Count Rust files".
+    async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval;
 }
 
 /// `ask_user_question`: the loop answers it through `Ui::ask` instead of
