@@ -1,6 +1,6 @@
 //! Agent Skills: directories holding a `SKILL.md` (YAML frontmatter with
-//! `name` and `description`, then instructions). Discovered from the same
-//! roots as fx, listed in the system prompt, and loaded on demand by the
+//! `name` and `description`, then instructions). Discovered from the
+//! usual skill roots, listed in the system prompt, and loaded on demand by the
 //! `skill` tool.
 
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<(PathBuf, Pat
     roots
 }
 
-/// Discover skills for a session. `home` is the nyq profile dir (~/.fx).
+/// Discover skills for a session. `home` is the nyq profile dir (~/.nyq).
 pub fn discover(home: &Path, cwd: &Path) -> Vec<Skill> {
     discover_in(&roots(home, dirs::home_dir().as_deref(), cwd))
 }
@@ -402,14 +402,14 @@ mod tests {
     #[test]
     fn discovery_precedence_and_fallbacks() {
         let t = tempfile::tempdir().unwrap();
-        let (cwd, home, user) = (t.path().join("proj"), t.path().join("fx"), t.path().join("user"));
+        let (cwd, home, user) = (t.path().join("proj"), t.path().join("home"), t.path().join("user"));
         write_skill(&cwd.join(".claude/skills"), "review", &md("review", "project review"));
         write_skill(&cwd.join(".agents/skills"), "rev", &md("review", "agents review wins"));
         write_skill(&home.join("skills"), "review", &md("review", "user review"));
         write_skill(&home.join("skills"), "deploy", &md("deploy", "ship it"));
         write_skill(&user.join(".codex/skills"), "nodesc", "no frontmatter at all\n");
         write_skill(&user.join(".claude/skills"), "deploy", &md("deploy", "shadowed"));
-        // Nested packs are not discovered (fx scans one level only).
+        // Nested packs are not discovered (only one level is scanned).
         write_skill(&cwd.join(".nyq/skills"), "pack/inner", &md("inner", "nested"));
         fs::write(cwd.join(".nyq/skills/stray.md"), "not a dir").unwrap();
 
@@ -434,25 +434,25 @@ mod tests {
         let root = proj.join(".claude/skills");
         fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(t.path().join("store/linked"), root.join("linked")).unwrap();
-        let skills = discover_in(&roots(&t.path().join("fx"), None, &proj));
+        let skills = discover_in(&roots(&t.path().join("home"), None, &proj));
         assert!(skills.is_empty(), "a skill directory symlink must not leave the project");
 
         write_skill(&root, "real", &md("real", "inside"));
         std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
-        let skills = discover_in(&roots(&t.path().join("fx"), None, &proj));
+        let skills = discover_in(&roots(&t.path().join("home"), None, &proj));
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "inside");
 
         let evil = root.join("evil");
         fs::create_dir(&evil).unwrap();
         std::os::unix::fs::symlink(t.path().join("store/linked/SKILL.md"), evil.join("SKILL.md")).unwrap();
-        let skills = discover_in(&roots(&t.path().join("fx"), None, &proj));
+        let skills = discover_in(&roots(&t.path().join("home"), None, &proj));
         assert!(skills.iter().all(|s| s.name != "linked"));
         if Path::new("/dev/zero").exists() {
             let huge = root.join("huge");
             fs::create_dir(&huge).unwrap();
             std::os::unix::fs::symlink("/dev/zero", huge.join("SKILL.md")).unwrap();
-            let _ = discover_in(&roots(&t.path().join("fx"), None, &proj));
+            let _ = discover_in(&roots(&t.path().join("home"), None, &proj));
         }
     }
 
@@ -493,7 +493,7 @@ mod tests {
         fs::write(root.join("pdf/scripts/fill.py"), "").unwrap();
         fs::write(root.join("pdf/REFERENCE.md"), "").unwrap();
         fs::write(root.join("pdf/.hidden"), "").unwrap();
-        let skills = discover_in(&roots(&t.path().join("fx"), None, &t.path().join("proj")));
+        let skills = discover_in(&roots(&t.path().join("home"), None, &t.path().join("proj")));
         let tool = tool(skills);
         assert!(!tool.needs_approval(&json!({"name": "pdf"})));
         let out = tool.run(json!({"name": "pdf"}), &ToolCtx::default()).await;

@@ -69,7 +69,7 @@ struct Rules {
 }
 
 pub fn user_path(home: &Path) -> PathBuf {
-    home.join("nyq").join("permissions.json")
+    home.join("permissions.json")
 }
 
 pub fn project_path(cwd: &Path) -> PathBuf {
@@ -416,7 +416,6 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join("nyq")).unwrap();
         std::fs::write(user_path(home.path()), "{ not json").unwrap();
         let (p, warnings) = Permissions::load(home.path(), cwd.path());
         assert_eq!(warnings.len(), 1, "{warnings:?}");

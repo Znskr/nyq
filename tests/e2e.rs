@@ -181,7 +181,7 @@ fn assert_success(out: &std::process::Output) {
 }
 
 fn session_items(home: &std::path::Path) -> Vec<Value> {
-    let path = std::fs::read_dir(home.join("nyq/sessions"))
+    let path = std::fs::read_dir(home.join("sessions"))
         .unwrap()
         .next()
         .unwrap()

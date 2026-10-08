@@ -119,7 +119,7 @@ impl State {
     }
 
     fn sessions_dir(&self) -> PathBuf {
-        self.home.join("nyq").join("sessions")
+        self.home.join("sessions")
     }
 
     fn get(&self, id: &acp::SessionId) -> Result<Arc<Live>, sdk::Error> {

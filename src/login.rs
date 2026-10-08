@@ -39,7 +39,7 @@ fn authorize(issuer: &str, state: &str, verifier: &str) -> Result<Url> {
         ("id_token_add_organizations", "true"),
         ("codex_cli_simplified_flow", "true"),
         ("state", state),
-        ("originator", "fx"),
+        ("originator", "nyq"),
     ]);
     Ok(url)
 }
@@ -320,7 +320,7 @@ mod tests {
             ("id_token_add_organizations", "true"),
             ("codex_cli_simplified_flow", "true"),
             ("state", "state"),
-            ("originator", "fx"),
+            ("originator", "nyq"),
         ] {
             assert_eq!(params[k], v);
         }
