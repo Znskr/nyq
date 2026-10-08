@@ -1,17 +1,22 @@
 mod acp;
 mod agent;
 mod catalog;
+mod commands;
 mod config;
+mod diagnostics;
 mod login;
 mod mcp;
 mod mcp_features;
 mod models;
+mod notify;
 mod permissions;
 mod prompt;
 mod provider;
 mod sandbox;
 mod session;
+mod settings;
 mod skills;
+mod templates;
 mod tools;
 mod types;
 mod undo;
@@ -122,6 +127,11 @@ async fn run() -> Result<()> {
     let home = config::home();
     let sessions_dir = home.join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
+    let (user_settings, settings_warning) = settings::load(&home);
+    settings::install(user_settings);
+    if let Some(w) = settings_warning {
+        ui::error(&w);
+    }
 
     match cli.command {
         Some(Command::Sessions) => return list_sessions(&sessions_dir),
@@ -205,6 +215,7 @@ async fn run() -> Result<()> {
 
     let mut text = cli.prompt.join(" ");
     let interactive = !cli.print && std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    commands::apply_startup(&home, &mut agent, interactive);
     if !interactive {
         anyhow::ensure!(!pick, "-r without an id needs a terminal to pick a session; pass -r ID or -c");
         if text.trim().is_empty() {
@@ -229,9 +240,16 @@ async fn run() -> Result<()> {
     }
 
     let footer = Footer { cwd: cwd.display().to_string(), sandbox: sandbox_label(&agent.sandbox), ..Footer::default() };
-    let commands = COMMANDS.iter().map(|(c, d)| (c.to_string(), d.to_string())).collect();
+    let reserved: Vec<&str> = COMMANDS.iter().chain(commands::COMMANDS).map(|(c, _)| &c[1..]).chain(["quit", "q", "clear", "img"]).collect();
+    let templates = templates::discover(&home, &cwd, &reserved);
+    let commands = COMMANDS
+        .iter()
+        .chain(commands::COMMANDS)
+        .map(|(c, d)| (c.to_string(), d.to_string()))
+        .chain(templates.iter().map(|t| (format!("/{}", t.name), format!("{} ({})", t.description, t.scope))))
+        .collect();
     let mut tui = Tui::start(footer, home.clone(), commands)?;
-    sync_footer(&tui, &agent);
+    sync_footer(&tui, &agent, None);
     ui::banner(env!("CARGO_PKG_VERSION"));
     ui::info(&sandbox::describe(&agent.sandbox));
     if let Some(meta) = &resumed {
@@ -253,7 +271,7 @@ async fn run() -> Result<()> {
     let mut current: Option<models::ModelChoice> = None;
 
     loop {
-        sync_footer(&tui, &agent);
+        sync_footer(&tui, &agent, current.as_ref());
         let line = match pending.pop_front() {
             Some(t) => t,
             None => match tui.commands.recv().await {
@@ -273,6 +291,10 @@ async fn run() -> Result<()> {
                     cycle_effort(&home, &mut agent, current.as_ref());
                     continue;
                 }
+                Some(UiCommand::Setting(id, value)) => {
+                    commands::apply_setting(&home, &mut agent, current.as_ref(), id, &value);
+                    continue;
+                }
                 Some(UiCommand::Exit) | None => break,
             },
         };
@@ -284,6 +306,11 @@ async fn run() -> Result<()> {
             shell(cmd, &cwd, &tui).await;
             continue;
         }
+        // A prompt template (`/name args`) sends its expanded text.
+        let line = match templates::invoke(&templates, &line) {
+            Some(text) if !text.trim().is_empty() => text,
+            _ => line,
+        };
         // An MCP prompt's messages become the turn's text.
         let mut turn_text = line.clone();
         if line.starts_with("/mcp:") {
@@ -297,6 +324,15 @@ async fn run() -> Result<()> {
         } else if line.starts_with('/') {
             if line.trim() == "/model" {
                 tui.open_models();
+                continue;
+            }
+            let cmd = line.split_whitespace().next().unwrap_or("");
+            if commands::handles(cmd) {
+                let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+                let ctx = commands::Ctx { agent: &mut agent, tui: &tui, home: &home, templates: &templates };
+                if let Err(e) = commands::run(cmd, &args, ctx).await {
+                    ui::error(&format!("{e:#}"));
+                }
                 continue;
             }
             let result = slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir, &tui, &skills).await;
@@ -314,7 +350,15 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        let (item, attached, warning) = tools::image::user_turn(&turn_text, &cwd);
+        let (mut item, mut attached, warning) = tools::image::user_turn(&turn_text, &cwd);
+        // Images added with /image, /paste or ctrl+v go with this message.
+        let extra: Vec<_> = tui.screen().attachments.drain(..).collect();
+        if let types::Item::User { images, .. } = &mut item {
+            for a in extra {
+                images.push(a.image);
+                attached.push(a.label);
+            }
+        }
         tui.screen().print_user(&line);
         if let Some(warning) = warning {
             ui::error(&warning);
@@ -323,7 +367,11 @@ async fn run() -> Result<()> {
         }
         let cancel = CancellationToken::new();
         tui.screen().set_busy(Some("Working"), Some(cancel.clone()));
+        let started = std::time::Instant::now();
         let result = agent.turn(item, &mut tui.ui(cwd.clone()), cancel.clone()).await;
+        if !matches!(result, Ok(TurnEnd::Cancelled)) {
+            notify::notify(&notify::Event::TurnEnd { secs: started.elapsed().as_secs(), failed: result.is_err() });
+        }
         let leftover = {
             let mut s = tui.screen();
             s.set_busy(None, None);
@@ -374,6 +422,7 @@ fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::Mode
     match models::build(home, choice, effort.clone()) {
         Ok(provider) => {
             agent.provider = provider;
+            agent.provider.set_fast(settings::current().fast_mode);
             agent.set_context_window(config::context_window_for(&choice.provider, choice.context_window));
             if let Err(e) = models::save_last(home, choice, effort.as_deref()) {
                 ui::error(&format!("could not remember the model: {e:#}"));
@@ -404,8 +453,9 @@ fn cycle_effort(home: &std::path::Path, agent: &mut Agent, current: Option<&mode
     }
 }
 
-fn sync_footer(tui: &Tui, agent: &Agent) {
+fn sync_footer(tui: &Tui, agent: &Agent, current: Option<&models::ModelChoice>) {
     let mut s = tui.screen();
+    commands::sync_footer(&mut s.footer, agent, current);
     s.footer.provider = agent.provider.name().to_string();
     s.footer.model = agent.provider.model().to_string();
     s.footer.effort = agent.provider.effort().map(str::to_string);
@@ -420,7 +470,7 @@ fn sync_footer(tui: &Tui, agent: &Agent) {
 /// supports it (falling back to off with a warning when it doesn't).
 fn sandbox_policy(cli: &Cli) -> Result<sandbox::Policy> {
     let mut policy = sandbox::Policy {
-        mode: cli.sandbox.unwrap_or_default(),
+        mode: cli.sandbox.unwrap_or_else(|| settings::sandbox_mode(&settings::current())),
         network: cli.allow_network,
         writable: Vec::new(),
     };
@@ -562,13 +612,13 @@ async fn slash(
     match cmd {
         "/exit" | "/quit" | "/q" => return Ok(false),
         "/help" | "/?" => {
-            for (c, d) in COMMANDS {
-                ui::info(&format!("  {c:<10} {d}"));
+            for (c, d) in COMMANDS.iter().chain(commands::COMMANDS) {
+                ui::info(&format!("  {c:<14} {d}"));
             }
             for (c, d) in mcp_features::prompt_commands(mcp) {
                 ui::info(&format!("  {c} — {d}"));
             }
-            ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts");
+            ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts\n  Ctrl+O transcript · Ctrl+V paste an image · prompt templates: see /alias");
         }
         "/new" | "/clear" => {
             agent.reset(Some(Session::create(sessions_dir, &agent.cwd, agent.provider.model())?));
