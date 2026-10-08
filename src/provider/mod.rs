@@ -1,8 +1,11 @@
 //! Model providers. Each provider turns a [`Request`] into a streamed
 //! [`Response`], reporting incremental [`StreamEvent`]s along the way.
 
+pub mod anthropic;
 pub mod codex;
+pub mod hosted;
 pub mod openai;
+pub mod responses;
 pub(crate) mod sse;
 
 use crate::types::{Request, Response, StreamEvent};
@@ -20,6 +23,15 @@ pub trait Provider: Send + Sync {
         None
     }
     fn set_effort(&mut self, _effort: Option<String>) {}
+    /// Supported reasoning efforts for the current model, lowest first, when
+    /// the provider knows them without listing models.
+    fn efforts(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The current model's context window, when the provider knows it.
+    fn context_window(&self) -> Option<u64> {
+        None
+    }
     /// A stable id for the current conversation, sent where the backend uses
     /// one for routing and prompt caching (Codex `session_id`,
     /// OpenCode Go `x-opencode-session`).

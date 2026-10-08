@@ -1,4 +1,5 @@
-//! Browser sign-in for the ChatGPT-subscription Codex provider.
+//! Signing in: the ChatGPT browser flow for the Codex provider, and API keys
+//! for hosted services (`nyq login opencode-go|opencode|xai|vercel`).
 use std::{io::Write, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
@@ -10,6 +11,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
+
+use crate::provider::hosted::{self, Service};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REDIRECT: &str = "http://localhost:1455/auth/callback";
@@ -285,6 +288,77 @@ fn open_browser_windows(url: &str) {
     unsafe {
         ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
     }
+}
+
+/// `nyq login <service>`: read an API key from the terminal (hidden) or
+/// stdin and store it in `<home>/auth.json`.
+pub fn login_key(home: &Path, service: Service) -> Result<String> {
+    let site = match service {
+        Service::OpencodeGo | Service::Opencode => "https://opencode.ai/auth",
+        Service::Xai => "https://console.x.ai",
+        Service::Vercel => "https://vercel.com/dashboard (AI Gateway → API Keys)",
+    };
+    eprintln!("Paste your {} API key from {site} and press Enter:", service.title());
+    let key = read_secret()?;
+    hosted::save_key(home, service, &key)?;
+    let mut msg = format!("Saved your {} key in {}.", service.title(), home.join("auth.json").display());
+    if hosted::api_key(home, service).as_deref() != Some(key.trim()) {
+        let other = if service.key_env() == "OPENCODE_API_KEY" { "OPENCODE_API_KEY or the OpenCode CLI's login" } else { service.key_env() };
+        msg.push_str(&format!("\nNote: {other} is set and takes precedence."));
+    }
+    Ok(msg)
+}
+
+/// `nyq logout <provider>`: forget nyq's stored credentials.
+pub fn logout(home: &Path, provider: &str) -> Result<String> {
+    if provider == "codex" {
+        let path = home.join("chatgpt-auth.json");
+        return Ok(match std::fs::remove_file(&path) {
+            Ok(()) => "Signed out of ChatGPT.".into(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "No ChatGPT sign-in stored by nyq.".into(),
+            Err(e) => return Err(e).context("removing chatgpt-auth.json"),
+        });
+    }
+    let service = Service::parse(provider)
+        .with_context(|| format!("unknown provider `{provider}` (expected codex, opencode-go, opencode, xai or vercel)"))?;
+    Ok(if hosted::remove_key(home, service)? {
+        format!("Removed the stored {} key.", service.title())
+    } else {
+        format!("No {} key stored by nyq.", service.title())
+    })
+}
+
+fn read_secret() -> Result<String> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim().to_owned());
+    }
+    use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
+    crossterm::terminal::enable_raw_mode()?;
+    let result = (|| -> Result<String> {
+        let mut key = String::new();
+        loop {
+            match read()? {
+                Event::Paste(text) => key.push_str(&text),
+                Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                    KeyCode::Enter => return Ok(key),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => anyhow::bail!("cancelled"),
+                    KeyCode::Esc => anyhow::bail!("cancelled"),
+                    KeyCode::Backspace => {
+                        key.pop();
+                    }
+                    KeyCode::Char(c) => key.push(c),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    })();
+    let _ = crossterm::terminal::disable_raw_mode();
+    eprintln!();
+    Ok(result?.trim().to_owned())
 }
 
 #[cfg(test)]
