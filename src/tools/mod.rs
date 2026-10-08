@@ -412,7 +412,7 @@ mod secret_tests {
 
     #[test]
     fn custom_auth_file_does_not_block_its_parent() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap();
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let auth = dir.path().join("auth.json");
         std::fs::write(&auth, "{}").unwrap();

@@ -473,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn models_endpoint() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut provider = CodexProvider::new(auth_file(&dir, i64::MAX), "test".into(), None);
         provider.set_effort(Some("high".into()));
@@ -626,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let _env = Env;
         let dir = tempfile::tempdir().unwrap();
         let provider = CodexProvider::new(auth_file(&dir, i64::MAX), "test".into(), None);
@@ -718,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_web_search() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let _env = Env;
         let dir = tempfile::tempdir().unwrap();
         let provider = CodexProvider::new(auth_file(&dir, i64::MAX), "test".into(), None);
@@ -755,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn errors() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let _env = Env;
         let dir = tempfile::tempdir().unwrap();
         let provider = CodexProvider::new(auth_file(&dir, i64::MAX), "test".into(), None);
@@ -794,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_on_401_and_cache() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let _env = Env;
         let dir = tempfile::tempdir().unwrap();
         let path = auth_file(&dir, i64::MAX);
@@ -860,7 +860,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_before_request() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let _env = Env;
         let dir = tempfile::tempdir().unwrap();
         let path = auth_file(&dir, chrono::Utc::now().timestamp_millis() + 30_000);
@@ -908,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_shares_rotated_refresh_token() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let _env = Env;
         let dir = tempfile::tempdir().unwrap();
         let path = auth_file(&dir, chrono::Utc::now().timestamp_millis() + 30_000);
@@ -943,7 +943,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cache_rereads_rotated_auth_file() {
-        let _lock = ENV.lock().unwrap();
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let _env = Env;
         Env::set("NYQ_CODEX_TOKEN_URL", "http://127.0.0.1:1");
         let dir = tempfile::tempdir().unwrap();

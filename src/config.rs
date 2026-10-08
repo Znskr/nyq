@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn saved_precedence() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap();
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
         let keys = [
             "NYQ_HOME",
             "NYQ_PROVIDER",
