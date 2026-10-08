@@ -1,5 +1,6 @@
 mod acp;
 mod agent;
+mod commands;
 mod config;
 mod login;
 mod mcp;
@@ -12,8 +13,9 @@ mod session;
 mod skills;
 mod tools;
 mod types;
-mod undo;
 mod ui;
+mod undo;
+mod workspace;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -30,7 +32,11 @@ use types::Usage;
 use ui::tui::{Command as UiCommand, Footer, Tui};
 
 #[derive(Parser)]
-#[command(name = "nyq", version, about = "A small, friendly coding agent for your terminal")]
+#[command(
+    name = "nyq",
+    version,
+    about = "A small, friendly coding agent for your terminal"
+)]
 struct Cli {
     /// Start the conversation with this message.
     prompt: Vec<String>,
@@ -52,6 +58,12 @@ struct Cli {
     /// Allow network access from sandboxed shell commands.
     #[arg(long, global = true)]
     allow_network: bool,
+    /// Add a workspace directory for this run. Repeatable.
+    #[arg(long = "add-dir", value_name = "PATH", global = true)]
+    add_dir: Vec<std::path::PathBuf>,
+    /// Ignore additional directories saved for this workspace.
+    #[arg(long = "no-additional-dirs", global = true)]
+    no_additional_dirs: bool,
     /// Continue the most recent conversation in this directory.
     #[arg(short = 'c', long = "continue")]
     continue_last: bool,
@@ -66,25 +78,98 @@ struct Cli {
 enum Command {
     /// List saved conversations.
     Sessions,
+    /// Answer one prompt and exit (same as -p). Reads stdin when no prompt is given.
+    Ask {
+        /// The request. When omitted, nyq reads stdin.
+        prompt: Vec<String>,
+    },
+    /// Inspect, resume, or delete a saved conversation.
+    Session {
+        #[command(subcommand)]
+        action: SessionCommand,
+    },
+    /// List, add, or remove additional workspace directories.
+    Workspace {
+        #[command(subcommand)]
+        action: Option<WorkspaceCommand>,
+    },
     /// Sign in with your ChatGPT subscription (Codex models).
     Login,
     /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
     Acp,
 }
 
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Print a transcript summary.
+    Show {
+        /// Session id, a unique prefix, or `last`.
+        #[arg(default_value = "last")]
+        which: String,
+    },
+    /// Resume a saved conversation (same as -r).
+    Resume {
+        /// Session id, a unique prefix, or `last`. Omit to pick one.
+        which: Option<String>,
+    },
+    /// Delete a saved conversation.
+    Delete {
+        /// Session id, a unique prefix, or `last`.
+        which: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    /// List the primary directory and additional directories.
+    List,
+    /// Persist an existing directory for this workspace.
+    Add { path: std::path::PathBuf },
+    /// Remove a saved or launch-only additional directory.
+    Remove { path: std::path::PathBuf },
+    /// Remove every saved additional directory for this workspace.
+    Clear,
+}
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     ("/new", "start a fresh conversation"),
-    ("/resume", "resume a saved conversation: pick one, or /resume ID|last"),
+    (
+        "/clear",
+        "start a fresh session (background processes are kept)",
+    ),
+    ("/reset", "clear this conversation, keeping the session"),
+    ("/continue", "continue an interrupted or cut-off response"),
+    (
+        "/rename",
+        "set the session title; /rename alone asks the model",
+    ),
+    (
+        "/resume",
+        "resume a saved conversation: pick one, or /resume ID|last",
+    ),
     ("/sessions", "list saved conversations"),
-    ("/model", "switch model or provider (ctrl+l); /model NAME sets the model id"),
+    (
+        "/workspace",
+        "additional directories: /workspace [list|add|remove PATH|clear]",
+    ),
+    (
+        "/model",
+        "switch model or provider (ctrl+l); /model NAME sets the model id",
+    ),
     ("/compact", "summarize the conversation to free up context"),
     ("/copy", "copy the last answer to the clipboard"),
     ("/undo", "revert the last file change nyq made"),
     ("/tools", "list available tools"),
     ("/skills", "list available skills"),
-    ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME]"),
-    ("/permissions", "permission rules and session grants; /permissions reload re-reads them"),
+    (
+        "/mcp",
+        "MCP servers: /mcp [connect|disconnect|login|logout NAME]",
+    ),
+    (
+        "/permissions",
+        "permission rules and session grants; /permissions reload re-reads them",
+    ),
     ("/yolo", "toggle auto-approval of tool calls"),
     ("/usage", "token usage for this conversation"),
     ("/exit", "quit (also Ctrl-D)"),
@@ -110,8 +195,29 @@ async fn run() -> Result<()> {
     let sessions_dir = home.join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
 
-    match cli.command {
+    match &cli.command {
         Some(Command::Sessions) => return list_sessions(&sessions_dir),
+        Some(Command::Session {
+            action: SessionCommand::Show { which },
+        }) => {
+            return session::print_summary(&sessions_dir, which, &cwd);
+        }
+        Some(Command::Session {
+            action: SessionCommand::Delete { which },
+        }) => {
+            let meta = session::delete(&sessions_dir, which, &cwd)?;
+            println!("Deleted {} ({})", meta.id, meta.title);
+            return Ok(());
+        }
+        Some(Command::Workspace { action }) => {
+            let request = match action {
+                None | Some(WorkspaceCommand::List) => workspace::CliRequest::List,
+                Some(WorkspaceCommand::Add { path }) => workspace::CliRequest::Add(path),
+                Some(WorkspaceCommand::Remove { path }) => workspace::CliRequest::Remove(path),
+                Some(WorkspaceCommand::Clear) => workspace::CliRequest::Clear,
+            };
+            return workspace::run_cli(&home, &cwd, request);
+        }
         Some(Command::Login) => {
             let msg = login::login(&home, |url| {
                 eprintln!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}");
@@ -122,19 +228,47 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Acp) => {
-            let opts = acp::Options { yolo: cli.yolo, sandbox: cli.sandbox, allow_network: cli.allow_network, model: cli.model, provider: cli.provider };
+            let opts = acp::Options {
+                yolo: cli.yolo,
+                sandbox: cli.sandbox,
+                allow_network: cli.allow_network,
+                model: cli.model,
+                provider: cli.provider,
+            };
             return acp::run(opts).await;
         }
-        None => {}
+        Some(Command::Ask { .. } | Command::Session { .. }) | None => {}
     }
 
+    let print = cli.print || matches!(cli.command, Some(Command::Ask { .. }));
+    let prompt = match &cli.command {
+        Some(Command::Ask { prompt }) => prompt.clone(),
+        _ => cli.prompt.clone(),
+    };
+    let resume = match &cli.command {
+        Some(Command::Session {
+            action: SessionCommand::Resume { which },
+        }) => Some(which.clone().unwrap_or_default()),
+        _ => cli
+            .resume
+            .clone()
+            .or_else(|| cli.continue_last.then(|| "last".to_string())),
+    };
+
     let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
-    let sandbox = std::sync::Arc::new(sandbox_policy(&cli)?);
+    let prepared = workspace::Runtime::prepare(&home, &cwd, &cli.add_dir, cli.no_additional_dirs)?;
+    for warning in &prepared.warnings {
+        ui::error(warning);
+    }
+    let mut policy = sandbox_policy(&cli)?;
+    policy.writable = prepared.active;
+    let sandbox = std::sync::Arc::new(policy);
+    let mut ws = prepared.runtime;
     let mut agent = Agent {
         session: Some(Session::create(&sessions_dir, &cwd, provider.model())?),
         provider,
         tools: Registry::builtin(),
-        system: prompt::system(&cwd, &sandbox),
+        system: String::new(),
         items: Vec::new(),
         cwd: cwd.clone(),
         yolo: cli.yolo,
@@ -151,12 +285,11 @@ async fn run() -> Result<()> {
     };
     agent.context_window = config::context_window_for(agent.provider.name(), None);
     let skills = skills::discover(&home, &cwd);
+    commands::sync_prompt(&mut agent, &skills);
     if !skills.is_empty() {
-        agent.system.push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
         agent.tools.add(skills::tool(skills.clone()));
     }
 
-    let resume = cli.resume.clone().or_else(|| cli.continue_last.then(|| "last".to_string()));
     // `-r` without an id opens the session picker once the TUI is up.
     let pick = resume.as_deref() == Some("");
     let mut resumed = None;
@@ -174,10 +307,15 @@ async fn run() -> Result<()> {
         ui::error(w);
     }
 
-    let mut text = cli.prompt.join(" ");
-    let interactive = !cli.print && std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let mut text = prompt.join(" ");
+    let interactive = !print
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
     if !interactive {
-        anyhow::ensure!(!pick, "-r without an id needs a terminal to pick a session; pass -r ID or -c");
+        anyhow::ensure!(
+            !pick,
+            "-r without an id needs a terminal to pick a session; pass -r ID or -c"
+        );
         if text.trim().is_empty() {
             use std::io::Read;
             std::io::stdin().read_to_string(&mut text)?;
@@ -197,8 +335,15 @@ async fn run() -> Result<()> {
         return r.map(|_| ());
     }
 
-    let footer = Footer { cwd: cwd.display().to_string(), sandbox: sandbox_label(&agent.sandbox), ..Footer::default() };
-    let commands = COMMANDS.iter().map(|(c, d)| (c.to_string(), d.to_string())).collect();
+    let footer = Footer {
+        cwd: cwd.display().to_string(),
+        sandbox: sandbox_label(&agent.sandbox),
+        ..Footer::default()
+    };
+    let commands = COMMANDS
+        .iter()
+        .map(|(c, d)| (c.to_string(), d.to_string()))
+        .collect();
     let mut tui = Tui::start(footer, home.clone(), commands)?;
     sync_footer(&tui, &agent);
     ui::banner(env!("CARGO_PKG_VERSION"));
@@ -215,7 +360,10 @@ async fn run() -> Result<()> {
         text.clear();
         open_sessions(&tui, &sessions_dir, &agent)?;
     }
-    let mut pending: std::collections::VecDeque<String> = (!text.trim().is_empty()).then_some(text).into_iter().collect();
+    let mut pending: std::collections::VecDeque<String> = (!text.trim().is_empty())
+        .then_some(text)
+        .into_iter()
+        .collect();
     // The model's catalog entry, once picked in the switcher (for its efforts).
     let mut current: Option<models::ModelChoice> = None;
 
@@ -256,7 +404,18 @@ async fn run() -> Result<()> {
                 tui.open_models();
                 continue;
             }
-            match slash(&line, &mut agent, &mut mcp, &servers, &sessions_dir, &tui, &skills).await {
+            match slash(
+                &line,
+                &mut agent,
+                &mut mcp,
+                &servers,
+                &sessions_dir,
+                &tui,
+                &skills,
+                &mut ws,
+            )
+            .await
+            {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
@@ -274,7 +433,9 @@ async fn run() -> Result<()> {
         }
         let cancel = CancellationToken::new();
         tui.screen().set_busy(Some("Working"), Some(cancel.clone()));
-        let result = agent.turn(item, &mut tui.ui(cwd.clone()), cancel.clone()).await;
+        let result = agent
+            .turn(item, &mut tui.ui(cwd.clone()), cancel.clone())
+            .await;
         let leftover = {
             let mut s = tui.screen();
             s.set_busy(None, None);
@@ -313,22 +474,36 @@ fn load_permissions(home: &Path, cwd: &Path) -> permissions::Permissions {
 fn sandbox_label(policy: &sandbox::Policy) -> String {
     match policy.mode {
         sandbox::Mode::Off => "no sandbox".into(),
-        sandbox::Mode::ReadOnly => format!("read-only{}", if policy.network { " + net" } else { "" }),
-        sandbox::Mode::WorkspaceWrite => format!("sandboxed{}", if policy.network { " + net" } else { "" }),
+        sandbox::Mode::ReadOnly => {
+            format!("read-only{}", if policy.network { " + net" } else { "" })
+        }
+        sandbox::Mode::WorkspaceWrite => {
+            format!("sandboxed{}", if policy.network { " + net" } else { "" })
+        }
     }
 }
 
 /// Switch provider and model, keeping the conversation.
 fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::ModelChoice) {
-    let effort = agent.provider.effort().map(str::to_string).filter(|e| choice.efforts.contains(e));
+    let effort = agent
+        .provider
+        .effort()
+        .map(str::to_string)
+        .filter(|e| choice.efforts.contains(e));
     match models::build(home, choice, effort.clone()) {
         Ok(provider) => {
             agent.provider = provider;
-            agent.set_context_window(config::context_window_for(&choice.provider, choice.context_window));
+            agent.set_context_window(config::context_window_for(
+                &choice.provider,
+                choice.context_window,
+            ));
             if let Err(e) = models::save_last(home, choice, effort.as_deref()) {
                 ui::error(&format!("could not remember the model: {e:#}"));
             }
-            ui::info(&format!("  Switched to {} · {}", choice.provider, choice.model));
+            ui::info(&format!(
+                "  Switched to {} · {}",
+                choice.provider, choice.model
+            ));
         }
         Err(e) => ui::error(&format!("{e:#}")),
     }
@@ -337,8 +512,12 @@ fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::Mode
 /// Shift+Tab: auto → each supported effort → auto.
 fn cycle_effort(home: &std::path::Path, agent: &mut Agent, current: Option<&models::ModelChoice>) {
     let efforts: Vec<String> = match current {
-        Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => c.efforts.clone(),
-        _ if agent.provider.name() == "codex" => ["low", "medium", "high", "xhigh"].map(String::from).to_vec(),
+        Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => {
+            c.efforts.clone()
+        }
+        _ if agent.provider.name() == "codex" => ["low", "medium", "high", "xhigh"]
+            .map(String::from)
+            .to_vec(),
         _ => Vec::new(),
     };
     if efforts.is_empty() {
@@ -347,7 +526,11 @@ fn cycle_effort(home: &std::path::Path, agent: &mut Agent, current: Option<&mode
     }
     let next = match agent.provider.effort() {
         None => Some(efforts[0].clone()),
-        Some(e) => efforts.iter().position(|x| x == e).and_then(|i| efforts.get(i + 1)).cloned(),
+        Some(e) => efforts
+            .iter()
+            .position(|x| x == e)
+            .and_then(|i| efforts.get(i + 1))
+            .cloned(),
     };
     agent.provider.set_effort(next.clone());
     if let Some(c) = current {
@@ -377,9 +560,13 @@ fn sandbox_policy(cli: &Cli) -> Result<sandbox::Policy> {
     };
     if let Err(e) = sandbox::check(&policy) {
         if cli.sandbox.is_some() {
-            anyhow::bail!("sandbox unavailable: {e} (use --sandbox off to run commands unconfined)");
+            anyhow::bail!(
+                "sandbox unavailable: {e} (use --sandbox off to run commands unconfined)"
+            );
         }
-        ui::error(&format!("sandbox unavailable ({e}); shell commands will run unconfined"));
+        ui::error(&format!(
+            "sandbox unavailable ({e}); shell commands will run unconfined"
+        ));
         policy.mode = sandbox::Mode::Off;
     }
     Ok(policy)
@@ -398,12 +585,21 @@ fn cancel_on_ctrl_c() -> CancellationToken {
     token
 }
 
-async fn connect_profile_servers(mcp: &mut McpManager, agent: &mut Agent, servers: &[ServerConfig], quiet: bool) {
+async fn connect_profile_servers(
+    mcp: &mut McpManager,
+    agent: &mut Agent,
+    servers: &[ServerConfig],
+    quiet: bool,
+) {
     for cfg in servers.iter().filter(|s| s.scope == Scope::Profile) {
         connect(mcp, agent, cfg, quiet).await;
     }
     if !quiet {
-        let project: Vec<_> = servers.iter().filter(|s| s.scope == Scope::Project).map(|s| s.name.as_str()).collect();
+        let project: Vec<_> = servers
+            .iter()
+            .filter(|s| s.scope == Scope::Project)
+            .map(|s| s.name.as_str())
+            .collect();
         if !project.is_empty() {
             ui::info(&format!(
                 "Project MCP servers in .mcp.json: {} (connect with /mcp connect NAME)",
@@ -419,7 +615,11 @@ fn drop_server_tools(agent: &mut Agent, mcp: &McpManager, name: &str) {
     agent.tools.remove_prefix(&mcp::tool_prefix(name));
 }
 
-fn install_mcp_tools(agent: &mut Agent, name: &str, tools: Vec<Box<dyn tools::Tool>>) -> Result<()> {
+fn install_mcp_tools(
+    agent: &mut Agent,
+    name: &str,
+    tools: Vec<Box<dyn tools::Tool>>,
+) -> Result<()> {
     let mut added = Vec::new();
     for tool in tools {
         let n = tool.spec().name.clone();
@@ -453,7 +653,10 @@ async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig, qu
 async fn shell(cmd: &str, cwd: &Path, tui: &Tui) {
     let cancel = CancellationToken::new();
     tui.screen().set_busy(Some("Running"), Some(cancel.clone()));
-    let policy = sandbox::Policy { mode: sandbox::Mode::Off, ..Default::default() };
+    let policy = sandbox::Policy {
+        mode: sandbox::Mode::Off,
+        ..Default::default()
+    };
     let output = tools::run_shell(cmd, cwd, &policy, &cancel, None).await;
     let mut screen = tui.screen();
     screen.idle();
@@ -467,7 +670,17 @@ fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
     }
     Ok(all
         .iter()
-        .map(|m| format!("{}  {}  {}  {}", session_label(&m.id), m.created.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"), m.cwd.display(), m.title))
+        .map(|m| {
+            format!(
+                "{}  {}  {}  {}",
+                session_label(&m.id),
+                m.created
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M"),
+                m.cwd.display(),
+                m.title
+            )
+        })
         .collect())
 }
 
@@ -498,6 +711,7 @@ fn list_sessions(dir: &std::path::Path) -> Result<()> {
 }
 
 /// Handle a slash command. Returns Ok(false) to quit.
+#[allow(clippy::too_many_arguments)]
 async fn slash(
     line: &str,
     agent: &mut Agent,
@@ -506,6 +720,7 @@ async fn slash(
     sessions_dir: &std::path::Path,
     tui: &Tui,
     skills: &[skills::Skill],
+    ws: &mut workspace::Runtime,
 ) -> Result<bool> {
     let mut parts = line.split_whitespace();
     let cmd = parts.next().unwrap_or("");
@@ -518,10 +733,18 @@ async fn slash(
             }
             ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts");
         }
-        "/new" | "/clear" => {
-            agent.reset(Some(Session::create(sessions_dir, &agent.cwd, agent.provider.model())?));
-            ui::info("Started a new conversation.");
+        "/new" | "/clear" => commands::fresh(agent, sessions_dir)?,
+        "/reset" => commands::reset(agent)?,
+        "/continue" => commands::continue_response(agent, tui).await?,
+        "/rename" => {
+            let explicit = if arg.is_empty() {
+                None
+            } else {
+                Some(arg.join(" "))
+            };
+            commands::rename(agent, tui, explicit.as_deref()).await?;
         }
+        "/workspace" => commands::workspace_cmd(agent, skills, ws, &arg.join(" "))?,
         "/sessions" => ui::list(&session_lines(sessions_dir)?),
         "/skills" => ui::list(&skills::list_lines(skills)),
         "/undo" if agent.undo.is_empty() => ui::info("  Nothing to undo."),
@@ -529,7 +752,9 @@ async fn slash(
             Ok(msg) => {
                 ui::info(&format!("  {msg}"));
                 // Tell the model, so it doesn't assume its edit is still there.
-                agent.push(types::Item::user(format!("[The user undid your last file change: {msg}]")));
+                agent.push(types::Item::user(format!(
+                    "[The user undid your last file change: {msg}]"
+                )));
             }
             Err(e) => ui::info(&format!("  {e}")),
         },
@@ -543,20 +768,28 @@ async fn slash(
                     tui.screen().copy_osc52(&text);
                     let native = {
                         let text = text.clone();
-                        tokio::time::timeout(std::time::Duration::from_secs(3), tokio::task::spawn_blocking(move || ui::tui::copy_native(&text))).await
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            tokio::task::spawn_blocking(move || ui::tui::copy_native(&text)),
+                        )
+                        .await
                     };
                     let via = match native {
                         Ok(Ok(Some(tool))) => tool,
                         _ => "terminal (OSC 52)",
                     };
-                    ui::info(&format!("  Copied the last answer ({} chars) via {via}.", text.chars().count()));
+                    ui::info(&format!(
+                        "  Copied the last answer ({} chars) via {via}.",
+                        text.chars().count()
+                    ));
                 }
                 None => ui::info("  Nothing to copy yet."),
             }
         }
         "/compact" => {
             let cancel = CancellationToken::new();
-            tui.screen().set_busy(Some("Compacting"), Some(cancel.clone()));
+            tui.screen()
+                .set_busy(Some("Compacting"), Some(cancel.clone()));
             let result = agent.compact(&mut tui.ui(agent.cwd.clone()), &cancel).await;
             tui.screen().idle();
             if !result? {
@@ -573,86 +806,127 @@ async fn slash(
                 agent.suppress_auto_compact = false;
                 ui::info(&format!("Model set to {m}."));
             }
-            None => ui::info(&format!("{} · {}", agent.provider.name(), agent.provider.model())),
+            None => ui::info(&format!(
+                "{} · {}",
+                agent.provider.name(),
+                agent.provider.model()
+            )),
         },
         "/tools" => {
             let lines: Vec<String> = agent
                 .tools
                 .specs()
                 .iter()
-                .map(|t| format!("{:<24} {}", t.name, t.description.lines().next().unwrap_or("")))
+                .map(|t| {
+                    format!(
+                        "{:<24} {}",
+                        t.name,
+                        t.description.lines().next().unwrap_or("")
+                    )
+                })
                 .collect();
             ui::list(&lines);
         }
-        "/mcp" => match (arg.first().copied(), arg.get(1).copied()) {
-            (Some("connect"), Some(name)) => {
-                let cfg = servers.iter().find(|s| s.name == name).with_context(|| format!("no MCP server named `{name}`"))?;
-                connect(mcp, agent, cfg, false).await;
-            }
-            (Some("login"), Some(name)) => {
-                let cfg = servers.iter().find(|s| s.name == name).with_context(|| format!("no MCP server named `{name}`"))?;
-                drop_server_tools(agent, mcp, name);
-                let cancel = CancellationToken::new();
-                tui.screen().set_busy(Some("Signing in"), Some(cancel.clone()));
-                let result = mcp
+        "/mcp" => {
+            match (arg.first().copied(), arg.get(1).copied()) {
+                (Some("connect"), Some(name)) => {
+                    let cfg = servers
+                        .iter()
+                        .find(|s| s.name == name)
+                        .with_context(|| format!("no MCP server named `{name}`"))?;
+                    connect(mcp, agent, cfg, false).await;
+                }
+                (Some("login"), Some(name)) => {
+                    let cfg = servers
+                        .iter()
+                        .find(|s| s.name == name)
+                        .with_context(|| format!("no MCP server named `{name}`"))?;
+                    drop_server_tools(agent, mcp, name);
+                    let cancel = CancellationToken::new();
+                    tui.screen()
+                        .set_busy(Some("Signing in"), Some(cancel.clone()));
+                    let result = mcp
                     .login(cfg, Some(&cancel), |url| {
                         ui::info(&format!("Sign in to {name} in your browser (waiting up to 5 minutes):\n  {url}"));
                         mcp::open_browser(url);
                     })
                     .await;
-                tui.screen().idle();
-                let tools = result?;
-                let n = tools.len();
-                install_mcp_tools(agent, name, tools)?;
-                ui::info(&format!("MCP {name}: signed in · {n} tools"));
-            }
-            (Some("logout"), Some(name)) => {
-                let cfg = servers.iter().find(|s| s.name == name).with_context(|| format!("no MCP server named `{name}`"))?;
-                let endpoint = mcp::canonical_endpoint(&cfg.transport)?;
-                drop_server_tools(agent, mcp, name);
-                let existed = mcp.logout(name, &endpoint).await?;
-                ui::info(&if existed { format!("Signed out of {name}.") } else { format!("No saved sign-in for {name}.") });
-            }
-            (Some("disconnect"), Some(name)) => {
-                drop_server_tools(agent, mcp, name);
-                mcp.disconnect(name).await?;
-                ui::info(&format!("Disconnected {name}."));
-            }
-            _ => {
-                let connected = mcp.connected();
-                if servers.is_empty() {
-                    ui::info("No MCP servers configured (add them to mcp.json or .mcp.json).");
+                    tui.screen().idle();
+                    let tools = result?;
+                    let n = tools.len();
+                    install_mcp_tools(agent, name, tools)?;
+                    ui::info(&format!("MCP {name}: signed in · {n} tools"));
                 }
-                for s in servers {
-                    let state = match connected.iter().find(|(n, _)| n == &s.name) {
-                        Some((_, n)) => {
-                            let (action, specific) = agent.permissions.server_default(&mcp::tool_prefix(&s.name));
-                            let more = if specific { " + tool rules" } else { "" };
-                            format!("connected · {n} tools · {}{more}", action.as_str())
-                        }
-                        None => "not connected".into(),
-                    };
-                    let scope = if s.scope == Scope::Project { "project" } else { "profile" };
-                    ui::info(&format!("  {:<20} {scope:<8} {state}", s.name));
+                (Some("logout"), Some(name)) => {
+                    let cfg = servers
+                        .iter()
+                        .find(|s| s.name == name)
+                        .with_context(|| format!("no MCP server named `{name}`"))?;
+                    let endpoint = mcp::canonical_endpoint(&cfg.transport)?;
+                    drop_server_tools(agent, mcp, name);
+                    let existed = mcp.logout(name, &endpoint).await?;
+                    ui::info(&if existed {
+                        format!("Signed out of {name}.")
+                    } else {
+                        format!("No saved sign-in for {name}.")
+                    });
+                }
+                (Some("disconnect"), Some(name)) => {
+                    drop_server_tools(agent, mcp, name);
+                    mcp.disconnect(name).await?;
+                    ui::info(&format!("Disconnected {name}."));
+                }
+                _ => {
+                    let connected = mcp.connected();
+                    if servers.is_empty() {
+                        ui::info("No MCP servers configured (add them to mcp.json or .mcp.json).");
+                    }
+                    for s in servers {
+                        let state = match connected.iter().find(|(n, _)| n == &s.name) {
+                            Some((_, n)) => {
+                                let (action, specific) =
+                                    agent.permissions.server_default(&mcp::tool_prefix(&s.name));
+                                let more = if specific { " + tool rules" } else { "" };
+                                format!("connected · {n} tools · {}{more}", action.as_str())
+                            }
+                            None => "not connected".into(),
+                        };
+                        let scope = if s.scope == Scope::Project {
+                            "project"
+                        } else {
+                            "profile"
+                        };
+                        ui::info(&format!("  {:<20} {scope:<8} {state}", s.name));
+                    }
                 }
             }
-        },
+        }
         "/permissions" => match arg.first().copied() {
             Some("reload") => {
-                agent.permissions = std::sync::Arc::new(load_permissions(&config::home(), &agent.cwd));
+                agent.permissions =
+                    std::sync::Arc::new(load_permissions(&config::home(), &agent.cwd));
                 ui::info("Reloaded permission rules.");
                 ui::list(&agent.permissions.lines(&agent.allowed));
             }
             None => ui::list(&agent.permissions.lines(&agent.allowed)),
-            Some(other) => ui::error(&format!("unknown /permissions argument `{other}` (try /permissions or /permissions reload)")),
+            Some(other) => ui::error(&format!(
+                "unknown /permissions argument `{other}` (try /permissions or /permissions reload)"
+            )),
         },
         "/yolo" => {
             agent.yolo = !agent.yolo;
-            ui::info(if agent.yolo { "Auto-approve on: tools run without asking." } else { "Auto-approve off." });
+            ui::info(if agent.yolo {
+                "Auto-approve on: tools run without asking."
+            } else {
+                "Auto-approve off."
+            });
         }
         "/usage" => {
             let u = agent.usage;
-            ui::info(&format!("input {} (cached {}) · output {}", u.input_tokens, u.cached_tokens, u.output_tokens));
+            ui::info(&format!(
+                "input {} (cached {}) · output {}",
+                u.input_tokens, u.cached_tokens, u.output_tokens
+            ));
         }
         other => ui::error(&format!("unknown command {other} (try /help)")),
     }
@@ -704,6 +978,58 @@ mod tests {
         assert_eq!(parse(&["nyq", "--resume=abc", "hello"]).prompt, ["hello"]);
         assert_eq!(parse(&["nyq", "hi"]).resume, None);
         assert!(parse(&["nyq", "-c"]).continue_last);
+        let ask = parse(&["nyq", "ask", "hello", "world"]);
+        match ask.command {
+            Some(Command::Ask { prompt }) => assert_eq!(prompt, ["hello", "world"]),
+            _ => panic!("ask did not parse as a subcommand"),
+        }
+        assert!(
+            matches!(parse(&["nyq", "ask"]).command, Some(Command::Ask { prompt }) if prompt.is_empty())
+        );
+        let dirs = parse(&[
+            "nyq",
+            "--add-dir",
+            "/a",
+            "--add-dir=/b",
+            "--no-additional-dirs",
+            "ask",
+            "hi",
+        ]);
+        assert_eq!(
+            dirs.add_dir,
+            [
+                std::path::PathBuf::from("/a"),
+                std::path::PathBuf::from("/b")
+            ]
+        );
+        assert!(dirs.no_additional_dirs);
+        assert!(matches!(dirs.command, Some(Command::Ask { .. })));
+        assert!(matches!(
+            parse(&["nyq", "session", "show"]).command,
+            Some(Command::Session { action: SessionCommand::Show { which } }) if which == "last"
+        ));
+        assert!(matches!(
+            parse(&["nyq", "session", "resume"]).command,
+            Some(Command::Session {
+                action: SessionCommand::Resume { which: None }
+            })
+        ));
+        assert!(matches!(
+            parse(&["nyq", "session", "delete", "abc"]).command,
+            Some(Command::Session { action: SessionCommand::Delete { which } }) if which == "abc"
+        ));
+        assert!(matches!(
+            parse(&["nyq", "workspace"]).command,
+            Some(Command::Workspace { action: None })
+        ));
+        assert!(matches!(
+            parse(&["nyq", "workspace", "add", "lib"]).command,
+            Some(Command::Workspace {
+                action: Some(WorkspaceCommand::Add { .. })
+            })
+        ));
+        assert!(Cli::try_parse_from(["nyq", "workspace", "add"]).is_err());
+        assert!(Cli::try_parse_from(["nyq", "session", "delete"]).is_err());
     }
 
     #[test]
