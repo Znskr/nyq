@@ -61,7 +61,7 @@ impl Auth {
 /// The Codex client version reported when listing models. The backend only
 /// lists newer models (e.g. the GPT-6 family) to new enough clients, so use
 /// the installed codex CLI's version when it is newer than our baseline.
-pub fn client_version() -> String {
+pub async fn client_version() -> String {
     const BASELINE: &str = "0.160.1";
     if let Ok(v) = std::env::var("NYQ_CODEX_CLIENT_VERSION") {
         return v;
@@ -74,7 +74,44 @@ pub fn client_version() -> String {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.split_whitespace().last().map(str::to_string));
-    newest(BASELINE, installed.as_deref()).to_string()
+    let latest = latest_published().await;
+    let best = newest(BASELINE, installed.as_deref());
+    newest(best, latest.as_deref()).to_string()
+}
+
+/// The newest codex CLI version published on npm, cached for a day under the
+/// nyq home so listing models stays fast and works offline.
+async fn latest_published() -> Option<String> {
+    let cache = crate::config::home().join("nyq").join("codex-version");
+    let fresh = std::fs::metadata(&cache)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < std::time::Duration::from_secs(86_400)));
+    let cached = || std::fs::read_to_string(&cache).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if fresh {
+        return cached();
+    }
+    let fetched = async {
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().ok()?;
+        let body: serde_json::Value = client
+            .get("https://registry.npmjs.org/@openai/codex/latest")
+            .header("User-Agent", concat!("nyq/", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        body["version"].as_str().map(str::to_string)
+    }
+    .await;
+    match fetched {
+        Some(v) => {
+            let _ = std::fs::create_dir_all(cache.parent().unwrap_or(&cache));
+            let _ = std::fs::write(&cache, &v);
+            Some(v)
+        }
+        None => cached(),
+    }
 }
 
 fn newest<'a>(baseline: &'a str, other: Option<&'a str>) -> &'a str {
@@ -129,9 +166,10 @@ impl CodexProvider {
         struct Level {
             effort: String,
         }
-        let url = std::env::var("NYQ_CODEX_MODELS_URL").unwrap_or_else(|_| {
-            format!("https://chatgpt.com/backend-api/codex/models?client_version={}", client_version())
-        });
+        let url = match std::env::var("NYQ_CODEX_MODELS_URL") {
+            Ok(url) => url,
+            Err(_) => format!("https://chatgpt.com/backend-api/codex/models?client_version={}", client_version().await),
+        };
         let send = |auth: Auth| {
             self.client
                 .get(&url)
@@ -352,6 +390,9 @@ fn output_item(item: &Value) -> Option<Item> {
 
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
+    fn set_conversation(&mut self, id: &str) {
+        self.session_id = id.to_string();
+    }
     fn fork(&self) -> Box<dyn Provider> {
         Box::new(Self {
             auth_path: self.auth_path.clone(),
@@ -513,7 +554,7 @@ mod tests {
         let old = std::env::var_os("NYQ_CODEX_MODELS_URL");
         std::env::set_var(
             "NYQ_CODEX_MODELS_URL",
-            format!("{url}/models?client_version={}", client_version()),
+            format!("{url}/models?client_version=test"),
         );
         let result = provider.list_models().await;
         if let Some(old) = old {
@@ -530,7 +571,7 @@ mod tests {
         assert_eq!(models[1].context_window, Some(272000));
         assert_eq!(models[0].provider, "codex");
         let request = requests.recv().await.unwrap().to_lowercase();
-        assert!(request.starts_with(&format!("get /models?client_version={} ", client_version())));
+        assert!(request.starts_with("get /models?client_version=test "));
         for header in [
             "authorization: bearer old",
             "chatgpt-account-id: account",
