@@ -73,11 +73,34 @@ Check that the release exists. If the repository is private, set GITHUB_TOKEN
 to a token with read access to it."
 
 asset_url() {
-    printf '%s\n' "$release_json" |
-        grep -oE '"browser_download_url": *"[^"]*"' |
-        sed -e 's/^"browser_download_url": *"//' -e 's/"$//' |
-        grep "/$1\$" |
-        head -n 1
+    if [ -n "$auth" ]; then
+        # Private repositories: browser download links ignore tokens, so use the
+        # API address of the asset (downloaded with Accept: application/octet-stream).
+        printf '%s\n' "$release_json" | tr ',{}' '\n\n\n' | awk -v want="$1" '
+            /"url": *"https:\/\/api\.github\.com\/repos\/.*\/releases\/assets\/[0-9]+"/ {
+                u = $0; sub(/^.*"url": *"/, "", u); sub(/".*$/, "", u)
+            }
+            /"name": *"/ {
+                n = $0; sub(/^.*"name": *"/, "", n); sub(/".*$/, "", n)
+                if (n == want && u != "") { print u; exit }
+            }'
+    else
+        printf '%s\n' "$release_json" |
+            grep -oE '"browser_download_url": *"[^"]*"' |
+            sed -e 's/^"browser_download_url": *"//' -e 's/"$//' |
+            grep "/$1\$" |
+            head -n 1
+    fi
+}
+
+download_asset() {
+    if [ -z "$auth" ]; then
+        download "$1"
+    elif [ "$fetcher" = curl ]; then
+        curl -fsSL -H "$auth" -H "Accept: application/octet-stream" "$1"
+    else
+        wget -qO- --header="$auth" --header="Accept: application/octet-stream" "$1"
+    fi
 }
 
 archive_url=$(asset_url "$archive")
@@ -105,8 +128,8 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 printf 'Downloading nyq %s for %s...\n' "$version" "$target"
 
-download "$archive_url" > "$tmpdir/$archive" || err "failed to download $archive from $archive_url"
-download "$sums_url" > "$tmpdir/SHA256SUMS" || err "failed to download SHA256SUMS from $sums_url"
+download_asset "$archive_url" > "$tmpdir/$archive" || err "failed to download $archive from $archive_url"
+download_asset "$sums_url" > "$tmpdir/SHA256SUMS" || err "failed to download SHA256SUMS from $sums_url"
 
 expected=$(awk -v f="$archive" '$2 == f { print $1; exit }' "$tmpdir/SHA256SUMS")
 [ -n "$expected" ] || err "SHA256SUMS of release '$tag' has no entry for $archive"
