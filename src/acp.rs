@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol as sdk;
@@ -30,6 +30,8 @@ use crate::{config, mcp, models, prompt, sandbox, session, skills};
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub yolo: bool,
+    /// Used when `yolo` is false. `--yolo` still forces yolo.
+    pub permission_mode: crate::permissions::Mode,
     pub sandbox: Option<sandbox::Mode>,
     pub allow_network: bool,
     pub model: Option<String>,
@@ -37,7 +39,16 @@ pub struct Options {
 }
 
 const MODE_ASK: &str = "ask";
+const MODE_AUTO: &str = "auto";
 const MODE_YOLO: &str = "yolo";
+
+fn startup_mode(opts: &Options) -> crate::permissions::Mode {
+    if opts.yolo {
+        crate::permissions::Mode::Yolo
+    } else {
+        opts.permission_mode
+    }
+}
 const MODEL_OPTION: &str = "model";
 /// Tool output shown in the editor is cut to about this many characters.
 const MAX_SHOWN: usize = 8_000;
@@ -56,17 +67,26 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         Arc::new(move || config::provider(&home, provider.as_deref(), model.as_deref()))
     };
     let state = State::new(home, opts, policy, factory, true);
-    let transport = sdk::ByteStreams::new(tokio::io::stdout().compat_write(), tokio::io::stdin().compat());
+    let transport = sdk::ByteStreams::new(
+        tokio::io::stdout().compat_write(),
+        tokio::io::stdin().compat(),
+    );
     serve(state, transport).await
 }
 
 /// The requested sandbox, or workspace-write where supported (else off, with
 /// a warning on stderr). Mirrors the interactive mode.
 fn sandbox_policy(opts: &Options) -> anyhow::Result<sandbox::Policy> {
-    let mut policy = sandbox::Policy { mode: opts.sandbox.unwrap_or_default(), network: opts.allow_network, writable: Vec::new() };
+    let mut policy = sandbox::Policy {
+        mode: opts.sandbox.unwrap_or_default(),
+        network: opts.allow_network,
+        writable: Vec::new(),
+    };
     if let Err(e) = sandbox::check(&policy) {
         if opts.sandbox.is_some() {
-            anyhow::bail!("sandbox unavailable: {e} (use --sandbox off to run commands unconfined)");
+            anyhow::bail!(
+                "sandbox unavailable: {e} (use --sandbox off to run commands unconfined)"
+            );
         }
         eprintln!("nyq: sandbox unavailable ({e}); shell commands will run unconfined");
         policy.mode = sandbox::Mode::Off;
@@ -92,8 +112,8 @@ struct Live {
     inner: tokio::sync::Mutex<Inner>,
     /// Tokens of prompts running or waiting for the session; `session/cancel` fires them all.
     cancels: Mutex<Vec<(u64, CancellationToken)>>,
-    /// The "yolo" session mode: approve everything without asking.
-    yolo: Arc<AtomicBool>,
+    /// Session permission mode (`Mode::code`).
+    mode: Arc<AtomicU8>,
     /// The model picked while a turn was running; swapped in before the next turn.
     next_provider: Mutex<Option<(Box<dyn Provider>, u64)>>,
     /// `provider:model` as shown in the model picker.
@@ -106,7 +126,13 @@ struct Inner {
 }
 
 impl State {
-    fn new(home: PathBuf, opts: Options, policy: sandbox::Policy, make_provider: ProviderFactory, list_models: bool) -> Arc<Self> {
+    fn new(
+        home: PathBuf,
+        opts: Options,
+        policy: sandbox::Policy,
+        make_provider: ProviderFactory,
+        list_models: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             home,
             opts,
@@ -160,13 +186,24 @@ fn anyhow_error(e: anyhow::Error) -> sdk::Error {
 // ------------------------------------------------------------------ server
 
 async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyhow::Result<()> {
-    let (s1, s2, s3, s4, s5, s6, s7, s8, s9) =
-        (state.clone(), state.clone(), state.clone(), state.clone(), state.clone(), state.clone(), state.clone(), state.clone(), state.clone());
+    let (s1, s2, s3, s4, s5, s6, s7, s8, s9) = (
+        state.clone(),
+        state.clone(),
+        state.clone(),
+        state.clone(),
+        state.clone(),
+        state.clone(),
+        state.clone(),
+        state.clone(),
+        state.clone(),
+    );
     let result = sdk::Agent
         .builder()
         .name("nyq")
         .on_receive_request(
-            async move |req: acp::InitializeRequest, responder: Responder<acp::InitializeResponse>, _cx: ConnectionTo<Client>| {
+            async move |req: acp::InitializeRequest,
+                        responder: Responder<acp::InitializeResponse>,
+                        _cx: ConnectionTo<Client>| {
                 if s1.list_models {
                     // Warm the model catalog so the first session can offer it soon.
                     let st = s1.clone();
@@ -179,7 +216,9 @@ async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyh
             sdk::on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: acp::NewSessionRequest, responder: Responder<acp::NewSessionResponse>, cx: ConnectionTo<Client>| {
+            async move |req: acp::NewSessionRequest,
+                        responder: Responder<acp::NewSessionResponse>,
+                        cx: ConnectionTo<Client>| {
                 let st = s2.clone();
                 tokio::spawn(async move {
                     let r = new_session(&st, &cx, req).await;
@@ -190,7 +229,9 @@ async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyh
             sdk::on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: acp::LoadSessionRequest, responder: Responder<acp::LoadSessionResponse>, cx: ConnectionTo<Client>| {
+            async move |req: acp::LoadSessionRequest,
+                        responder: Responder<acp::LoadSessionResponse>,
+                        cx: ConnectionTo<Client>| {
                 let st = s3.clone();
                 tokio::spawn(async move {
                     let r = load_session(&st, &cx, req).await;
@@ -201,7 +242,9 @@ async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyh
             sdk::on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: acp::PromptRequest, responder: Responder<acp::PromptResponse>, cx: ConnectionTo<Client>| {
+            async move |req: acp::PromptRequest,
+                        responder: Responder<acp::PromptResponse>,
+                        cx: ConnectionTo<Client>| {
                 let st = s4.clone();
                 let request_cancel = responder.cancellation();
                 tokio::spawn(async move {
@@ -224,7 +267,9 @@ async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyh
             sdk::on_receive_notification!(),
         )
         .on_receive_request(
-            async move |req: acp::SetSessionModeRequest, responder: Responder<acp::SetSessionModeResponse>, _cx: ConnectionTo<Client>| {
+            async move |req: acp::SetSessionModeRequest,
+                        responder: Responder<acp::SetSessionModeResponse>,
+                        _cx: ConnectionTo<Client>| {
                 responder.respond_with_result(set_mode(&s6, req))
             },
             sdk::on_receive_request!(),
@@ -243,13 +288,17 @@ async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyh
             sdk::on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: acp::ListSessionsRequest, responder: Responder<acp::ListSessionsResponse>, _cx: ConnectionTo<Client>| {
+            async move |req: acp::ListSessionsRequest,
+                        responder: Responder<acp::ListSessionsResponse>,
+                        _cx: ConnectionTo<Client>| {
                 responder.respond_with_result(list_sessions(&s8, req))
             },
             sdk::on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: acp::CloseSessionRequest, responder: Responder<acp::CloseSessionResponse>, _cx: ConnectionTo<Client>| {
+            async move |req: acp::CloseSessionRequest,
+                        responder: Responder<acp::CloseSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
                 let removed = lock(&s9.sessions).remove(&*req.session_id.0);
                 tokio::spawn(async move {
                     if let Some(live) = removed {
@@ -278,16 +327,28 @@ async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyh
 }
 
 fn initialize(req: acp::InitializeRequest) -> acp::InitializeResponse {
-    let version = if req.protocol_version < ProtocolVersion::LATEST { req.protocol_version } else { ProtocolVersion::LATEST };
+    let version = if req.protocol_version < ProtocolVersion::LATEST {
+        req.protocol_version
+    } else {
+        ProtocolVersion::LATEST
+    };
     acp::InitializeResponse::new(version)
-        .agent_info(acp::Implementation::new("nyq", env!("CARGO_PKG_VERSION")).title("nyq".to_string()))
+        .agent_info(
+            acp::Implementation::new("nyq", env!("CARGO_PKG_VERSION")).title("nyq".to_string()),
+        )
         .agent_capabilities(
             acp::AgentCapabilities::new()
                 .load_session(true)
-                .prompt_capabilities(acp::PromptCapabilities::new().image(true).embedded_context(true))
+                .prompt_capabilities(
+                    acp::PromptCapabilities::new()
+                        .image(true)
+                        .embedded_context(true),
+                )
                 .mcp_capabilities(acp::McpCapabilities::new().http(true))
                 .session_capabilities(
-                    acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new()).close(acp::SessionCloseCapabilities::new()),
+                    acp::SessionCapabilities::new()
+                        .list(acp::SessionListCapabilities::new())
+                        .close(acp::SessionCloseCapabilities::new()),
                 ),
         )
 }
@@ -296,24 +357,47 @@ fn initialize(req: acp::InitializeRequest) -> acp::InitializeResponse {
 
 fn check_cwd(cwd: &Path) -> Result<(), sdk::Error> {
     if !cwd.is_absolute() || !cwd.is_dir() {
-        return Err(sdk::Error::invalid_params().data(format!("cwd must be an absolute directory: {}", cwd.display())));
+        return Err(sdk::Error::invalid_params().data(format!(
+            "cwd must be an absolute directory: {}",
+            cwd.display()
+        )));
     }
     Ok(())
 }
 
-async fn new_session(state: &Arc<State>, cx: &ConnectionTo<Client>, req: acp::NewSessionRequest) -> Result<acp::NewSessionResponse, sdk::Error> {
+async fn new_session(
+    state: &Arc<State>,
+    cx: &ConnectionTo<Client>,
+    req: acp::NewSessionRequest,
+) -> Result<acp::NewSessionResponse, sdk::Error> {
     check_cwd(&req.cwd)?;
     let provider = (state.make_provider)().map_err(anyhow_error)?;
-    let session = Session::create(&state.sessions_dir(), &req.cwd, provider.model()).map_err(anyhow_error)?;
-    let live = open(state, req.cwd, provider, session, Vec::new(), &req.mcp_servers).await;
+    let session =
+        Session::create(&state.sessions_dir(), &req.cwd, provider.model()).map_err(anyhow_error)?;
+    let live = open(
+        state,
+        req.cwd,
+        provider,
+        session,
+        Vec::new(),
+        &req.mcp_servers,
+    )
+    .await;
     let (modes, options) = describe(state, &live, cx);
-    Ok(acp::NewSessionResponse::new(live.id.clone()).modes(modes).config_options(options))
+    Ok(acp::NewSessionResponse::new(live.id.clone())
+        .modes(modes)
+        .config_options(options))
 }
 
-async fn load_session(state: &Arc<State>, cx: &ConnectionTo<Client>, req: acp::LoadSessionRequest) -> Result<acp::LoadSessionResponse, sdk::Error> {
+async fn load_session(
+    state: &Arc<State>,
+    cx: &ConnectionTo<Client>,
+    req: acp::LoadSessionRequest,
+) -> Result<acp::LoadSessionResponse, sdk::Error> {
     check_cwd(&req.cwd)?;
     let id = req.session_id.0.to_string();
-    let (session, meta, items) = session::load(&state.sessions_dir(), &id, &req.cwd).map_err(anyhow_error)?;
+    let (session, meta, items) =
+        session::load(&state.sessions_dir(), &id, &req.cwd).map_err(anyhow_error)?;
     if meta.id != id {
         return Err(sdk::Error::resource_not_found(Some(id)));
     }
@@ -331,7 +415,9 @@ async fn load_session(state: &Arc<State>, cx: &ConnectionTo<Client>, req: acp::L
         replay(cx, &live.id, &inner.agent);
     }
     let (modes, options) = describe(state, &live, cx);
-    Ok(acp::LoadSessionResponse::new().modes(modes).config_options(options))
+    Ok(acp::LoadSessionResponse::new()
+        .modes(modes)
+        .config_options(options))
 }
 
 /// Build the agent for a session, connect MCP servers and register it.
@@ -352,7 +438,11 @@ async fn open(
     for w in warnings {
         eprintln!("nyq: {w}");
     }
-    let source = if items.is_empty() { "startup" } else { "resume" };
+    let source = if items.is_empty() {
+        "startup"
+    } else {
+        "resume"
+    };
     let model = format!("{}:{}", provider.name(), provider.model());
     let mut agent = Agent {
         session: Some(session),
@@ -361,11 +451,12 @@ async fn open(
         system: prompt::system(&cwd, &sandbox),
         items: Vec::new(),
         cwd: cwd.clone(),
-        yolo: state.opts.yolo,
+        permission_mode: startup_mode(&state.opts),
+        review_cache: Default::default(),
         allowed: Default::default(),
         permissions: Arc::new(permissions),
         usage: Usage::default(),
-            stats: Default::default(),
+        stats: Default::default(),
         context_window: 0,
         context_tokens: 0,
         context_estimated: false,
@@ -375,7 +466,8 @@ async fn open(
         sandbox,
         undo: Default::default(),
     };
-    agent.context_window = config::context_window_for(agent.provider.name(), agent.provider.context_window());
+    agent.context_window =
+        config::context_window_for(agent.provider.name(), agent.provider.context_window());
     let skills = skills::discover(&state.home, &cwd);
     if !skills.is_empty() {
         agent.system.push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
@@ -391,7 +483,10 @@ async fn open(
     for w in warnings {
         eprintln!("nyq: {w}");
     }
-    let mut wanted: Vec<ServerConfig> = servers.into_iter().filter(|s| s.scope == Scope::Profile).collect();
+    let mut wanted: Vec<ServerConfig> = servers
+        .into_iter()
+        .filter(|s| s.scope == Scope::Profile)
+        .collect();
     for server in client_servers {
         match server_config(server, &cwd) {
             Ok(cfg) => {
@@ -409,11 +504,17 @@ async fn open(
     crate::hooks::session_start(&agent, source).await;
 
     let live = Arc::new(Live {
-        id: acp::SessionId::new(agent.session.as_ref().map(|s| s.id.clone()).unwrap_or_default()),
+        id: acp::SessionId::new(
+            agent
+                .session
+                .as_ref()
+                .map(|s| s.id.clone())
+                .unwrap_or_default(),
+        ),
         cwd,
         inner: tokio::sync::Mutex::new(Inner { agent, mcp }),
         cancels: Mutex::new(Vec::new()),
-        yolo: Arc::new(AtomicBool::new(state.opts.yolo)),
+        mode: Arc::new(AtomicU8::new(startup_mode(&state.opts).code())),
         next_provider: Mutex::new(None),
         model: Mutex::new(model),
     });
@@ -429,22 +530,42 @@ fn server_config(server: &acp::McpServer, cwd: &Path) -> Result<ServerConfig, St
             Transport::Stdio {
                 command: s.command.to_string_lossy().into_owned(),
                 args: s.args.clone(),
-                env: s.env.iter().map(|e| (e.name.clone(), e.value.clone())).collect::<BTreeMap<_, _>>(),
+                env: s
+                    .env
+                    .iter()
+                    .map(|e| (e.name.clone(), e.value.clone()))
+                    .collect::<BTreeMap<_, _>>(),
                 cwd: Some(cwd.to_path_buf()),
             },
         ),
         acp::McpServer::Http(s) => (
             s.name.clone(),
-            Transport::Http { url: s.url.clone(), headers: s.headers.iter().map(|h| (h.name.clone(), h.value.clone())).collect() },
+            Transport::Http {
+                url: s.url.clone(),
+                headers: s
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.value.clone()))
+                    .collect(),
+            },
         ),
-        acp::McpServer::Sse(s) => return Err(format!("MCP {}: SSE servers are not supported (use streamable HTTP)", s.name)),
+        acp::McpServer::Sse(s) => {
+            return Err(format!(
+                "MCP {}: SSE servers are not supported (use streamable HTTP)",
+                s.name
+            ))
+        }
         #[allow(unreachable_patterns)]
         _ => return Err("MCP: unsupported server transport".into()),
     };
     if name.trim().is_empty() {
         return Err("MCP: a server without a name was skipped".into());
     }
-    Ok(ServerConfig { name, transport, scope: Scope::Profile })
+    Ok(ServerConfig {
+        name,
+        transport,
+        scope: Scope::Profile,
+    })
 }
 
 async fn connect_server(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig) {
@@ -469,13 +590,21 @@ async fn connect_server(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerCon
 
 /// The session's modes and model picker. When the model catalog is still
 /// loading, the picker starts with the current model and is updated later.
-fn describe(state: &Arc<State>, live: &Arc<Live>, cx: &ConnectionTo<Client>) -> (acp::SessionModeState, Vec<acp::SessionConfigOption>) {
-    let current = if live.yolo.load(Ordering::Relaxed) { MODE_YOLO } else { MODE_ASK };
+fn describe(
+    state: &Arc<State>,
+    live: &Arc<Live>,
+    cx: &ConnectionTo<Client>,
+) -> (acp::SessionModeState, Vec<acp::SessionConfigOption>) {
+    let current = crate::permissions::Mode::from_code(live.mode.load(Ordering::Relaxed)).as_str();
     let modes = acp::SessionModeState::new(
         current,
         vec![
-            acp::SessionMode::new(MODE_ASK, "Ask").description("Ask before edits, commands and other side effects".to_string()),
-            acp::SessionMode::new(MODE_YOLO, "Yolo").description("Run every tool call without asking".to_string()),
+            acp::SessionMode::new(MODE_ASK, "Ask")
+                .description("Ask before risky tool calls".to_string()),
+            acp::SessionMode::new(MODE_AUTO, "Auto")
+                .description("A classifier allows, asks, or denies risky tool calls".to_string()),
+            acp::SessionMode::new(MODE_YOLO, "Yolo")
+                .description("Run tools without asking; deny rules still block".to_string()),
         ],
     );
     let options = match state.catalog.get() {
@@ -486,8 +615,11 @@ fn describe(state: &Arc<State>, live: &Arc<Live>, cx: &ConnectionTo<Client>) -> 
                 tokio::spawn(async move {
                     let catalog = st.catalog().await;
                     let options = model_options(catalog, &lock(&live.model));
-                    let update = acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(options));
-                    let _ = cx.send_notification(acp::SessionNotification::new(live.id.clone(), update));
+                    let update = acp::SessionUpdate::ConfigOptionUpdate(
+                        acp::ConfigOptionUpdate::new(options),
+                    );
+                    let _ = cx
+                        .send_notification(acp::SessionNotification::new(live.id.clone(), update));
                 });
             }
             model_options(&[], &lock(&live.model))
@@ -498,7 +630,9 @@ fn describe(state: &Arc<State>, live: &Arc<Live>, cx: &ConnectionTo<Client>) -> 
 
 fn model_options(catalog: &[ModelChoice], current: &str) -> Vec<acp::SessionConfigOption> {
     let mut groups: Vec<(String, Vec<acp::SessionConfigSelectOption>)> = Vec::new();
-    let listed = catalog.iter().any(|c| format!("{}:{}", c.provider, c.model) == current);
+    let listed = catalog
+        .iter()
+        .any(|c| format!("{}:{}", c.provider, c.model) == current);
     let mut add = |provider: &str, model: &str| {
         let value = format!("{provider}:{model}");
         let option = acp::SessionConfigSelectOption::new(value, model.to_string());
@@ -521,44 +655,77 @@ fn model_options(catalog: &[ModelChoice], current: &str) -> Vec<acp::SessionConf
     }
     let groups = groups
         .into_iter()
-        .map(|(provider, options)| acp::SessionConfigSelectGroup::new(provider.clone(), provider, options))
+        .map(|(provider, options)| {
+            acp::SessionConfigSelectGroup::new(provider.clone(), provider, options)
+        })
         .collect::<Vec<_>>();
-    vec![acp::SessionConfigOption::select(MODEL_OPTION, "Model", current.to_string(), groups)
-        .category(acp::SessionConfigOptionCategory::Model)]
+    vec![
+        acp::SessionConfigOption::select(MODEL_OPTION, "Model", current.to_string(), groups)
+            .category(acp::SessionConfigOptionCategory::Model),
+    ]
 }
 
-fn set_mode(state: &Arc<State>, req: acp::SetSessionModeRequest) -> Result<acp::SetSessionModeResponse, sdk::Error> {
+fn set_mode(
+    state: &Arc<State>,
+    req: acp::SetSessionModeRequest,
+) -> Result<acp::SetSessionModeResponse, sdk::Error> {
     let live = state.get(&req.session_id)?;
-    let yolo = match &*req.mode_id.0 {
-        MODE_ASK => false,
-        MODE_YOLO => true,
-        other => return Err(sdk::Error::invalid_params().data(format!("unknown mode {other}"))),
-    };
-    live.yolo.store(yolo, Ordering::Relaxed);
+    let mode = crate::permissions::Mode::parse(&req.mode_id.0).ok_or_else(|| {
+        sdk::Error::invalid_params().data(format!("unknown mode {}", req.mode_id.0))
+    })?;
+    live.mode.store(mode.code(), Ordering::Relaxed);
     Ok(acp::SetSessionModeResponse::new())
 }
 
-async fn set_config_option(state: &Arc<State>, req: acp::SetSessionConfigOptionRequest) -> Result<acp::SetSessionConfigOptionResponse, sdk::Error> {
+async fn set_config_option(
+    state: &Arc<State>,
+    req: acp::SetSessionConfigOptionRequest,
+) -> Result<acp::SetSessionConfigOptionResponse, sdk::Error> {
     let live = state.get(&req.session_id)?;
     if &*req.config_id.0 != MODEL_OPTION {
-        return Err(sdk::Error::invalid_params().data(format!("unknown config option {}", req.config_id.0)));
+        return Err(
+            sdk::Error::invalid_params().data(format!("unknown config option {}", req.config_id.0))
+        );
     }
-    let value = req.value.as_value_id().ok_or_else(|| sdk::Error::invalid_params().data("model must be a select value"))?.0.to_string();
-    let catalog = if state.list_models { state.catalog().await } else { &[] };
-    let choice = match catalog.iter().find(|c| format!("{}:{}", c.provider, c.model) == value) {
+    let value = req
+        .value
+        .as_value_id()
+        .ok_or_else(|| sdk::Error::invalid_params().data("model must be a select value"))?
+        .0
+        .to_string();
+    let catalog = if state.list_models {
+        state.catalog().await
+    } else {
+        &[]
+    };
+    let choice = match catalog
+        .iter()
+        .find(|c| format!("{}:{}", c.provider, c.model) == value)
+    {
         Some(c) => c.clone(),
         None => {
-            let (provider, model) =
-                value.split_once(':').ok_or_else(|| sdk::Error::invalid_params().data(format!("unknown model {value}")))?;
-            ModelChoice { provider: provider.into(), model: model.into(), ..Default::default() }
+            let (provider, model) = value.split_once(':').ok_or_else(|| {
+                sdk::Error::invalid_params().data(format!("unknown model {value}"))
+            })?;
+            ModelChoice {
+                provider: provider.into(),
+                model: model.into(),
+                ..Default::default()
+            }
         }
     };
     let window = config::context_window_for(&choice.provider, choice.context_window);
     // Keep the reasoning effort when the new model supports it.
     match live.inner.try_lock() {
         Ok(mut inner) => {
-            let effort = inner.agent.provider.effort().map(str::to_string).filter(|e| choice.efforts.contains(e));
-            let provider = models::build(&state.home, &choice, effort.clone()).map_err(anyhow_error)?;
+            let effort = inner
+                .agent
+                .provider
+                .effort()
+                .map(str::to_string)
+                .filter(|e| choice.efforts.contains(e));
+            let provider =
+                models::build(&state.home, &choice, effort.clone()).map_err(anyhow_error)?;
             inner.agent.provider = provider;
             inner.agent.set_context_window(window);
             let _ = models::save_last(&state.home, &choice, effort.as_deref());
@@ -571,15 +738,24 @@ async fn set_config_option(state: &Arc<State>, req: acp::SetSessionConfigOptionR
         }
     }
     *lock(&live.model) = value.clone();
-    Ok(acp::SetSessionConfigOptionResponse::new(model_options(catalog, &value)))
+    Ok(acp::SetSessionConfigOptionResponse::new(model_options(
+        catalog, &value,
+    )))
 }
 
-fn list_sessions(state: &Arc<State>, req: acp::ListSessionsRequest) -> Result<acp::ListSessionsResponse, sdk::Error> {
+fn list_sessions(
+    state: &Arc<State>,
+    req: acp::ListSessionsRequest,
+) -> Result<acp::ListSessionsResponse, sdk::Error> {
     let all = session::list(&state.sessions_dir()).map_err(anyhow_error)?;
     let sessions = all
         .into_iter()
         .filter(|m| req.cwd.as_ref().is_none_or(|cwd| &m.cwd == cwd))
-        .map(|m| acp::SessionInfo::new(m.id, m.cwd).title(m.title).updated_at(m.created.to_rfc3339()))
+        .map(|m| {
+            acp::SessionInfo::new(m.id, m.cwd)
+                .title(m.title)
+                .updated_at(m.created.to_rfc3339())
+        })
         .collect();
     Ok(acp::ListSessionsResponse::new(sessions))
 }
@@ -612,8 +788,14 @@ async fn prompt(
             inner.agent.provider = provider;
             inner.agent.set_context_window(window);
         }
-        inner.agent.yolo = live.yolo.load(Ordering::Relaxed);
-        let perms = Arc::new(Asker { cx: cx.clone(), session: live.id.clone(), cwd: live.cwd.clone(), yolo: live.yolo.clone() });
+        inner.agent.permission_mode =
+            crate::permissions::Mode::from_code(live.mode.load(Ordering::Relaxed));
+        let perms = Arc::new(Asker {
+            cx: cx.clone(),
+            session: live.id.clone(),
+            cwd: live.cwd.clone(),
+            mode: live.mode.clone(),
+        });
         let mut ui = AcpUi::new(perms, inner.agent.context_window);
         let blocked = if token.is_cancelled() {
             None
@@ -623,14 +805,18 @@ async fn prompt(
         let result = if token.is_cancelled() {
             Ok(TurnEnd::Cancelled)
         } else if let Some(msg) = blocked {
-            ui.notify(acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(msg.into())));
+            ui.notify(acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(msg.into()),
+            ));
             Ok(TurnEnd::Done)
         } else {
             inner.agent.turn(item, &mut ui, token.clone()).await
         };
         let (used, size) = (inner.agent.context_tokens, inner.agent.context_window);
         if size > 0 {
-            ui.notify(acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(used, size)));
+            ui.notify(acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(
+                used, size,
+            )));
         }
         result
     };
@@ -669,13 +855,22 @@ fn user_item(blocks: &[acp::ContentBlock], cwd: &Path) -> Item {
             acp::ContentBlock::Resource(r) => match &r.resource {
                 acp::EmbeddedResourceResource::TextResourceContents(t) => {
                     text.push_str(&mention(&t.uri, ""));
-                    context.push(format!("<context ref=\"{}\">\n{}\n</context>", t.uri, t.text));
+                    context.push(format!(
+                        "<context ref=\"{}\">\n{}\n</context>",
+                        t.uri, t.text
+                    ));
                 }
                 acp::EmbeddedResourceResource::BlobResourceContents(b) => {
                     text.push_str(&mention(&b.uri, ""));
                     match b.mime_type.as_deref().filter(|m| supported_image(m)) {
-                        Some(mime) => images.push(Image { media_type: mime.into(), data: b.blob.clone() }),
-                        None => notes.push(format!("[{} is binary; its content is not included]", b.uri)),
+                        Some(mime) => images.push(Image {
+                            media_type: mime.into(),
+                            data: b.blob.clone(),
+                        }),
+                        None => notes.push(format!(
+                            "[{} is binary; its content is not included]",
+                            b.uri
+                        )),
                     }
                 }
                 #[allow(unreachable_patterns)]
@@ -683,14 +878,20 @@ fn user_item(blocks: &[acp::ContentBlock], cwd: &Path) -> Item {
             },
             acp::ContentBlock::Image(img) => {
                 if !img.data.is_empty() && supported_image(&img.mime_type) {
-                    images.push(Image { media_type: img.mime_type.clone(), data: img.data.clone() });
+                    images.push(Image {
+                        media_type: img.mime_type.clone(),
+                        data: img.data.clone(),
+                    });
                 } else if let Some(path) = img.uri.as_deref().and_then(|u| file_path(u, cwd)) {
                     match crate::tools::image::load(&path) {
                         Ok(image) => images.push(image),
                         Err(e) => notes.push(format!("[image not attached: {e:#}]")),
                     }
                 } else {
-                    notes.push(format!("[an image of type {} was not attached: unsupported]", img.mime_type));
+                    notes.push(format!(
+                        "[an image of type {} was not attached: unsupported]",
+                        img.mime_type
+                    ));
                 }
             }
             acp::ContentBlock::Audio(_) => notes.push("[audio input is not supported]".into()),
@@ -708,12 +909,19 @@ fn user_item(blocks: &[acp::ContentBlock], cwd: &Path) -> Item {
 }
 
 fn supported_image(mime: &str) -> bool {
-    matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
 }
 
 /// `@/abs/path` for files (so the model can read them), else `[name](uri)`.
 fn mention(uri: &str, name: &str) -> String {
-    match reqwest::Url::parse(uri).ok().filter(|u| u.scheme() == "file").and_then(|u| u.to_file_path().ok()) {
+    match reqwest::Url::parse(uri)
+        .ok()
+        .filter(|u| u.scheme() == "file")
+        .and_then(|u| u.to_file_path().ok())
+    {
         Some(path) => format!("@{}", path.display()),
         None if name.is_empty() => format!("<{uri}>"),
         None => format!("[{name}]({uri})"),
@@ -741,12 +949,20 @@ fn replay(cx: &ConnectionTo<Client>, session: &acp::SessionId, agent: &Agent) {
             Item::Reasoning { summary, .. } if !summary.trim().is_empty() => {
                 send(acp::SessionUpdate::AgentThoughtChunk(chunk(summary)))
             }
-            Item::Compaction { summary } => {
-                send(acp::SessionUpdate::AgentThoughtChunk(chunk(&format!("Earlier conversation, summarized:\n\n{summary}"))))
-            }
-            Item::ToolCall { id, name, arguments } => {
+            Item::Compaction { summary } => send(acp::SessionUpdate::AgentThoughtChunk(chunk(
+                &format!("Earlier conversation, summarized:\n\n{summary}"),
+            ))),
+            Item::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
                 let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
-                let summary = agent.tools.get(name).map(|t| t.summary(&args)).unwrap_or_default();
+                let summary = agent
+                    .tools
+                    .get(name)
+                    .map(|t| t.summary(&args))
+                    .unwrap_or_default();
                 let call = acp::ToolCall::new(id.clone(), title(name, &summary))
                     .kind(tool_kind(name))
                     .status(acp::ToolCallStatus::Completed)
@@ -754,11 +970,21 @@ fn replay(cx: &ConnectionTo<Client>, session: &acp::SessionId, agent: &Agent) {
                     .raw_input(args);
                 send(acp::SessionUpdate::ToolCall(call))
             }
-            Item::ToolResult { id, output, is_error } => {
+            Item::ToolResult {
+                id,
+                output,
+                is_error,
+            } => {
                 let fields = acp::ToolCallUpdateFields::new()
-                    .status(if *is_error { acp::ToolCallStatus::Failed } else { acp::ToolCallStatus::Completed })
+                    .status(if *is_error {
+                        acp::ToolCallStatus::Failed
+                    } else {
+                        acp::ToolCallStatus::Completed
+                    })
                     .content(vec![text_content(&fenced(&shorten(output), ""))]);
-                send(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id.clone(), fields)))
+                send(acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(id.clone(), fields),
+                ))
             }
             _ => {}
         }
@@ -773,12 +999,14 @@ struct Asker {
     cx: ConnectionTo<Client>,
     session: acp::SessionId,
     cwd: PathBuf,
-    yolo: Arc<AtomicBool>,
+    mode: Arc<AtomicU8>,
 }
 
 impl Asker {
     fn notify(&self, update: acp::SessionUpdate) {
-        let _ = self.cx.send_notification(acp::SessionNotification::new(self.session.clone(), update));
+        let _ = self
+            .cx
+            .send_notification(acp::SessionNotification::new(self.session.clone(), update));
     }
 
     /// Show the call as pending and ask. Returns the decision and the tool call id.
@@ -799,10 +1027,14 @@ impl Asker {
             .content(content)
             .locations(locations(req.tool, req.summary, &self.cwd));
         self.notify(acp::SessionUpdate::ToolCall(call));
-        if self.yolo.load(Ordering::Relaxed) {
+        if crate::permissions::Mode::from_code(self.mode.load(Ordering::Relaxed)).is_yolo() {
             return (Approval::Yes, id);
         }
-        let mut options = vec![acp::PermissionOption::new("allow_once", "Allow", acp::PermissionOptionKind::AllowOnce)];
+        let mut options = vec![acp::PermissionOption::new(
+            "allow_once",
+            "Allow",
+            acp::PermissionOptionKind::AllowOnce,
+        )];
         if let Some(rule) = &req.rule {
             options.push(acp::PermissionOption::new(
                 "allow_always",
@@ -810,12 +1042,21 @@ impl Asker {
                 acp::PermissionOptionKind::AllowAlways,
             ));
         }
-        options.push(acp::PermissionOption::new("reject_once", "Reject", acp::PermissionOptionKind::RejectOnce));
+        options.push(acp::PermissionOption::new(
+            "reject_once",
+            "Reject",
+            acp::PermissionOptionKind::RejectOnce,
+        ));
         let request = acp::RequestPermissionRequest::new(
             self.session.clone(),
             // Repeat the title and kind so clients that don't merge with the
             // earlier tool_call card still show what is being approved.
-            acp::ToolCallUpdate::new(id.clone(), acp::ToolCallUpdateFields::new().title(name).kind(tool_kind(req.tool))),
+            acp::ToolCallUpdate::new(
+                id.clone(),
+                acp::ToolCallUpdateFields::new()
+                    .title(name)
+                    .kind(tool_kind(req.tool)),
+            ),
             options,
         );
         let answer = match self.cx.send_request(request).block_task().await {
@@ -841,8 +1082,14 @@ impl Approver for Asker {
     async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval {
         let (answer, id) = self.ask(Some(origin), req).await;
         // The subagent runs the call itself; just settle the card.
-        let status = if matches!(answer, Approval::No) { acp::ToolCallStatus::Failed } else { acp::ToolCallStatus::Completed };
-        self.notify(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id, acp::ToolCallUpdateFields::new().status(status))));
+        let status = if matches!(answer, Approval::No) {
+            acp::ToolCallStatus::Failed
+        } else {
+            acp::ToolCallStatus::Completed
+        };
+        self.notify(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(id, acp::ToolCallUpdateFields::new().status(status)),
+        ));
         answer
     }
 }
@@ -864,7 +1111,12 @@ struct AcpUi {
 
 impl AcpUi {
     fn new(asker: Arc<Asker>, context_window: u64) -> Self {
-        Self { asker, pending: None, running: None, context_window }
+        Self {
+            asker,
+            pending: None,
+            running: None,
+            context_window,
+        }
     }
 
     fn notify(&self, update: acp::SessionUpdate) {
@@ -877,8 +1129,12 @@ impl Ui for AcpUi {
     fn stream(&mut self, event: &StreamEvent) {
         let chunk = |t: &str| acp::ContentChunk::new(t.to_string().into());
         match event {
-            StreamEvent::Text(t) if !t.is_empty() => self.notify(acp::SessionUpdate::AgentMessageChunk(chunk(t))),
-            StreamEvent::Reasoning(t) if !t.is_empty() => self.notify(acp::SessionUpdate::AgentThoughtChunk(chunk(t))),
+            StreamEvent::Text(t) if !t.is_empty() => {
+                self.notify(acp::SessionUpdate::AgentMessageChunk(chunk(t)))
+            }
+            StreamEvent::Reasoning(t) if !t.is_empty() => {
+                self.notify(acp::SessionUpdate::AgentThoughtChunk(chunk(t)))
+            }
             _ => {}
         }
     }
@@ -893,8 +1149,11 @@ impl Ui for AcpUi {
         });
         let id = match self.pending.take() {
             Some(id) => {
-                let fields = acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress);
-                self.notify(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id.clone(), fields)));
+                let fields =
+                    acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress);
+                self.notify(acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(id.clone(), fields),
+                ));
                 id
             }
             None => {
@@ -911,13 +1170,20 @@ impl Ui for AcpUi {
     }
 
     fn tool_end(&mut self, tool: &str, output: &ToolOutput) {
-        let running = self.running.take().or_else(|| self.pending.take().map(|id| Running { id, file: None }));
+        let running = self
+            .running
+            .take()
+            .or_else(|| self.pending.take().map(|id| Running { id, file: None }));
         let Some(Running { id, file }) = running else {
             // Ended without a start (e.g. refused before running): show it once.
             let id = uuid::Uuid::new_v4().to_string();
             let call = acp::ToolCall::new(id.clone(), title(tool, ""))
                 .kind(tool_kind(tool))
-                .status(if output.is_error { acp::ToolCallStatus::Failed } else { acp::ToolCallStatus::Completed })
+                .status(if output.is_error {
+                    acp::ToolCallStatus::Failed
+                } else {
+                    acp::ToolCallStatus::Completed
+                })
                 .content(vec![text_content(&shorten(&output.content))]);
             self.notify(acp::SessionUpdate::ToolCall(call));
             return;
@@ -927,7 +1193,9 @@ impl Ui for AcpUi {
         } else if let Some((path, before)) = file {
             match read_small(&path) {
                 Some(after) if Some(&after) != before.as_ref() => {
-                    vec![acp::ToolCallContent::Diff(acp::Diff::new(path, after).old_text(before))]
+                    vec![acp::ToolCallContent::Diff(
+                        acp::Diff::new(path, after).old_text(before),
+                    )]
                 }
                 _ => match output.display.as_deref().filter(|d| is_diff(d)) {
                     Some(diff) => vec![text_content(&fenced(&shorten(diff), "diff"))],
@@ -940,9 +1208,15 @@ impl Ui for AcpUi {
             vec![text_content(&fenced(&shorten(&output.content), ""))]
         };
         let fields = acp::ToolCallUpdateFields::new()
-            .status(if output.is_error { acp::ToolCallStatus::Failed } else { acp::ToolCallStatus::Completed })
+            .status(if output.is_error {
+                acp::ToolCallStatus::Failed
+            } else {
+                acp::ToolCallStatus::Completed
+            })
             .content(content);
-        self.notify(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id, fields)));
+        self.notify(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(id, fields),
+        ));
     }
 
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
@@ -954,12 +1228,17 @@ impl Ui for AcpUi {
     fn usage(&mut self, usage: &Usage) {
         if self.context_window > 0 {
             let used = usage.input_tokens + usage.output_tokens;
-            self.notify(acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(used, self.context_window)));
+            self.notify(acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(
+                used,
+                self.context_window,
+            )));
         }
     }
 
     fn notice(&mut self, msg: &str) {
-        self.notify(acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(format!("{msg}\n").into())));
+        self.notify(acp::SessionUpdate::AgentThoughtChunk(
+            acp::ContentChunk::new(format!("{msg}\n").into()),
+        ));
     }
 
     /// No ACP request asks the user a free-form question: the model is told
@@ -993,7 +1272,11 @@ fn prose(tool: &str) -> bool {
 
 fn title(tool: &str, summary: &str) -> String {
     let s: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s = if s.chars().count() > 160 { format!("{}…", s.chars().take(159).collect::<String>()) } else { s };
+    let s = if s.chars().count() > 160 {
+        format!("{}…", s.chars().take(159).collect::<String>())
+    } else {
+        s
+    };
     if s.is_empty() {
         return tool.to_string();
     }
@@ -1018,7 +1301,9 @@ fn title(tool: &str, summary: &str) -> String {
 
 fn locations(tool: &str, summary: &str, cwd: &Path) -> Vec<acp::ToolCallLocation> {
     match tool {
-        "read_file" | "list_dir" | "view_image" | "write_file" | "edit_file" if !summary.is_empty() => {
+        "read_file" | "list_dir" | "view_image" | "write_file" | "edit_file"
+            if !summary.is_empty() =>
+        {
             vec![acp::ToolCallLocation::new(resolve(cwd, summary))]
         }
         _ => Vec::new(),
@@ -1059,7 +1344,10 @@ fn shorten(text: &str) -> String {
     }
     let head: String = text.chars().take(MAX_SHOWN * 3 / 4).collect();
     let tail: String = text.chars().skip(count - MAX_SHOWN / 4).collect();
-    format!("{head}\n… [{} characters omitted] …\n{tail}", count - MAX_SHOWN)
+    format!(
+        "{head}\n… [{} characters omitted] …\n{tail}",
+        count - MAX_SHOWN
+    )
 }
 
 /// A markdown code block that the text itself cannot close.
@@ -1106,7 +1394,11 @@ mod tests {
         fn fork(&self) -> Box<dyn Provider> {
             Box::new(self.clone())
         }
-        async fn stream(&self, _req: Request<'_>, on_event: crate::provider::EventSink<'_>) -> anyhow::Result<Response> {
+        async fn stream(
+            &self,
+            _req: Request<'_>,
+            on_event: crate::provider::EventSink<'_>,
+        ) -> anyhow::Result<Response> {
             let i = self.next.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
             match self.steps.get(i).cloned() {
@@ -1116,7 +1408,14 @@ mod tests {
                             on_event(StreamEvent::Text(text.clone()));
                         }
                     }
-                    Ok(Response { items, usage: Some(Usage { input_tokens: 10, output_tokens: 5, cached_tokens: 0 }) })
+                    Ok(Response {
+                        items,
+                        usage: Some(Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            cached_tokens: 0,
+                        }),
+                    })
                 }
                 Some(Step::Hang) => std::future::pending().await,
                 None => anyhow::bail!("script exhausted"),
@@ -1134,19 +1433,39 @@ mod tests {
     fn harness(steps: Vec<Step>) -> Harness {
         let home = tempfile::tempdir().unwrap();
         let started = Arc::new(tokio::sync::Notify::new());
-        let provider = Scripted { steps: Arc::new(steps), next: Arc::new(AtomicUsize::new(0)), started: started.clone() };
-        let factory: ProviderFactory = Arc::new(move || Ok(Box::new(provider.clone()) as Box<dyn Provider>));
-        let opts = Options { sandbox: Some(sandbox::Mode::Off), ..Options::default() };
-        let policy = sandbox::Policy { mode: sandbox::Mode::Off, ..Default::default() };
+        let provider = Scripted {
+            steps: Arc::new(steps),
+            next: Arc::new(AtomicUsize::new(0)),
+            started: started.clone(),
+        };
+        let factory: ProviderFactory =
+            Arc::new(move || Ok(Box::new(provider.clone()) as Box<dyn Provider>));
+        let opts = Options {
+            sandbox: Some(sandbox::Mode::Off),
+            ..Options::default()
+        };
+        let policy = sandbox::Policy {
+            mode: sandbox::Mode::Off,
+            ..Default::default()
+        };
         let state = State::new(home.path().to_path_buf(), opts, policy, factory, false);
         let (client, server) = tokio::io::duplex(1 << 20);
         let st = state.clone();
         tokio::spawn(async move {
             use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
             let (read, write) = tokio::io::split(server);
-            let _ = serve(st, sdk::ByteStreams::new(write.compat_write(), read.compat())).await;
+            let _ = serve(
+                st,
+                sdk::ByteStreams::new(write.compat_write(), read.compat()),
+            )
+            .await;
         });
-        Harness { state, client, started, _home: home }
+        Harness {
+            state,
+            client,
+            started,
+            _home: home,
+        }
     }
 
     /// Everything the client saw.
@@ -1170,7 +1489,9 @@ mod tests {
             .builder()
             .on_receive_notification(
                 async move |n: acp::SessionNotification, _cx: ConnectionTo<sdk::Agent>| {
-                    lock(&s1).updates.push(serde_json::to_value(&n.update).unwrap());
+                    lock(&s1)
+                        .updates
+                        .push(serde_json::to_value(&n.update).unwrap());
                     Ok(())
                 },
                 sdk::on_receive_notification!(),
@@ -1179,14 +1500,21 @@ mod tests {
                 async move |r: acp::RequestPermissionRequest,
                             responder: Responder<acp::RequestPermissionResponse>,
                             _cx: ConnectionTo<sdk::Agent>| {
-                    lock(&s2).permissions.push(serde_json::to_value(&r).unwrap());
-                    responder.respond(acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Selected(
-                        acp::SelectedPermissionOutcome::new("allow_once"),
-                    )))
+                    lock(&s2)
+                        .permissions
+                        .push(serde_json::to_value(&r).unwrap());
+                    responder.respond(acp::RequestPermissionResponse::new(
+                        acp::RequestPermissionOutcome::Selected(
+                            acp::SelectedPermissionOutcome::new("allow_once"),
+                        ),
+                    ))
                 },
                 sdk::on_receive_request!(),
             )
-            .connect_with(sdk::ByteStreams::new(write.compat_write(), read.compat()), body)
+            .connect_with(
+                sdk::ByteStreams::new(write.compat_write(), read.compat()),
+                body,
+            )
             .await
             .unwrap()
     }
@@ -1202,55 +1530,112 @@ mod tests {
     #[tokio::test]
     async fn prompt_runs_tools_with_editor_approval() {
         let h = harness(vec![
-            Step::Reply(vec![Item::Assistant { text: "Writing.".into() }, write_call()]),
-            Step::Reply(vec![Item::Assistant { text: "All done.".into() }]),
+            Step::Reply(vec![
+                Item::Assistant {
+                    text: "Writing.".into(),
+                },
+                write_call(),
+            ]),
+            Step::Reply(vec![Item::Assistant {
+                text: "All done.".into(),
+            }]),
         ]);
         let work = tempfile::tempdir().unwrap();
         let cwd = work.path().to_path_buf();
         let cwd2 = cwd.clone();
         let seen = Arc::new(Mutex::new(Seen::default()));
-        let (init, session, stop) = as_client(h.client, seen.clone(), async move |cx: ConnectionTo<sdk::Agent>| {
-            let init = cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-            let session = cx.send_request(acp::NewSessionRequest::new(cwd)).block_task().await?;
-            let prompt = vec![acp::ContentBlock::from("copy the notes")];
-            let stop = cx.send_request(acp::PromptRequest::new(session.session_id.clone(), prompt)).block_task().await?;
-            // Reopening the saved session replays it before answering.
-            cx.send_request(acp::LoadSessionRequest::new(session.session_id.clone(), cwd2)).block_task().await?;
-            Ok((init, session, stop))
-        })
+        let (init, session, stop) = as_client(
+            h.client,
+            seen.clone(),
+            async move |cx: ConnectionTo<sdk::Agent>| {
+                let init = cx
+                    .send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(acp::NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                let prompt = vec![acp::ContentBlock::from("copy the notes")];
+                let stop = cx
+                    .send_request(acp::PromptRequest::new(session.session_id.clone(), prompt))
+                    .block_task()
+                    .await?;
+                // Reopening the saved session replays it before answering.
+                cx.send_request(acp::LoadSessionRequest::new(
+                    session.session_id.clone(),
+                    cwd2,
+                ))
+                .block_task()
+                .await?;
+                Ok((init, session, stop))
+            },
+        )
         .await;
 
         let init = serde_json::to_value(&init).unwrap();
         assert_eq!(init["protocolVersion"], 1);
         assert_eq!(init["agentInfo"]["name"], "nyq");
         assert_eq!(init["agentCapabilities"]["loadSession"], true);
-        assert_eq!(init["agentCapabilities"]["promptCapabilities"]["image"], true);
-        assert_eq!(init["agentCapabilities"]["promptCapabilities"]["embeddedContext"], true);
+        assert_eq!(
+            init["agentCapabilities"]["promptCapabilities"]["image"],
+            true
+        );
+        assert_eq!(
+            init["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            true
+        );
         assert_eq!(init["agentCapabilities"]["mcpCapabilities"]["http"], true);
         assert!(session.modes.is_some());
         assert_eq!(stop.stop_reason, acp::StopReason::EndTurn);
-        assert_eq!(std::fs::read_to_string(work.path().join("out.txt")).unwrap(), "done\n");
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("out.txt")).unwrap(),
+            "done\n"
+        );
 
         let seen = lock(&seen);
         assert_eq!(seen.permissions.len(), 1, "{:?}", seen.permissions);
         let perm = &seen.permissions[0];
-        let options: Vec<&str> = perm["options"].as_array().unwrap().iter().map(|o| o["optionId"].as_str().unwrap()).collect();
-        assert!(options.contains(&"allow_once") && options.contains(&"reject_once"), "{options:?}");
+        let options: Vec<&str> = perm["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["optionId"].as_str().unwrap())
+            .collect();
+        assert!(
+            options.contains(&"allow_once") && options.contains(&"reject_once"),
+            "{options:?}"
+        );
         let call_id = perm["toolCall"]["toolCallId"].as_str().unwrap();
 
-        let kinds: Vec<&str> = seen.updates.iter().map(|u| u["sessionUpdate"].as_str().unwrap()).collect();
+        let kinds: Vec<&str> = seen
+            .updates
+            .iter()
+            .map(|u| u["sessionUpdate"].as_str().unwrap())
+            .collect();
         let text: String = seen
             .updates
             .iter()
             .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
             .map(|u| u["content"]["text"].as_str().unwrap())
             .collect();
-        assert_eq!(text, "Writing.All done.".repeat(2), "live, then replayed by session/load");
-        let card = seen.updates.iter().find(|u| u["sessionUpdate"] == "tool_call").expect("tool_call");
+        assert_eq!(
+            text,
+            "Writing.All done.".repeat(2),
+            "live, then replayed by session/load"
+        );
+        let card = seen
+            .updates
+            .iter()
+            .find(|u| u["sessionUpdate"] == "tool_call")
+            .expect("tool_call");
         assert_eq!(card["toolCallId"], call_id);
         assert_eq!(card["kind"], "edit");
         assert_eq!(card["title"], "Write out.txt");
-        assert_eq!(card["locations"][0]["path"], work.path().join("out.txt").display().to_string());
+        assert_eq!(
+            card["locations"][0]["path"],
+            work.path().join("out.txt").display().to_string()
+        );
         let done = seen
             .updates
             .iter()
@@ -1260,9 +1645,20 @@ mod tests {
         assert_eq!(done["content"][0]["type"], "diff");
         assert_eq!(done["content"][0]["newText"], "done\n");
         assert!(kinds.contains(&"usage_update"), "{kinds:?}");
-        let replayed = seen.updates.iter().find(|u| u["sessionUpdate"] == "user_message_chunk").expect("replay");
+        let replayed = seen
+            .updates
+            .iter()
+            .find(|u| u["sessionUpdate"] == "user_message_chunk")
+            .expect("replay");
         assert_eq!(replayed["content"]["text"], "copy the notes");
-        assert_eq!(seen.updates.iter().filter(|u| u["sessionUpdate"] == "tool_call").count(), 2, "live + replayed");
+        assert_eq!(
+            seen.updates
+                .iter()
+                .filter(|u| u["sessionUpdate"] == "tool_call")
+                .count(),
+            2,
+            "live + replayed"
+        );
         // The conversation was saved like any other nyq session.
         assert_eq!(session::list(&h.state.sessions_dir()).unwrap().len(), 1);
     }
@@ -1275,8 +1671,13 @@ mod tests {
         let started = h.started.clone();
         let seen = Arc::new(Mutex::new(Seen::default()));
         let stop = as_client(h.client, seen, async move |cx: ConnectionTo<sdk::Agent>| {
-            cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-            let session = cx.send_request(acp::NewSessionRequest::new(cwd)).block_task().await?;
+            cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let session = cx
+                .send_request(acp::NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
             let id = session.session_id.clone();
             let pending = cx.send_request(acp::PromptRequest::new(id.clone(), vec!["wait".into()]));
             started.notified().await;
@@ -1294,21 +1695,43 @@ mod tests {
         let cwd = Path::new("/work");
         let blocks = vec![
             acp::ContentBlock::from("look at "),
-            acp::ContentBlock::ResourceLink(acp::ResourceLink::new("main.rs", "file:///work/src/main.rs")),
-            acp::ContentBlock::Resource(acp::EmbeddedResource::new(acp::EmbeddedResourceResource::TextResourceContents(
-                acp::TextResourceContents::new("fn main() {}", "file:///work/lib.rs"),
-            ))),
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                "main.rs",
+                "file:///work/src/main.rs",
+            )),
+            acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new("fn main() {}", "file:///work/lib.rs"),
+                ),
+            )),
             acp::ContentBlock::Image(acp::ImageContent::new("aGk=", "image/png")),
         ];
-        let Item::User { text, images } = user_item(&blocks, cwd) else { panic!() };
+        let Item::User { text, images } = user_item(&blocks, cwd) else {
+            panic!()
+        };
         // `file:///work/...` is a local path only on Unix; Windows keeps the link.
         if cfg!(unix) {
-            assert!(text.starts_with("look at @/work/src/main.rs@/work/lib.rs"), "{text}");
+            assert!(
+                text.starts_with("look at @/work/src/main.rs@/work/lib.rs"),
+                "{text}"
+            );
         } else {
-            assert!(text.starts_with("look at ") && text.contains("file:///work/src/main.rs"), "{text}");
+            assert!(
+                text.starts_with("look at ") && text.contains("file:///work/src/main.rs"),
+                "{text}"
+            );
         }
-        assert!(text.contains("<context ref=\"file:///work/lib.rs\">\nfn main() {}\n</context>"), "{text}");
-        assert_eq!(images, vec![Image { media_type: "image/png".into(), data: "aGk=".into() }]);
+        assert!(
+            text.contains("<context ref=\"file:///work/lib.rs\">\nfn main() {}\n</context>"),
+            "{text}"
+        );
+        assert_eq!(
+            images,
+            vec![Image {
+                media_type: "image/png".into(),
+                data: "aGk=".into()
+            }]
+        );
     }
 
     #[test]
@@ -1317,6 +1740,9 @@ mod tests {
         assert_eq!(title("mcp__fs__read", "x"), "fs: read x");
         assert_eq!(fenced("a ``` b", ""), "````\na ``` b\n````");
         assert!(shorten(&"x".repeat(20_000)).contains("characters omitted"));
-        assert_eq!(model_options(&[], "openai:gpt-5")[0].id.0.as_ref(), MODEL_OPTION);
+        assert_eq!(
+            model_options(&[], "openai:gpt-5")[0].id.0.as_ref(),
+            MODEL_OPTION
+        );
     }
 }

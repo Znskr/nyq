@@ -6,7 +6,8 @@
 //! A pattern is a tool name with `*` wildcards (`web_fetch`, `mcp__deepwiki__*`,
 //! `mcp__*`), `subagent:explore` / `subagent:general`, `web_fetch:<url>` (with
 //! wildcards), or `bash:<prefix>` for shell commands. Precedence:
-//! deny > ask > allow > session grants > the tool's default.
+//! deny > ask > allow > session grants > the permission mode. Deny wins in
+//! every mode, including yolo. `auto` classifies whatever is still undecided.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,93 @@ const READ_TOOLS: &[&str] = &["read_file", "list_dir", "glob", "grep", "view_ima
 
 pub(crate) fn is_read_tool(tool: &str) -> bool {
     READ_TOOLS.contains(&tool)
+}
+
+/// How undecided risky calls are handled. Deny rules still block in every mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Ask before a call the tool marks as risky.
+    #[default]
+    Ask,
+    /// A model classifier returns allow, ask, or deny.
+    Auto,
+    /// Never ask. Deny rules still block.
+    Yolo,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Ask => "ask",
+            Mode::Auto => "auto",
+            Mode::Yolo => "yolo",
+        }
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            Mode::Ask => "ask before risky tool calls",
+            Mode::Auto => "a classifier allows, asks, or denies risky tool calls",
+            Mode::Yolo => "run tools without asking (deny rules still block)",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(Mode::Ask),
+            "auto" => Some(Mode::Auto),
+            "yolo" => Some(Mode::Yolo),
+            _ => None,
+        }
+    }
+
+    pub fn is_yolo(self) -> bool {
+        self == Mode::Yolo
+    }
+
+    pub fn code(self) -> u8 {
+        match self {
+            Mode::Ask => 0,
+            Mode::Auto => 1,
+            Mode::Yolo => 2,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            1 => Mode::Auto,
+            2 => Mode::Yolo,
+            _ => Mode::Ask,
+        }
+    }
+}
+
+/// `--permission-mode` wins, then `--yolo`, then the settings value.
+/// An unknown settings value falls back to ask and returns a warning.
+/// An unknown flag is an error.
+pub fn resolve_mode(
+    flag: Option<&str>,
+    yolo_flag: bool,
+    settings_mode: &str,
+) -> Result<(Mode, Option<String>)> {
+    if let Some(raw) = flag {
+        let mode = Mode::parse(raw).with_context(|| {
+            format!("unknown permission mode `{raw}` (expected ask, auto or yolo)")
+        })?;
+        return Ok((mode, None));
+    }
+    if yolo_flag {
+        return Ok((Mode::Yolo, None));
+    }
+    match Mode::parse(settings_mode) {
+        Some(mode) => Ok((mode, None)),
+        None => Ok((
+            Mode::Ask,
+            Some(format!(
+                "ignoring permission_mode `{settings_mode}` in settings (expected ask, auto or yolo); using ask"
+            )),
+        )),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +140,8 @@ pub enum Decision {
     },
     /// Blocked by this rule (already described for the model).
     Deny(String),
+    /// Risky, and no rule or grant decided it. Only `auto` mode returns this.
+    Classify,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -187,9 +277,9 @@ impl Permissions {
         args: &Value,
         cwd: &Path,
         needs_approval: bool,
-        yolo: bool,
+        mode: Mode,
     ) -> Decision {
-        self.decide_in(session, tool, args, cwd, &[], needs_approval, yolo)
+        self.decide_in(session, tool, args, cwd, &[], needs_approval, mode)
     }
 
     /// Like [`decide`], treating `extra` directories as inside the workspace.
@@ -202,13 +292,13 @@ impl Permissions {
         cwd: &Path,
         extra: &[PathBuf],
         needs_approval: bool,
-        yolo: bool,
+        mode: Mode,
     ) -> Decision {
         if let Some(rule) = self.find(Action::Deny, tool, args) {
             return Decision::Deny(rule);
         }
         if let Some(rule) = self.find(Action::Ask, tool, args) {
-            return if yolo {
+            return if mode == Mode::Yolo {
                 Decision::Run
             } else {
                 Decision::Ask { forced: Some(rule) }
@@ -217,10 +307,14 @@ impl Permissions {
         if self.find(Action::Allow, tool, args).is_some() && allow_applies(tool, args, cwd, extra) {
             return Decision::Run;
         }
-        if !needs_approval || yolo || crate::agent::is_allowed_in(session, tool, args, cwd, extra) {
+        if !needs_approval || crate::agent::is_allowed_in(session, tool, args, cwd, extra) {
             return Decision::Run;
         }
-        Decision::Ask { forced: None }
+        match mode {
+            Mode::Yolo => Decision::Run,
+            Mode::Ask => Decision::Ask { forced: None },
+            Mode::Auto => Decision::Classify,
+        }
     }
 
     /// The action every tool of an MCP server gets from server-wide rules
@@ -290,6 +384,43 @@ impl Permissions {
         Ok(())
     }
 
+    /// Drop `rule` from the user file's `allow` list. A missing file or a
+    /// rule that is only in memory is fine; a malformed file is left alone.
+    /// Returns whether the in-memory list or the file changed.
+    pub fn remove_allow(&mut self, rule: &str) -> Result<bool> {
+        let had = self.allow.iter().any(|r| r == rule);
+        self.allow.retain(|r| r != rule);
+        if self.path.as_os_str().is_empty() {
+            return Ok(had);
+        }
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(had),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
+        };
+        parse(&text).map_err(|e| {
+            anyhow::anyhow!("{} is malformed ({e}); fix it first", self.path.display())
+        })?;
+        let mut doc: Value = serde_json::from_str(&text)?;
+        let Some(allow) = doc
+            .as_object_mut()
+            .and_then(|map| map.get_mut("allow"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Ok(had);
+        };
+        let before = allow.len();
+        allow.retain(|v| v.as_str() != Some(rule));
+        if allow.len() == before {
+            return Ok(had);
+        }
+        let mut text = serde_json::to_string_pretty(&doc)?;
+        text.push('\n');
+        crate::session::write_private(&self.path, text.as_bytes())
+            .with_context(|| format!("writing {}", self.path.display()))?;
+        Ok(true)
+    }
+
     /// Rows for `/permissions`.
     pub fn lines(&self, session: &HashSet<String>) -> Vec<String> {
         let list = |rules: &[String]| {
@@ -332,7 +463,7 @@ impl Permissions {
                 grants.join("  ")
             }
         ));
-        out.push("Precedence: deny > ask > allow > session grants > default. /permissions reload re-reads the files.".into());
+        out.push("Precedence: deny > ask > allow > session grants > mode (ask prompts, auto classifies, yolo runs). Deny wins in every mode. /permissions reload re-reads the files.".into());
         out
     }
 }
@@ -438,6 +569,236 @@ pub fn glob(pattern: &str, text: &str) -> bool {
         }
     }
     p[pi..].iter().all(|&c| c == '*')
+}
+
+/// Text for `nyq permissions`. Session grants exist only inside a conversation.
+pub fn format_report(perms: &Permissions, mode: Mode, warnings: &[String], json: bool) -> String {
+    if json {
+        let v = serde_json::json!({
+            "kind": "permissions",
+            "mode": mode.as_str(),
+            "file": perms.path,
+            "rules_file": perms.path.display().to_string(),
+            "deny": perms.deny,
+            "ask": perms.ask,
+            "allow": perms.allow,
+            "project_file": perms.project_path.as_ref().map(|p| p.display().to_string()),
+            "project_deny": perms.project_deny,
+            "project_ask": perms.project_ask,
+            "warnings": warnings,
+        });
+        return serde_json::to_string_pretty(&v).unwrap_or_default();
+    }
+    let mut out = vec![format!("Mode         {} ({})", mode.as_str(), mode.summary())];
+    out.extend(
+        perms
+            .lines(&Default::default())
+            .into_iter()
+            .filter(|l| !l.starts_with("Session")),
+    );
+    out.push("Session grants only exist inside a conversation; see /allowlist.".into());
+    out.push(
+        "Change the mode with /permissions, --permission-mode, or `permission_mode` in settings.json; --yolo skips approvals for one run."
+            .into(),
+    );
+    out.join("\n")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustKind {
+    Command,
+    Tool,
+    Url,
+}
+
+impl TrustKind {
+    fn label(self) -> &'static str {
+        match self {
+            TrustKind::Command => "command",
+            TrustKind::Tool => "tool",
+            TrustKind::Url => "url",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "command" | "commands" => Some(TrustKind::Command),
+            "tool" | "tools" => Some(TrustKind::Tool),
+            "url" | "urls" => Some(TrustKind::Url),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustEntry {
+    pub kind: TrustKind,
+    pub rule: String,
+    pub display: String,
+    pub session: bool,
+    pub saved: bool,
+}
+
+fn trust_kind(rule: &str) -> TrustKind {
+    if rule.starts_with("bash:") {
+        TrustKind::Command
+    } else if rule.starts_with("web_fetch:") {
+        TrustKind::Url
+    } else {
+        TrustKind::Tool
+    }
+}
+
+fn trust_display(rule: &str) -> String {
+    rule.strip_prefix("bash:")
+        .or_else(|| rule.strip_prefix("web_fetch:"))
+        .unwrap_or(rule)
+        .to_string()
+}
+
+fn canonical_rule(kind: TrustKind, raw: &str) -> String {
+    let raw = raw.trim();
+    match kind {
+        TrustKind::Command => format!("bash:{}", raw.strip_prefix("bash:").unwrap_or(raw)),
+        TrustKind::Url => format!(
+            "web_fetch:{}",
+            raw.strip_prefix("web_fetch:").unwrap_or(raw)
+        ),
+        TrustKind::Tool => raw.to_string(),
+    }
+}
+
+/// Session grants and `permissions.json` allow entries, commands then tools then URLs.
+pub fn trust_entries(perms: &Permissions, session: &HashSet<String>) -> Vec<TrustEntry> {
+    let mut rules: Vec<String> = perms
+        .allow
+        .iter()
+        .cloned()
+        .chain(session.iter().cloned())
+        .collect();
+    rules.sort();
+    rules.dedup();
+    let mut entries: Vec<TrustEntry> = rules
+        .into_iter()
+        .map(|rule| TrustEntry {
+            kind: trust_kind(&rule),
+            display: trust_display(&rule),
+            session: session.contains(&rule),
+            saved: perms.allow.iter().any(|r| r == &rule),
+            rule,
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        (kind_ord(a.kind), a.display.as_str()).cmp(&(kind_ord(b.kind), b.display.as_str()))
+    });
+    entries
+}
+
+fn kind_ord(kind: TrustKind) -> u8 {
+    match kind {
+        TrustKind::Command => 0,
+        TrustKind::Tool => 1,
+        TrustKind::Url => 2,
+    }
+}
+
+fn source_label(entry: &TrustEntry) -> String {
+    match (entry.session, entry.saved) {
+        (true, true) => "session, permissions.json".into(),
+        (true, false) => "session".into(),
+        (false, true) => "permissions.json".into(),
+        (false, false) => "unknown".into(),
+    }
+}
+
+/// Lines for `/allowlist`.
+pub fn allowlist_lines(perms: &Permissions, session: &HashSet<String>) -> Vec<String> {
+    let entries = trust_entries(perms, session);
+    if entries.is_empty() {
+        return vec!["Nothing is trusted yet. \"always\" grants it for this session; \"always, and save\" writes permissions.json.".into()];
+    }
+    let mut out = vec!["Trusted commands, tools and URLs".into()];
+    let mut current: Option<TrustKind> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if current != Some(entry.kind) {
+            current = Some(entry.kind);
+            out.push(format!(
+                "  {}:",
+                match entry.kind {
+                    TrustKind::Command => "commands",
+                    TrustKind::Tool => "tools",
+                    TrustKind::Url => "urls",
+                }
+            ));
+        }
+        out.push(format!(
+            "    {}  {}  ({})",
+            index + 1,
+            entry.display,
+            source_label(entry)
+        ));
+    }
+    out.push(
+        "Remove one with /allowlist remove N, or /allowlist remove command|tool|url PATTERN."
+            .into(),
+    );
+    out
+}
+
+/// Remove one trusted command, tool, or URL from the session and the allow file.
+pub fn allowlist_remove(
+    perms: &mut Permissions,
+    session: &mut HashSet<String>,
+    args: &[&str],
+) -> Result<String, String> {
+    let entries = trust_entries(perms, session);
+    let entry = resolve_removal(args, &entries)?;
+    let rule = entry.rule.clone();
+    let kind = entry.kind;
+    let display = entry.display.clone();
+    let sources = source_label(&entry);
+    let session_hit = session.remove(&rule);
+    let saved = perms.remove_allow(&rule).map_err(|e| format!("{e:#}"))?;
+    if !session_hit && !saved {
+        return Err(format!("no matching {} `{display}`", kind.label()));
+    }
+    Ok(format!("removed {} `{display}` ({sources})", kind.label()))
+}
+
+fn resolve_removal(args: &[&str], entries: &[TrustEntry]) -> Result<TrustEntry, String> {
+    let usage = "usage: /allowlist remove N, or /allowlist remove command|tool|url PATTERN";
+    if args.is_empty() {
+        return Err(usage.into());
+    }
+    if args.len() == 1 {
+        if let Ok(n) = args[0].parse::<usize>() {
+            if n == 0 || n > entries.len() {
+                return Err(format!("no allowlist entry {n}"));
+            }
+            return Ok(entries[n - 1].clone());
+        }
+    }
+    let kind = TrustKind::parse(args[0]).ok_or_else(|| usage.to_string())?;
+    let raw = args[1..].join(" ");
+    if raw.trim().is_empty() {
+        return Err(usage.into());
+    }
+    let rule = canonical_rule(kind, &raw);
+    if let Some(entry) = entries
+        .iter()
+        .find(|e| e.rule == rule || e.display == raw.trim())
+    {
+        if entry.kind != kind {
+            return Err(format!(
+                "`{}` is a {}, not a {}",
+                raw.trim(),
+                entry.kind.label(),
+                kind.label()
+            ));
+        }
+        return Ok(entry.clone());
+    }
+    Err(format!("no matching {} `{}`", kind.label(), raw.trim()))
 }
 
 #[cfg(test)]
@@ -579,9 +940,23 @@ mod tests {
         assert_eq!(p.project_ask, ["web_fetch"]);
         assert_eq!(p.project_deny, ["mcp__evil__*"]);
         let none = HashSet::new();
-        let d = p.decide(&none, "mcp__good__x", &json!({}), cwd.path(), true, false);
+        let d = p.decide(
+            &none,
+            "mcp__good__x",
+            &json!({}),
+            cwd.path(),
+            true,
+            Mode::Ask,
+        );
         assert_eq!(d, Decision::Ask { forced: None });
-        let d = p.decide(&none, "mcp__evil__x", &json!({}), cwd.path(), true, true);
+        let d = p.decide(
+            &none,
+            "mcp__evil__x",
+            &json!({}),
+            cwd.path(),
+            true,
+            Mode::Yolo,
+        );
         assert!(matches!(d, Decision::Deny(r) if r.contains("project")));
         let d = p.decide(
             &none,
@@ -589,7 +964,7 @@ mod tests {
             &json!({"url": "https://a"}),
             cwd.path(),
             false,
-            false,
+            Mode::Ask,
         );
         assert!(matches!(d, Decision::Ask { forced: Some(_) }));
     }
@@ -602,16 +977,16 @@ mod tests {
         let args = json!({});
         let session: HashSet<String> = [tool.to_string()].into();
         let none = HashSet::new();
-        for yolo in [false, true] {
+        for (mode, yolo) in [(Mode::Ask, false), (Mode::Yolo, true)] {
             // deny beats everything, even yolo.
             let p = perms(&["mcp__*"], &["mcp__*"], &["mcp__wiki__*"]);
             assert!(matches!(
-                p.decide(&session, tool, &args, cwd, true, yolo),
+                p.decide(&session, tool, &args, cwd, true, mode),
                 Decision::Deny(_)
             ));
             // ask beats allow and a session grant; yolo skips it.
             let p = perms(&["mcp__*"], &["mcp__wiki__*"], &[]);
-            let d = p.decide(&session, tool, &args, cwd, true, yolo);
+            let d = p.decide(&session, tool, &args, cwd, true, mode);
             if yolo {
                 assert_eq!(d, Decision::Run)
             } else {
@@ -619,15 +994,15 @@ mod tests {
             }
             // allow runs without asking.
             let p = perms(&["mcp__wiki__*"], &[], &[]);
-            assert_eq!(p.decide(&none, tool, &args, cwd, true, yolo), Decision::Run);
+            assert_eq!(p.decide(&none, tool, &args, cwd, true, mode), Decision::Run);
             // session grant.
             let p = perms(&[], &[], &[]);
             assert_eq!(
-                p.decide(&session, tool, &args, cwd, true, yolo),
+                p.decide(&session, tool, &args, cwd, true, mode),
                 Decision::Run
             );
             // default: asks unless yolo; free tools run.
-            let d = p.decide(&none, tool, &args, cwd, true, yolo);
+            let d = p.decide(&none, tool, &args, cwd, true, mode);
             assert_eq!(
                 d,
                 if yolo {
@@ -637,16 +1012,73 @@ mod tests {
                 }
             );
             assert_eq!(
-                p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, yolo),
+                p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, mode),
                 Decision::Run
             );
             // deny applies to tools that never ask.
             let p = perms(&[], &[], &["subagent:explore"]);
             assert!(matches!(
-                p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, yolo),
+                p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, mode),
                 Decision::Deny(_)
             ));
         }
+    }
+
+    #[test]
+    fn mode_precedence_with_rules() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path();
+        let tool = "mcp__wiki__ask";
+        let args = json!({});
+        let none = HashSet::new();
+        let session: HashSet<String> = [tool.to_string()].into();
+        let denied = perms(&["mcp__*"], &[], &["mcp__wiki__*"]);
+        for mode in [Mode::Ask, Mode::Auto, Mode::Yolo] {
+            assert!(matches!(
+                denied.decide(&session, tool, &args, cwd, true, mode),
+                Decision::Deny(_)
+            ));
+        }
+        let asked = perms(&["mcp__*"], &["mcp__wiki__ask"], &[]);
+        assert!(matches!(
+            asked.decide(&session, tool, &args, cwd, true, Mode::Auto),
+            Decision::Ask { forced: Some(_) }
+        ));
+        assert_eq!(
+            asked.decide(&session, tool, &args, cwd, true, Mode::Yolo),
+            Decision::Run
+        );
+        let allowed = perms(&["mcp__wiki__*"], &[], &[]);
+        assert_eq!(
+            allowed.decide(&none, tool, &args, cwd, true, Mode::Auto),
+            Decision::Run
+        );
+        let open = perms(&[], &[], &[]);
+        assert_eq!(
+            open.decide(&none, tool, &args, cwd, true, Mode::Ask),
+            Decision::Ask { forced: None }
+        );
+        assert_eq!(
+            open.decide(&none, tool, &args, cwd, true, Mode::Auto),
+            Decision::Classify
+        );
+        assert_eq!(
+            open.decide(&none, tool, &args, cwd, true, Mode::Yolo),
+            Decision::Run
+        );
+        assert_eq!(
+            open.decide(&session, tool, &args, cwd, true, Mode::Auto),
+            Decision::Run
+        );
+        let (mode, warn) = resolve_mode(Some("ask"), true, "yolo").unwrap();
+        assert_eq!(mode, Mode::Ask);
+        assert!(warn.is_none());
+        assert_eq!(resolve_mode(None, true, "ask").unwrap().0, Mode::Yolo);
+        assert_eq!(resolve_mode(None, false, "auto").unwrap().0, Mode::Auto);
+        let (mode, warn) = resolve_mode(None, false, "plan").unwrap();
+        assert_eq!(mode, Mode::Ask);
+        assert!(warn.unwrap().contains("plan"));
+        assert!(resolve_mode(Some("read-only"), false, "ask").is_err());
     }
 
     #[test]
@@ -656,7 +1088,7 @@ mod tests {
         let p = perms(&["write_file", "read_file", "*"], &[], &[]);
         let none = HashSet::new();
         let d = |tool: &str, path: &str| {
-            p.decide(&none, tool, &json!({"path": path}), cwd, true, false)
+            p.decide(&none, tool, &json!({"path": path}), cwd, true, Mode::Ask)
         };
         assert_eq!(d("write_file", "src/a.rs"), Decision::Run);
         assert_eq!(
@@ -718,5 +1150,60 @@ mod tests {
         assert_eq!(p.server_default("mcp__a__"), (Action::Allow, false));
         assert_eq!(p.server_default("mcp__b__"), (Action::Ask, true));
         assert_eq!(p.server_default("mcp__c__"), (Action::Ask, false));
+    }
+
+    #[test]
+    fn allowlist_removal_drops_session_grants_and_saved_allows() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut p, _) = Permissions::load(home.path(), cwd.path());
+        p.save_allow("bash:cargo test").unwrap();
+        p.save_allow("web_fetch:https://docs.rs/*").unwrap();
+        p.save_allow("write_file").unwrap();
+        p.deny = vec!["bash:rm".into()];
+        let mut session: HashSet<String> =
+            ["bash:cargo test".into(), "mcp__wiki__ask".into()].into();
+        let lines = allowlist_lines(&p, &session);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("cargo test") && text.contains("session, permissions.json"),
+            "{text}"
+        );
+        assert!(
+            text.contains("https://docs.rs/*") && text.contains("mcp__wiki__ask"),
+            "{text}"
+        );
+        assert!(!text.contains("bash:rm"), "{text}");
+
+        let msg = allowlist_remove(&mut p, &mut session, &["command", "cargo test"]).unwrap();
+        assert!(msg.contains("removed command `cargo test`"), "{msg}");
+        assert!(!session.contains("bash:cargo test"));
+        assert!(!p.allow.iter().any(|r| r == "bash:cargo test"));
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&p.path).unwrap()).unwrap();
+        assert_eq!(
+            saved["allow"],
+            json!(["web_fetch:https://docs.rs/*", "write_file"])
+        );
+        assert!(p.deny.iter().any(|r| r == "bash:rm"));
+
+        allowlist_remove(&mut p, &mut session, &["1"]).unwrap();
+        assert!(!session.contains("mcp__wiki__ask"));
+        let err =
+            allowlist_remove(&mut p, &mut session, &["tool", "https://docs.rs/*"]).unwrap_err();
+        assert!(err.contains("url") && err.contains("not a tool"), "{err}");
+        allowlist_remove(&mut p, &mut session, &["url", "https://docs.rs/*"]).unwrap();
+        assert!(!p.allow.iter().any(|r| r.starts_with("web_fetch:")));
+        assert!(allowlist_remove(&mut p, &mut session, &["command", "missing"]).is_err());
+
+        let report = format_report(&p, Mode::Auto, &[], false);
+        assert!(report.contains("Mode         auto"), "{report}");
+        assert!(report.contains("write_file"), "{report}");
+        assert!(report.contains("Session grants"), "{report}");
+        let json: Value =
+            serde_json::from_str(&format_report(&p, Mode::Auto, &["w".into()], true)).unwrap();
+        assert_eq!(json["warnings"][0], "w");
+        assert_eq!(json["mode"], "auto");
+        assert_eq!(json["kind"], "permissions");
     }
 }

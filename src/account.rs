@@ -334,31 +334,15 @@ pub fn cli_teams(home: &Path) -> Result<()> {
     bail!("{TEAMS_UNAVAILABLE}")
 }
 
-/// `nyq permissions [--json]`: the permission mode and rules.
-pub fn cli_permissions(home: &Path, cwd: &Path, as_json: bool) -> Result<()> {
+/// `nyq permissions [--json]`: the permission mode (as resolved from
+/// `--permission-mode`, `--yolo` and settings) and the rules.
+pub fn cli_permissions(home: &Path, cwd: &Path, mode: crate::permissions::Mode, as_json: bool) -> Result<()> {
     let (perms, warnings) = crate::permissions::Permissions::load(home, cwd);
-    let mode = crate::settings::current().permission_mode;
-    if as_json {
-        let v = json!({
-            "mode": mode, "file": perms.path, "allow": perms.allow, "ask": perms.ask, "deny": perms.deny,
-            "project_file": perms.project_path, "project_ask": perms.project_ask, "project_deny": perms.project_deny,
-            "warnings": warnings,
-        });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-    let about = if mode == "yolo" {
-        "tools run without approval; deny rules still apply"
-    } else {
-        "writes, commands, web fetches and MCP tools ask first"
-    };
-    println!("Mode         {mode} ({about})");
-    for line in perms.lines(&Default::default()).iter().filter(|l| !l.starts_with("Session")) {
-        println!("{line}");
-    }
-    println!("Change the mode in /settings (or `permission_mode` in settings.json); --yolo skips approvals for one run.");
-    for w in warnings {
-        ui::error(&w);
+    println!("{}", crate::permissions::format_report(&perms, mode, &warnings, as_json));
+    if !as_json {
+        for w in warnings {
+            ui::error(&w);
+        }
     }
     Ok(())
 }
