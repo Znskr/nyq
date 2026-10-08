@@ -204,6 +204,14 @@ pub struct ToolCtx {
     pub yolo: bool,
     /// Rules granted with "always", inherited by subagents.
     pub allowed: HashSet<String>,
+    /// Asks the user about calls made outside the agent loop (a subagent's
+    /// tool calls); None when nobody can be asked, so such calls are denied.
+    pub approver: Option<std::sync::Arc<dyn crate::agent::Approver>>,
+    /// The session's permission rules, applied to subagents' calls too.
+    pub permissions: std::sync::Arc<crate::permissions::Permissions>,
+    /// Rules granted with "always" while this call ran (a subagent's calls);
+    /// the loop adds them to its session grants afterwards.
+    pub granted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, Default)]
