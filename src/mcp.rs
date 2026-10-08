@@ -113,9 +113,12 @@ pub fn load_configs(home: &Path, cwd: &Path) -> (Vec<ServerConfig>, Vec<String>)
                 continue;
             }
         };
+        let start = servers.len();
         if let Err(e) = parse_file(&text, &path, scope, &mut servers, &mut warnings) {
             warnings.push(format!("{}: {e}", path.display()));
         }
+        // Stable order regardless of JSON map ordering: by name within each file.
+        servers[start..].sort_by(|a, b| a.name.cmp(&b.name));
     }
     (servers, warnings)
 }

@@ -6,7 +6,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::{Registry, Tool, ToolCtx, ToolOutput};
-use crate::agent::{Agent, Approval, ApprovalRequest, TurnEnd, Ui};
+use std::sync::Arc;
+
+use crate::agent::{Agent, Approval, ApprovalRequest, Approver, TurnEnd, Ui};
 use crate::types::{Item, StreamEvent, ToolSpec, Usage};
 
 const NAME: &str = "subagent";
@@ -43,6 +45,16 @@ struct Subagent;
 
 fn is_general(args: &Value) -> bool {
     args.get("mode").and_then(Value::as_str) == Some("general")
+}
+
+/// The short label: `description`, else the task's first line.
+fn label(args: &Value) -> &str {
+    args.get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| args.get("task").and_then(Value::as_str).and_then(|t| t.lines().next()))
+        .unwrap_or("")
+        .trim()
 }
 
 /// The child's tools: builtins (minus mutating ones for explore), never itself.
@@ -86,13 +98,7 @@ impl Tool for Subagent {
     }
 
     fn summary(&self, args: &Value) -> String {
-        let label = args
-            .get("description")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| args.get("task").and_then(Value::as_str).and_then(|t| t.lines().next()))
-            .unwrap_or("")
-            .trim();
+        let label = label(args);
         if is_general(args) { format!("{label} (general)") } else { label.to_string() }
     }
 
@@ -122,11 +128,13 @@ impl Tool for Subagent {
             items: Vec::new(),
             session: None,
             cwd: ctx.cwd.clone(),
-            // Inherit the parent's yolo flag and "always" grants. Further
-            // mutations are asked on the parent's UI, or denied when there
-            // is none — approving this call does not auto-approve them.
+            // Inherit the parent's yolo flag, "always" grants and rules.
+            // Calls that still need approval are forwarded to the parent's
+            // approver, or denied when there is none: approving this call
+            // does not auto-approve them.
             yolo: ctx.yolo,
             allowed: ctx.allowed.clone(),
+            permissions: ctx.permissions.clone(),
             usage: Usage::default(),
             context_window,
             context_tokens: 0,
@@ -136,11 +144,16 @@ impl Tool for Subagent {
             sandbox: ctx.sandbox.clone(),
             undo: Default::default(),
         };
-        let mut ui = Collector::default();
+        let origin = format!("subagent: {}", one_line(label(&args)));
+        let mut ui = Collector { calls: Vec::new(), approver: ctx.approver.clone(), origin };
         let cancel = ctx.cancel.child_token();
         let result = drive_turn(agent.turn(Item::user(task), &mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await;
         let display = Some(ui.display());
         let undo = std::mem::take(&mut agent.undo);
+        ctx.granted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(agent.allowed.difference(&ctx.allowed).cloned());
         let fail = |msg: String| ToolOutput { display: display.clone(), undo: undo.clone(), ..ToolOutput::err(msg) };
         match result {
             Err(e) if e.to_string().contains("timed out") => {
@@ -200,11 +213,18 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}\n[… report truncated, {} more bytes]", &s[..end], s.len() - end)
 }
 
+fn one_line(s: &str) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() > 60 { format!("{}…", s.chars().take(59).collect::<String>()) } else { s }
+}
+
 /// Headless UI for the child agent: records tool calls. Approvals go to the
-/// parent terminal when one is active; otherwise the call is denied.
-#[derive(Default)]
+/// parent's approver (the user) when there is one; otherwise they are denied.
 struct Collector {
     calls: Vec<(String, String)>,
+    approver: Option<Arc<dyn Approver>>,
+    /// Who is asking, e.g. "subagent: Count files".
+    origin: String,
 }
 
 impl Collector {
@@ -229,9 +249,10 @@ impl Ui for Collector {
     }
     fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
-        crate::ui::tui::approve_active(req.tool, req.summary, req.preview, req.rule.clone())
-            .await
-            .unwrap_or(Approval::No)
+        match &self.approver {
+            Some(approver) => approver.approve(&self.origin, req).await,
+            None => Approval::No,
+        }
     }
 }
 
@@ -247,6 +268,8 @@ mod tests {
     struct Fake {
         script: Arc<Mutex<Vec<Response>>>,
         seen_tools: Arc<Mutex<Vec<Vec<String>>>>,
+        /// Tool results the child model was shown.
+        seen_results: Arc<Mutex<Vec<String>>>,
         hang: bool,
     }
 
@@ -264,6 +287,14 @@ mod tests {
         }
         async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> anyhow::Result<Response> {
             self.seen_tools.lock().unwrap().push(req.tools.iter().map(|t| t.name.clone()).collect());
+            *self.seen_results.lock().unwrap() = req
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::ToolResult { output, .. } => Some(output.clone()),
+                    _ => None,
+                })
+                .collect();
             if self.hang {
                 std::future::pending::<()>().await;
             }
@@ -379,6 +410,83 @@ mod tests {
         let out = Subagent.run(json!({"task": "write", "mode": "general"}), &c).await;
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "x");
+    }
+
+    /// Answers every request with `answer` and records what it was asked.
+    struct FakeApprover {
+        answer: Approval,
+        asked: Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Approver for FakeApprover {
+        async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval {
+            self.asked.lock().unwrap().push((origin.to_string(), req.summary.to_string(), req.save_rule.clone()));
+            self.answer
+        }
+    }
+
+    /// Run a general subagent whose child calls `bash touch ran.txt`.
+    async fn run_touch(
+        answer: Approval,
+        permissions: crate::permissions::Permissions,
+    ) -> (tempfile::TempDir, ToolOutput, Arc<FakeApprover>, Fake, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            resp(vec![Item::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"touch ran.txt"}"#.into(),
+            }]),
+            resp(vec![Item::Assistant { text: "finished".into() }]),
+        ];
+        let approver = Arc::new(FakeApprover { answer, asked: Mutex::new(Vec::new()) });
+        let mut c = ctx(&fake, dir.path());
+        c.sandbox = Arc::new(crate::sandbox::Policy { mode: crate::sandbox::Mode::Off, ..Default::default() });
+        c.approver = Some(approver.clone());
+        c.permissions = Arc::new(permissions);
+        let out = Subagent
+            .run(json!({"task": "touch it", "description": "Touch a file", "mode": "general"}), &c)
+            .await;
+        let granted = c.granted.lock().unwrap().clone();
+        (dir, out, approver, fake, granted)
+    }
+
+    #[tokio::test]
+    async fn child_calls_are_forwarded_to_the_parent_approver() {
+        let (dir, out, approver, _, granted) = run_touch(Approval::Yes, Default::default()).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(dir.path().join("ran.txt").exists());
+        let asked = approver.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].0, "subagent: Touch a file");
+        assert_eq!(asked[0].1, "touch ran.txt");
+        assert_eq!(asked[0].2.as_deref(), Some("bash:touch ran.txt"));
+        assert!(granted.is_empty());
+
+        let (dir, out, approver, fake, _) = run_touch(Approval::No, Default::default()).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!dir.path().join("ran.txt").exists());
+        assert_eq!(approver.asked.lock().unwrap().len(), 1);
+        let results = fake.seen_results.lock().unwrap().clone();
+        assert!(results.iter().any(|r| r.contains("denied")), "{results:?}");
+
+        // "Always" for a child's call is handed back to the parent's session.
+        let (dir, out, _, _, granted) = run_touch(Approval::Always, Default::default()).await;
+        assert!(!out.is_error && dir.path().join("ran.txt").exists());
+        assert_eq!(granted, ["bash:touch ran.txt"]);
+    }
+
+    #[tokio::test]
+    async fn deny_rules_block_child_calls_without_asking() {
+        let perms = crate::permissions::Permissions { deny: vec!["bash:touch".into()], ..Default::default() };
+        let (dir, out, approver, fake, _) = run_touch(Approval::Yes, perms).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!dir.path().join("ran.txt").exists());
+        assert!(approver.asked.lock().unwrap().is_empty());
+        let results = fake.seen_results.lock().unwrap();
+        assert!(results.iter().any(|r| r.contains("blocked by permissions.json rule `deny bash:touch`")), "{results:?}");
     }
 
     #[tokio::test]

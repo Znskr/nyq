@@ -23,7 +23,7 @@ use super::editor::{Action, Editor};
 use super::render::{
     diff, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells, truncate, visible_width, Markdown,
 };
-use crate::agent::{Approval, ApprovalRequest, Ui};
+use crate::agent::{Approval, ApprovalRequest, Approver, Ui};
 use crate::models::ModelChoice;
 use crate::session::Meta;
 use crate::tools::ToolOutput;
@@ -104,6 +104,10 @@ struct PendingApproval {
     scroll: usize,
     /// What "always" grants; None when the call can't be scoped.
     rule: Option<String>,
+    /// The raw rule "always, and save" writes to permissions.json; None hides `s`.
+    save_rule: Option<String>,
+    /// Who asks when it isn't the main agent, e.g. "subagent · Count files".
+    origin: Option<String>,
     reply: oneshot::Sender<Approval>,
 }
 
@@ -602,6 +606,9 @@ impl Screen {
         // Input, or the approval prompt in its place.
         let (cursor_row, cursor_col);
         if let Some(a) = &self.approval {
+            if let Some(origin) = &a.origin {
+                rows.push(format!("{} {}", paint(fg(YELLOW), "┃"), paint(fg(GRAY), &truncate(origin, w.saturating_sub(3)))));
+            }
             rows.push(format!("{} {}", paint(fg(YELLOW), "┃"), a.title));
             cursor_row = rows.len() - 1;
             cursor_col = 2;
@@ -621,13 +628,22 @@ impl Screen {
             }
             let always = match &a.rule {
                 Some(r) => format!("Always allow {r}"),
-                None => "Always: can't be scoped to a rule (chained or wrapped command), approves once".into(),
+                None => "Always: can't be scoped to a rule here, approves once".into(),
             };
-            for (key, text) in [("y", "Yes, once"), ("a", always.as_str()), ("n", "No, tell nyq what to do instead")] {
+            let save = a.save_rule.as_ref().map(|r| format!("Always, and save `{r}` to permissions.json"));
+            let mut choices = vec![("y", "Yes, once"), ("a", always.as_str())];
+            choices.extend(save.as_deref().map(|t| ("s", t)));
+            choices.push(("n", "No, tell nyq what to do instead"));
+            for (key, text) in choices {
                 rows.push(format!("{}  {}", paint(fg(BRIGHT), key), paint(fg(MID), &truncate(text, w.saturating_sub(3)))));
             }
             rows.push(rule(w));
-            rows.push(hints(&[("y", "Once"), ("a", "Always"), ("n", "Deny"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]));
+            let mut keys = vec![("y", "Once"), ("a", "Always")];
+            if save.is_some() {
+                keys.push(("s", "Save"));
+            }
+            keys.extend([("n", "Deny"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]);
+            rows.push(hints(&keys));
         } else {
             let view = self.editor.render(w.saturating_sub(2).max(1));
             let top = rows.len();
@@ -1243,6 +1259,7 @@ impl Screen {
             let answer = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Approval::Yes),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(Approval::Always),
+                KeyCode::Char('s') | KeyCode::Char('S') if a.save_rule.is_some() => Some(Approval::AlwaysSave),
                 KeyCode::Char('n') | KeyCode::Char('N') => Some(Approval::No),
                 _ => None,
             };
@@ -1657,13 +1674,13 @@ impl Drop for ClearQuestion {
     }
 }
 
-/// Prompt on the active TUI, if one is running. `None` when there is no screen
-/// (print mode, tests): the caller denies the call.
-pub async fn approve_active(tool: &str, summary: &str, preview: Option<&str>, rule: Option<String>) -> Option<Approval> {
-    let screen = active()?;
+/// Show the approval pane on `screen` and wait for the answer. `origin`
+/// names who asks when it isn't the main agent (shown above the title).
+async fn approve_on(screen: &Arc<Mutex<Screen>>, origin: Option<&str>, req: &ApprovalRequest<'_>) -> Approval {
+    let (tool, summary, preview) = (req.tool, req.summary, req.preview);
     let (tx, rx) = oneshot::channel();
     {
-        let mut s = lock(&screen);
+        let mut s = lock(screen);
         s.flush_live();
         let w = s.width;
         let (verb, target) = describe_tool(tool, summary);
@@ -1691,13 +1708,42 @@ pub async fn approve_active(tool: &str, summary: &str, preview: Option<&str>, ru
             lines.truncate(500);
             lines.push("… [preview truncated]".into());
         }
-        s.approval = Some(PendingApproval { title, lines, prewrapped, scroll: 0, rule, reply: tx });
+        let origin = origin.map(|o| {
+            let o = match o.split_once(": ") {
+                Some((who, what)) => format!("{who} · {what}"),
+                None => o.to_string(),
+            };
+            one_line(&o, 200)
+        });
+        s.approval = Some(PendingApproval {
+            title,
+            lines,
+            prewrapped,
+            scroll: 0,
+            rule: req.rule.as_deref().map(|r| one_line(r, 300)),
+            save_rule: req.save_rule.as_deref().map(|r| one_line(r, 300)),
+            origin,
+            reply: tx,
+        });
         s.redraw();
     }
-    let guard = ClearApproval(Arc::clone(&screen));
+    let guard = ClearApproval(Arc::clone(screen));
     let answer = rx.await.unwrap_or(Approval::No);
     drop(guard);
-    Some(answer)
+    answer
+}
+
+/// Asks on the screen directly, so it works while the main turn is blocked
+/// inside a tool (a subagent) and holds the `&mut Ui`.
+struct TuiApprover {
+    screen: Arc<Mutex<Screen>>,
+}
+
+#[async_trait::async_trait]
+impl Approver for TuiApprover {
+    async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval {
+        approve_on(&self.screen, Some(origin), req).await
+    }
 }
 
 /// Clears a pending approval if the prompt is dropped before the user answers.
@@ -1767,14 +1813,16 @@ impl Ui for TuiUi {
     }
 
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
-        let answer = approve_active(req.tool, req.summary, req.preview, req.rule.clone())
-            .await
-            .unwrap_or(Approval::No);
+        let answer = approve_on(&self.screen, None, req).await;
         if answer == Approval::No {
             // The loop reports the denial through tool_end.
             self.s().tool_start(req.tool, req.summary);
         }
         answer
+    }
+
+    fn approver(&self) -> Option<Arc<dyn Approver>> {
+        Some(Arc::new(TuiApprover { screen: Arc::clone(&self.screen) }))
     }
 
     fn usage(&mut self, usage: &Usage) {
@@ -2058,6 +2106,8 @@ mod tests {
             prewrapped: false,
             scroll: 0,
             rule: None,
+            save_rule: None,
+            origin: None,
             reply: tx,
         });
         let (rows, _, _) = s.pane();
@@ -2101,7 +2151,7 @@ mod tests {
         let cancel = CancellationToken::new();
         s.cancel = Some(cancel.clone());
         let (tx, mut rx) = oneshot::channel();
-        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, reply: tx });
+        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, save_rule: None, origin: None, reply: tx });
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &cmd_tx);
         assert_eq!(rx.try_recv().unwrap(), Approval::No);
@@ -2109,10 +2159,43 @@ mod tests {
         assert!(s.approval.is_none());
 
         let (tx, mut rx) = oneshot::channel();
-        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, reply: tx });
+        s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, save_rule: None, origin: None, reply: tx });
         s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &cmd_tx);
         assert_eq!(rx.try_recv().unwrap(), Approval::No);
         assert!(matches!(cmd_rx.try_recv().unwrap(), Command::Exit));
+    }
+
+    #[test]
+    fn save_key_only_when_offered() {
+        let mut s = screen();
+        s.width = 80;
+        s.height = 40;
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let pending = |save: Option<&str>, tx| PendingApproval {
+            title: "Called wiki.ask".into(),
+            lines: Vec::new(),
+            prewrapped: false,
+            scroll: 0,
+            rule: Some("`mcp__wiki__ask`".into()),
+            save_rule: save.map(str::to_string),
+            origin: Some("subagent · Count files".into()),
+            reply: tx,
+        };
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(pending(None, tx));
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("subagent · Count files") && !text.contains("save"), "{text}");
+        s.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &cmd_tx);
+        assert!(rx.try_recv().is_err() && s.approval.is_some());
+        s.approval = None;
+
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(pending(Some("mcp__wiki__ask"), tx));
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("Always, and save `mcp__wiki__ask` to permissions.json"), "{text}");
+        s.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), Approval::AlwaysSave);
+        assert!(s.approval.is_none());
     }
 
     #[test]
@@ -2179,7 +2262,7 @@ mod tests {
         {
             let mut s = lock(&screen);
             let (tx, _rx) = oneshot::channel();
-            s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, reply: tx });
+            s.approval = Some(PendingApproval { title: "t".into(), lines: Vec::new(), prewrapped: false, scroll: 0, rule: None, save_rule: None, origin: None, reply: tx });
         }
         drop(ClearApproval(Arc::clone(&screen)));
         assert!(lock(&screen).approval.is_none());
