@@ -11,7 +11,6 @@ use crate::tools::{slash_path, Tool, ToolCtx, ToolOutput};
 use crate::types::ToolSpec;
 
 const MAX_PROMPT_SKILLS: usize = 100;
-const MAX_PROMPT_DESCRIPTION: usize = 120;
 const MAX_LISTED_FILES: usize = 50;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -203,11 +202,14 @@ fn unescape_double(s: &str) -> String {
 /// One-line, length-capped description.
 fn short(description: &str, max: usize) -> String {
     let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
+    if flat.len() <= max {
         return flat;
     }
-    let cut: String = flat.chars().take(max.saturating_sub(3)).collect();
-    format!("{}...", cut.trim_end())
+    let mut end = max.saturating_sub(3);
+    while !flat.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", flat[..end].trim_end())
 }
 
 /// System-prompt section listing the available skills ("" when none).
@@ -219,8 +221,9 @@ pub fn prompt_section(skills: &[Skill]) -> String {
         "# Skills\n\nSkills are packaged instructions for specific tasks. When a task matches a skill, \
          call the `skill` tool with its name before starting, then follow its instructions.\n\n",
     );
+    let max_description = crate::limits::get("skill_description_bytes").unwrap_or(usize::MAX);
     for skill in skills.iter().take(MAX_PROMPT_SKILLS) {
-        match short(&skill.description, MAX_PROMPT_DESCRIPTION) {
+        match short(&skill.description, max_description) {
             d if d.is_empty() => out.push_str(&format!("- {}\n", skill.name)),
             d => out.push_str(&format!("- {}: {d}\n", skill.name)),
         }
@@ -228,7 +231,7 @@ pub fn prompt_section(skills: &[Skill]) -> String {
     if skills.len() > MAX_PROMPT_SKILLS {
         out.push_str(&format!("- ... and {} more\n", skills.len() - MAX_PROMPT_SKILLS));
     }
-    out
+    crate::limits::clip("skill_catalog_bytes", &out)
 }
 
 /// Lines for a `/skills` listing.

@@ -2398,6 +2398,12 @@ impl Tui {
                                     continue;
                                 }
                             }
+                            // Typed secrets (API keys) never reach a tape.
+                            if s.secret.is_none() {
+                                if let Some(text) = crate::record_tape::key_text(&k) {
+                                    crate::record_tape::input(&text);
+                                }
+                            }
                             s.on_key(k, &tx);
                             if std::mem::take(&mut s.clipboard_request) {
                                 let screen = screen.clone();
