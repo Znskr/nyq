@@ -12,6 +12,11 @@ use crate::types::ToolSpec;
 
 const MAX_GLOB: usize = 200;
 const MAX_GREP: usize = 300;
+/// Largest page `limit` the search tools accept.
+const MAX_PAGE: usize = 2000;
+const MAX_CONTEXT: usize = 10;
+/// Files larger than this get no context lines around their matches.
+const GREP_CONTEXT_FILE: u64 = 8 * 1024 * 1024;
 const GREP_WINDOW: usize = 1024 * 1024;
 const GREP_OVERLAP: usize = 64 * 1024;
 
@@ -46,6 +51,35 @@ fn check_root(tool: &str, root: &Path) -> Option<ToolOutput> {
     }
 }
 
+// ------------------------------------------------------------------------------- paging
+
+/// `offset` and `limit` arguments: (offset, limit), with `limit` defaulting
+/// to `default` and capped at `max`.
+fn page_args(args: &Value, default: usize, max: usize) -> (usize, usize) {
+    let int = |k: &str| args.get(k).and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)));
+    let offset = int("offset").unwrap_or(0) as usize;
+    let limit = int("limit").map_or(default, |n| (n as usize).clamp(1, max));
+    (offset, limit)
+}
+
+/// The `offset..offset+limit` page of `lines`, with a note when more follow.
+/// `exact` is false when `lines` was cut short after one more than the page.
+fn page(lines: Vec<String>, offset: usize, limit: usize, what: &str, exact: bool) -> String {
+    let total = lines.len();
+    let mut out: Vec<String> = lines.into_iter().skip(offset).take(limit).collect();
+    if out.is_empty() {
+        return format!("No {what} at offset {offset}.");
+    }
+    let end = offset + out.len();
+    if end < total {
+        out.push(match exact {
+            true => format!("({} more {what}; continue with offset {end})", total - end),
+            false => format!("(more {what}; continue with offset {end})"),
+        });
+    }
+    out.join("\n")
+}
+
 // ------------------------------------------------------------------------------- glob
 
 struct GlobFiles;
@@ -57,13 +91,17 @@ impl Tool for GlobFiles {
             name: "glob".into(),
             description: "Find files matching a glob pattern (e.g. \"**/*.rs\", \"src/**/*.ts\"), \
                 respecting .gitignore. Returns paths relative to the search root, \
-                newest-modified first, at most 200 (a note is added when truncated)."
+                newest-modified first, 200 per page (use offset to page). With mode=\"count\", \
+                returns only the number of matching files."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Glob pattern, matched against paths relative to the search root."},
-                    "path": {"type": "string", "description": "Directory to search (default: the workspace root)."}
+                    "path": {"type": "string", "description": "Directory to search (default: the workspace root)."},
+                    "mode": {"type": "string", "enum": ["list", "count"], "description": "\"list\" returns paths (default); \"count\" returns the number of matches."},
+                    "offset": {"type": "integer", "description": "Skip this many paths (for paging; default 0)."},
+                    "limit": {"type": "integer", "description": format!("Paths per page (default {MAX_GLOB}, max {MAX_PAGE}).")}
                 },
                 "required": ["pattern"]
             }),
@@ -85,6 +123,11 @@ impl Tool for GlobFiles {
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(pattern) = args.get("pattern").and_then(Value::as_str).filter(|p| !p.is_empty()) else {
             return ToolOutput::err("glob: missing required argument `pattern`.");
+        };
+        let count = match args.get("mode").and_then(Value::as_str).unwrap_or("list") {
+            "list" => false,
+            "count" => true,
+            other => return ToolOutput::err(format!("glob: mode must be \"list\" or \"count\", got {other:?}.")),
         };
         let matcher = match compile_glob(pattern) {
             Ok(m) => m,
@@ -111,13 +154,12 @@ impl Tool for GlobFiles {
         if found.is_empty() {
             return ToolOutput::ok("No files matched.");
         }
-        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))); // newest first
-        let total = found.len();
-        let mut out: Vec<String> = found.into_iter().take(MAX_GLOB).map(|(_, p)| p).collect();
-        if total > MAX_GLOB {
-            out.push(format!("({} more matches)", total - MAX_GLOB));
+        if count {
+            return ToolOutput::ok(format!("{} files match.", found.len()));
         }
-        ToolOutput::ok(out.join("\n"))
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))); // newest first
+        let (offset, limit) = page_args(&args, MAX_GLOB, MAX_PAGE);
+        ToolOutput::ok(page(found.into_iter().map(|(_, p)| p).collect(), offset, limit, "matches", true))
     }
 }
 
@@ -150,15 +192,34 @@ fn collect_glob(
 
 struct Grep;
 
+/// What grep reports.
+#[derive(Clone, Copy, PartialEq)]
+enum Output {
+    /// Matching lines.
+    Content,
+    /// Paths of files with a match.
+    Files,
+    /// Matching lines per file.
+    Count,
+}
+
+/// One matching line (or, for `Files`, one file).
+struct Hit {
+    rel: String,
+    line: usize,
+    text: String,
+}
+
 #[async_trait::async_trait]
 impl Tool for Grep {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep".into(),
             description: "Search file contents with a regular expression, respecting .gitignore. \
-                Returns matching lines as \"path:line: text\" (at most 300, long lines truncated) \
-                or, with output=\"files\", just the paths of files containing matches. \
-                Use glob to restrict which files are searched."
+                Returns matching lines as \"path:line: text\" (300 per page, long lines truncated; \
+                `context` adds surrounding lines as \"path-line- text\"), with output=\"files\" just the \
+                paths of files containing matches, or with output=\"count\" the number of matching lines \
+                per file. Page with offset/limit. Use glob to restrict which files are searched."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -167,7 +228,10 @@ impl Tool for Grep {
                     "path": {"type": "string", "description": "File or directory to search (default: the workspace root)."},
                     "glob": {"type": "string", "description": "Only search files matching this glob pattern (e.g. \"*.rs\")."},
                     "case_insensitive": {"type": "boolean", "description": "Match without regard to case (default false)."},
-                    "output": {"type": "string", "enum": ["content", "files"], "description": "\"content\" returns matching lines (default); \"files\" returns the list of matching files."}
+                    "output": {"type": "string", "enum": ["content", "files", "count"], "description": "\"content\" returns matching lines (default); \"files\" the matching files; \"count\" matching lines per file."},
+                    "context": {"type": "integer", "description": format!("Lines of context before and after each match (content output; default 0, max {MAX_CONTEXT}).")},
+                    "offset": {"type": "integer", "description": "Skip this many results (lines, or files) for paging (default 0)."},
+                    "limit": {"type": "integer", "description": format!("Results per page (default {MAX_GREP}, max {MAX_PAGE}).")}
                 },
                 "required": ["pattern"]
             }),
@@ -195,11 +259,12 @@ impl Tool for Grep {
             Ok(re) => re,
             Err(e) => return ToolOutput::err(format!("grep: invalid regex {pattern:?}: {e}")),
         };
-        let files_only = match args.get("output").and_then(Value::as_str).unwrap_or("content") {
-            "content" => false,
-            "files" => true,
+        let output = match args.get("output").and_then(Value::as_str).unwrap_or("content") {
+            "content" => Output::Content,
+            "files" => Output::Files,
+            "count" => Output::Count,
             other => {
-                return ToolOutput::err(format!("grep: output must be \"content\" or \"files\", got {other:?}."))
+                return ToolOutput::err(format!("grep: output must be \"content\", \"files\" or \"count\", got {other:?}."))
             }
         };
         let filter = match args.get("glob").and_then(Value::as_str) {
@@ -209,6 +274,8 @@ impl Tool for Grep {
             },
             None => None,
         };
+        let (offset, limit) = page_args(&args, MAX_GREP, MAX_PAGE);
+        let context = args.get("context").and_then(Value::as_u64).unwrap_or(0).min(MAX_CONTEXT as u64) as usize;
         let user = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let root = resolve(&ctx.cwd, user);
         let secrets = super::SecretRoots::load();
@@ -220,38 +287,97 @@ impl Tool for Grep {
         }
 
         let cancel = ctx.cancel.clone();
-        let found = tokio::task::spawn_blocking(move || collect_grep(&root, &re, filter.as_ref(), files_only, &cancel, &secrets)).await;
-        let (mut matches, truncated) = match found {
-            Ok(Ok(r)) => r,
-            Ok(Err(msg)) => return ToolOutput::err(msg),
-            Err(e) => return ToolOutput::err(format!("grep: {e}")),
-        };
-
-        if matches.is_empty() {
-            return ToolOutput::ok("No matches found.");
+        let cap = if output == Output::Count { usize::MAX } else { offset.saturating_add(limit).saturating_add(1) };
+        let found = tokio::task::spawn_blocking(move || {
+            let hits = collect_grep(&root, &re, filter.as_ref(), output, cap, &cancel, &secrets)?;
+            Ok::<_, String>(render_grep(&root, hits, output, offset, limit, context))
+        })
+        .await;
+        match found {
+            Ok(Ok(text)) => ToolOutput::ok(text),
+            Ok(Err(msg)) => ToolOutput::err(msg),
+            Err(e) => ToolOutput::err(format!("grep: {e}")),
         }
-        if truncated {
-            matches.push(if files_only {
-                format!("(stopped after {MAX_GREP} files)")
-            } else {
-                format!("(stopped after {MAX_GREP} matches)")
-            });
-        }
-        ToolOutput::ok(matches.join("\n"))
     }
 }
 
-/// Matching lines ("path:line: text") or file paths, plus whether the cap hit.
+/// Format collected hits as one page of grep output.
+fn render_grep(root: &Path, hits: Vec<Hit>, output: Output, offset: usize, limit: usize, context: usize) -> String {
+    if hits.is_empty() {
+        return "No matches found.".into();
+    }
+    match output {
+        Output::Files => page(hits.into_iter().map(|h| h.rel).collect(), offset, limit, "files", false),
+        Output::Count => {
+            let total: usize = hits.iter().map(|h| h.line).sum();
+            let files = hits.len();
+            let lines = hits.into_iter().map(|h| format!("{}: {}", h.rel, h.line)).collect();
+            format!("{}\n({total} matching lines in {files} files)", page(lines, offset, limit, "files", true))
+        }
+        Output::Content if context == 0 => {
+            page(hits.into_iter().map(|h| format!("{}:{}: {}", h.rel, h.line, h.text)).collect(), offset, limit, "matches", false)
+        }
+        Output::Content => {
+            let more = hits.len() > offset + limit;
+            let shown: Vec<Hit> = hits.into_iter().skip(offset).take(limit).collect();
+            if shown.is_empty() {
+                return format!("No matches at offset {offset}.");
+            }
+            let end = offset + shown.len();
+            let mut out = with_context(root, &shown, context);
+            if more {
+                out.push_str(&format!("\n(more matches; continue with offset {end})"));
+            }
+            out
+        }
+    }
+}
+
+/// Matches with `context` lines around them, groups separated by `--`.
+fn with_context(root: &Path, hits: &[Hit], context: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < hits.len() {
+        let rel = &hits[i].rel;
+        let j = i + hits[i..].iter().take_while(|h| &h.rel == rel).count();
+        let file = if root.is_file() { root.to_path_buf() } else { root.join(rel) };
+        let text = super::safeio::read_capped(&file, GREP_CONTEXT_FILE).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let lines: Vec<&str> = text.as_deref().map(|t| t.lines().collect()).unwrap_or_default();
+        if !out.is_empty() {
+            out.push("--".into());
+        }
+        let mut last = 0; // last line number printed for this file
+        for hit in &hits[i..j] {
+            let from = hit.line.saturating_sub(context).max(last + 1).max(1);
+            let to = (hit.line + context).min(lines.len().max(hit.line));
+            if last > 0 && from > last + 1 {
+                out.push("--".into());
+            }
+            for n in from..=to {
+                if n == hit.line {
+                    out.push(format!("{rel}:{n}: {}", hit.text));
+                } else if let Some(line) = lines.get(n - 1) {
+                    out.push(format!("{rel}-{n}- {}", snippet(line.as_bytes())));
+                }
+            }
+            last = last.max(to);
+        }
+        i = j;
+    }
+    out.join("\n")
+}
+
+/// Matching lines or files (at most `cap`), or per-file counts in `Hit::line`.
 fn collect_grep(
     root: &Path,
     re: &regex::Regex,
     filter: Option<&globset::GlobMatcher>,
-    files_only: bool,
+    output: Output,
+    cap: usize,
     cancel: &tokio_util::sync::CancellationToken,
     secrets: &super::SecretRoots,
-) -> Result<(Vec<String>, bool), String> {
-    let mut matches: Vec<String> = Vec::new();
-    let mut truncated = false;
+) -> Result<Vec<Hit>, String> {
+    let mut matches: Vec<Hit> = Vec::new();
     let owned = secrets.clone();
 
     // Search one file; returns true when the match cap was reached.
@@ -267,11 +393,14 @@ fn collect_grep(
         if owned.blocks_path(abs) {
             return false;
         }
-        match grep_file(abs, rel, re, files_only, &mut matches, cancel) {
-            GrepFile::Skip => false,
-            GrepFile::Continue => false,
-            GrepFile::Cap => true,
+        let before = matches.len();
+        let result = grep_file(abs, rel, re, output, cap, &mut matches, cancel);
+        if output == Output::Count && matches.len() > before {
+            let n = matches.len() - before;
+            matches.truncate(before);
+            matches.push(Hit { rel: super::slash_path(rel), line: n, text: String::new() });
         }
+        matches!(result, GrepFile::Cap)
     };
 
     if root.is_file() {
@@ -279,7 +408,7 @@ fn collect_grep(
             return Err("Cancelled by user.".into());
         }
         let rel = Path::new(root.file_name().unwrap_or_default());
-        truncated = check(rel, root);
+        check(rel, root);
     } else {
         for entry in walk(root, secrets).flatten() {
             if cancel.is_cancelled() {
@@ -290,10 +419,6 @@ fn collect_grep(
             }
             let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
             if check(rel, entry.path()) {
-                if cancel.is_cancelled() {
-                    return Err("Cancelled by user.".into());
-                }
-                truncated = true;
                 break;
             }
         }
@@ -301,7 +426,7 @@ fn collect_grep(
     if cancel.is_cancelled() {
         return Err("Cancelled by user.".into());
     }
-    Ok((matches, truncated))
+    Ok(matches)
 }
 
 enum GrepFile {
@@ -317,11 +442,13 @@ fn grep_file(
     path: &Path,
     rel: &Path,
     re: &regex::Regex,
-    files_only: bool,
-    matches: &mut Vec<String>,
+    output: Output,
+    cap: usize,
+    matches: &mut Vec<Hit>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> GrepFile {
     use std::io::Read;
+    let files_only = output == Output::Files;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return GrepFile::Skip,
@@ -335,9 +462,10 @@ fn grep_file(
     let mut line_no: usize = 1;
     let mut chunk = [0u8; 64 * 1024];
     let mut binary = false;
-    let mut cap = false;
+    let mut cap_hit = false;
     let mut hit = false;
     let mut file_done = false;
+    let record = |line: &[u8], line_no: usize, matches: &mut Vec<Hit>| record_line(line, line_no, rel, re, output, cap, matches);
     loop {
         if cancel.is_cancelled() {
             matches.truncate(start);
@@ -346,7 +474,7 @@ fn grep_file(
         let n = match reader.read(&mut chunk) {
             Ok(0) => {
                 if !pending.is_empty() && !hit && !file_done && !binary {
-                    cap = record_line(&pending, line_no, rel, re, files_only, matches);
+                    cap_hit = record(&pending, line_no, matches);
                 }
                 break;
             }
@@ -366,7 +494,7 @@ fn grep_file(
             rest = &rest[i + 1..];
             if !hit && !file_done {
                 let before = matches.len();
-                cap = record_line(&pending, line_no, rel, re, files_only, matches) || cap;
+                cap_hit = record(&pending, line_no, matches) || cap_hit;
                 if files_only && matches.len() > before {
                     file_done = true;
                 }
@@ -374,14 +502,14 @@ fn grep_file(
             pending.clear();
             hit = false;
             line_no += 1;
-            if cap || binary {
+            if cap_hit || binary {
                 break;
             }
         }
         if binary {
             break;
         }
-        if cap {
+        if cap_hit {
             if rest.contains(&0) || read_has_nul(&mut reader) {
                 binary = true;
             }
@@ -394,7 +522,7 @@ fn grep_file(
         }
         if pending.len() > GREP_WINDOW {
             if !hit && !file_done && line_matches(re, &pending) {
-                cap = record_line(&pending, line_no, rel, re, files_only, matches);
+                cap_hit = record(&pending, line_no, matches);
                 hit = true;
                 if files_only {
                     file_done = true;
@@ -402,7 +530,7 @@ fn grep_file(
             }
             let keep = GREP_OVERLAP.min(pending.len());
             pending.drain(..pending.len() - keep);
-            if cap && read_has_nul(&mut reader) {
+            if cap_hit && read_has_nul(&mut reader) {
                 binary = true;
                 break;
             }
@@ -412,7 +540,7 @@ fn grep_file(
         matches.truncate(start);
         return GrepFile::Skip;
     }
-    if cap { GrepFile::Cap } else { GrepFile::Continue }
+    if cap_hit { GrepFile::Cap } else { GrepFile::Continue }
 }
 
 fn read_has_nul(reader: &mut impl std::io::Read) -> bool {
@@ -427,29 +555,32 @@ fn read_has_nul(reader: &mut impl std::io::Read) -> bool {
     }
 }
 
+/// A line as shown in results: trimmed and cut at 300 characters.
+fn snippet(line: &[u8]) -> String {
+    let text = String::from_utf8_lossy(line);
+    let mut snippet = text.trim().to_string();
+    if snippet.chars().count() > 300 {
+        snippet = snippet.chars().take(300).collect::<String>() + "…";
+    }
+    snippet
+}
+
 fn record_line(
     line: &[u8],
     line_no: usize,
     rel: &Path,
     re: &regex::Regex,
-    files_only: bool,
-    matches: &mut Vec<String>,
+    output: Output,
+    cap: usize,
+    matches: &mut Vec<Hit>,
 ) -> bool {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     if !line_matches(re, line) {
         return false;
     }
-    if files_only {
-        matches.push(super::slash_path(rel));
-    } else {
-        let text = String::from_utf8_lossy(line);
-        let mut snippet = text.trim().to_string();
-        if snippet.chars().count() > 300 {
-            snippet = snippet.chars().take(300).collect::<String>() + "…";
-        }
-        matches.push(format!("{}:{line_no}: {snippet}", super::slash_path(rel)));
-    }
-    matches.len() >= MAX_GREP
+    let text = if output == Output::Content { snippet(line) } else { String::new() };
+    matches.push(Hit { rel: super::slash_path(rel), line: line_no, text });
+    matches.len() >= cap
 }
 
 fn line_matches(re: &regex::Regex, line: &[u8]) -> bool {
@@ -560,7 +691,43 @@ mod tests {
         assert!(!out.is_error);
         let lines: Vec<&str> = out.content.lines().collect();
         assert_eq!(lines.len(), 201); // 200 + note
-        assert!(lines.last().unwrap().contains("(5 more matches)"));
+        assert!(lines.last().unwrap().contains("(5 more matches; continue with offset 200)"));
+
+        let out = run(&GlobFiles, json!({"pattern": "*.txt", "offset": 200}), dir.path()).await;
+        assert_eq!(out.content.lines().count(), 5, "{}", out.content);
+        let out = run(&GlobFiles, json!({"pattern": "*.txt", "limit": 3, "offset": 1}), dir.path()).await;
+        assert_eq!(out.content.lines().count(), 4, "{}", out.content);
+        assert!(out.content.ends_with("(201 more matches; continue with offset 4)"), "{}", out.content);
+        let out = run(&GlobFiles, json!({"pattern": "*.txt", "mode": "count"}), dir.path()).await;
+        assert_eq!(out.content, "205 files match.");
+        assert!(run(&GlobFiles, json!({"pattern": "*", "mode": "bogus"}), dir.path()).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn grep_counts_pages_and_shows_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=10).map(|i| if i % 4 == 0 { format!("hit {i}\n") } else { format!("line {i}\n") }).collect();
+        std::fs::write(dir.path().join("a.txt"), &body).unwrap();
+        std::fs::write(dir.path().join("b.txt"), "hit\nhit\n").unwrap();
+
+        let out = run(&Grep, json!({"pattern": "hit", "output": "count", "glob": "a.txt"}), dir.path()).await;
+        assert_eq!(out.content, "a.txt: 2\n(2 matching lines in 1 files)");
+
+        let out = run(&Grep, json!({"pattern": "hit", "path": "a.txt", "context": 1}), dir.path()).await;
+        assert_eq!(
+            out.content,
+            "a.txt-3- line 3\na.txt:4: hit 4\na.txt-5- line 5\n--\na.txt-7- line 7\na.txt:8: hit 8\na.txt-9- line 9"
+        );
+        let out = run(&Grep, json!({"pattern": "hit", "path": "a.txt", "context": 2}), dir.path()).await;
+        assert!(!out.content.contains("--"), "adjacent groups merge: {}", out.content);
+        assert_eq!(out.content.lines().count(), 9, "{}", out.content);
+
+        let out = run(&Grep, json!({"pattern": "hit", "path": "a.txt", "limit": 1}), dir.path()).await;
+        assert_eq!(out.content, "a.txt:4: hit 4\n(more matches; continue with offset 1)");
+        let out = run(&Grep, json!({"pattern": "hit", "path": "a.txt", "limit": 1, "offset": 1}), dir.path()).await;
+        assert_eq!(out.content, "a.txt:8: hit 8");
+        let out = run(&Grep, json!({"pattern": "hit", "path": "a.txt", "offset": 5}), dir.path()).await;
+        assert!(out.content.contains("No matches at offset 5"), "{}", out.content);
     }
 
     #[tokio::test]
@@ -611,7 +778,7 @@ mod tests {
         assert!(!out.is_error);
         let lines: Vec<&str> = out.content.lines().collect();
         assert_eq!(lines.len(), MAX_GREP + 1); // 300 + note
-        assert!(lines.last().unwrap().contains("stopped after 300"));
+        assert!(lines.last().unwrap().contains("continue with offset 300"));
 
         let out = run(&Grep, json!({"pattern": "match", "glob": "long.txt"}), dir.path()).await;
         let line = out.content.lines().next().unwrap();
@@ -628,7 +795,7 @@ mod tests {
         assert!(!out.is_error);
         let lines: Vec<&str> = out.content.lines().collect();
         assert_eq!(lines.len(), MAX_GREP + 1);
-        assert!(lines.last().unwrap().contains("stopped after 300 files"));
+        assert!(lines.last().unwrap().contains("(more files; continue with offset 300)"));
     }
 
     #[tokio::test]
@@ -638,7 +805,7 @@ mod tests {
         assert_eq!(spec.parameters["required"], json!(["pattern"]));
         let spec = Grep.spec();
         assert_eq!(spec.name, "grep");
-        assert_eq!(spec.parameters["properties"]["output"]["enum"], json!(["content", "files"]));
+        assert_eq!(spec.parameters["properties"]["output"]["enum"], json!(["content", "files", "count"]));
         assert!(!GlobFiles.needs_approval(&json!({})));
         assert!(!Grep.needs_approval(&json!({})));
     }
