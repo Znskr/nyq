@@ -145,9 +145,26 @@ pub fn set_permission_mode(home: &Path, agent: &mut Agent, raw: &str) {
     }
 }
 
-/// `/permissions`: open the mode menu, switch mode, list rules, or reload.
-pub fn permissions(agent: &mut Agent, tui: &Tui, home: &Path, args: &[&str]) {
+/// `/permissions`: open the mode menu, switch mode, list rules, reload,
+/// reset, or remember and revoke exact-call rules for this session.
+pub async fn permissions(agent: &mut Agent, tui: &Tui, home: &Path, args: &[&str]) {
     match args {
+        ["remember", rest @ ..] => {
+            if let Err(e) = crate::grants::remember(agent, tui, rest).await {
+                ui::error(&format!("{e:#}"));
+            }
+        }
+        ["revoke", id] => {
+            if let Err(e) = crate::grants::revoke(agent, id) {
+                ui::error(&format!("{e:#}"));
+            }
+        }
+        ["reset"] => {
+            agent.allowed.clear();
+            std::sync::Arc::make_mut(&mut agent.permissions).session_rules.clear();
+            apply_mode(home, agent, crate::permissions::Mode::Ask);
+            ui::info("  Forgot this session's grants and rules.");
+        }
         [] => tui.screen().open_permission_modes(),
         ["reload"] => {
             let (perms, warnings) = crate::permissions::Permissions::load(home, &agent.cwd);
@@ -162,10 +179,10 @@ pub fn permissions(agent: &mut Agent, tui: &Tui, home: &Path, args: &[&str]) {
         [name] => match crate::permissions::Mode::parse(name) {
             Some(mode) => apply_mode(home, agent, mode),
             None => ui::error(&format!(
-                "unknown /permissions argument `{name}` (ask, auto, yolo, rules, or reload)"
+                "unknown /permissions argument `{name}` (ask, auto, yolo, rules, reload, reset, remember or revoke)"
             )),
         },
-        _ => ui::error("usage: /permissions [ask|auto|yolo|rules|reload]"),
+        _ => ui::error("usage: /permissions [ask|auto|yolo|rules|reload|reset] | remember allow|deny TOOL ARGS-JSON | revoke ID"),
     }
 }
 
@@ -176,24 +193,18 @@ fn list_rules(agent: &Agent) {
         agent.permission_mode.summary()
     )];
     lines.extend(agent.permissions.lines(&agent.allowed));
+    lines.extend(crate::grants::rule_lines(&agent.permissions));
     ui::list(&lines);
 }
 
-/// `/allowlist`: list or remove trusted commands, tools and URLs.
+/// `/allowlist`: view, add, remove or reset trusted commands, tools and
+/// URLs, for every workspace (user) or this one (local).
 pub fn allowlist(agent: &mut Agent, args: &[&str]) {
-    match args.first().copied() {
-        None => ui::list(&crate::permissions::allowlist_lines(
-            &agent.permissions,
-            &agent.allowed,
-        )),
-        Some("remove") => {
-            let perms = std::sync::Arc::make_mut(&mut agent.permissions);
-            match crate::permissions::allowlist_remove(perms, &mut agent.allowed, &args[1..]) {
-                Ok(msg) => ui::info(&format!("  {msg}")),
-                Err(e) => ui::error(&e),
-            }
-        }
-        Some(_) => ui::error("usage: /allowlist [remove N | remove command|tool|url PATTERN]"),
+    let perms = std::sync::Arc::make_mut(&mut agent.permissions);
+    match crate::grants::allowlist(perms, &mut agent.allowed, args) {
+        Ok(lines) if lines.len() == 1 => ui::info(&format!("  {}", lines[0])),
+        Ok(lines) => ui::list(&lines),
+        Err(e) => ui::error(&e),
     }
 }
 
@@ -491,10 +502,16 @@ pub fn fresh(agent: &mut Agent, sessions_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `/reset`: drop the transcript and keep this session's settings.
+/// `/reset`: drop the transcript and background processes, keeping this
+/// session's settings. (`/new` and `/clear` keep background processes.)
 pub fn reset(agent: &mut Agent) -> Result<()> {
     agent.clear_context()?;
+    std::sync::Arc::make_mut(&mut agent.permissions).session_rules.clear();
+    let stopped = crate::tools::background::forget_all();
     ui::info("Cleared the conversation. Session settings are unchanged.");
+    if stopped > 0 {
+        ui::info(&format!("Stopped {stopped} background process(es)."));
+    }
     Ok(())
 }
 
