@@ -4,6 +4,7 @@
 pub mod clipboard;
 pub mod editor;
 pub mod help_menu;
+pub mod history;
 pub mod mode_menu;
 mod render;
 pub mod settings;

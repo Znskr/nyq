@@ -122,8 +122,12 @@ enum Block {
 fn usage_from(usage: &Value, into: &mut Usage) {
     let get = |k: &str| usage[k].as_u64();
     let read = get("cache_read_input_tokens");
+    let write = get("cache_creation_input_tokens");
     if let Some(input) = get("input_tokens") {
-        into.input_tokens = input + read.unwrap_or(0) + get("cache_creation_input_tokens").unwrap_or(0);
+        into.input_tokens = input + read.unwrap_or(0) + write.unwrap_or(0);
+    }
+    if let Some(write) = write {
+        into.cache_write_tokens = write;
     }
     if let Some(read) = read {
         into.cached_tokens = read;
@@ -349,7 +353,7 @@ mod tests {
                 Item::ToolCall { id: "toolu_2".into(), name: "list_dir".into(), arguments: "{}".into() },
             ]
         );
-        assert_eq!(response.usage, Some(Usage { input_tokens: 105, output_tokens: 42, cached_tokens: 90 }));
+        assert_eq!(response.usage, Some(Usage { input_tokens: 105, output_tokens: 42, cached_tokens: 90, cache_write_tokens: 5, ..Default::default() }));
         assert_eq!(
             seen,
             vec![

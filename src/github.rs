@@ -446,6 +446,7 @@ mod tests {
                         input_tokens: 3,
                         output_tokens: 4,
                         cached_tokens: 1,
+                        ..Default::default()
                     }),
                 })
             }

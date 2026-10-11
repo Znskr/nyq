@@ -402,9 +402,7 @@ async fn run_named(mut record: Record, input: Option<Item>, dir: &Path, ctx: &To
     record.items = agent.items.clone();
     record.turns += 1;
     record.tool_calls += outcome.calls.len() as u64;
-    record.usage.input_tokens += agent.usage.input_tokens;
-    record.usage.output_tokens += agent.usage.output_tokens;
-    record.usage.cached_tokens += agent.usage.cached_tokens;
+    record.usage.add(&agent.usage);
     record.updated = chrono::Utc::now();
     let saved = subagents::save(dir, &record);
     let footer = match record.status {
@@ -549,6 +547,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 10,
                 cached_tokens: 0,
+                ..Default::default()
             }),
         }
     }

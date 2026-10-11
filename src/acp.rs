@@ -858,7 +858,7 @@ fn list_sessions(
         .map(|m| {
             acp::SessionInfo::new(m.id, m.cwd)
                 .title(m.title)
-                .updated_at(m.created.to_rfc3339())
+                .updated_at(m.updated.to_rfc3339())
         })
         .collect();
     Ok(acp::ListSessionsResponse::new(sessions))
@@ -1520,6 +1520,7 @@ mod tests {
                             input_tokens: 10,
                             output_tokens: 5,
                             cached_tokens: 0,
+                            ..Default::default()
                         }),
                     })
                 }

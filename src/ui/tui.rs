@@ -181,19 +181,43 @@ impl ModelMenu {
 
 /// The session picker (`/resume`, `nyq -r`).
 struct SessionMenu {
+    /// Most recently active first, without the current session.
     sessions: Vec<Meta>,
+    /// Ids of the sessions started in this workspace.
+    local: std::collections::HashSet<String>,
+    /// Show every workspace's sessions (Tab toggles).
+    all: bool,
     filter: String,
     selected: usize,
 }
 
 impl SessionMenu {
+    fn new(mut sessions: Vec<Meta>, cwd: &std::path::Path, current: Option<&str>) -> Self {
+        sessions.retain(|m| Some(m.id.as_str()) != current);
+        sessions.sort_by_key(|m| std::cmp::Reverse(m.updated));
+        let local: std::collections::HashSet<String> = sessions
+            .iter()
+            .filter(|m| crate::session::same_cwd(&m.cwd, cwd))
+            .map(|m| m.id.clone())
+            .collect();
+        Self {
+            all: local.is_empty(),
+            sessions,
+            local,
+            filter: String::new(),
+            selected: 0,
+        }
+    }
+
     fn visible(&self) -> Vec<&Meta> {
         let f = self.filter.to_lowercase();
         self.sessions
             .iter()
+            .filter(|m| self.all || self.local.contains(&m.id))
             .filter(|m| {
                 f.is_empty()
                     || m.title.to_lowercase().contains(&f)
+                    || m.preview.to_lowercase().contains(&f)
                     || m.cwd.to_string_lossy().to_lowercase().contains(&f)
                     || m.id.starts_with(&f)
             })
@@ -215,14 +239,6 @@ fn ago(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) 
             .format("%Y-%m-%d")
             .to_string(),
     }
-}
-
-/// Sessions for the picker: this folder's first, each group newest first,
-/// without the current one.
-fn order_sessions(mut all: Vec<Meta>, cwd: &std::path::Path, current: Option<&str>) -> Vec<Meta> {
-    all.retain(|m| Some(m.id.as_str()) != current);
-    all.sort_by_key(|m| (m.cwd != cwd, std::cmp::Reverse(m.created)));
-    all
 }
 
 pub struct Screen {
@@ -268,7 +284,8 @@ pub struct Screen {
     slash_moved: bool,
     pub footer: Footer,
     cancel: Option<CancellationToken>,
-    history: Vec<String>,
+    /// The last prompt saved to the history file (repeats are not saved again).
+    last_prompt: Option<String>,
     /// A one-off hint shown in the status area until the next key.
     hint: Option<String>,
     home: PathBuf,
@@ -517,7 +534,7 @@ fn thinking_summary(text: &str, secs: u64, width: usize) -> String {
 }
 
 impl Screen {
-    fn new(footer: Footer, editor: Editor, history: Vec<String>, home: PathBuf) -> Self {
+    fn new(footer: Footer, editor: Editor, home: PathBuf) -> Self {
         let (w, h) = terminal::size().unwrap_or((80, 24));
         Screen {
             out: crate::record_tape::stdout(),
@@ -554,7 +571,7 @@ impl Screen {
             slash_moved: false,
             footer,
             cancel: None,
-            history,
+            last_prompt: None,
             hint: None,
             home,
             upgrader: None,
@@ -1168,10 +1185,19 @@ impl Screen {
                 )
             } else if let Some(m) = &self.sessions {
                 let visible = m.visible();
+                let scope = |label: &str, on: bool| {
+                    if on {
+                        paint(fg(BRIGHT), &format!("[{label}]"))
+                    } else {
+                        paint(fg(GRAY), label)
+                    }
+                };
                 let prefix = format!(
-                    "{} {}  ",
+                    "{} {}  {} {}  ",
                     paint(fg(BRIGHT).bold(), "Sessions"),
-                    paint(fg(GRAY), &visible.len().to_string())
+                    paint(fg(GRAY), &visible.len().to_string()),
+                    scope("This workspace", !m.all),
+                    scope("All workspaces", m.all)
                 );
                 let filter_text = if m.filter.is_empty() {
                     "Type to filter"
@@ -1184,14 +1210,12 @@ impl Screen {
                     .iter()
                     .map(|m| MenuItem {
                         label: one_line(&m.title, 200),
-                        detail: String::new(),
-                        tag: one_line(
-                            &format!(
-                                "{} · {}",
-                                ago(m.created, now),
-                                tilde(&m.cwd.display().to_string())
-                            ),
-                            200,
+                        detail: one_line(&tilde(&m.cwd.display().to_string()), 200),
+                        tag: format!(
+                            "{} turn{} · {}",
+                            m.turns,
+                            if m.turns == 1 { "" } else { "s" },
+                            ago(m.updated, now)
                         ),
                     })
                     .collect();
@@ -1199,7 +1223,12 @@ impl Screen {
                     header,
                     items,
                     m.selected,
-                    vec![("↑↓", "Navigate"), ("Enter", "Resume"), ("Esc", "Close")],
+                    vec![
+                        ("↑↓", "Navigate"),
+                        ("Tab", "Scope"),
+                        ("Enter", "Resume"),
+                        ("Esc", "Close"),
+                    ],
                 )
             } else {
                 let s = self.editor.suggestions();
@@ -1764,11 +1793,7 @@ impl Screen {
         self.settings = None;
         self.modes = None;
         self.help = None;
-        self.sessions = Some(SessionMenu {
-            sessions: order_sessions(all, cwd, current),
-            filter: String::new(),
-            selected: 0,
-        });
+        self.sessions = Some(SessionMenu::new(all, cwd, current));
         self.redraw();
     }
 
@@ -1792,6 +1817,10 @@ impl Screen {
                 } else {
                     (m.selected + 1) % count
                 }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                m.all = !m.all;
+                m.selected = 0;
             }
             KeyCode::Backspace => {
                 m.filter.pop();
@@ -2049,9 +2078,13 @@ impl Screen {
 
     fn remember(&mut self, text: &str) {
         self.editor.push_history(text);
-        if self.history.last().map(String::as_str) != Some(text) {
-            self.history.push(text.to_string());
+        let saving = crate::settings::current().prompt_history && !self.home.as_os_str().is_empty();
+        if saving && self.last_prompt.as_deref() != Some(text) {
+            if let Err(e) = super::history::append(&self.home.join("history"), text, &self.footer.cwd) {
+                self.hint = Some(format!("could not save prompt history: {e}"));
+            }
         }
+        self.last_prompt = Some(text.to_string());
     }
 
     fn on_secret_key(&mut self, key: KeyEvent) {
@@ -2362,6 +2395,9 @@ impl Screen {
             }
             Action::Dequeue => self.dequeue(),
         }
+        if let Some(status) = self.editor.search_status() {
+            self.hint = Some(status);
+        }
         self.slash_selected = self
             .slash_selected
             .min(self.editor.suggestions().len().saturating_sub(1));
@@ -2451,7 +2487,6 @@ pub struct Tui {
     pub commands: mpsc::UnboundedReceiver<Command>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     enhanced: bool,
-    history_path: PathBuf,
 }
 
 impl Tui {
@@ -2460,20 +2495,10 @@ impl Tui {
         home: PathBuf,
         commands: Vec<(String, String)>,
     ) -> io::Result<Self> {
-        let history_path = home.join("history");
-        // One JSON string per line (multi-line prompts); plain lines are accepted too.
-        let history: Vec<String> = std::fs::read_to_string(&history_path)
-            .map(|s| {
-                s.lines()
-                    .filter(|l| !l.is_empty())
-                    .map(|l| serde_json::from_str(l).unwrap_or_else(|_| l.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let history = super::history::load(&home.join("history"), &footer.cwd);
         let screen = Arc::new(Mutex::new(Screen::new(
             footer,
-            Editor::new(history.clone(), commands),
-            history,
+            Editor::new(history, commands),
             home,
         )));
         terminal::enable_raw_mode()?;
@@ -2596,7 +2621,6 @@ impl Tui {
             commands: rx,
             tasks: vec![input, ticker],
             enhanced,
-            history_path,
         })
     }
 
@@ -2679,17 +2703,6 @@ impl Drop for Tui {
             s.flush_all();
             s.clear_pane();
             let _ = s.out.flush();
-            let skip = s.history.len().saturating_sub(1000);
-            let history: Vec<String> = s.history[skip..]
-                .iter()
-                .map(|h| serde_json::to_string(h).unwrap_or_default())
-                .collect();
-            if crate::settings::current().prompt_history {
-                let _ = crate::session::write_private(
-                    &self.history_path,
-                    (history.join("\n") + "\n").as_bytes(),
-                );
-            }
         }
         *SCREEN.lock().unwrap() = None;
         if self.enhanced {
@@ -3174,7 +3187,6 @@ mod tests {
         let mut s = Screen::new(
             Footer::default(),
             Editor::new(Vec::new(), Vec::new()),
-            Vec::new(),
             PathBuf::new(),
         );
         s.width = 40;
@@ -3225,35 +3237,53 @@ mod tests {
     }
 
     fn meta(id: &str, cwd: &str, mins: i64) -> Meta {
+        let when = chrono::Utc::now() - chrono::Duration::minutes(mins);
         Meta {
             id: id.into(),
-            created: chrono::Utc::now() - chrono::Duration::minutes(mins),
+            // Created long ago: ordering follows the last activity.
+            created: when - chrono::Duration::days(mins),
+            updated: when,
             cwd: cwd.into(),
             model: String::new(),
             title: format!("title {id}"),
+            preview: format!("first prompt of {id}"),
+            turns: 1,
+            prefs: None,
             path: PathBuf::new(),
         }
     }
 
     #[test]
-    fn session_picker_orders_and_filters() {
+    fn session_picker_scopes_orders_and_filters() {
         let all = vec![
             meta("a", "/other", 1),
             meta("b", "/here", 5),
             meta("cur", "/here", 0),
             meta("c", "/here", 2),
         ];
-        let ordered = order_sessions(all, std::path::Path::new("/here"), Some("cur"));
-        let ids: Vec<&str> = ordered.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["c", "b", "a"]);
-        let mut m = SessionMenu {
-            sessions: ordered,
-            filter: "other".into(),
-            selected: 0,
+        let mut m = SessionMenu::new(all.clone(), std::path::Path::new("/here"), Some("cur"));
+        let ids = |m: &SessionMenu| m.visible().iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        assert!(!m.all);
+        assert_eq!(ids(&m), ["c", "b"]);
+        let key = |m: &mut Screen, code| {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            m.on_sessions_key(KeyEvent::new(code, KeyModifiers::NONE), &tx);
         };
-        assert_eq!(m.visible().len(), 1);
+        let mut s = Screen::new(Footer::default(), Editor::default(), PathBuf::new());
+        s.sessions = Some(SessionMenu::new(all.clone(), std::path::Path::new("/here"), None));
+        key(&mut s, KeyCode::Tab);
+        let menu = s.sessions.as_ref().unwrap();
+        assert!(menu.all);
+        assert_eq!(ids(menu), ["cur", "a", "c", "b"]);
+        m.all = true;
+        m.filter = "other".into();
+        assert_eq!(ids(&m), ["a"]);
         m.filter = "TITLE B".into();
-        assert_eq!(m.visible()[0].id, "b");
+        assert_eq!(ids(&m), ["b"]);
+        m.filter = "prompt of c".into();
+        assert_eq!(ids(&m), ["c"]);
+        // Nothing here: start on every workspace.
+        assert!(SessionMenu::new(all, std::path::Path::new("/nowhere"), None).all);
     }
 
     #[test]
