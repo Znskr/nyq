@@ -15,14 +15,19 @@
 //!
 //! - `PreToolUse` (before validation, permissions and execution): a
 //!   non-zero exit, or `{"decision":"block","reason":…}` on stdout, blocks
-//!   the call; the reason is told to the model.
+//!   the call; the reason is told to the model. `{"updatedInput":{…}}`
+//!   replaces the call's arguments (the last hook that sets it wins).
 //! - `PostToolUse` (after a call ran) observes the call and its output.
 //! - `UserPromptSubmit` (before a prompt is sent): `{"decision":"block"}`
 //!   cancels the prompt, `{"context":"…"}` adds text to the conversation
 //!   before it.
-//! - `Stop` (after a turn finishes) observes the final answer.
+//! - `Stop` (after a turn finishes) observes the final answer;
+//!   `{"decision":"block","reason":…}` continues the turn once, with the
+//!   reason given to the model.
 //! - `SessionStart` (at startup, and on `/new` and `/resume`) observes the
 //!   session.
+//! - `AttentionRequired` (when nyq waits for an approval or an answer) runs
+//!   in the background, e.g. to send a notification.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,6 +59,7 @@ pub enum Event {
     UserPromptSubmit,
     Stop,
     SessionStart,
+    AttentionRequired,
 }
 
 impl Event {
@@ -64,6 +70,7 @@ impl Event {
             "UserPromptSubmit" => Event::UserPromptSubmit,
             "Stop" => Event::Stop,
             "SessionStart" => Event::SessionStart,
+            "AttentionRequired" => Event::AttentionRequired,
             _ => return None,
         })
     }
@@ -75,6 +82,7 @@ impl Event {
             Event::UserPromptSubmit => "UserPromptSubmit",
             Event::Stop => "Stop",
             Event::SessionStart => "SessionStart",
+            Event::AttentionRequired => "AttentionRequired",
         }
     }
 
@@ -182,11 +190,14 @@ impl Hooks {
         !self.matching(Event::PostToolUse, Some(tool)).is_empty()
     }
 
-    /// The hooks a subagent runs: the tool hooks only, so a user's
-    /// PreToolUse guard also covers delegated calls, while turn and session
-    /// events stay the parent's.
+    /// The hooks a subagent runs: the tool hooks (so a user's PreToolUse
+    /// guard also covers delegated calls) and AttentionRequired (its
+    /// approvals wait on the user too), while turn and session events stay
+    /// the parent's.
     pub fn for_subagent(&self) -> Self {
-        let tools = |v: &[Hook]| v.iter().filter(|h| h.event.is_tool_event()).cloned().collect();
+        let tools = |v: &[Hook]| {
+            v.iter().filter(|h| h.event.is_tool_event() || h.event == Event::AttentionRequired).cloned().collect()
+        };
         Hooks {
             user_path: self.user_path.clone(),
             user: tools(&self.user),
@@ -303,7 +314,7 @@ fn parse_hook(v: &Value) -> Result<Hook, String> {
     };
     let event = map.get("event").and_then(Value::as_str).and_then(Event::parse).ok_or_else(|| {
         format!(
-            "\"event\" must be PreToolUse, PostToolUse, UserPromptSubmit, Stop or SessionStart, got {}",
+            "\"event\" must be PreToolUse, PostToolUse, UserPromptSubmit, Stop, SessionStart or AttentionRequired, got {}",
             map.get("event").unwrap_or(&Value::Null)
         )
     })?;
@@ -530,7 +541,8 @@ impl Hooks {
         }
     }
 
-    /// PreToolUse, before permissions and execution. Returns the error to
+    /// PreToolUse, before permissions and execution. `Ok` carries replacement
+    /// arguments when a hook returned `updatedInput`; `Err` is the error to
     /// give the model instead of running the call when a hook blocked it
     /// (the first block wins) or the user cancelled while a hook ran.
     pub async fn pre_tool_use(
@@ -540,7 +552,7 @@ impl Hooks {
         cwd: &Path,
         session_id: Option<&str>,
         cancel: &CancellationToken,
-    ) -> Option<String> {
+    ) -> Result<Option<Value>, String> {
         let payload = json!({
             "event": Event::PreToolUse.as_str(),
             "session_id": session_id,
@@ -549,19 +561,26 @@ impl Hooks {
             "args": args,
         });
         let mut blocked = None;
+        let mut updated = None;
         self.dispatch(Event::PreToolUse, Some(tool), &payload, cwd, cancel, |_, r| {
             blocked = block_reason(r);
+            if blocked.is_none() {
+                updated = updated_input(r).or(updated.take());
+            }
             blocked.is_some()
         })
         .await;
         if let Some(reason) = blocked {
-            return Some(format!(
+            return Err(format!(
                 "This call was blocked by a PreToolUse hook and did not run: {reason}. \
                  Do not retry it; find another way or ask the user."
             ));
         }
         // A hook that was cut short by a cancel never vetted the call.
-        cancel.is_cancelled().then(|| "Cancelled by user.".to_string())
+        if cancel.is_cancelled() {
+            return Err("Cancelled by user.".to_string());
+        }
+        Ok(updated)
     }
 
     /// PostToolUse, after a call ran, with its output.
@@ -618,15 +637,53 @@ impl Hooks {
         }
     }
 
-    /// Stop, after a turn finished with this answer.
-    pub async fn stop(&self, assistant_text: &str, cwd: &Path, session_id: Option<&str>, cancel: &CancellationToken) {
+    /// Stop, after a turn finished with this answer. Returns the reason when
+    /// a hook answered `{"decision":"block","reason":…}`: the turn should
+    /// continue with it (the first block wins).
+    pub async fn stop(
+        &self,
+        assistant_text: &str,
+        cwd: &Path,
+        session_id: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Option<String> {
         let payload = json!({
             "event": Event::Stop.as_str(),
             "session_id": session_id,
             "cwd": cwd.display().to_string(),
             "assistant_text": cap(assistant_text, MAX_TEXT),
         });
-        self.dispatch(Event::Stop, None, &payload, cwd, cancel, |_, _| false).await;
+        let mut reason = None;
+        self.dispatch(Event::Stop, None, &payload, cwd, cancel, |_, r| {
+            if r.error.is_none() && !r.timed_out && !r.cancelled {
+                reason = block_decision(&r.stdout);
+            }
+            reason.is_some()
+        })
+        .await;
+        reason.filter(|_| !cancel.is_cancelled())
+    }
+
+    /// AttentionRequired, when nyq waits for the user (`kind` is `approval`
+    /// or `question`). Runs in the background so a slow hook never delays
+    /// the prompt.
+    pub fn attention(self: &std::sync::Arc<Self>, kind: &str, message: &str, cwd: &Path, session_id: Option<&str>) {
+        if self.matching(Event::AttentionRequired, None).is_empty() {
+            return;
+        }
+        let payload = json!({
+            "event": Event::AttentionRequired.as_str(),
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+            "kind": kind,
+            "message": cap(message, MAX_TEXT),
+        });
+        let (hooks, cwd) = (std::sync::Arc::clone(self), cwd.to_path_buf());
+        tokio::spawn(async move {
+            hooks
+                .dispatch(Event::AttentionRequired, None, &payload, &cwd, &CancellationToken::new(), |_, _| false)
+                .await;
+        });
     }
 
     /// SessionStart: `source` is `startup`, `resume` or `new`.
@@ -683,14 +740,15 @@ pub async fn session_start(agent: &crate::agent::Agent, source: &str) {
         .await;
 }
 
-/// Stop hooks after an agent's turn, with its final answer.
-pub async fn stop(agent: &crate::agent::Agent, cancel: &CancellationToken) {
+/// Stop hooks after an agent's turn, with its final answer. Returns the
+/// reason a hook gave for continuing the turn.
+pub async fn stop(agent: &crate::agent::Agent, cancel: &CancellationToken) -> Option<String> {
     let last = agent.items.iter().rev().find_map(|i| match i {
         crate::types::Item::Assistant { text } => Some(text.as_str()),
         _ => None,
     });
     let session = agent.session.as_ref().map(|s| s.id.as_str());
-    agent.hooks.stop(last.unwrap_or(""), &agent.cwd, session, cancel).await;
+    agent.hooks.stop(last.unwrap_or(""), &agent.cwd, session, cancel).await
 }
 
 /// UserPromptSubmit hooks for a prompt; any context they add is placed in
@@ -788,6 +846,15 @@ fn block_decision(stdout: &str) -> Option<String> {
         .filter(|r| !r.is_empty())
         .unwrap_or("blocked by a hook");
     Some(reason.to_string())
+}
+
+/// `{"updatedInput":{…}}` on the stdout of a PreToolUse hook that exited 0.
+fn updated_input(r: &RunOutcome) -> Option<Value> {
+    if r.error.is_some() || r.timed_out || r.cancelled || r.exit != Some(0) {
+        return None;
+    }
+    let v = serde_json::from_str::<Value>(r.stdout.trim()).ok()?;
+    v.get("updatedInput").filter(|u| u.is_object()).cloned()
 }
 
 #[derive(Debug, PartialEq)]
@@ -945,6 +1012,7 @@ mod tests {
             ("UserPromptSubmit", Event::UserPromptSubmit),
             ("Stop", Event::Stop),
             ("SessionStart", Event::SessionStart),
+            ("AttentionRequired", Event::AttentionRequired),
         ] {
             assert_eq!(Event::parse(name), Some(event));
             assert_eq!(event.as_str(), name);
@@ -1154,7 +1222,7 @@ mod tests {
             false,
         );
         let args = json!({"command": "cargo test"});
-        assert_eq!(h.pre_tool_use("bash", &args, &cwd, Some("sess-7"), &live()).await, None);
+        assert_eq!(h.pre_tool_use("bash", &args, &cwd, Some("sess-7"), &live()).await, Ok(None));
         let payload: Value = serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
         assert_eq!(payload["event"], "PreToolUse");
         assert_eq!(payload["tool"], "bash");
@@ -1169,10 +1237,10 @@ mod tests {
             Vec::new(),
             false,
         );
-        let msg = h.pre_tool_use("bash", &args, &cwd, None, &live()).await.unwrap();
+        let msg = h.pre_tool_use("bash", &args, &cwd, None, &live()).await.unwrap_err();
         assert!(msg.contains("blocked by a PreToolUse hook") && msg.contains(": not on my watch."), "{msg}");
         let h = hooks_with(vec![hook(Event::PreToolUse, None, "echo why not >&2; exit 3")], Vec::new(), false);
-        let msg = h.pre_tool_use("bash", &args, &cwd, None, &live()).await.unwrap();
+        let msg = h.pre_tool_use("bash", &args, &cwd, None, &live()).await.unwrap_err();
         assert!(msg.contains("why not (exit code 3)"), "{msg}");
 
         // The first block wins: later hooks do not run.
@@ -1182,12 +1250,59 @@ mod tests {
             Vec::new(),
             false,
         );
-        assert!(h.pre_tool_use("bash", &args, &cwd, None, &live()).await.is_some());
+        assert!(h.pre_tool_use("bash", &args, &cwd, None, &live()).await.is_err());
         assert!(!marker.exists());
 
         // A hook that does not match leaves the call alone.
         let h = hooks_with(vec![hook(Event::PreToolUse, Some("write_file"), "exit 1")], Vec::new(), false);
-        assert_eq!(h.pre_tool_use("bash", &args, &cwd, None, &live()).await, None);
+        assert_eq!(h.pre_tool_use("bash", &args, &cwd, None, &live()).await, Ok(None));
+
+        // updatedInput rewrites the arguments; the last hook that sets it wins.
+        let h = hooks_with(
+            vec![
+                hook(Event::PreToolUse, None, r#"echo '{"updatedInput":{"command":"first"}}'"#),
+                hook(Event::PreToolUse, None, r#"echo '{"updatedInput":{"command":"cargo test -q"}}'"#),
+                hook(Event::PreToolUse, None, r#"echo '{"updatedInput":"not an object"}'"#),
+            ],
+            Vec::new(),
+            false,
+        );
+        let updated = h.pre_tool_use("bash", &args, &cwd, None, &live()).await.unwrap();
+        assert_eq!(updated, Some(json!({"command": "cargo test -q"})));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_hooks_can_continue_the_turn_and_attention_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = hooks_with(
+            vec![hook(Event::Stop, None, r#"echo '{"decision":"block","reason":"tests are failing"}'"#)],
+            Vec::new(),
+            false,
+        );
+        assert_eq!(h.stop("done", dir.path(), None, &live()).await.as_deref(), Some("tests are failing"));
+        // A failing or silent Stop hook does not continue anything.
+        let h = hooks_with(vec![hook(Event::Stop, None, "echo hi; exit 3")], Vec::new(), false);
+        assert_eq!(h.stop("done", dir.path(), None, &live()).await, None);
+
+        let dumped = dir.path().join("attention.json");
+        let h = std::sync::Arc::new(hooks_with(
+            vec![hook(Event::AttentionRequired, None, &format!("cat > {}", dumped.display()))],
+            Vec::new(),
+            false,
+        ));
+        h.attention("approval", "Approve: Run cargo test", dir.path(), Some("s1"));
+        for _ in 0..100 {
+            if std::fs::read_to_string(&dumped).is_ok_and(|t| t.ends_with('}')) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let line: Value = serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
+        assert_eq!(line["event"], "AttentionRequired");
+        assert_eq!(line["kind"], "approval");
+        assert_eq!(line["message"], "Approve: Run cargo test");
+        assert_eq!(h.for_subagent().matching(Event::AttentionRequired, None).len(), 1);
     }
 
     #[cfg(unix)]
@@ -1253,7 +1368,7 @@ mod tests {
         });
         let started = std::time::Instant::now();
         let msg = h.pre_tool_use("bash", &json!({}), dir.path(), None, &cancel).await;
-        assert_eq!(msg.as_deref(), Some("Cancelled by user."));
+        assert_eq!(msg.err().as_deref(), Some("Cancelled by user."));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
