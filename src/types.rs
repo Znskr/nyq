@@ -88,6 +88,8 @@ pub enum StreamEvent {
     Reasoning(String),
     /// The model started emitting a tool call (arguments still streaming).
     ToolCallStart { id: String, name: String },
+    /// A request failed before any output and will be retried (status text).
+    Retrying(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -99,6 +101,7 @@ pub struct Usage {
 }
 
 /// A request for one model response.
+#[derive(Clone, Copy)]
 pub struct Request<'a> {
     pub system: &'a str,
     pub items: &'a [Item],
