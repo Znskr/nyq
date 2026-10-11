@@ -201,9 +201,7 @@ impl Agent {
     fn record_usage(&mut self, usage: Option<Usage>) -> Option<Usage> {
         self.stats.requests += 1;
         let u = usage?;
-        self.usage.input_tokens += u.input_tokens;
-        self.usage.output_tokens += u.output_tokens;
-        self.usage.cached_tokens += u.cached_tokens;
+        self.usage.add(&u);
         // Permissions are loaded from the active profile, including in ACP and subagents.
         if let Some(home) = self
             .permissions
@@ -290,10 +288,13 @@ impl Agent {
                     tools: &specs,
                 };
                 let mut sink = |ev: StreamEvent| ui.stream(&ev);
-                tokio::select! {
+                let started = std::time::Instant::now();
+                let r = tokio::select! {
                     r = self.provider.stream(req, &mut sink) => Some(r),
                     _ = cancel.cancelled() => None,
-                }
+                };
+                self.stats.api_time += started.elapsed();
+                r
             };
             ui.end_message();
             let Some(result) = result else {
@@ -717,6 +718,7 @@ impl Agent {
             .hooks
             .observes_post_tool_use(name)
             .then(|| args.clone());
+        let change_args = matches!(name, "write_file" | "edit_file").then(|| args.clone());
         let mut out = if tool.handles_cancel() {
             tool.run(args, &ctx).await
         } else {
@@ -729,6 +731,9 @@ impl Agent {
             self.undo.discard_last();
         }
         self.undo.append(std::mem::take(&mut out.undo));
+        if let Some(args) = change_args.filter(|_| !out.is_error) {
+            self.stats.file_change(name, &args, out.display.as_deref());
+        }
         if name == "memory" && !out.is_error {
             crate::tools::memory::refresh_section(&mut self.system, &crate::config::home());
         }
@@ -781,11 +786,13 @@ impl Agent {
             tools: &[],
         };
         let mut ignore = |_: StreamEvent| {};
+        let started = std::time::Instant::now();
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(false),
             r = self.provider.stream(req, &mut ignore) => r?,
         };
+        self.stats.api_time += started.elapsed();
         self.account_usage(response.usage, ui);
         if cancel.is_cancelled() {
             return Ok(false);
@@ -889,11 +896,13 @@ impl Agent {
             tools: &specs,
         };
         let mut ignore = |_: StreamEvent| {};
+        let started = std::time::Instant::now();
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => anyhow::bail!("Interrupted."),
             r = self.provider.stream(req, &mut ignore) => r?,
         };
+        self.stats.api_time += started.elapsed();
         self.record_usage(response.usage);
         let raw: String = response
             .items
@@ -1673,6 +1682,7 @@ mod tests {
                     input_tokens: 100,
                     output_tokens: 10,
                     cached_tokens: 5,
+                    ..Default::default()
                 }),
             },
             Some(cancel.clone()),
@@ -1699,7 +1709,8 @@ mod tests {
             Usage {
                 input_tokens: 100,
                 output_tokens: 10,
-                cached_tokens: 5
+                cached_tokens: 5,
+                ..Default::default()
             }
         );
         assert_eq!(agent.stats.requests, 1);
@@ -1718,6 +1729,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 20,
             cached_tokens: 40,
+            ..Default::default()
         };
         let mut agent = agent(
             Response {
@@ -1755,6 +1767,7 @@ mod tests {
             input_tokens: 900,
             output_tokens: 20,
             cached_tokens: 40,
+            ..Default::default()
         };
         let mut agent = agent(
             Response {
@@ -2176,6 +2189,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 1000,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 },
                 Response {
@@ -2187,6 +2201,7 @@ mod tests {
                         input_tokens: 900,
                         output_tokens: 50,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 },
                 Response {
@@ -2198,6 +2213,7 @@ mod tests {
                         input_tokens: 900,
                         output_tokens: 10,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 },
             ])),
@@ -2263,6 +2279,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 1,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 })
             }
@@ -2336,6 +2353,7 @@ mod tests {
                             input_tokens: 1,
                             output_tokens: 1,
                             cached_tokens: 0,
+                            ..Default::default()
                         }),
                     },
                     Response {
@@ -2347,6 +2365,7 @@ mod tests {
                             input_tokens: 2,
                             output_tokens: 1,
                             cached_tokens: 0,
+                            ..Default::default()
                         }),
                     },
                 ])),
@@ -2729,6 +2748,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 1,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 })
             }
@@ -2820,6 +2840,7 @@ mod tests {
                             input_tokens: 10,
                             output_tokens: 1,
                             cached_tokens: 0,
+                            ..Default::default()
                         }),
                     });
                 }
@@ -2834,6 +2855,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 1,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 })
             }
@@ -3183,6 +3205,7 @@ mod tests {
                     input_tokens: 9,
                     output_tokens: 2,
                     cached_tokens: 0,
+                    ..Default::default()
                 }),
             }])),
         });

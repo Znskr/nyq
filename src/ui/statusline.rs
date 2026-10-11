@@ -124,6 +124,7 @@ mod tests {
                 input_tokens: 1200,
                 output_tokens: 300,
                 cached_tokens: 0,
+                ..Default::default()
             },
             context_tokens: 27_200,
             context_window: 272_000,

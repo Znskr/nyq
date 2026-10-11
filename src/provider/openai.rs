@@ -253,6 +253,10 @@ impl Provider for OpenAiProvider {
                     cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
                         .as_u64()
                         .unwrap_or(0),
+                    reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                    ..Default::default()
                 });
             }
             // A request asks for one choice; ignore any unsolicited alternatives.
@@ -503,7 +507,7 @@ mod tests {
             json!({"choices":[{"index":0,"delta":{"content":"hé"}}]}),
             json!({"choices":[{"index":0,"delta":{"content":"llo","tool_calls":[{"index":0,"id":"a","function":{"name":"one","arguments":"{"}},{"index":1,"id":"b","function":{"name":"two","arguments":"{}"}}]}}]}),
             json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}),
-            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3}}}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":1}}}),
         ]) + "data: [DONE]\n\n";
         let (url, mut requests, task) = server(vec![(200, body)]).await;
         let provider = OpenAiProvider::new(url, Some("test-key".into()), "test".into());
@@ -547,7 +551,9 @@ mod tests {
             Some(Usage {
                 input_tokens: 10,
                 output_tokens: 4,
-                cached_tokens: 3
+                cached_tokens: 3,
+                reasoning_tokens: 1,
+                ..Default::default()
             })
         );
         assert_eq!(received.len(), 6);

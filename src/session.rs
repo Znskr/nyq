@@ -629,6 +629,8 @@ pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
     let _ = fs::remove_dir_all(crate::subagents::store_dir(&meta.path));
     if let Some(home) = dir.parent() {
         crate::tools::artifacts::remove_session(home, &meta.id);
+        crate::usage::remove_session(home, &meta.id);
+        let _ = fs::remove_file(home.join("tapes").join(format!("{}.cast", meta.id)));
     }
     Ok(meta)
 }
@@ -1247,9 +1249,15 @@ mod tests {
         let _ = crate::tools::artifacts::spill(tmp.path(), &s.id, "c", "bash", big);
         let id = s.id.clone();
         assert!(tmp.path().join("artifacts").join(&id).is_dir());
+        let tape = tmp.path().join("tapes").join(format!("{id}.cast"));
+        fs::create_dir(tmp.path().join("tapes")).unwrap();
+        fs::write(&tape, "{}\n").unwrap();
+        let usage = sessions.join(format!("{id}.usage"));
+        fs::write(&usage, "").unwrap();
         drop(s);
         delete(&sessions, &id, Path::new("/w")).unwrap();
         assert!(!tmp.path().join("artifacts").join(&id).exists());
+        assert!(!tape.exists() && !usage.exists());
     }
 
     #[cfg(unix)]

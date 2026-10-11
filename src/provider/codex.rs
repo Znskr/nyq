@@ -621,7 +621,7 @@ mod tests {
     }
 
     fn completed() -> Value {
-        json!({"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":5,"input_tokens_details":{"cached_tokens":4}}}})
+        json!({"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":5,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":2}}}})
     }
 
     #[tokio::test]
@@ -684,7 +684,9 @@ mod tests {
             Some(Usage {
                 input_tokens: 12,
                 output_tokens: 5,
-                cached_tokens: 4
+                cached_tokens: 4,
+                reasoning_tokens: 2,
+                ..Default::default()
             })
         );
         assert_eq!(

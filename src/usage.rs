@@ -1,13 +1,25 @@
 //! Append-only profile usage and period reports.
+//!
+//! `usage.jsonl` keeps one record per model request for every session. Each
+//! saved session also gets a `<id>.usage` copy of its own records next to its
+//! transcript, so resuming does not rescan the profile log. The profile log
+//! drops records older than [`RETAIN_DAYS`] once it grows past [`COMPACT_AT`].
 use crate::types::{Item, Usage};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    time::Duration,
 };
+
+/// Records older than this are dropped when the log is compacted.
+const RETAIN_DAYS: i64 = 35;
+/// The log is compacted once it is larger than this.
+const COMPACT_AT: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum Period {
@@ -45,29 +57,42 @@ pub struct Record {
     pub input: u64,
     pub cached: u64,
     pub output: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write: u64,
     pub cost_usd: Option<f64>,
 }
-pub fn append(
-    home: &Path,
-    session: &str,
-    provider: &str,
-    pricing_provider: &str,
-    model: &str,
-    u: Usage,
-) -> Result<()> {
-    std::fs::create_dir_all(home)?;
-    let record = Record {
-        ts: Utc::now(),
-        session: session.into(),
-        provider: provider.into(),
-        model: model.into(),
-        input: u.input_tokens,
-        cached: u.cached_tokens,
-        output: u.output_tokens,
-        cost_usd: crate::pricing::lookup(home, pricing_provider, model).map(|p| p.cost(u)),
-    };
-    let mut line = serde_json::to_vec(&record)?;
-    line.push(b'\n');
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+impl Record {
+    fn usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.input,
+            output_tokens: self.output,
+            cached_tokens: self.cached,
+            reasoning_tokens: self.reasoning,
+            cache_write_tokens: self.cache_write,
+        }
+    }
+}
+
+/// `<home>/sessions/<id>.usage`, the per-session copy of its records.
+fn sidecar(home: &Path, session: &str) -> Option<PathBuf> {
+    let safe = !session.is_empty()
+        && session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    safe.then(|| home.join("sessions").join(format!("{session}.usage")))
+}
+
+/// When the profile log started (or, after compaction, how far back it is complete).
+fn since_path(home: &Path) -> PathBuf {
+    home.join("usage-since")
+}
+
+fn open_append(path: &Path) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true).read(true);
     #[cfg(unix)]
@@ -75,12 +100,19 @@ pub fn append(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(home.join("usage.jsonl"))?;
+    let file = options.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    Ok(file)
+}
+
+/// Append one line under an exclusive lock, rolling back a partial write.
+/// Returns the file (still locked) and its length before the write.
+fn locked_append(path: &Path, line: &[u8]) -> Result<(File, u64)> {
+    let mut file = open_append(path)?;
     // Serialize concurrent writers and roll back a partial record on failure.
     file.lock()?;
     let before = file.metadata()?.len();
@@ -93,22 +125,101 @@ pub fn append(
                 file.write_all(b"\n")?;
             }
         }
-        file.write_all(&line)?;
+        file.write_all(line)?;
         file.sync_data()
     })();
     if let Err(e) = write {
         let _ = file.set_len(before);
         return Err(e.into());
     }
+    Ok((file, before))
+}
+
+pub fn append(
+    home: &Path,
+    session: &str,
+    provider: &str,
+    pricing_provider: &str,
+    model: &str,
+    u: Usage,
+) -> Result<()> {
+    std::fs::create_dir_all(home)?;
+    let now = Utc::now();
+    let record = Record {
+        ts: now,
+        session: session.into(),
+        provider: provider.into(),
+        model: model.into(),
+        input: u.input_tokens,
+        cached: u.cached_tokens,
+        output: u.output_tokens,
+        reasoning: u.reasoning_tokens,
+        cache_write: u.cache_write_tokens,
+        cost_usd: crate::pricing::lookup(home, pricing_provider, model).map(|p| p.cost(u)),
+    };
+    let mut line = serde_json::to_vec(&record)?;
+    line.push(b'\n');
+    let (mut file, before) = locked_append(&home.join("usage.jsonl"), &line)?;
+    if before == 0 && !since_path(home).exists() {
+        let _ = crate::session::write_private(&since_path(home), now.to_rfc3339().as_bytes());
+    }
+    if before + line.len() as u64 > COMPACT_AT {
+        if let Err(e) = compact(home, &mut file, now) {
+            crate::ui::error(&format!("could not compact the usage log: {e:#}"));
+        }
+    }
     file.unlock()?;
+    // Only saved sessions get a copy; subagents share their parent's.
+    if let Some(path) =
+        sidecar(home, session).filter(|p| p.with_extension("jsonl").exists())
+    {
+        locked_append(&path, &line)?.0.unlock()?;
+    }
     Ok(())
 }
+
+/// Drop records older than [`RETAIN_DAYS`], in place under the caller's lock
+/// (so concurrent writers keep appending to the same file). Cheap when the
+/// oldest record is still recent.
+fn compact(home: &Path, file: &mut File, now: DateTime<Utc>) -> Result<()> {
+    let cutoff = now - chrono::Duration::days(RETAIN_DAYS);
+    file.seek(SeekFrom::Start(0))?;
+    let mut first = String::new();
+    BufReader::new(&*file).read_line(&mut first)?;
+    if serde_json::from_str::<Record>(&first).is_ok_and(|r| r.ts >= cutoff) {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut kept = Vec::new();
+    for line in BufReader::new(&*file).split(b'\n') {
+        let line = line?;
+        if serde_json::from_slice::<Record>(&line).is_ok_and(|r| r.ts >= cutoff) {
+            kept.extend_from_slice(&line);
+            kept.push(b'\n');
+        }
+    }
+    // Rewrite through the locked handle (Windows locks are mandatory, so a
+    // second handle could not write). It appends, so cut first.
+    file.set_len(0)?;
+    file.write_all(&kept)?;
+    file.sync_data()?;
+    let since = tracking_since(home).map_or(cutoff, |s| s.max(cutoff));
+    crate::session::write_private(&since_path(home), since.to_rfc3339().as_bytes())?;
+    Ok(())
+}
+
+fn tracking_since(home: &Path) -> Option<DateTime<Utc>> {
+    std::fs::read_to_string(since_path(home)).ok()?.trim().parse().ok()
+}
+
 #[derive(Default, Debug)]
 pub struct Total {
     pub requests: u64,
     pub input: u64,
     pub output: u64,
     pub cached: u64,
+    pub reasoning: u64,
+    pub cache_write: u64,
     pub cost: f64,
     pub unknown: u64,
     pub subscription: u64,
@@ -119,6 +230,8 @@ impl Total {
         self.input += r.input;
         self.output += r.output;
         self.cached += r.cached;
+        self.reasoning += r.reasoning;
+        self.cache_write += r.cache_write;
         if r.provider == "codex" {
             self.subscription += 1;
         } else if let Some(c) = r.cost_usd {
@@ -128,23 +241,32 @@ impl Total {
         }
     }
     fn line(&self, label: &str) -> String {
-        format!(
-            "  {label}: {} requests · input {} (cached {}) · output {} · ${:.6} estimated{}{}",
-            self.requests,
-            self.input,
-            self.cached,
-            self.output,
-            self.cost,
-            if self.unknown > 0 {
-                format!(" · {} unknown cost", self.unknown)
-            } else {
-                String::new()
-            },
-            if self.subscription > 0 {
-                format!(" · {} subscription", self.subscription)
+        let extra = |n: u64, what: &str| {
+            if n > 0 {
+                format!(" · {n} {what}")
             } else {
                 String::new()
             }
+        };
+        format!(
+            "  {label}: {} requests · input {} (cached {}{}) · output {}{} · ${:.6} estimated{}{}",
+            self.requests,
+            self.input,
+            self.cached,
+            if self.cache_write > 0 {
+                format!(", cache writes {}", self.cache_write)
+            } else {
+                String::new()
+            },
+            self.output,
+            if self.reasoning > 0 {
+                format!(" (reasoning {})", self.reasoning)
+            } else {
+                String::new()
+            },
+            self.cost,
+            extra(self.unknown, "unknown cost"),
+            extra(self.subscription, "subscription"),
         )
     }
 }
@@ -153,6 +275,8 @@ pub struct Report {
     pub providers: BTreeMap<String, Total>,
     pub models: BTreeMap<(String, String), Total>,
     pub malformed: usize,
+    /// How far back the log is complete.
+    pub since: Option<DateTime<Utc>>,
 }
 impl Report {
     fn add(&mut self, r: Record, period: Period, now: DateTime<Utc>) {
@@ -186,25 +310,39 @@ impl Report {
                 self.malformed
             ));
         }
+        if let Some(since) = self.since {
+            lines.push(format!(
+                "  Tracking since {} (records are kept for {RETAIN_DAYS} days).",
+                since.with_timezone(&chrono::Local).format("%Y-%m-%d")
+            ));
+        }
         lines
     }
 }
 pub fn read(home: &Path, period: Period) -> Result<Report> {
     let path = home.join("usage.jsonl");
-    let file = match std::fs::File::open(&path) {
+    let file = match File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Report::default()),
         Err(e) => return Err(e).context("reading usage log"),
     };
-    let mut report = Report::default();
+    let mut report = Report {
+        since: tracking_since(home),
+        ..Report::default()
+    };
+    let mut earliest: Option<DateTime<Utc>> = None;
     let now = Utc::now();
     for line in BufReader::new(file).lines() {
         let line = line?;
-        match serde_json::from_str(&line) {
-            Ok(r) => report.add(r, period, now),
+        match serde_json::from_str::<Record>(&line) {
+            Ok(r) => {
+                earliest = Some(earliest.map_or(r.ts, |e| e.min(r.ts)));
+                report.add(r, period, now);
+            }
             Err(_) => report.malformed += 1,
         }
     }
+    report.since = report.since.or(earliest);
     Ok(report)
 }
 pub fn show(home: &Path, period: Period) -> Result<()> {
@@ -212,12 +350,61 @@ pub fn show(home: &Path, period: Period) -> Result<()> {
     Ok(())
 }
 
+/// Totals of a session's records: its sidecar, or (for sessions saved before
+/// sidecars existed) a scan of the profile log that then becomes the sidecar.
+fn session_records(home: &Path, session: &str) -> Result<Vec<Record>> {
+    let parse = |data: &[u8]| -> Vec<Record> {
+        data.split(|b| *b == b'\n')
+            .filter_map(|l| serde_json::from_slice(l).ok())
+            .collect()
+    };
+    let path = sidecar(home, session);
+    if let Some(path) = &path {
+        match std::fs::read(path) {
+            Ok(data) => return Ok(parse(&data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut lines = Vec::new();
+    match File::open(home.join("usage.jsonl")) {
+        Ok(file) => {
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if serde_json::from_str::<Record>(&line).is_ok_and(|r| r.session == session) {
+                    lines.extend_from_slice(line.as_bytes());
+                    lines.push(b'\n');
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if let Some(path) = path.filter(|p| p.with_extension("jsonl").exists()) {
+        let _ = crate::session::write_private(&path, &lines);
+    }
+    Ok(parse(&lines))
+}
+
+/// Remove a session's usage sidecar (the profile log keeps its records).
+pub fn remove_session(home: &Path, session: &str) {
+    if let Some(path) = sidecar(home, session) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub struct Stats {
     pub id: String,
     pub turns: u64,
     pub requests: u64,
     pub tools: BTreeMap<String, u64>,
+    /// When this run started (not when the session was created).
     started: DateTime<Utc>,
+    /// Time spent waiting on model responses in this run.
+    pub api_time: Duration,
+    /// Lines changed by write_file and edit_file in this run.
+    pub lines_added: u64,
+    pub lines_removed: u64,
 }
 impl Default for Stats {
     fn default() -> Self {
@@ -227,6 +414,9 @@ impl Default for Stats {
             requests: 0,
             tools: BTreeMap::new(),
             started: Utc::now(),
+            api_time: Duration::ZERO,
+            lines_added: 0,
+            lines_removed: 0,
         }
     }
 }
@@ -237,36 +427,23 @@ impl Stats {
         session: &crate::session::Session,
         home: Option<&Path>,
     ) -> Result<Usage> {
-        *self = Self::default();
-        if let Ok(file) = std::fs::File::open(&session.path) {
+        let started = self.started;
+        *self = Self {
+            started,
+            ..Self::default()
+        };
+        if let Ok(file) = File::open(&session.path) {
             for line in BufReader::new(file).lines() {
-                let line = line?;
-                if let Ok(item) = serde_json::from_str::<Item>(&line) {
+                if let Ok(item) = serde_json::from_str::<Item>(&line?) {
                     self.item(&item);
-                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(created) = v["created"].as_str().and_then(|s| s.parse().ok()) {
-                        self.started = created;
-                    }
                 }
             }
         }
         let mut usage = Usage::default();
         if let Some(home) = home {
-            match std::fs::File::open(home.join("usage.jsonl")) {
-                Ok(file) => {
-                    for line in BufReader::new(file).lines() {
-                        if let Ok(r) = serde_json::from_str::<Record>(&line?) {
-                            if r.session == session.id {
-                                self.requests += 1;
-                                usage.input_tokens += r.input;
-                                usage.output_tokens += r.output;
-                                usage.cached_tokens += r.cached;
-                            }
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+            for r in session_records(home, &session.id)? {
+                self.requests += 1;
+                usage.add(&r.usage());
             }
         }
         Ok(usage)
@@ -279,17 +456,52 @@ impl Stats {
             _ => {}
         }
     }
-    pub fn show(&self, u: Usage) {
+
+    /// Count the lines a successful file write or edit changed.
+    pub fn file_change(&mut self, tool: &str, args: &serde_json::Value, display: Option<&str>) {
+        if !matches!(tool, "write_file" | "edit_file") {
+            return;
+        }
+        let Some(display) = display else { return };
+        if display.starts_with("---") || display.contains("\n@@") {
+            for line in display.lines() {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    self.lines_added += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    self.lines_removed += 1;
+                }
+            }
+        } else if let Some(content) = args["content"].as_str() {
+            // A new file (or one too large or binary to diff).
+            self.lines_added += content.lines().count() as u64;
+        }
+    }
+
+    pub fn lines(&self, u: Usage) -> Vec<String> {
         let mut lines = vec![
+            format!("{} turns · {} requests", self.turns, self.requests),
             format!(
-                "{} turns · {} requests · duration {}s",
-                self.turns,
-                self.requests,
-                (Utc::now() - self.started).num_seconds().max(0)
+                "this run: wall {} · API {} · lines +{} -{}",
+                duration((Utc::now() - self.started).to_std().unwrap_or_default()),
+                duration(self.api_time),
+                self.lines_added,
+                self.lines_removed
             ),
             format!(
-                "input {} · output {} · cached {}",
-                u.input_tokens, u.output_tokens, u.cached_tokens
+                "input {} · output {} · cached {}{}{}",
+                u.input_tokens,
+                u.output_tokens,
+                u.cached_tokens,
+                if u.reasoning_tokens > 0 {
+                    format!(" · reasoning {}", u.reasoning_tokens)
+                } else {
+                    String::new()
+                },
+                if u.cache_write_tokens > 0 {
+                    format!(" · cache writes {}", u.cache_write_tokens)
+                } else {
+                    String::new()
+                }
             ),
         ];
         lines.extend(
@@ -297,7 +509,21 @@ impl Stats {
                 .iter()
                 .map(|(name, n)| format!("  {name}: {n} tool calls")),
         );
-        crate::ui::list(&lines);
+        lines
+    }
+
+    pub fn show(&self, u: Usage) {
+        crate::ui::list(&self.lines(u));
+    }
+}
+
+/// `1h 2m`, `3m 4s`, `5s`.
+fn duration(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
     }
 }
 #[cfg(test)]
@@ -327,6 +553,7 @@ mod tests {
                                 input_tokens: 10,
                                 cached_tokens: 2,
                                 output_tokens: 3,
+                                ..Default::default()
                             },
                         )
                         .unwrap();
@@ -380,6 +607,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 2,
                 cached_tokens: 3,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -419,6 +647,8 @@ mod tests {
                         input: 10,
                         cached: 2,
                         output: 3,
+                        reasoning: 1,
+                        cache_write: 0,
                         cost_usd: c,
                     },
                     period,
@@ -428,11 +658,99 @@ mod tests {
             assert_eq!(report.models.len(), 3);
             let t = &report.providers["openai"];
             assert_eq!(
-                (t.requests, t.input, t.cached, t.output, t.unknown),
-                (2, 20, 4, 6, 1)
+                (t.requests, t.input, t.cached, t.output, t.reasoning, t.unknown),
+                (2, 20, 4, 6, 2, 1)
             );
             assert_eq!(t.cost, 1.0);
             assert_eq!(report.providers["codex"].subscription, 1);
+            assert!(t.line("openai").contains("(reasoning 2)"));
         }
+    }
+    fn record_line(ts: DateTime<Utc>, session: &str) -> String {
+        let r = Record {
+            ts,
+            session: session.into(),
+            provider: "openai".into(),
+            model: "m".into(),
+            input: 4,
+            cached: 0,
+            output: 1,
+            reasoning: 0,
+            cache_write: 2,
+            cost_usd: None,
+        };
+        serde_json::to_string(&r).unwrap() + "\n"
+    }
+    #[test]
+    fn sessions_keep_their_own_usage_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut session =
+            crate::session::Session::create(&home.join("sessions"), home, "m").unwrap();
+        session.append(&Item::user("hi")).unwrap();
+        // A session saved before sidecars existed: backfilled from the profile log.
+        std::fs::write(
+            home.join("usage.jsonl"),
+            record_line(Utc::now(), &session.id) + &record_line(Utc::now(), "other"),
+        )
+        .unwrap();
+        let mut stats = Stats::default();
+        let usage = stats.restore(&session, Some(home)).unwrap();
+        assert_eq!((stats.requests, usage.input_tokens, usage.cache_write_tokens), (1, 4, 2));
+        let sidecar = home.join("sessions").join(format!("{}.usage", session.id));
+        assert!(sidecar.exists());
+        let u = Usage { input_tokens: 6, output_tokens: 1, ..Default::default() };
+        append(home, &session.id, "openai", "openai", "m", u).unwrap();
+        // Unsaved sessions (and unknown ids) get no copy.
+        append(home, "nosuch", "openai", "openai", "m", u).unwrap();
+        assert!(!home.join("sessions").join("nosuch.usage").exists());
+        // Resume reads only the copy.
+        std::fs::remove_file(home.join("usage.jsonl")).unwrap();
+        let usage = stats.restore(&session, Some(home)).unwrap();
+        assert_eq!((stats.requests, usage.input_tokens), (2, 10));
+        remove_session(home, &session.id);
+        assert!(!sidecar.exists());
+    }
+    #[test]
+    fn large_logs_drop_old_records_and_remember_tracking_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let old = record_line(Utc::now() - chrono::Duration::days(RETAIN_DAYS + 5), "s");
+        let mut data = String::new();
+        while data.len() as u64 <= COMPACT_AT {
+            data.push_str(&old);
+        }
+        data.push_str(&record_line(Utc::now() - chrono::Duration::days(2), "s"));
+        std::fs::write(home.join("usage.jsonl"), data).unwrap();
+        append(home, "s", "openai", "openai", "m", Usage::default()).unwrap();
+        let log = std::fs::read_to_string(home.join("usage.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 2);
+        let report = read(home, Period::Month).unwrap();
+        assert_eq!(report.providers["openai"].requests, 2);
+        let since = report.since.unwrap();
+        assert!(since > Utc::now() - chrono::Duration::days(RETAIN_DAYS + 1));
+        assert!(report.lines().last().unwrap().contains("Tracking since"));
+        // A small log is left alone.
+        append(home, "s", "openai", "openai", "m", Usage::default()).unwrap();
+        assert_eq!(std::fs::read_to_string(home.join("usage.jsonl")).unwrap().lines().count(), 3);
+    }
+    #[test]
+    fn activity_counts_changed_lines_and_formats_durations() {
+        let mut stats = Stats::default();
+        let diff = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n+more\n keep\n";
+        stats.file_change("edit_file", &serde_json::json!({}), Some(diff));
+        stats.file_change(
+            "write_file",
+            &serde_json::json!({"content": "a\nb\nc\n"}),
+            Some("new file: y\na\nb\nc"),
+        );
+        stats.file_change("bash", &serde_json::json!({}), Some(diff));
+        assert_eq!((stats.lines_added, stats.lines_removed), (5, 1));
+        stats.api_time = Duration::from_secs(75);
+        let u = Usage { reasoning_tokens: 7, cache_write_tokens: 3, ..Default::default() };
+        let lines = stats.lines(u);
+        assert!(lines[1].starts_with("this run: wall 0s · API 1m 15s · lines +5 -1"), "{}", lines[1]);
+        assert!(lines[2].contains("reasoning 7") && lines[2].contains("cache writes 3"));
+        assert_eq!(duration(Duration::from_secs(3720)), "1h 2m");
     }
 }
