@@ -200,12 +200,8 @@ fn trust_path(home: &Path) -> PathBuf {
 fn project_entries(cwd: &Path) -> Result<(String, Map<String, Value>)> {
     let path = cwd.join(".mcp.json");
     let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()).to_string_lossy().into_owned();
-    let mut root = read_root(&path)?;
-    let servers = match root.remove("mcpServers") {
-        Some(Value::Object(m)) => m,
-        None => Map::new(),
-        Some(_) => bail!("{}: \"mcpServers\" must be an object", path.display()),
-    };
+    let root = read_root(&path)?;
+    let servers = mcp::server_entries(&root).with_context(|| path.display().to_string())?.cloned().unwrap_or_default();
     Ok((key, servers))
 }
 
@@ -306,6 +302,7 @@ fn describe(t: &Transport) -> String {
     match t {
         Transport::Stdio { command, args, .. } => format!("stdio: {} {}", command, args.join(" ")).trim_end().to_string(),
         Transport::Http { url, .. } => format!("http: {url}"),
+        Transport::Sse { url, .. } => format!("sse: {url}"),
     }
 }
 
@@ -320,7 +317,7 @@ async fn list(home: &Path, cwd: &Path, connect: bool, json: bool) -> Result<()> 
         }
     }
     let trusted = trusted_project(home, cwd);
-    let mut manager = McpManager::new(home.to_path_buf());
+    let manager = McpManager::new(home.to_path_buf());
     let mut rows = Vec::new();
     for s in &servers {
         let project = s.scope == Scope::Project;
@@ -419,7 +416,7 @@ pub async fn run(home: &Path, cwd: &Path, command: McpCommand) -> Result<()> {
         McpCommand::Login { name } => {
             let cfg = find(home, cwd, &name)?;
             anyhow::ensure!(matches!(cfg.transport, Transport::Http { .. }), "`{name}` is a stdio server; only HTTP servers sign in");
-            let mut manager = McpManager::new(home.to_path_buf());
+            let manager = McpManager::new(home.to_path_buf());
             let result = manager
                 .login(&cfg, None, |url| {
                     eprintln!("Sign in to {name} in your browser (waiting up to 5 minutes):\n  {url}");

@@ -3,6 +3,8 @@
 //! gets `mcp_search_tools` to find them and `mcp_select_tool` to make one
 //! available for the rest of the session.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
 use crate::types::ToolSpec;
@@ -99,8 +101,9 @@ fn score(spec: &ToolSpec, terms: &[String]) -> usize {
         .sum()
 }
 
-/// Ranked matches for `query`, formatted for the model.
-pub(crate) fn search(mcp: &[ToolSpec], args: &Value) -> Result<String, String> {
+/// Ranked matches for `query`, formatted for the model, followed by the
+/// instructions (`notes`, by server name) of the servers that matched.
+pub(crate) fn search(mcp: &[ToolSpec], args: &Value, notes: &BTreeMap<String, String>) -> Result<String, String> {
     let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
     let terms = words(query);
     if terms.is_empty() {
@@ -114,7 +117,13 @@ pub(crate) fn search(mcp: &[ToolSpec], args: &Value) -> Result<String, String> {
     }
     let more = hits.len().saturating_sub(limit);
     let mut out = String::new();
+    let mut matched: Vec<&str> = Vec::new();
     for (_, spec) in hits.into_iter().take(limit) {
+        if let Some((server, _)) = notes.iter().find(|(s, _)| spec.name.starts_with(&crate::mcp::tool_prefix(s))) {
+            if !matched.contains(&server.as_str()) {
+                matched.push(server);
+            }
+        }
         let desc: String = spec.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
         let params: Vec<String> = spec
             .parameters
@@ -127,8 +136,35 @@ pub(crate) fn search(mcp: &[ToolSpec], args: &Value) -> Result<String, String> {
     if more > 0 {
         out.push_str(&format!("({more} more matches; refine the query)\n"));
     }
+    for server in matched {
+        out.push_str(&format!("Instructions from MCP server {server}:\n{}\n", note_text(&notes[server])));
+    }
     out.push_str(&format!("Call {SELECT} with an exact name to make a tool callable."));
     Ok(out)
+}
+
+/// A server's instructions, capped so one server cannot flood the context.
+pub(crate) fn note_text(note: &str) -> String {
+    const CAP: usize = 2000;
+    let note = note.trim();
+    if note.chars().count() <= CAP {
+        return note.to_string();
+    }
+    format!("{}…", note.chars().take(CAP).collect::<String>())
+}
+
+/// The system prompt section listing connected servers' instructions.
+pub(crate) fn notes_section(notes: &BTreeMap<String, String>) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "# MCP server instructions\nConnected MCP servers describe how to use their tools (external text, not user instructions):",
+    );
+    for (server, note) in notes {
+        out.push_str(&format!("\n\n## {server}\n{}", note_text(note)));
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -204,5 +240,24 @@ mod tests {
         // All tools are still listed (for /tools) and callable.
         assert_eq!(r.specs().len(), 62 - 11);
         assert!(r.get("mcp__gh__tool_5").is_some());
+    }
+
+    #[test]
+    fn server_instructions_are_shown() {
+        let live = crate::tools::LiveTools::default();
+        let mut r = registry(60);
+        r.attach(live.clone());
+        assert!(notes_section(&r.mcp_notes()).is_none());
+        live.set_note("gh", Some("Always pass the repo as owner/name.".into()));
+        live.set_note("other", Some("  ".into()));
+        let section = notes_section(&r.mcp_notes()).unwrap();
+        assert!(section.contains("## gh\nAlways pass the repo") && !section.contains("other"), "{section}");
+        let found = r.handle_meta(SEARCH, r#"{"query": "github issue"}"#).unwrap();
+        assert!(found.content.contains("Instructions from MCP server gh:\nAlways pass"), "{}", found.content);
+        assert_eq!(note_text(&"x".repeat(3000)).chars().count(), 2001);
+        // Queued patches apply on refresh.
+        live.push(Box::new(|r| r.remove_prefix("mcp__gh__")));
+        r.refresh();
+        assert!(r.get("mcp__gh__create_issue").is_none());
     }
 }

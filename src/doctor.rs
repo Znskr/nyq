@@ -118,6 +118,15 @@ pub fn show_agent_status(
         (servers, &manager.connected()),
         skills_count,
     );
+    let mut value = value;
+    // Live state of each server (connecting, ready, needs sign-in, failed).
+    if let Some(list) = value["mcp"].as_array_mut() {
+        for entry in list {
+            let name = entry["name"].as_str().unwrap_or_default().to_string();
+            let state = manager.status(&name).map_or_else(|| "not started".to_string(), |s| s.label());
+            entry["state"] = json!(state);
+        }
+    }
     show_status(&value, false)
 }
 

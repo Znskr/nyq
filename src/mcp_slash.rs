@@ -17,11 +17,42 @@ fn starts(servers: &[ServerConfig], trusted: &std::collections::HashSet<String>,
     cfg.scope == Scope::Profile || (trusted.contains(&cfg.name) && !profile(&cfg.name))
 }
 
-pub async fn connect_profile_servers(mcp: &mut McpManager, agent: &mut Agent, servers: &[ServerConfig], quiet: bool) {
+/// Connect the servers that start on their own. Print mode (`quiet`) waits
+/// for every one before its single turn; interactively only `required`
+/// servers hold up startup and the rest connect in the background (see
+/// [`McpManager::status`]). A `required` server that fails is an error.
+pub async fn connect_profile_servers(
+    mcp: &mut McpManager,
+    agent: &mut Agent,
+    servers: &[ServerConfig],
+    quiet: bool,
+) -> Result<()> {
+    mcp.attach(&mut agent.tools);
     let trusted = mcp_cli::trusted_project(&config::home(), &agent.cwd);
-    for cfg in servers.iter().filter(|s| starts(servers, &trusted, s)) {
-        connect(mcp, agent, cfg, quiet).await;
+    let (now, later): (Vec<ServerConfig>, Vec<ServerConfig>) = servers
+        .iter()
+        .filter(|s| starts(servers, &trusted, s) && s.options.enabled)
+        .cloned()
+        .partition(|s| quiet || s.options.required);
+    for (cfg, result) in now.iter().zip(mcp.connect_all(&now).await) {
+        trace_result(cfg, &result);
+        let result = result.and_then(|tools| {
+            let n = tools.len();
+            install_mcp_tools(agent, &cfg.name, tools).map(|()| n)
+        });
+        if result.is_err() {
+            let _ = mcp.disconnect(&cfg.name).await;
+        }
+        match result {
+            Ok(n) if !quiet => ui::info(&format!("MCP {}: {n} tools", cfg.name)),
+            Ok(_) => {}
+            Err(e) if cfg.options.required => {
+                bail!("required MCP server '{}' did not start: {e:#} (set \"required\": false in its config to continue without it)", cfg.name)
+            }
+            Err(e) => ui::error(&format!("MCP {}: {e:#}", cfg.name)),
+        }
     }
+    mcp.start_background(later, !quiet);
     if !quiet {
         let project: Vec<_> = servers.iter().filter(|s| !starts(servers, &trusted, s)).map(|s| s.name.as_str()).collect();
         if !project.is_empty() {
@@ -31,6 +62,14 @@ pub async fn connect_profile_servers(mcp: &mut McpManager, agent: &mut Agent, se
             ));
         }
     }
+    Ok(())
+}
+
+fn trace_result(cfg: &ServerConfig, result: &Result<Vec<Box<dyn tools::Tool>>>) {
+    crate::trace::log("mcp", || match result {
+        Ok(tools) => format!("{} connected · {} tools", cfg.name, tools.len()),
+        Err(e) => format!("{} failed: {e:#}", cfg.name),
+    });
 }
 
 fn drop_server_tools(agent: &mut Agent, mcp: &McpManager, name: &str) {
@@ -56,10 +95,7 @@ fn install_mcp_tools(agent: &mut Agent, name: &str, tools: Vec<Box<dyn tools::To
 pub async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig, quiet: bool) {
     drop_server_tools(agent, mcp, &cfg.name);
     let result = mcp.connect(cfg).await;
-    crate::trace::log("mcp", || match &result {
-        Ok(tools) => format!("{} connected · {} tools", cfg.name, tools.len()),
-        Err(e) => format!("{} failed: {e:#}", cfg.name),
-    });
+    trace_result(cfg, &result);
     match result {
         Ok(tools) => {
             let n = tools.len();
@@ -77,10 +113,12 @@ pub async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig
 /// Everything that decides how a server is started (values included, so a
 /// changed secret counts as a change).
 fn fingerprint(cfg: &ServerConfig) -> String {
-    match &cfg.transport {
-        Transport::Stdio { command, args, env, cwd } => format!("{:?} stdio {command:?} {args:?} {env:?} {cwd:?}", cfg.scope),
-        Transport::Http { url, headers } => format!("{:?} http {url} {headers:?}", cfg.scope),
-    }
+    let transport = match &cfg.transport {
+        Transport::Stdio { command, args, env, cwd } => format!("stdio {command:?} {args:?} {env:?} {cwd:?}"),
+        Transport::Http { url, headers } => format!("http {url} {headers:?}"),
+        Transport::Sse { url, headers } => format!("sse {url} {headers:?}"),
+    };
+    format!("{:?} {transport} {:?}", cfg.scope, cfg.options)
 }
 
 /// Re-read the MCP configs. Servers that are gone are disconnected, changed
@@ -91,23 +129,39 @@ pub async fn reload(mcp: &mut McpManager, agent: &mut Agent, servers: &mut Vec<S
     for w in &warnings {
         ui::error(w);
     }
+    mcp.attach(&mut agent.tools);
     let trusted = mcp_cli::trusted_project(&config::home(), &agent.cwd);
     let connected: Vec<String> = mcp.connected().into_iter().map(|(n, _)| n).collect();
+    let mut start = Vec::new();
     for name in &connected {
         let old = servers.iter().find(|s| &s.name == name).map(fingerprint);
         match fresh.iter().find(|s| &s.name == name) {
-            None => {
+            Some(cfg) if old.as_deref() == Some(fingerprint(cfg).as_str()) => {}
+            found => {
                 drop_server_tools(agent, mcp, name);
                 let _ = mcp.disconnect(name).await;
-                ui::info(&format!("MCP {name}: removed, disconnected"));
+                match found {
+                    Some(cfg) if cfg.options.enabled => start.push(cfg.clone()),
+                    Some(_) => ui::info(&format!("MCP {name}: disabled, disconnected")),
+                    None => ui::info(&format!("MCP {name}: removed, disconnected")),
+                }
             }
-            Some(cfg) if old.as_deref() != Some(fingerprint(cfg).as_str()) => connect(mcp, agent, cfg, false).await,
-            Some(_) => {}
         }
     }
-    for cfg in fresh.iter().filter(|s| !connected.contains(&s.name) && starts(&fresh, &trusted, s)) {
-        connect(mcp, agent, cfg, false).await;
-    }
+    // New servers that start on their own (and changed ones) connect in the
+    // background; `/mcp` shows how they are getting on.
+    start.extend(
+        fresh
+            .iter()
+            .filter(|s| {
+                !connected.contains(&s.name)
+                    && s.options.enabled
+                    && starts(&fresh, &trusted, s)
+                    && !matches!(mcp.status(&s.name), Some(mcp::Status::Connecting))
+            })
+            .cloned(),
+    );
+    mcp.start_background(start, true);
     *servers = fresh;
 }
 
@@ -163,7 +217,11 @@ fn list_lines(agent: &Agent, mcp: &McpManager, servers: &[ServerConfig]) -> Vec<
                 let more = if specific { " + tool rules" } else { "" };
                 format!("connected · {n} tools · {}{more}", action.as_str())
             }
-            None => "not connected".into(),
+            None if !s.options.enabled => "disabled".into(),
+            None => match mcp.status(&s.name) {
+                Some(status) if status != mcp::Status::Ready => status.label(),
+                _ => "not connected".into(),
+            },
         };
         lines.push(format!("{:<20} {scope:<8} {state}", s.name));
         let prefix = mcp::tool_prefix(&s.name);
@@ -194,7 +252,11 @@ pub async fn command(
         ["path"] => ui::info(&format!("  {}", mcp_cli::config_path(&home).display())),
         ["reload"] => {
             reload(mcp, agent, servers).await;
-            ui::info(&format!("Reloaded MCP config: {} server(s), {} connected.", servers.len(), mcp.connected().len()));
+            ui::info(&format!(
+                "Reloaded MCP config: {} server(s), {} connected (others connect in the background; /mcp shows their status).",
+                servers.len(),
+                mcp.connected().len()
+            ));
         }
         ["add", rest @ ..] => {
             let (name, entry, force) = parse_add(rest)?;
@@ -272,13 +334,15 @@ mod tests {
 
     #[test]
     fn fingerprints_see_secret_changes() {
-        let cfg = |token: &str| ServerConfig {
-            name: "w".into(),
-            transport: Transport::Http {
-                url: "https://x".into(),
-                headers: [("Authorization".to_string(), token.to_string())].into(),
-            },
-            scope: Scope::Profile,
+        let cfg = |token: &str| {
+            ServerConfig::new(
+                "w",
+                Transport::Http {
+                    url: "https://x".into(),
+                    headers: [("Authorization".to_string(), token.to_string())].into(),
+                },
+                Scope::Profile,
+            )
         };
         assert_eq!(fingerprint(&cfg("a")), fingerprint(&cfg("a")));
         assert_ne!(fingerprint(&cfg("a")), fingerprint(&cfg("b")));
