@@ -1,13 +1,10 @@
 //! Accounts and management: sign-in status per provider, the default
-//! provider, AI Gateway credits and teams, and the permission summary. Backs
-//! `/login`, `/logout`, `/setup`, `/credits` and `nyq provider|setup|teams|
-//! credits|permissions`.
+//! provider and the permission summary. Backs `/login`, `/logout`, `/setup`
+//! and `nyq provider|setup|permissions`.
 
 use std::path::Path;
-use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde::Serialize;
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -18,16 +15,14 @@ use crate::provider::hosted::{self, Service};
 use crate::ui::{self, tui::Tui};
 
 /// Every provider nyq can use, in menu order.
-pub const PROVIDERS: [&str; 7] = ["codex", "opencode-go", "opencode", "xai", "vercel", "openai", "ollama"];
+pub const PROVIDERS: [&str; 6] = ["codex", "opencode-go", "opencode", "xai", "openai", "ollama"];
 /// Providers `/login` can sign in to (the rest are configured by endpoint).
-const LOGIN: [&str; 5] = ["codex", "opencode-go", "opencode", "xai", "vercel"];
+const LOGIN: [&str; 4] = ["codex", "opencode-go", "opencode", "xai"];
 
 const OPENAI_HELP: &str = "OpenAI-compatible APIs need no sign-in: set NYQ_BASE_URL, NYQ_MODEL and NYQ_API_KEY, or base_url/model/api_key in ~/.nyq/model.json.";
 const OLLAMA_HELP: &str = "Ollama runs locally and needs no sign-in: start it (OLLAMA_HOST picks the address) and choose a model with /model.";
-pub const TEAMS_UNAVAILABLE: &str = "Choosing a Vercel team is not available: nyq reaches the AI Gateway with an API key, and each AI Gateway key belongs to exactly one team, so there is no team to switch. To use another team, create a key in that team (vercel.com → AI Gateway → API Keys) and run `nyq login vercel`.";
-const NO_GATEWAY_KEY: &str = "AI Gateway credits need an AI Gateway API key: run `nyq login vercel` (or /login vercel), or set AI_GATEWAY_API_KEY. ChatGPT, OpenCode and xAI accounts have no AI Gateway balance.";
 
-/// The provider id for a name or alias (`chatgpt` → `codex`, `gateway` → `vercel`, …).
+/// The provider id for a name or alias (`chatgpt` → `codex`, `grok` → `xai`, …).
 pub fn canonical(name: &str) -> Option<&'static str> {
     match name.trim().to_ascii_lowercase().as_str() {
         "codex" | "chatgpt" => Some("codex"),
@@ -200,102 +195,6 @@ fn summary_lines(home: &Path) -> Vec<String> {
     lines
 }
 
-// ------------------------------------------------------------------ credits
-
-/// The AI Gateway balance (`GET /v1/credits`). Amounts are kept as reported.
-#[derive(Debug, Default, PartialEq, Serialize)]
-pub struct Credits {
-    pub balance: Option<String>,
-    pub used: Option<String>,
-    pub plan: Option<String>,
-}
-
-fn text_field(v: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|k| match v.get(*k) {
-        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        Some(Value::Number(n)) => Some(n.to_string()),
-        _ => None,
-    })
-}
-
-pub fn parse_credits(body: &str) -> Result<Credits> {
-    let v: Value = serde_json::from_str(body).context("invalid JSON response from the AI Gateway")?;
-    anyhow::ensure!(v.is_object(), "unexpected response format from the AI Gateway");
-    Ok(Credits {
-        balance: text_field(&v, &["balance"]),
-        used: text_field(&v, &["total_used", "used"]),
-        plan: text_field(&v, &["plan"]),
-    })
-}
-
-/// "API access denied · HTTP 403 · credit_card_required: Buy credits…"
-fn http_error(status: u16, body: &str) -> String {
-    let label = match status {
-        401 => "authentication failed (check your AI Gateway API key)",
-        403 => "API access denied",
-        404 => "credits endpoint not found",
-        429 => "rate limited",
-        500..=599 => "AI Gateway server error",
-        _ => "request failed",
-    };
-    let detail = serde_json::from_str::<Value>(body).ok().and_then(|v| match &v["error"] {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(e) => {
-            let message = e.get("message").and_then(Value::as_str);
-            match (e.get("code").and_then(Value::as_str), message) {
-                (Some(c), Some(m)) => Some(format!("{c}: {m}")),
-                (c, m) => c.or(m).map(str::to_string),
-            }
-        }
-        _ => v["message"].as_str().map(str::to_string),
-    });
-    let detail = detail
-        .map(|d| format!(" · {}", d.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect::<String>()))
-        .unwrap_or_default();
-    format!("{label} · HTTP {status}{detail}")
-}
-
-pub async fn fetch_credits(base_url: &str, key: &str) -> Result<Credits> {
-    let url = format!("{}/credits", base_url.trim_end_matches('/'));
-    let response = reqwest::Client::new()
-        .get(&url)
-        .bearer_auth(key)
-        .header(reqwest::header::USER_AGENT, config::USER_AGENT)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await
-        .context("could not reach the AI Gateway")?;
-    let status = response.status().as_u16();
-    let body = response.text().await.context("reading the AI Gateway response")?;
-    if !(200..300).contains(&status) {
-        bail!("{}", http_error(status, &body));
-    }
-    parse_credits(&body)
-}
-
-/// The balance for the configured AI Gateway key.
-pub async fn credits(home: &Path) -> Result<Credits> {
-    let key = hosted::api_key(home, Service::Vercel).ok_or_else(|| anyhow!(NO_GATEWAY_KEY))?;
-    fetch_credits(&Service::Vercel.base_url(), &key).await
-}
-
-fn amount(s: &str) -> String {
-    match s.parse::<f64>() {
-        Ok(n) if n.is_finite() => format!("${n:.2}"),
-        _ => s.to_string(),
-    }
-}
-
-pub fn credits_lines(c: &Credits) -> Vec<String> {
-    let mut lines = vec!["AI Gateway credits".to_string()];
-    let rows = [("Balance", c.balance.as_deref().map(amount)), ("Used", c.used.as_deref().map(amount)), ("Plan", c.plan.clone())];
-    lines.extend(rows.into_iter().filter_map(|(k, v)| v.map(|v| format!("  {k:<9}{v}"))));
-    if lines.len() == 1 {
-        lines.push("  (no balance reported)".into());
-    }
-    lines
-}
-
 // ---------------------------------------------------------------------- CLI
 
 /// `nyq provider [NAME]`.
@@ -309,29 +208,6 @@ pub fn cli_provider(home: &Path, name: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// `nyq credits|balance [--json]`.
-pub async fn cli_credits(home: &Path, as_json: bool) -> Result<()> {
-    match credits(home).await {
-        Ok(c) if as_json => println!("{}", serde_json::to_string_pretty(&c)?),
-        Ok(c) => credits_lines(&c).iter().for_each(|l| println!("{l}")),
-        Err(e) => {
-            if as_json {
-                println!("{}", json!({ "error": format!("{e:#}") }));
-            }
-            return Err(e);
-        }
-    }
-    Ok(())
-}
-
-/// `nyq teams`.
-pub fn cli_teams(home: &Path) -> Result<()> {
-    if hosted::api_key(home, Service::Vercel).is_none() {
-        bail!("{TEAMS_UNAVAILABLE}\n(No AI Gateway key is configured yet.)");
-    }
-    bail!("{TEAMS_UNAVAILABLE}")
 }
 
 /// `nyq permissions [--json]`: the permission mode (as resolved from
@@ -385,7 +261,7 @@ pub async fn cli_setup(home: &Path) -> Result<()> {
     use std::io::IsTerminal;
     summary_lines(home).iter().for_each(|l| println!("{l}"));
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        println!("\nSign in with `nyq login [codex|opencode-go|opencode|xai|vercel]`, choose the default with `nyq provider NAME`, or run /setup inside nyq.");
+        println!("\nSign in with `nyq login [codex|opencode-go|opencode|xai]`, choose the default with `nyq provider NAME`, or run /setup inside nyq.");
         return Ok(());
     }
     let labels = |home: &Path| -> Vec<String> { PROVIDERS.iter().map(|id| format!("{:<24} {}", title(id), connection(home, id).status)).collect() };
@@ -422,14 +298,13 @@ pub async fn cli_setup(home: &Path) -> Result<()> {
 
 // --------------------------------------------------------------------- TUI
 
-/// `/login`, `/logout`, `/setup`, `/credits` (`/balance`).
+/// `/login`, `/logout`, `/setup`.
 pub async fn slash(cmd: &str, args: &[&str], agent: &mut Agent, tui: &Tui) -> Result<()> {
     let home = config::home();
     match cmd {
         "/login" => tui_login(&home, tui, args.first().copied()).await,
         "/logout" => tui_logout(&home, tui, args.first().copied()).await,
-        "/setup" => tui_setup(&home, agent, tui).await,
-        _ => tui_credits(&home, tui).await,
+        _ => tui_setup(&home, agent, tui).await,
     }
 }
 
@@ -501,20 +376,6 @@ async fn tui_logout(home: &Path, tui: &Tui, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn tui_credits(home: &Path, tui: &Tui) -> Result<()> {
-    let cancel = CancellationToken::new();
-    tui.screen().set_busy(Some("Fetching AI Gateway credits"), Some(cancel.clone()));
-    let result = tokio::select! {
-        r = credits(home) => Some(r),
-        _ = cancel.cancelled() => None,
-    };
-    tui.screen().idle();
-    if let Some(r) = result {
-        ui::list(&credits_lines(&r?));
-    }
-    Ok(())
-}
-
 async fn tui_setup(home: &Path, agent: &mut Agent, tui: &Tui) -> Result<()> {
     loop {
         let connected = PROVIDERS.iter().filter(|id| connection(home, id).connected).count();
@@ -524,10 +385,8 @@ async fn tui_setup(home: &Path, agent: &mut Agent, tui: &Tui) -> Result<()> {
             format!("{:<20} {current}", "Model provider"),
             format!("{:<20} {}", "Model", agent.provider.model()),
             format!("{:<20} {}", "Credential source", connection(home, &current).status),
-            format!("{:<20} not available", "Vercel team"),
-            format!("{:<20} show balance", "AI Gateway credits"),
         ];
-        let Some(choice) = tui.pick("Setup", "Accounts, model provider and AI Gateway access", &options).await else {
+        let Some(choice) = tui.pick("Setup", "Accounts and model provider", &options).await else {
             return Ok(());
         };
         let result = match choice {
@@ -537,15 +396,10 @@ async fn tui_setup(home: &Path, agent: &mut Agent, tui: &Tui) -> Result<()> {
                 tui.open_models();
                 return Ok(());
             }
-            3 => {
+            _ => {
                 ui::list(&source_lines(home));
                 Ok(())
             }
-            4 => {
-                ui::info(TEAMS_UNAVAILABLE);
-                Ok(())
-            }
-            _ => tui_credits(home, tui).await,
         };
         if let Err(e) = result {
             ui::error(&format!("{e:#}"));
@@ -598,12 +452,12 @@ async fn tui_provider(home: &Path, agent: &mut Agent, tui: &Tui) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn provider_names() {
         assert_eq!(canonical("ChatGPT"), Some("codex"));
-        assert_eq!(canonical("gateway"), Some("vercel"));
+        assert_eq!(canonical("vercel"), None);
+        assert_eq!(canonical("gateway"), None);
         assert_eq!(canonical("grok"), Some("xai"));
         assert_eq!(canonical("ollama"), Some("ollama"));
         assert_eq!(canonical("nope"), None);
@@ -624,7 +478,7 @@ mod tests {
         assert_eq!((last["provider"].as_str(), last["model"].as_str()), (Some("xai"), Some("grok-custom")));
         assert!(last["effort"].is_null());
         // Built-in default model, then a provider without one drops last-model.json.
-        assert_eq!(persist_default(home, "vercel").unwrap().as_deref(), Some(Service::Vercel.default_model()));
+        assert_eq!(persist_default(home, "opencode").unwrap().as_deref(), Some(Service::Opencode.default_model()));
         assert_eq!(persist_default(home, "ollama").unwrap(), None);
         assert!(!home.join("last-model.json").exists());
         let settings: Value = serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
@@ -635,53 +489,5 @@ mod tests {
             assert_eq!(std::fs::metadata(home.join("settings.json")).unwrap().permissions().mode() & 0o777, 0o600);
         }
         assert!(set_default_provider(home, "bogus").is_err());
-    }
-
-    #[test]
-    fn credits_parsing() {
-        let c = parse_credits(r#"{"balance":"95.5","total_used":"4.50","plan":"pro"}"#).unwrap();
-        assert_eq!(c, Credits { balance: Some("95.5".into()), used: Some("4.50".into()), plan: Some("pro".into()) });
-        assert_eq!(credits_lines(&c), ["AI Gateway credits", "  Balance  $95.50", "  Used     $4.50", "  Plan     pro"]);
-        let n = parse_credits(r#"{"balance":10,"used":false,"plan":null}"#).unwrap();
-        assert_eq!((n.balance.as_deref(), n.used, n.plan), (Some("10"), None, None));
-        assert_eq!(credits_lines(&Credits::default())[1], "  (no balance reported)");
-        assert!(parse_credits("[1]").is_err());
-        assert!(parse_credits("not json").is_err());
-        assert_eq!(
-            http_error(403, r#"{"error":{"code":"credit_card_required","message":"Buy credits to use AI Gateway."}}"#),
-            "API access denied · HTTP 403 · credit_card_required: Buy credits to use AI Gateway."
-        );
-        assert_eq!(http_error(502, "<html>"), "AI Gateway server error · HTTP 502");
-    }
-
-    /// Serve one canned HTTP response; returns the base URL and the request.
-    async fn serve(status: &'static str, body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/v1", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            while !bytes.ends_with(b"\r\n\r\n") {
-                bytes.push(socket.read_u8().await.unwrap());
-            }
-            let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-            socket.write_all(response.as_bytes()).await.unwrap();
-            String::from_utf8(bytes).unwrap()
-        });
-        (url, task)
-    }
-
-    #[tokio::test]
-    async fn credits_from_fake_gateway() {
-        let (url, request) = serve("200 OK", r#"{"balance":"12.3","total_used":"0.7"}"#).await;
-        let c = fetch_credits(&url, "test-key").await.unwrap();
-        assert_eq!((c.balance.as_deref(), c.used.as_deref()), (Some("12.3"), Some("0.7")));
-        let request = request.await.unwrap().to_ascii_lowercase();
-        assert!(request.starts_with("get /v1/credits http/1.1"));
-        assert!(request.contains("authorization: bearer test-key"));
-
-        let (url, _) = serve("401 Unauthorized", r#"{"error":"invalid api key"}"#).await;
-        let e = fetch_credits(&url, "bad").await.unwrap_err().to_string();
-        assert_eq!(e, "authentication failed (check your AI Gateway API key) · HTTP 401 · invalid api key");
     }
 }

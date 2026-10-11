@@ -57,7 +57,7 @@ pub fn category(cmd: &str) -> Category {
         "/new" | "/clear" | "/reset" | "/continue" | "/rename" | "/resume" | "/sessions" | "/compact" => {
             Category::Session
         }
-        "/login" | "/logout" | "/setup" | "/credits" | "/usage" | "/stats" => Category::Account,
+        "/login" | "/logout" | "/setup" | "/usage" | "/stats" => Category::Account,
         "/model" | "/fast" => Category::Model,
         "/settings" | "/statusline" | "/sound" | "/notifications" => Category::Appearance,
         "/permissions" | "/allowlist" | "/yolo" | "/hooks" => Category::Security,
@@ -75,7 +75,6 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("/quit", "/exit"),
     ("/q", "/exit"),
     ("/cost", "/usage"),
-    ("/balance", "/credits"),
     ("/img", "/image"),
 ];
 
@@ -246,7 +245,6 @@ const PROVIDERS: &[ArgOption] = &[
     ("opencode-go", "OpenCode Go", false),
     ("opencode", "OpenCode Zen", false),
     ("xai", "xAI", false),
-    ("vercel", "Vercel AI Gateway", false),
 ];
 
 /// Completions for the next argument of `cmd`, given the words already

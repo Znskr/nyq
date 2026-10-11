@@ -100,7 +100,7 @@ pub fn listed_fast(provider: &str, model: &str) -> bool {
 
 /// Providers whose listing says which models offer fast mode.
 pub fn lists_fast(provider: &str) -> bool {
-    matches!(provider, "codex" | "vercel")
+    provider == "codex"
 }
 
 /// Retries after the first attempt.

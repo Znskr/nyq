@@ -1,5 +1,5 @@
-//! API-key model services: OpenCode Go, OpenCode Zen, xAI and the Vercel AI
-//! Gateway. Each speaks OpenAI-compatible chat completions; OpenCode also
+//! API-key model services: OpenCode Go, OpenCode Zen and xAI. Each speaks
+//! OpenAI-compatible chat completions; OpenCode also
 //! serves some models over the Responses or Anthropic Messages protocol (per
 //! model, from models.dev), and xAI is used through the Responses API.
 //!
@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use super::{
     anthropic::AnthropicProvider,
-    openai::{EffortStyle, OpenAiProvider},
+    openai::OpenAiProvider,
     responses::ResponsesProvider,
     EventSink, Provider,
 };
@@ -32,11 +32,10 @@ pub enum Service {
     OpencodeGo,
     Opencode,
     Xai,
-    Vercel,
 }
 
 impl Service {
-    pub const ALL: [Service; 4] = [Service::OpencodeGo, Service::Opencode, Service::Xai, Service::Vercel];
+    pub const ALL: [Service; 3] = [Service::OpencodeGo, Service::Opencode, Service::Xai];
 
     /// Provider id, as used by `--provider`, the switcher tab and models.dev.
     pub fn id(self) -> &'static str {
@@ -44,7 +43,6 @@ impl Service {
             Service::OpencodeGo => "opencode-go",
             Service::Opencode => "opencode",
             Service::Xai => "xai",
-            Service::Vercel => "vercel",
         }
     }
 
@@ -53,7 +51,6 @@ impl Service {
             "opencode-go" | "go" => Some(Service::OpencodeGo),
             "opencode" | "zen" | "opencode-zen" => Some(Service::Opencode),
             "xai" | "grok" => Some(Service::Xai),
-            "vercel" | "gateway" | "ai-gateway" => Some(Service::Vercel),
             _ => None,
         }
     }
@@ -63,7 +60,6 @@ impl Service {
             Service::OpencodeGo => "OpenCode Go",
             Service::Opencode => "OpenCode Zen",
             Service::Xai => "xAI",
-            Service::Vercel => "Vercel AI Gateway",
         }
     }
 
@@ -72,7 +68,6 @@ impl Service {
         match self {
             Service::OpencodeGo | Service::Opencode => "OPENCODE_API_KEY",
             Service::Xai => "XAI_API_KEY",
-            Service::Vercel => "AI_GATEWAY_API_KEY",
         }
     }
 
@@ -81,7 +76,6 @@ impl Service {
             Service::OpencodeGo => "glm-5.3",
             Service::Opencode => "claude-sonnet-5-5",
             Service::Xai => "grok-4.7",
-            Service::Vercel => "anthropic/claude-sonnet-5-5",
         }
     }
 
@@ -91,7 +85,6 @@ impl Service {
             Service::OpencodeGo => ("NYQ_OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1"),
             Service::Opencode => ("NYQ_OPENCODE_BASE_URL", "https://opencode.ai/zen/v1"),
             Service::Xai => ("NYQ_XAI_BASE_URL", "https://api.x.ai/v1"),
-            Service::Vercel => ("NYQ_VERCEL_BASE_URL", "https://ai-gateway.vercel.sh/v1"),
         };
         std::env::var(var).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.into())
     }
@@ -176,12 +169,10 @@ pub enum KeyCheck {
     Unknown(String),
 }
 
-/// Probe `base_url` with `key`: the models list, or for the AI Gateway (whose
-/// model list is public) the credit balance.
-pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck {
-    let path = if service == Service::Vercel { "credits" } else { "models" };
+/// Probe `base_url` with `key` through the models list.
+pub async fn check_key(base_url: &str, key: &str) -> KeyCheck {
     let request = reqwest::Client::new()
-        .get(format!("{}/{path}", base_url.trim_end_matches('/')))
+        .get(format!("{}/models", base_url.trim_end_matches('/')))
         .bearer_auth(key.trim())
         .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
         .timeout(std::time::Duration::from_secs(10));
@@ -195,8 +186,6 @@ pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck 
     }
     let message = super::sse::http_error(status, &response.text().await.unwrap_or_default());
     match status.as_u16() {
-        // A valid AI Gateway key without credits gets a 403 from the balance.
-        403 if service == Service::Vercel && message.contains("credit") => KeyCheck::Accepted,
         401 | 403 => KeyCheck::Refused(message),
         _ => KeyCheck::Unknown(message),
     }
@@ -218,8 +207,6 @@ pub struct HostedProvider {
     pub api_key: String,
     pub model: String,
     pub effort: Option<String>,
-    /// Fast mode, where the model offers it (AI Gateway `speed: fast`).
-    pub fast: bool,
     session: String,
     models: Arc<Models>,
 }
@@ -232,7 +219,6 @@ impl HostedProvider {
             api_key,
             model,
             effort: effort.filter(|e| e != "auto"),
-            fast: false,
             session: uuid::Uuid::new_v4().to_string(),
             models,
         }
@@ -254,7 +240,6 @@ impl HostedProvider {
     pub fn protocol(&self) -> Protocol {
         match self.service {
             Service::Xai => Protocol::Responses,
-            Service::Vercel => Protocol::Chat,
             // A missing catalog used to force chat completions for every model.
             Service::OpencodeGo | Service::Opencode => {
                 self.meta().map_or_else(|| infer_protocol(&self.model), ModelMeta::protocol)
@@ -268,7 +253,6 @@ impl HostedProvider {
             Service::OpencodeGo | Service::Opencode => headers.push(("x-opencode-session".into(), self.session.clone())),
             // Routes a conversation to the same cache.
             Service::Xai => headers.push(("x-grok-conv-id".into(), self.session.clone())),
-            Service::Vercel => {}
         }
         headers
     }
@@ -276,11 +260,8 @@ impl HostedProvider {
     fn chat(&self) -> OpenAiProvider {
         OpenAiProvider {
             effort: self.effort.clone(),
-            effort_style: if self.service == Service::Vercel { EffortStyle::ReasoningObject } else { EffortStyle::ReasoningEffort },
             headers: self.headers(),
             reasoning_field: self.meta().and_then(|m| m.interleaved.clone()),
-            anthropic_cache: self.service == Service::Vercel && self.model.starts_with("anthropic/"),
-            provider_options: self.fast().then(|| json!({"gateway":{"speed":"fast"}})),
             ..OpenAiProvider::with_label(self.service.id().into(), self.base_url.clone(), Some(self.api_key.clone()), self.model.clone())
         }
     }
@@ -292,11 +273,7 @@ impl HostedProvider {
         let listed = tokio::time::timeout(std::time::Duration::from_secs(6), self.chat().list_models_detailed())
             .await
             .context("timed out listing models")??;
-        super::remember_listing(
-            self.service.id(),
-            listed.iter().map(|m| m.id.clone()).collect(),
-            listed.iter().filter(|m| m.fast).map(|m| m.id.clone()).collect(),
-        );
+        super::remember_listing(self.service.id(), listed.iter().map(|m| m.id.clone()).collect(), Vec::new());
         Ok(listed
             .into_iter()
             .filter_map(|m| {
@@ -351,22 +328,12 @@ impl Provider for HostedProvider {
     fn context_window(&self) -> Option<u64> {
         self.meta().and_then(|m| m.context)
     }
-    fn fast(&self) -> bool {
-        self.fast && self.supports_fast()
-    }
-    fn set_fast(&mut self, fast: bool) {
-        self.fast = fast;
-    }
-    fn supports_fast(&self) -> bool {
-        self.service == Service::Vercel && super::listed_fast(self.service.id(), &self.model)
-    }
     fn set_conversation(&mut self, id: &str) {
         self.session = id.to_string();
     }
     fn fork(&self) -> Box<dyn Provider> {
         let mut fork = Self::new(self.service, self.base_url.clone(), self.api_key.clone(), self.model.clone(), self.effort.clone(), Arc::clone(&self.models));
         fork.session = uuid::Uuid::new_v4().to_string();
-        fork.fast = self.fast;
         Box::new(fork)
     }
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
@@ -442,9 +409,8 @@ mod tests {
         assert_eq!(bare("grok-4"), Protocol::Responses);
         assert_eq!(bare("glm-5"), Protocol::Chat);
         assert_eq!(p(Service::Xai, "anything"), Protocol::Responses);
-        assert_eq!(p(Service::Vercel, "claude"), Protocol::Chat);
         assert_eq!(Service::parse("Grok"), Some(Service::Xai));
-        assert_eq!(Service::parse("gateway"), Some(Service::Vercel));
+        assert!(Service::parse("vercel").is_none());
         assert!(Service::parse("codex").is_none());
         for s in Service::ALL {
             assert_eq!(Service::parse(s.id()), Some(s));
@@ -503,57 +469,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xai_and_vercel() {
+    async fn xai_uses_responses_with_conversation_id() {
         let responses = events(&[json!({"type":"response.completed","response":{}})]);
-        let chat = events(&[json!({"choices":[{"index":0,"delta":{"content":"v"},"finish_reason":"stop"}]})]);
-        let (url, mut requests, task) = server(vec![(200, responses), (200, chat)]).await;
+        let (url, mut requests, task) = server(vec![(200, responses)]).await;
         let mut xai = provider(Service::Xai, &url, "grok-x");
         xai.set_conversation("c");
         xai.stream(Request { system: "", items: &[], tools: &[] }, &mut |_| {}).await.unwrap();
-        let mut vercel = provider(Service::Vercel, &url, "anthropic/claude");
-        vercel.set_effort(Some("low".into()));
-        vercel.stream(Request { system: "", items: &[], tools: &[] }, &mut |_| {}).await.unwrap();
         let first = requests.recv().await.unwrap();
         assert!(first.starts_with("POST /responses "));
         assert!(first.to_lowercase().contains("x-grok-conv-id: c"));
-        let second = requests.recv().await.unwrap();
-        assert!(second.starts_with("POST /chat/completions ") && !second.to_lowercase().contains("x-opencode-session"));
-        assert_eq!(body_of(&second)["reasoning"], json!({"effort":"low"}));
-        task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn vercel_prompt_caching_and_fast_mode() {
-        let listing = json!({"data":[
-            {"id":"anthropic/claude-fast-test","type":"language","fast_options":[{"type":"toggle"}]},
-            {"id":"openai/gpt-tier-test","type":"language","owned_by":"openai","pricing":{"service_tiers":{"priority":{"input":"1"}}}},
-            {"id":"zai/glm-priced-test","type":"language","pricing":{"fast":{"input":"1"}}},
-            {"id":"zai/glm-slow-test","type":"language","pricing":{"input":"1"}}
-        ]});
-        let chat = || events(&[json!({"choices":[{"index":0,"delta":{"content":"v"},"finish_reason":"stop"}]})]);
-        let (url, mut requests, task) = server(vec![(200, listing.to_string()), (200, chat()), (200, chat())]).await;
-        let mut p = provider(Service::Vercel, &url, "anthropic/claude-fast-test");
-        p.set_fast(true);
-        assert!(!p.supports_fast() && !p.fast(), "unknown until listed");
-        p.list_models().await.unwrap();
-        assert!(p.supports_fast() && p.fast());
-        for (model, fast) in [("openai/gpt-tier-test", true), ("zai/glm-priced-test", true), ("zai/glm-slow-test", false)] {
-            assert_eq!(super::super::listed_fast("vercel", model), fast, "{model}");
-        }
-        let items = [Item::user("one"), Item::Assistant { text: "two".into() }, Item::user("three")];
-        p.stream(Request { system: "sys", items: &items, tools: &[] }, &mut |_| {}).await.unwrap();
-        p.set_model("zai/glm-slow-test".into());
-        p.stream(Request { system: "sys", items: &items, tools: &[] }, &mut |_| {}).await.unwrap();
-        requests.recv().await.unwrap();
-        let cache = json!({"anthropic":{"cacheControl":{"type":"ephemeral"}}});
-        let body = body_of(&requests.recv().await.unwrap());
-        assert_eq!(body["providerOptions"], json!({"gateway":{"speed":"fast"}}));
-        let marked: Vec<bool> = body["messages"].as_array().unwrap().iter().map(|m| m["providerOptions"] == cache).collect();
-        assert_eq!(marked, [true, false, true, false]);
-        // Neither for other models (or without fast support).
-        let body = body_of(&requests.recv().await.unwrap());
-        assert!(body.get("providerOptions").is_none());
-        assert!(body["messages"].as_array().unwrap().iter().all(|m| m.get("providerOptions").is_none()));
         task.await.unwrap();
     }
 
@@ -625,7 +549,7 @@ mod tests {
         assert!(!remove_key(home, Service::Xai).unwrap());
         assert_eq!(api_key(home, Service::Xai), None);
         assert_eq!(read_key(&home.join("auth.json"), "opencode-go").as_deref(), Some("own-go"));
-        assert!(save_key(home, Service::Vercel, "  ").is_err());
+        assert!(save_key(home, Service::Xai, "  ").is_err());
         for (k, v) in saved {
             match v {
                 Some(v) => std::env::set_var(k, v),
