@@ -798,7 +798,7 @@ mod tests {
     async fn error_and_timeout_fall_back_to_ask_without_caching() {
         let action = Action::new("write_file", r#"{"path":"a.txt"}"#, "Write the note.");
         let boom = Script {
-            responses: Mutex::new(vec![Err("gateway down".into()), Err("gateway down".into())]),
+            responses: Mutex::new(vec![Err("server down".into()), Err("server down".into())]),
             calls: AtomicUsize::new(0),
             delay: Duration::ZERO,
         };
@@ -808,7 +808,7 @@ mod tests {
         assert!(first.fallback && !first.cancelled);
         assert!(matches!(first.verdict, Verdict::Ask { .. }));
         assert!(first.verdict.reason().contains("classifier unavailable"));
-        assert!(first.verdict.reason().contains("gateway down"));
+        assert!(first.verdict.reason().contains("server down"));
         assert!(cache.is_empty());
         let _ = review(&boom, &action, &mut cache, TIMEOUT, &cancel).await;
         assert_eq!(boom.calls.load(Ordering::SeqCst), 2);

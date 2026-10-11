@@ -1,5 +1,5 @@
 //! Signing in: the ChatGPT browser flow for the Codex provider, and API keys
-//! for hosted services (`nyq login opencode-go|opencode|xai|vercel`).
+//! for hosted services (`nyq login opencode-go|opencode|xai`).
 use std::{io::Write, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
@@ -343,7 +343,6 @@ pub fn key_site(service: Service) -> &'static str {
     match service {
         Service::OpencodeGo | Service::Opencode => "https://opencode.ai/auth",
         Service::Xai => "https://console.x.ai",
-        Service::Vercel => "https://vercel.com/dashboard (AI Gateway → API Keys)",
     }
 }
 
@@ -356,7 +355,7 @@ pub async fn store_key(home: &Path, service: Service, key: &str) -> Result<Strin
 
 async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) -> Result<String> {
     anyhow::ensure!(!key.trim().is_empty(), "the API key is empty");
-    let warning = match hosted::check_key(service, base_url, key).await {
+    let warning = match hosted::check_key(base_url, key).await {
         hosted::KeyCheck::Accepted => None,
         hosted::KeyCheck::Refused(e) => anyhow::bail!("{} rejected this API key, so it was not saved: {e}", service.title()),
         hosted::KeyCheck::Unknown(e) => Some(format!("\nWarning: could not check the key with {} ({e}); saved it anyway.", service.title())),
@@ -382,7 +381,7 @@ pub fn logout(home: &Path, provider: &str) -> Result<String> {
         });
     }
     let service = Service::parse(provider)
-        .with_context(|| format!("unknown provider `{provider}` (expected codex, opencode-go, opencode, xai or vercel)"))?;
+        .with_context(|| format!("unknown provider `{provider}` (expected codex, opencode-go, opencode or xai)"))?;
     Ok(if hosted::remove_key(home, service)? {
         format!("Removed the stored {} key.", service.title())
     } else {
@@ -533,8 +532,7 @@ mod tests {
         let (url, mut requests, task) = server(vec![
             (401, r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key"}}"#.into()),
             (200, r#"{"data":[]}"#.into()),
-            (402, r#"{"error":{"code":"credit_card_required","message":"Buy credits"}}"#.into()),
-            (403, r#"{"error":{"code":"credit_card_required","message":"Buy credits"}}"#.into()),
+            (402, r#"{"error":{"code":"payment_required","message":"Add a payment method"}}"#.into()),
         ])
         .await;
         let err = store_key_at(home, Service::Xai, "bad", &url).await.unwrap_err().to_string();
@@ -545,13 +543,10 @@ mod tests {
         let msg = store_key_at(home, Service::Xai, " good ", &url).await.unwrap();
         assert!(msg.starts_with("Saved your xAI key") && !msg.contains("Warning"), "{msg}");
         assert_eq!(stored(), Some(json!("good")));
-        // The gateway is checked through the credit balance; no credits is still a valid key.
-        let msg = store_key_at(home, Service::Vercel, "gw", &url).await.unwrap();
+        // A status that says nothing about the key: saved with a warning.
+        let msg = store_key_at(home, Service::Xai, "maybe", &url).await.unwrap();
         assert!(msg.contains("Warning: could not check the key") && msg.contains("HTTP 402"), "{msg}");
-        let msg = store_key_at(home, Service::Vercel, "gw", &url).await.unwrap();
-        assert!(msg.starts_with("Saved") && !msg.contains("Warning"), "{msg}");
-        requests.recv().await.unwrap();
-        assert!(requests.recv().await.unwrap().starts_with("GET /credits "));
+        assert_eq!(stored(), Some(json!("maybe")));
         task.await.unwrap();
         // Unreachable: saved with a warning.
         let msg = store_key_at(home, Service::Xai, "offline", "http://127.0.0.1:1").await.unwrap();

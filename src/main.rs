@@ -84,7 +84,7 @@ struct Cli {
     /// Model id (overrides config).
     #[arg(short, long, global = true)]
     model: Option<String>,
-    /// Provider: codex, openai, ollama, opencode-go, opencode, xai or vercel.
+    /// Provider: codex, openai, ollama, opencode-go, opencode or xai.
     #[arg(long, global = true)]
     provider: Option<String>,
     /// Run tools without asking for approval.
@@ -221,14 +221,14 @@ enum Command {
         json: bool,
     },
     /// Sign in: ChatGPT subscription (default, Codex models), or store an API
-    /// key for opencode-go, opencode, xai or vercel.
+    /// key for opencode-go, opencode or xai.
     Login {
-        /// codex (default), opencode-go, opencode, xai or vercel.
+        /// codex (default), opencode-go, opencode or xai.
         provider: Option<String>,
     },
     /// Remove nyq's stored login for a provider, or every stored login.
     Logout {
-        /// codex, opencode-go, opencode, xai or vercel [default: all of them].
+        /// codex, opencode-go, opencode or xai [default: all of them].
         provider: Option<String>,
     },
     /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
@@ -271,15 +271,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Choose the default provider (codex, opencode-go, opencode, xai, vercel, openai, ollama).
+    /// Choose the default provider (codex, opencode-go, opencode, xai, openai, ollama).
     Provider { name: Option<String> },
     /// Show sign-in status per provider and the default; on a terminal, set them up.
     Setup,
-    /// Choose the Vercel team used by AI Gateway (not available with API keys).
-    Teams,
-    /// Show the AI Gateway credit balance.
-    #[command(alias = "balance")]
-    Credits { #[arg(long)] json: bool },
     /// Manage MCP servers and project trust without opening the interactive shell.
     Mcp {
         #[command(subcommand)]
@@ -373,8 +368,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/agents", "named subagents: /agents [list|show NAME|stop NAME|delete NAME]"),
     ("/login", "sign in: ChatGPT in the browser, or an API key (hidden input)"),
     ("/logout", "remove nyq's stored sign-in: /logout [provider]"),
-    ("/setup", "connections, default provider, credential source, AI Gateway"),
-    ("/credits", "AI Gateway credit balance (also /balance)"),
+    ("/setup", "connections, default provider, credential source"),
     ("/mcp", "MCP servers and tools: /mcp [list|add|remove|reload|path|connect|disconnect|login|logout|trust|resource|prompt]"),
     ("/memory", "saved memories; /memory remove N forgets one"),
     (
@@ -581,8 +575,6 @@ async fn run() -> Result<()> {
         }
         Some(Command::Provider { name }) => return account::cli_provider(&home, name.as_deref()),
         Some(Command::Setup) => return account::cli_setup(&home).await,
-        Some(Command::Teams) => return account::cli_teams(&home),
-        Some(Command::Credits { json }) => return account::cli_credits(&home, *json).await,
         Some(Command::Permissions { json }) => {
             return account::cli_permissions(&home, &cwd, permission_mode, *json)
         }
@@ -596,7 +588,7 @@ async fn run() -> Result<()> {
             let msg = match provider.as_deref().filter(|p| *p != "codex") {
                 Some(name) => {
                     let service = provider::hosted::Service::parse(name).with_context(|| {
-                        format!("unknown provider `{name}` (expected codex, opencode-go, opencode, xai or vercel)")
+                        format!("unknown provider `{name}` (expected codex, opencode-go, opencode or xai)")
                     })?;
                     login::login_key(&home, service).await?
                 }
@@ -1647,7 +1639,7 @@ async fn slash(
         "/permissions" => commands::permissions(agent, tui, &config::home(), &arg).await,
         "/allowlist" => commands::allowlist(agent, &arg),
         "/hooks" => hooks::command(agent, arg.first().copied()),
-        "/login" | "/logout" | "/setup" | "/credits" | "/balance" => account::slash(cmd, &arg, agent, tui).await?,
+        "/login" | "/logout" | "/setup" => account::slash(cmd, &arg, agent, tui).await?,
         "/yolo" => commands::toggle_yolo(&config::home(), agent),
         "/usage" | "/cost" => usage::slash(&config::home(), &arg, agent.session.as_ref().map(|s| s.id.as_str()))?,
         "/stats" => agent.stats.show(agent.usage),
@@ -1829,7 +1821,6 @@ mod tests {
             Some(Command::Mcp { action: mcp_cli::McpCommand::Login { .. } })
         ));
         assert!(Cli::try_parse_from(["nyq", "workspace", "add"]).is_err());
-        assert!(matches!(parse(&["nyq", "balance", "--json"]).command, Some(Command::Credits { json: true })));
         assert!(matches!(parse(&["nyq", "provider", "xai"]).command, Some(Command::Provider { name: Some(n) }) if n == "xai"));
         match parse(&["nyq", "mcp", "add", "fs", "--env", "A=1", "--", "npx", "-y", "srv"]).command {
             Some(Command::Mcp { action: mcp_cli::McpCommand::Add { name, env, command, .. } }) => {

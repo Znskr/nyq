@@ -45,13 +45,9 @@ pub fn http_error(status: reqwest::StatusCode, body: &str) -> String {
         return if excerpt.is_empty() { format!("HTTP {status}") } else { format!("HTTP {status}: {excerpt}") };
     };
     let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
-    let message = text(error).or_else(|| text(&error["message"])).or_else(|| text(&error["param"]["message"]));
-    let kind = text(&error["code"]).or_else(|| text(&error["type"])).or_else(|| text(&error["param"]["name"]));
-    let provider = text(&error["provider"]).or_else(|| {
-        let m = message.as_deref()?;
-        let rest = &m[m.find("Providers considered:")? + "Providers considered:".len()..];
-        text(&Value::from(rest.split([',', ';']).next()?.trim_end_matches('.')))
-    });
+    let message = text(error).or_else(|| text(&error["message"]));
+    let kind = text(&error["code"]).or_else(|| text(&error["type"]));
+    let provider = text(&error["provider"]);
     let title = if matches!(code, 401 | 403) { "API access denied" } else { "API request failed" };
     let mut out = format!("{title} · HTTP {code}");
     if let Some(p) = provider {
@@ -177,16 +173,12 @@ mod parsing_tests {
     fn http_errors() {
         let e = |status: u16, body: &str| super::http_error(StatusCode::from_u16(status).unwrap(), body);
         assert_eq!(
-            e(403, r#"{"error":{"code":"RestrictedProvidersError","message":"demo account is restricted from provider wafer","provider":"wafer"}}"#),
-            "API access denied · HTTP 403 · Provider: wafer · RestrictedProvidersError: demo account is restricted from provider wafer"
+            e(403, r#"{"error":{"code":"model_not_allowed","message":"this key may not use the model","provider":"anthropic"}}"#),
+            "API access denied · HTTP 403 · Provider: anthropic · model_not_allowed: this key may not use the model"
         );
         assert_eq!(
-            e(403, r#"{"error":{"message":"Your team has restricted access. Providers considered: wafer","type":"no_providers_available","param":{"name":"RestrictedProvidersError"}}}"#),
-            "API access denied · HTTP 403 · Provider: wafer · no_providers_available: Your team has restricted access. Providers considered: wafer"
-        );
-        assert_eq!(
-            e(401, r#"{"error":{"code":"api_key_required","message":"Set AI_GATEWAY_API_KEY\n to use this endpoint."}}"#),
-            "API access denied · HTTP 401 · api_key_required: Set AI_GATEWAY_API_KEY to use this endpoint."
+            e(401, r#"{"error":{"code":"api_key_required","message":"Set OPENCODE_API_KEY\n to use this endpoint."}}"#),
+            "API access denied · HTTP 401 · api_key_required: Set OPENCODE_API_KEY to use this endpoint."
         );
         assert_eq!(
             e(529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#),

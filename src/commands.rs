@@ -21,7 +21,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/statusline", "toggle status line segments: /statusline [model|session|provider|context|tokens|sandbox|folder|branch]"),
     ("/sound", "terminal bell for long turns and prompts: /sound [on|off|max]"),
     ("/notifications", "desktop notifications: /notifications [on|off|after SECONDS]"),
-    ("/fast", "toggle fast mode (Codex priority processing, AI Gateway fast speed) when the model supports it"),
+    ("/fast", "toggle fast mode (Codex priority processing) when the model supports it"),
     ("/image", "attach an image to the next message: /image PATH"),
     ("/images", "pending image attachments: /images [clear|remove N]"),
     ("/paste", "attach an image from the clipboard (also ctrl+v)"),
