@@ -414,7 +414,7 @@ async fn run() -> Result<()> {
                     let service = provider::hosted::Service::parse(name).with_context(|| {
                         format!("unknown provider `{name}` (expected codex, opencode-go, opencode, xai or vercel)")
                     })?;
-                    login::login_key(&home, service)?
+                    login::login_key(&home, service).await?
                 }
                 None => {
                     login::login(&home, |url| {
