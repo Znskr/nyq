@@ -170,14 +170,10 @@ struct ModelMenu {
 impl ModelMenu {
     fn visible(&self) -> Vec<&ModelChoice> {
         let tab = &self.tabs[self.tab];
-        let f = self.filter.to_lowercase();
-        self.choices
-            .iter()
-            .filter(|c| tab == "All" || &c.provider == tab)
-            .filter(|c| {
-                f.is_empty() || c.model.to_lowercase().contains(&f) || c.provider.contains(&f)
-            })
-            .collect()
+        crate::models::search(
+            self.choices.iter().filter(|c| tab == "All" || &c.provider == tab),
+            &self.filter,
+        )
     }
 }
 
@@ -1688,6 +1684,17 @@ impl Screen {
         m.tabs = tabs;
         m.warnings = warnings;
         m.loading = false;
+        self.redraw();
+    }
+
+    /// Open the model switcher on already listed models, filtered by `filter`.
+    pub fn show_models(&mut self, choices: Vec<ModelChoice>, warnings: Vec<String>, filter: &str) {
+        self.open_models();
+        self.set_models(choices, warnings);
+        if let Some(m) = &mut self.menu {
+            m.filter = filter.to_string();
+            m.selected = 0;
+        }
         self.redraw();
     }
 
