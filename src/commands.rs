@@ -18,7 +18,7 @@ use crate::workspace;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/settings", "browse and change settings"),
-    ("/statusline", "toggle status line segments: /statusline [model|provider|context|tokens|sandbox|folder|branch]"),
+    ("/statusline", "toggle status line segments: /statusline [model|session|provider|context|tokens|sandbox|folder|branch]"),
     ("/sound", "terminal bell for long turns and prompts: /sound [on|off|max]"),
     ("/notifications", "desktop notifications: /notifications [on|off|after SECONDS]"),
     ("/fast", "toggle fast mode (Codex priority processing) when the model supports it"),
