@@ -61,8 +61,16 @@ pub enum Command {
 
 /// An image waiting to be sent with the next message.
 pub struct Attachment {
+    /// The number in its `[Image #N]` token.
+    pub id: usize,
     pub label: String,
     pub image: crate::types::Image,
+}
+
+impl Attachment {
+    pub fn token(&self) -> String {
+        format!("[Image #{}]", self.id)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -283,6 +291,11 @@ pub struct Screen {
     pub attachments: Vec<Attachment>,
     /// Ctrl+V asked for a clipboard image (read by the input task).
     clipboard_request: bool,
+    /// Workspace files for the `@` picker, indexed on first use.
+    files: Option<Vec<String>>,
+    file_selected: usize,
+    /// Esc closed the `@` picker for the word being typed.
+    files_closed: bool,
     slash_selected: usize,
     /// Arrow keys moved the slash selection since the last edit.
     slash_moved: bool,
@@ -571,6 +584,9 @@ impl Screen {
             deferred: Vec::new(),
             attachments: Vec::new(),
             clipboard_request: false,
+            files: None,
+            file_selected: 0,
+            files_closed: false,
             slash_selected: 0,
             slash_moved: false,
             footer,
@@ -770,21 +786,6 @@ impl Screen {
         }
         if !rows.is_empty() {
             rows.push(String::new());
-        }
-
-        if !self.attachments.is_empty() && self.approval.is_none() {
-            let names: Vec<String> = self
-                .attachments
-                .iter()
-                .enumerate()
-                .map(|(i, a)| format!("[Image #{}] {}", i + 1, a.label))
-                .collect();
-            let text = truncate(&sanitize_text(&names.join(" · ")), w.saturating_sub(4));
-            rows.push(format!(
-                "{} {}",
-                paint(fg(GRAY), "▣"),
-                paint(fg(MID), &text)
-            ));
         }
 
         // Input, or the approval prompt in its place.
@@ -1114,7 +1115,10 @@ impl Screen {
                     .iter()
                     .map(|spec| MenuItem {
                         label: spec.label.to_string(),
-                        detail: sanitize_text(&crate::settings::value(spec.id, &s, &live)),
+                        detail: sanitize_text(&match crate::settings::source(spec.id) {
+                            Some(layer) => format!("{} · {}", crate::settings::value(spec.id, &s, &live), layer.label()),
+                            None => crate::settings::value(spec.id, &s, &live),
+                        }),
                         tag: spec.description.to_string(),
                     })
                     .collect();
@@ -1252,6 +1256,26 @@ impl Screen {
                         ("Esc", "Close"),
                     ],
                 )
+            } else if let Some(found) = self.file_matches().filter(|_| self.approval.is_none()) {
+                let header = format!(
+                    "{} {}",
+                    paint(fg(BRIGHT).bold(), "Files"),
+                    paint(fg(GRAY), &found.len().to_string())
+                );
+                let items = found
+                    .into_iter()
+                    .map(|f| MenuItem {
+                        label: sanitize_text(&f),
+                        detail: String::new(),
+                        tag: String::new(),
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    self.file_selected,
+                    vec![("↑↓", "Navigate"), ("Tab", "Insert"), ("Esc", "Close")],
+                )
             } else {
                 let s = self.editor.suggestions();
                 if s.is_empty() || self.approval.is_some() {
@@ -1262,12 +1286,13 @@ impl Screen {
                     paint(fg(BRIGHT).bold(), "Commands"),
                     paint(fg(GRAY), &s.len().to_string())
                 );
+                let tags = crate::settings::current().slash_menu_categories;
                 let items = s
                     .into_iter()
                     .map(|s| MenuItem {
                         label: s.label,
                         detail: s.detail,
-                        tag: s.tag,
+                        tag: if tags { s.tag } else { String::new() },
                     })
                     .collect();
                 (
@@ -1761,6 +1786,31 @@ impl Screen {
         let _ = self.out.flush();
     }
 
+    /// Ctrl+Z: give the terminal back to the shell and stop (job control);
+    /// on `fg`, take it again and repaint.
+    #[cfg(unix)]
+    fn suspend(&mut self) {
+        self.clear_pane();
+        let _ = self.out.flush();
+        let enhanced = KEYBOARD_ENHANCED.load(Ordering::SeqCst);
+        restore_terminal();
+        // SAFETY: raising a signal in our own process; the default action
+        // stops it until SIGCONT.
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+        let _ = terminal::enable_raw_mode();
+        let _ = execute!(self.out, crossterm::event::EnableBracketedPaste);
+        if enhanced {
+            let _ = execute!(
+                self.out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
+            KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
+        }
+        self.redraw();
+    }
+
     /// Open the model switcher; `models` arrive later via `set_models`.
     pub fn open_models(&mut self) {
         self.sessions = None;
@@ -1978,9 +2028,10 @@ impl Screen {
                 let mut next = current.clone();
                 if crate::settings::apply(id, &value, &mut next) {
                     match crate::settings::update(&self.home, |s| *s = next.clone()) {
-                        Ok(saved) => {
+                        Ok((saved, notice)) => {
                             self.footer.segments = saved.statusline;
                             crate::agent::set_auto_compact_percent(saved.auto_compact);
+                            self.hint = notice;
                         }
                         Err(e) => self.hint = Some(format!("Could not save settings: {e:#}")),
                     }
@@ -2017,14 +2068,36 @@ impl Screen {
     }
 
     /// Add an image to the next message.
+    /// The image shows as an `[Image #N]` token in the input; deleting the
+    /// token drops the image.
     pub fn attach(&mut self, image: crate::types::Image, label: &str) {
         let label = sanitize_text(label);
-        self.attachments.push(Attachment { label, image });
-        self.hint = Some(format!(
-            "Attached [Image #{}] · /images lists or removes attachments",
-            self.attachments.len()
-        ));
+        let id = self.attachments.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+        let a = Attachment { id, label, image };
+        self.editor.insert_token(&a.token());
+        self.hint = Some(format!("Attached {} · /images lists attachments", a.token()));
+        self.attachments.push(a);
         self.redraw();
+    }
+
+    /// Files matching the `@word` at the cursor while the picker is open.
+    fn file_matches(&self) -> Option<Vec<String>> {
+        let query = self.editor.at_query().filter(|_| !self.files_closed)?;
+        let found = super::files::matches(self.files.as_ref()?, &query, 50);
+        (!found.is_empty()).then_some(found)
+    }
+
+    /// Drop images whose token is no longer in `text`.
+    fn prune_attachments(&mut self, text: &str) {
+        self.attachments.retain(|a| text.contains(&a.token()));
+    }
+
+    /// Remove an attachment and its token from the input.
+    pub fn detach(&mut self, id: usize) -> Option<Attachment> {
+        let i = self.attachments.iter().position(|a| a.id == id)?;
+        let a = self.attachments.remove(i);
+        self.editor.remove_token(&a.token());
+        Some(a)
     }
 
     // ------------------------------------------------------- transcript viewer
@@ -2310,7 +2383,7 @@ impl Screen {
                 }
                 KeyCode::Enter if key.modifiers.is_empty() => {
                     let q = self.question.take().unwrap();
-                    let typed = if q.menu.is_some() { String::new() } else { self.editor.text() };
+                    let typed = if q.menu.is_some() { String::new() } else { self.editor.submitted_text() };
                     let answer = if typed.trim().is_empty() { q.options.get(q.selected).cloned() } else { Some(typed) };
                     if q.menu.is_none() {
                         self.editor.set_text("");
@@ -2342,8 +2415,38 @@ impl Screen {
             let _ = commands.send(Command::CycleEffort);
             return;
         }
+        if ctrl && key.code == KeyCode::Char('z') && !key.modifiers.contains(KeyModifiers::SHIFT) {
+            #[cfg(unix)]
+            self.suspend();
+            return;
+        }
+        // The `@` file picker takes arrows, Tab, Enter and Esc while it shows.
+        let searching = self.editor.searching();
+        if let Some(found) = self.file_matches().filter(|_| !searching) {
+            let n = found.len();
+            match key.code {
+                KeyCode::Up => {
+                    self.file_selected = self.file_selected.checked_sub(1).unwrap_or(n - 1);
+                    return self.redraw();
+                }
+                KeyCode::Down => {
+                    self.file_selected = (self.file_selected + 1) % n;
+                    return self.redraw();
+                }
+                KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
+                    self.editor.complete_at(&found[self.file_selected.min(n - 1)]);
+                    self.file_selected = 0;
+                    return self.redraw();
+                }
+                KeyCode::Esc => {
+                    self.files_closed = true;
+                    return self.redraw();
+                }
+                _ => {}
+            }
+        }
         // The slash menu takes arrows and Enter while it is showing.
-        let suggestions = self.editor.suggestions();
+        let suggestions = if searching { Vec::new() } else { self.editor.suggestions() };
         if !suggestions.is_empty() {
             let pick = &suggestions[self.slash_selected.min(suggestions.len() - 1)];
             match key.code {
@@ -2403,7 +2506,17 @@ impl Screen {
         let busy = self.is_busy();
         let was_empty = self.editor.is_empty();
         self.hint = None;
-        match self.editor.handle_key(key, busy) {
+        let action = self.editor.handle_key(key, busy);
+        // An image lives as long as its token: deleting it drops the image.
+        // Browsing history swaps the text without editing it.
+        let browsing = matches!(key.code, KeyCode::Up | KeyCode::Down)
+            || (ctrl && matches!(key.code, KeyCode::Char('p' | 'n')));
+        match &action {
+            Action::Submit(text) | Action::FollowUp(text) => self.prune_attachments(text),
+            _ if !browsing && !self.attachments.is_empty() => self.prune_attachments(&self.editor.text()),
+            _ => {}
+        }
+        match action {
             Action::None => {}
             Action::Submit(text) => {
                 self.remember(&text);
@@ -2421,6 +2534,14 @@ impl Screen {
                 if let Some(c) = &self.cancel {
                     c.cancel();
                 }
+                if !busy && !self.editor.is_empty() {
+                    self.hint = Some("Press esc again to clear the input".into());
+                }
+            }
+            Action::Copy(text) => {
+                self.copy_osc52(&text);
+                std::thread::spawn(move || copy_native(&text));
+                self.hint = Some("Copied".into());
             }
             Action::CtrlC { exit } => {
                 if busy && was_empty {
@@ -2439,7 +2560,13 @@ impl Screen {
                 }
                 let _ = commands.send(Command::Exit);
             }
-            Action::Dequeue => self.dequeue(),
+            Action::Dequeue => {
+                // The newest queued message comes back first, ahead of the draft.
+                if let Some((_, text)) = self.queue.pop() {
+                    let draft = self.editor.text();
+                    self.editor.set_text(&if draft.is_empty() { text } else { format!("{text}\n\n{draft}") });
+                }
+            }
         }
         if let Some(status) = self.editor.search_status() {
             self.hint = Some(status);
@@ -2447,6 +2574,13 @@ impl Screen {
         self.slash_selected = self
             .slash_selected
             .min(self.editor.suggestions().len().saturating_sub(1));
+        self.file_selected = 0;
+        if self.editor.at_query().is_none() {
+            self.files_closed = false;
+        } else if self.files.is_none() {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            self.files = Some(super::files::index(&cwd));
+        }
         self.redraw();
     }
 }
@@ -3831,5 +3965,54 @@ mod tests {
                 .any(|r| super::super::render::strip_ansi(r).contains("evilmodel")),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn composer_images_queue_and_file_picker() {
+        let mut s = screen();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let img = || crate::types::Image { media_type: "image/png".into(), data: String::new() };
+        // Images are tokens in the text; deleting a token drops its image.
+        s.attach(img(), "a.png");
+        s.attach(img(), "b.png");
+        assert_eq!(s.editor.text(), "[Image #1] [Image #2] ");
+        s.on_key(key(KeyCode::Backspace), &tx);
+        s.on_key(key(KeyCode::Backspace), &tx);
+        assert_eq!(s.attachments.iter().map(|a| a.id).collect::<Vec<_>>(), [1]);
+        s.attach(img(), "c.png");
+        assert_eq!(s.editor.text(), "[Image #1] [Image #2] ");
+        assert_eq!(s.detach(1).map(|a| a.label).as_deref(), Some("a.png"));
+        assert_eq!(s.editor.text(), "[Image #2]");
+        s.on_key(key(KeyCode::Enter), &tx);
+        assert_eq!(s.attachments.len(), 1, "sent with the message");
+
+        // Alt+Up takes queued messages back one at a time, newest first.
+        s.queue = vec![(Queued::Steer, "one".into()), (Queued::FollowUp, "two".into())];
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        s.on_key(alt_up, &tx);
+        assert_eq!((s.editor.text().as_str(), s.queue.len()), ("two", 1));
+        s.on_key(alt_up, &tx);
+        assert_eq!(s.editor.text(), "one\n\ntwo");
+        assert!(s.queue.is_empty());
+
+        // `@` opens the file picker; Tab inserts the pick, Esc closes it.
+        s.files = Some(vec!["README.md".into(), "src/main.rs".into()]);
+        s.editor.set_text("open @mai");
+        assert_eq!(s.file_matches(), Some(vec!["src/main.rs".to_string()]));
+        s.on_key(key(KeyCode::Tab), &tx);
+        assert_eq!(s.editor.text(), "open @src/main.rs ");
+        s.editor.set_text("@r");
+        s.on_key(key(KeyCode::Down), &tx);
+        assert_eq!(s.file_selected, 1);
+        s.on_key(key(KeyCode::Esc), &tx);
+        assert_eq!(s.file_matches(), None);
+        s.on_key(key(KeyCode::Char('e')), &tx);
+        assert_eq!(s.file_matches(), None, "stays closed for this word");
+        s.on_key(key(KeyCode::Char(' ')), &tx);
+        s.on_key(key(KeyCode::Char('@')), &tx);
+        assert!(s.file_matches().is_some());
+        s.on_key(key(KeyCode::Enter), &tx);
+        assert_eq!(s.editor.text(), "@re @README.md ");
     }
 }

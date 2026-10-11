@@ -91,8 +91,17 @@ fn learn_models_in_background(home: &Path, agent: &Agent) {
     }
 }
 
+/// Save settings, saying so when a project or workspace layer overrides the change.
+fn persist(home: &Path, f: impl FnOnce(&mut settings::Settings)) -> anyhow::Result<settings::Settings> {
+    let (saved, notice) = settings::update(home, f)?;
+    if let Some(notice) = notice {
+        ui::info(&format!("  {notice}"));
+    }
+    Ok(saved)
+}
+
 fn save(home: &Path, f: impl FnOnce(&mut settings::Settings)) {
-    if let Err(e) = settings::update(home, f) {
+    if let Err(e) = persist(home, f) {
         ui::error(&format!("could not save settings: {e:#}"));
     }
 }
@@ -262,7 +271,7 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
             for seg in &changes {
                 s.statusline.set(*seg, !s.statusline.get(*seg));
             }
-            let saved = settings::update(home, |x| x.statusline = s.statusline)?;
+            let saved = persist(home, |x| x.statusline = s.statusline)?;
             let shown: Vec<String> = changes
                 .iter()
                 .map(|seg| {
@@ -291,7 +300,7 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                 Some(l @ ("on" | "off" | "max")) => l,
                 Some(_) => anyhow::bail!("Use: /sound [on|off|max]."),
             };
-            settings::update(home, |s| s.sound = level.into())?;
+            persist(home, |s| s.sound = level.into())?;
             ui::info(&format!(
                 "  Sound {level}{}",
                 match level {
@@ -310,7 +319,7 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                 ["after", n] | [n] if n.parse::<u64>().is_ok() => (true, n.parse::<u64>()?),
                 _ => anyhow::bail!("Use: /notifications [on|off|after SECONDS]."),
             };
-            settings::update(home, |s| {
+            persist(home, |s| {
                 s.notifications = on;
                 s.notify_after_secs = after;
             })?;
@@ -364,11 +373,10 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                     let lines: Vec<String> = s
                         .attachments
                         .iter()
-                        .enumerate()
-                        .map(|(i, a)| {
+                        .map(|a| {
                             format!(
-                                "[Image #{}] {}  {} · {} KB",
-                                i + 1,
+                                "{} {}  {} · {} KB",
+                                a.token(),
                                 a.label,
                                 a.image.media_type,
                                 a.image.data.len() * 3 / 4 / 1024
@@ -380,21 +388,19 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                     ui::info("  They go with your next message. /images remove N or /images clear drops them.");
                 }
                 ["clear"] => {
-                    s.attachments.clear();
+                    let ids: Vec<usize> = s.attachments.iter().map(|a| a.id).collect();
+                    for id in ids {
+                        s.detach(id);
+                    }
                     s.redraw();
                     drop(s);
                     ui::info("  cleared pending images");
                 }
                 ["remove" | "rm", n] => {
-                    let i = n
-                        .trim_start_matches('#')
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|i| (1..=s.attachments.len()).contains(i));
-                    let Some(i) = i else {
+                    let a = n.trim_start_matches('#').parse::<usize>().ok().and_then(|id| s.detach(id));
+                    let Some(a) = a else {
                         anyhow::bail!("no pending image #{n}")
                     };
-                    let a = s.attachments.remove(i - 1);
                     s.redraw();
                     drop(s);
                     ui::info(&format!("  removed image: {}", a.label));

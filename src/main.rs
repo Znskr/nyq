@@ -486,9 +486,9 @@ async fn run() -> Result<()> {
     let home = config::home();
     let sessions_dir = home.join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
-    let (user_settings, settings_warning) = settings::load(&home);
+    let (user_settings, settings_warnings) = settings::load_layered(&home, &cwd);
     settings::install(user_settings);
-    if let Some(w) = settings_warning {
+    for w in settings_warnings {
         ui::error(&w);
     }
     limits::configure(&settings::current(), &cli.context_limit)?;
