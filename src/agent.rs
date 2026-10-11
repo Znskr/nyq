@@ -80,6 +80,11 @@ pub trait Ui: Send {
     fn tool_start(&mut self, tool: &str, summary: &str);
     fn tool_end(&mut self, tool: &str, output: &ToolOutput);
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval;
+    /// A note the user attached to their last approval answer, passed to the
+    /// model with the call's result (or its denial).
+    fn approval_note(&mut self) -> Option<String> {
+        None
+    }
     fn usage(&mut self, _usage: &Usage) {}
     /// A short status message from the loop (e.g. "Compacting…").
     fn notice(&mut self, _msg: &str) {}
@@ -109,6 +114,10 @@ pub trait Ui: Send {
 pub trait Approver: Send + Sync {
     /// `origin` names who is asking, e.g. "subagent: Count Rust files".
     async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval;
+    /// Like `approve`, with the note the user attached to the answer.
+    async fn approve_noted(&self, origin: &str, req: &ApprovalRequest<'_>) -> (Approval, Option<String>) {
+        (self.approve(origin, req).await, None)
+    }
 }
 
 /// `ask_user_question`: the loop answers it through `Ui::ask` instead of
@@ -240,6 +249,16 @@ impl Agent {
         self.items.push(item);
     }
 
+    /// Run AttentionRequired hooks (in the background): nyq waits for the user.
+    fn attention(&self, kind: &str, message: &str) {
+        let session = self
+            .session
+            .as_ref()
+            .map(|s| s.id.as_str())
+            .or(self.usage_session_id.as_deref());
+        self.hooks.attention(kind, message, &self.cwd, session);
+    }
+
     fn bind_conversation(&mut self) {
         if let Some(s) = &self.session {
             self.provider.set_conversation(&s.id);
@@ -275,6 +294,8 @@ impl Agent {
         cancel: CancellationToken,
         continue_note: bool,
     ) -> Result<TurnEnd> {
+        // A Stop hook may keep the turn going once.
+        let mut stop_continued = false;
         for _ in 0..MAX_STEPS {
             self.sync_estimate();
             if !self.auto_compact(ui, &cancel).await? {
@@ -339,8 +360,17 @@ impl Agent {
                 }
                 if queued.is_empty() {
                     self.sync_estimate();
-                    crate::hooks::stop(self, &cancel).await;
-                    return Ok(TurnEnd::Done);
+                    let reason = crate::hooks::stop(self, &cancel).await;
+                    match reason.filter(|_| !stop_continued) {
+                        Some(reason) => {
+                            stop_continued = true;
+                            ui.notice(&format!("A Stop hook continues the turn: {reason}"));
+                            queued.push(Item::user(format!(
+                                "[A Stop hook asked you to keep going before finishing]\n{reason}"
+                            )));
+                        }
+                        None => return Ok(TurnEnd::Done),
+                    }
                 }
                 for item in queued {
                     self.push_counted(item);
@@ -405,15 +435,28 @@ impl Agent {
         anyhow::bail!("stopped after {MAX_STEPS} steps without a final answer")
     }
 
-    /// Ask the session provider whether one risky call may run.
+    /// Ask the session provider whether one risky call may run. `ctx` lets
+    /// a file change be summarized from the tool's preview.
     async fn auto_review(
         &mut self,
         id: &str,
         name: &str,
         arguments: &str,
         args: &Value,
+        ctx: &ToolCtx,
         cancel: &CancellationToken,
     ) -> crate::classifier::ReviewResult {
+        let tool = self.tools.get(name);
+        let file_change = is_file_tool(name).then(|| {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            let existed = !path.is_empty() && self.cwd.join(path).exists();
+            let preview = tool.and_then(|t| t.preview(args, ctx)).unwrap_or_default();
+            let content = args.get("content").and_then(Value::as_str);
+            crate::classifier::file_change(path, existed, &preview, content)
+        });
+        let input_schema = tool
+            .filter(|_| crate::tools::mcp_search::is_mcp(name))
+            .map(|t| t.spec().parameters.to_string());
         let mut provider = self.provider.fork();
         if let Some(model) = crate::settings::classifier_model() {
             provider.set_model(model);
@@ -437,6 +480,8 @@ impl Agent {
         .to_string();
         action.branch = crate::ui::statusline::git_branch(&self.cwd);
         action.older_omitted = older_omitted;
+        action.file_change = file_change;
+        action.input_schema = input_schema;
         let prepared = crate::classifier::prepare(&action);
         if prepared.skip.is_none() {
             let hit = self
@@ -497,6 +542,7 @@ impl Agent {
                         .collect()
                 })
                 .unwrap_or_default();
+            self.attention("question", &question);
             let answer = tokio::select! {
                 a = ui.ask(&question, &options) => a,
                 _ = cancel.cancelled() => None,
@@ -508,7 +554,7 @@ impl Agent {
                 ),
             };
         }
-        let args: Value = match serde_json::from_str(if arguments.trim().is_empty() {
+        let mut args: Value = match serde_json::from_str(if arguments.trim().is_empty() {
             "{}"
         } else {
             arguments
@@ -536,30 +582,44 @@ impl Agent {
             hooks: self.hooks.clone(),
             subagent_dir: self.session.as_ref().map(|s| crate::subagents::store_dir(&s.path)),
         };
-        let summary = if meta {
-            args.get("query")
-                .and_then(Value::as_str)
-                .or_else(|| args.get("name").and_then(Value::as_str))
-                .unwrap_or("")
-                .to_string()
-        } else {
-            self.tools
-                .get(name)
-                .map(|tool| tool.summary(&args))
-                .unwrap_or_default()
+        let summary_of = |args: &Value| {
+            if meta {
+                args.get("query")
+                    .and_then(Value::as_str)
+                    .or_else(|| args.get("name").and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                self.tools
+                    .get(name)
+                    .map(|tool| tool.summary(args))
+                    .unwrap_or_default()
+            }
         };
+        let mut summary = summary_of(&args);
 
         let session_id = ctx.session_id.clone();
-        if let Some(msg) = self
+        let mut arguments = std::borrow::Cow::Borrowed(arguments);
+        match self
             .hooks
             .pre_tool_use(name, &args, &self.cwd, session_id.as_deref(), cancel)
             .await
         {
-            ui.tool_start(name, &summary);
-            let out = ToolOutput::err(msg);
-            ui.tool_end(name, &out);
-            return out;
+            Err(msg) => {
+                ui.tool_start(name, &summary);
+                let out = ToolOutput::err(msg);
+                ui.tool_end(name, &out);
+                return out;
+            }
+            Ok(Some(updated)) => {
+                // A hook rewrote the call: everything below sees the new input.
+                arguments = std::borrow::Cow::Owned(updated.to_string());
+                args = updated;
+                summary = summary_of(&args);
+            }
+            Ok(None) => {}
         }
+        let arguments = arguments.as_ref();
 
         let mut needs_approval = self
             .tools
@@ -570,6 +630,19 @@ impl Agent {
             if inside_any(&self.cwd, &self.sandbox.writable, path) {
                 needs_approval = false;
             }
+        }
+        // Shell commands: read-only pipelines run without asking (and run as
+        // the rebuilt, hardened command); auto mode skips the classifier for
+        // known reversible dev commands.
+        let command = (name == "bash"
+            && args.get("run_in_background").and_then(Value::as_bool) != Some(true))
+        .then(|| args.get("command").and_then(Value::as_str).map(str::to_string))
+        .flatten();
+        let read_only = command.as_deref().and_then(|c| {
+            crate::command_effect::read_only(c, &self.cwd, &self.sandbox.writable)
+        });
+        if read_only.is_some() {
+            needs_approval = false;
         }
         let forced = match self.permissions.decide_in(
             &self.allowed,
@@ -591,8 +664,17 @@ impl Agent {
                 return out;
             }
             Decision::Ask { forced } => Some(forced),
+            Decision::Classify
+                if command.as_deref().is_some_and(|c| {
+                    crate::command_effect::known_reversible(c, &self.cwd, &self.sandbox.writable)
+                }) =>
+            {
+                None
+            }
             Decision::Classify => {
-                let review = self.auto_review(id, name, arguments, &args, cancel).await;
+                let review = self
+                    .auto_review(id, name, arguments, &args, &ctx, cancel)
+                    .await;
                 if let Some(usage) = review.usage {
                     self.account_usage(Some(usage), ui);
                 }
@@ -635,6 +717,7 @@ impl Agent {
             return out;
         }
         let preview = self.tools.get(name).and_then(|tool| tool.preview(&args, &ctx));
+        let mut note = None;
         if let Some(forced) = forced {
             // A call that an `ask` rule forces can't be covered by a grant.
             let rule = if forced.is_some() {
@@ -652,6 +735,7 @@ impl Agent {
                 rule: rule.as_deref().map(rule_label),
                 save_rule: save_rule.clone(),
             };
+            self.attention("approval", &format!("Approve {name}: {summary}"));
             let decision = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => None,
@@ -663,6 +747,7 @@ impl Agent {
                 ui.tool_end(name, &out);
                 return out;
             };
+            note = ui.approval_note();
             match answer {
                 Approval::Yes => {}
                 Approval::Always => {
@@ -682,13 +767,20 @@ impl Agent {
                     }
                 }
                 Approval::No => {
-                    let out = ToolOutput::err(
-                        "The user denied this tool call. Ask what they want instead.",
-                    );
+                    let out = ToolOutput::err(match &note {
+                        Some(note) => format!(
+                            "The user denied this tool call and said: {note}"
+                        ),
+                        None => "The user denied this tool call. Ask what they want instead."
+                            .into(),
+                    });
                     ui.tool_end(name, &out);
                     return out;
                 }
             }
+        }
+        if let Some(cmd) = read_only {
+            args["command"] = Value::String(cmd);
         }
 
         if meta {
@@ -740,6 +832,10 @@ impl Agent {
                 .drain(..),
         );
         ui.tool_end(name, &out);
+        if let Some(note) = note {
+            out.content
+                .push_str(&format!("\n\n[The user approved this call with a note: {note}]"));
+        }
         if let Some(args) = hook_args {
             self.hooks
                 .post_tool_use(name, &args, &out, &self.cwd, session_id.as_deref(), cancel)
@@ -3305,5 +3401,211 @@ mod tests {
             .unwrap();
         assert!(msg.contains("no"), "{msg}");
         assert_eq!(agent.items.len(), n);
+    }
+
+    /// A `bash` stand-in that asks by default and records what it ran.
+    struct BashStub(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for BashStub {
+        fn spec(&self) -> crate::types::ToolSpec {
+            crate::types::ToolSpec {
+                name: "bash".into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            }
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            true
+        }
+        fn summary(&self, args: &Value) -> String {
+            args["command"].as_str().unwrap_or("").into()
+        }
+        async fn run(&self, args: Value, _: &ToolCtx) -> ToolOutput {
+            let cmd = args["command"].as_str().unwrap_or("").to_string();
+            self.0.lock().unwrap().push(cmd);
+            ToolOutput::ok("ran")
+        }
+    }
+
+    /// An agent whose model runs these shell commands, then answers.
+    fn shell_agent(
+        commands: &[&str],
+        mode: crate::permissions::Mode,
+    ) -> (Agent, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tempfile::TempDir) {
+        let ran = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut script: Vec<Response> = commands
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Response {
+                truncated: false,
+                items: vec![Item::ToolCall {
+                    id: i.to_string(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({ "command": c }).to_string(),
+                }],
+                usage: None,
+            })
+            .collect();
+        script.push(Response {
+            truncated: false,
+            items: vec![Item::Assistant {
+                text: "done".into(),
+            }],
+            usage: None,
+        });
+        let mut agent = agent(Response::default(), None);
+        agent.cwd = dir.path().to_path_buf();
+        agent.permission_mode = mode;
+        agent.context_window = 0;
+        agent.tools.add(Box::new(BashStub(ran.clone())));
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(script)),
+        });
+        (agent, ran, dir)
+    }
+
+    #[tokio::test]
+    async fn read_only_shell_commands_run_without_asking() {
+        use crate::permissions::Mode;
+        let (mut agent, ran, _dir) = shell_agent(&["git status --short", "rm -rf x"], Mode::Ask);
+        let mut ui = ScriptUi {
+            answer: Approval::Yes,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(ui.asked.len(), 1, "only rm asks");
+        let ran = ran.lock().unwrap().clone();
+        assert!(
+            ran[0].starts_with("git --no-pager -c core.fsmonitor=false") && ran[0].ends_with("status --short"),
+            "{ran:?}"
+        );
+        assert_eq!(ran[1], "rm -rf x");
+
+        // Deny and ask rules still win over a read-only command.
+        let (mut agent, ran, _dir) = shell_agent(&["git status", "cat a.txt"], Mode::Yolo);
+        agent.permissions = std::sync::Arc::new(crate::permissions::Permissions {
+            deny: vec!["bash:git".into()],
+            ask: vec!["bash:cat".into()],
+            ..Default::default()
+        });
+        let mut ui = ScriptUi {
+            answer: Approval::No,
+            asked: Vec::new(),
+        };
+        agent.permission_mode = Mode::Ask;
+        agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(ran.lock().unwrap().is_empty());
+        assert_eq!(ui.asked.len(), 1);
+        assert!(results(&agent)[0].contains("blocked by permissions.json"));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_runs_known_dev_commands_without_the_classifier() {
+        // The script has no classifier answer: consulting it would fall back
+        // to asking.
+        let (mut agent, ran, _dir) = shell_agent(
+            &["cargo build && cargo test -p nyq 2>&1", "git fetch origin && npm ci"],
+            crate::permissions::Mode::Auto,
+        );
+        let mut ui = ScriptUi {
+            answer: Approval::No,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(Item::user("Run the tests."), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(ui.asked.is_empty());
+        assert_eq!(
+            *ran.lock().unwrap(),
+            ["cargo build && cargo test -p nyq 2>&1", "git fetch origin && npm ci"]
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_notes_reach_the_model() {
+        struct NoteUi(Approval);
+        #[async_trait::async_trait]
+        impl Ui for NoteUi {
+            fn stream(&mut self, _: &StreamEvent) {}
+            fn end_message(&mut self) {}
+            fn tool_start(&mut self, _: &str, _: &str) {}
+            fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
+            async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval {
+                self.0
+            }
+            fn approval_note(&mut self) -> Option<String> {
+                Some("use the staging wiki".into())
+            }
+        }
+        for (answer, ran, expect) in [
+            (Approval::No, 0, "The user denied this tool call and said: use the staging wiki"),
+            (Approval::Yes, 1, "answer\n\n[The user approved this call with a note: use the staging wiki]"),
+        ] {
+            let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut agent = calling_agent(&runs, 1);
+            agent
+                .turn(Item::user("go"), &mut NoteUi(answer), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), ran);
+            assert_eq!(results(&agent)[0], expect);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stop_hook_can_continue_the_turn_once() {
+        let done = |text: &str| Response {
+            truncated: false,
+            items: vec![Item::Assistant { text: text.into() }],
+            usage: None,
+        };
+        let mut agent = agent(Response::default(), None);
+        agent.context_window = 0;
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(vec![done("first"), done("second")])),
+        });
+        agent.hooks = hooks_with(
+            crate::hooks::Event::Stop,
+            r#"echo '{"decision":"block","reason":"run the tests first"}'"#,
+        );
+        // A third request would exhaust the script and fail the turn.
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(agent.items.iter().any(
+            |i| matches!(i, Item::User { text, .. } if text.contains("run the tests first"))
+        ));
+        assert!(matches!(agent.items.last(), Some(Item::Assistant { text }) if text == "second"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pre_tool_use_hook_can_rewrite_the_input() {
+        let (mut agent, ran, _dir) = shell_agent(&["rm -rf /"], crate::permissions::Mode::Ask);
+        agent.hooks = hooks_with(
+            crate::hooks::Event::PreToolUse,
+            r#"echo '{"updatedInput":{"command":"echo safe"}}'"#,
+        );
+        let mut ui = ScriptUi {
+            answer: Approval::No,
+            asked: Vec::new(),
+        };
+        agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
+        // The rewritten command is read-only, so it runs without asking.
+        assert!(ui.asked.is_empty());
+        assert_eq!(*ran.lock().unwrap(), ["echo safe"]);
     }
 }

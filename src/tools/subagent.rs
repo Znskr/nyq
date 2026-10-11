@@ -255,7 +255,7 @@ async fn drive_child(
     live: LiveGuard,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Outcome {
-    let mut ui = Collector { calls: Vec::new(), approver: ctx.approver.clone(), origin, live };
+    let mut ui = Collector { calls: Vec::new(), approver: ctx.approver.clone(), origin, live, note: None };
     let result = match input {
         Some(item) => drive_turn(agent.turn(item, &mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await,
         None => drive_turn(agent.continue_turn(&mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await,
@@ -471,6 +471,8 @@ struct Collector {
     /// Who is asking, e.g. "subagent: Count files".
     origin: String,
     live: LiveGuard,
+    /// The note the user attached to the last approval.
+    note: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -483,10 +485,15 @@ impl Ui for Collector {
     }
     fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
-        match &self.approver {
-            Some(approver) => approver.approve(&self.origin, req).await,
-            None => Approval::No,
-        }
+        let (answer, note) = match &self.approver {
+            Some(approver) => approver.approve_noted(&self.origin, req).await,
+            None => (Approval::No, None),
+        };
+        self.note = note;
+        answer
+    }
+    fn approval_note(&mut self) -> Option<String> {
+        self.note.take()
     }
 }
 
