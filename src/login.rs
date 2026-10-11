@@ -292,10 +292,10 @@ fn open_browser_windows(url: &str) {
 
 /// `nyq login <service>`: read an API key from the terminal (hidden) or
 /// stdin and store it in `<home>/auth.json`.
-pub fn login_key(home: &Path, service: Service) -> Result<String> {
+pub async fn login_key(home: &Path, service: Service) -> Result<String> {
     eprintln!("Paste your {} API key from {} and press Enter:", service.title(), key_site(service));
     let key = read_secret()?;
-    store_key(home, service, &key)
+    store_key(home, service, &key).await
 }
 
 /// Where to get an API key for `service`.
@@ -307,10 +307,23 @@ pub fn key_site(service: Service) -> &'static str {
     }
 }
 
-/// Save `key` for `service`, noting when an environment key takes precedence.
-pub fn store_key(home: &Path, service: Service, key: &str) -> Result<String> {
+/// Check `key` with `service` and save it, noting when an environment key
+/// takes precedence. A rejected key is not saved; one that could not be
+/// checked is saved with a warning.
+pub async fn store_key(home: &Path, service: Service, key: &str) -> Result<String> {
+    store_key_at(home, service, key, &service.base_url()).await
+}
+
+async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) -> Result<String> {
+    anyhow::ensure!(!key.trim().is_empty(), "the API key is empty");
+    let warning = match hosted::check_key(service, base_url, key).await {
+        hosted::KeyCheck::Accepted => None,
+        hosted::KeyCheck::Refused(e) => anyhow::bail!("{} rejected this API key, so it was not saved: {e}", service.title()),
+        hosted::KeyCheck::Unknown(e) => Some(format!("\nWarning: could not check the key with {} ({e}); saved it anyway.", service.title())),
+    };
     hosted::save_key(home, service, key)?;
     let mut msg = format!("Saved your {} key in {}.", service.title(), home.join("auth.json").display());
+    msg.extend(warning);
     if hosted::api_key(home, service).as_deref() != Some(key.trim()) {
         let other = if service.key_env() == "OPENCODE_API_KEY" { "OPENCODE_API_KEY or the OpenCode CLI's login" } else { service.key_env() };
         msg.push_str(&format!("\nNote: {other} is set and takes precedence."));
@@ -425,6 +438,42 @@ mod tests {
         assert!(callback("/auth/callback?code=c", "s").is_err());
         assert!(callback("/auth/callback?code=c&state=s&state=s", "s").is_err());
         assert_eq!(callback("/favicon.ico", "s").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn keys_are_checked_before_saving() {
+        use crate::provider::sse::tests::server;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let stored = || hosted::read_own(home).unwrap().get("xai").map(|v| v["key"].clone());
+        let (url, mut requests, task) = server(vec![
+            (401, r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key"}}"#.into()),
+            (200, r#"{"data":[]}"#.into()),
+            (402, r#"{"error":{"code":"credit_card_required","message":"Buy credits"}}"#.into()),
+            (403, r#"{"error":{"code":"credit_card_required","message":"Buy credits"}}"#.into()),
+        ])
+        .await;
+        let err = store_key_at(home, Service::Xai, "bad", &url).await.unwrap_err().to_string();
+        assert!(err.contains("rejected") && err.contains("HTTP 401 · invalid_api_key: Incorrect API key"), "{err}");
+        assert_eq!(stored(), None);
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("get /models ") && request.contains("authorization: bearer bad"), "{request}");
+        let msg = store_key_at(home, Service::Xai, " good ", &url).await.unwrap();
+        assert!(msg.starts_with("Saved your xAI key") && !msg.contains("Warning"), "{msg}");
+        assert_eq!(stored(), Some(json!("good")));
+        // The gateway is checked through the credit balance; no credits is still a valid key.
+        let msg = store_key_at(home, Service::Vercel, "gw", &url).await.unwrap();
+        assert!(msg.contains("Warning: could not check the key") && msg.contains("HTTP 402"), "{msg}");
+        let msg = store_key_at(home, Service::Vercel, "gw", &url).await.unwrap();
+        assert!(msg.starts_with("Saved") && !msg.contains("Warning"), "{msg}");
+        requests.recv().await.unwrap();
+        assert!(requests.recv().await.unwrap().starts_with("GET /credits "));
+        task.await.unwrap();
+        // Unreachable: saved with a warning.
+        let msg = store_key_at(home, Service::Xai, "offline", "http://127.0.0.1:1").await.unwrap();
+        assert!(msg.contains("Warning"), "{msg}");
+        assert_eq!(stored(), Some(json!("offline")));
+        assert!(store_key_at(home, Service::Xai, " ", &url).await.is_err());
     }
 
     #[test]

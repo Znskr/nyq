@@ -149,7 +149,7 @@ pub fn key_source(home: &Path, service: Service) -> Option<String> {
     read_key(&own_auth(home), service.id()).map(|_| "stored by nyq".into())
 }
 
-fn read_own(home: &Path) -> Result<serde_json::Map<String, Value>> {
+pub(crate) fn read_own(home: &Path) -> Result<serde_json::Map<String, Value>> {
     match std::fs::read(own_auth(home)) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("parsing auth.json"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
@@ -164,6 +164,42 @@ pub fn save_key(home: &Path, service: Service, key: &str) -> Result<()> {
     let mut all = read_own(home)?;
     all.insert(service.id().into(), json!({"type":"api","key":key}));
     crate::config::write_private(&own_auth(home), &serde_json::to_vec_pretty(&all)?)
+}
+
+/// What `service` said about an API key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyCheck {
+    Accepted,
+    /// HTTP 401/403: the key is wrong (the formatted error).
+    Refused(String),
+    /// The check could not be made (network trouble, an unexpected status).
+    Unknown(String),
+}
+
+/// Probe `base_url` with `key`: the models list, or for the AI Gateway (whose
+/// model list is public) the credit balance.
+pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck {
+    let path = if service == Service::Vercel { "credits" } else { "models" };
+    let request = reqwest::Client::new()
+        .get(format!("{}/{path}", base_url.trim_end_matches('/')))
+        .bearer_auth(key.trim())
+        .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10));
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return KeyCheck::Unknown(format!("{e}")),
+    };
+    let status = response.status();
+    if status.is_success() {
+        return KeyCheck::Accepted;
+    }
+    let message = super::sse::http_error(status, &response.text().await.unwrap_or_default());
+    match status.as_u16() {
+        // A valid AI Gateway key without credits gets a 403 from the balance.
+        403 if service == Service::Vercel && message.contains("credit") => KeyCheck::Accepted,
+        401 | 403 => KeyCheck::Refused(message),
+        _ => KeyCheck::Unknown(message),
+    }
 }
 
 /// Remove nyq's stored key for `service`; false if there was none.
