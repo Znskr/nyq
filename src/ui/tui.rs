@@ -22,7 +22,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::editor::{Action, Editor};
 use super::render::{
-    diff, escape_len, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells,
+    escape_len, is_table_sep, numbered_diff, looks_like_diff, one_line, sanitize_text, table, table_cells,
     truncate, visible_width, wrap_row, file_url, link, Fence, Markdown, RULE,
 };
 use super::statusline::{tilde, tokens};
@@ -35,6 +35,8 @@ use crate::types::{Item, StreamEvent, Usage};
 
 const MAX_PREVIEW: usize = 14;
 const MENU_ROWS: usize = 8;
+/// Diff rows shown under an edit before the rest is folded.
+const INLINE_DIFF_ROWS: usize = 12;
 /// Rows kept for repainting after a resize.
 const RECENT_ROWS: usize = 1000;
 
@@ -115,6 +117,8 @@ struct ToolRow {
     note: String,
     detail: Vec<String>,
     status: Status,
+    /// The change an edit or write made (a unified diff), shown inline.
+    diff: Option<String>,
 }
 
 struct PendingApproval {
@@ -130,7 +134,25 @@ struct PendingApproval {
     save_rule: Option<String>,
     /// Who asks when it isn't the main agent, e.g. "subagent · Count files".
     origin: Option<String>,
+    /// The highlighted choice (arrows move it, Enter picks it).
+    selected: usize,
+    /// The whole preview for the full-screen review, when it doesn't fit.
+    review: Option<String>,
     reply: oneshot::Sender<Approval>,
+}
+
+/// The approval choices: key, answer and label.
+fn approval_choices(a: &PendingApproval) -> Vec<(char, Approval, String)> {
+    let always = match &a.rule {
+        Some(r) => format!("Always allow {r}"),
+        None => "Always: can't be scoped to a rule here, approves once".into(),
+    };
+    let mut choices = vec![('y', Approval::Yes, "Yes, once".to_string()), ('a', Approval::Always, always)];
+    if let Some(r) = &a.save_rule {
+        choices.push(('s', Approval::AlwaysSave, format!("Always, and save `{r}` to permissions.json")));
+    }
+    choices.push(('n', Approval::No, "No, tell nyq what to do instead".into()));
+    choices
 }
 
 struct PendingQuestion {
@@ -260,6 +282,8 @@ pub struct Screen {
     /// Everything shown so far, for the transcript viewer.
     pub log: super::transcript::Log,
     viewer: Option<super::transcript::Viewer>,
+    /// What the viewer shows instead of the log: an approval's full preview.
+    review: Option<super::transcript::Log>,
     /// Scrollback rows held while the viewer covers the screen.
     deferred: Vec<String>,
     /// Images for the next message.
@@ -544,6 +568,7 @@ impl Screen {
             modes: None,
             log: Default::default(),
             viewer: None,
+            review: None,
             deferred: Vec::new(),
             attachments: Vec::new(),
             clipboard_request: false,
@@ -617,6 +642,16 @@ impl Screen {
                     paint(style, &truncate(d, w.saturating_sub(4)))
                 ));
             }
+            if let Some(d) = &t.diff {
+                let bar = paint(fg(FAINT), bar);
+                let mut shown = numbered_diff(d, true, w, &bar);
+                if shown.len() > INLINE_DIFF_ROWS {
+                    let more = shown.len() - INLINE_DIFF_ROWS;
+                    shown.truncate(INLINE_DIFF_ROWS);
+                    shown.push(format!("{bar}{}", paint(fg(FAINT), &format!("… {more} more lines (ctrl+o to view)"))));
+                }
+                rows.extend(shown);
+            }
         };
         if n == 1 {
             let t = &self.tools[0];
@@ -655,6 +690,9 @@ impl Screen {
             paint(fg(BRIGHT), "●"),
             paint(fg(GRAY), &format!("{n} tool calls · {}", parts.join(" · ")))
         ));
+        if !live && crate::settings::current().collapse_tool_calls {
+            return;
+        }
         for (i, t) in self.tools.iter().enumerate() {
             let last = i + 1 == n;
             rows.push(row_text(
@@ -794,30 +832,25 @@ impl Screen {
             if !a.lines.is_empty() {
                 rows.push(String::new());
             }
-            let always = match &a.rule {
-                Some(r) => format!("Always allow {r}"),
-                None => "Always: can't be scoped to a rule here, approves once".into(),
-            };
-            let save = a
-                .save_rule
-                .as_ref()
-                .map(|r| format!("Always, and save `{r}` to permissions.json"));
-            let mut choices = vec![("y", "Yes, once"), ("a", always.as_str())];
-            choices.extend(save.as_deref().map(|t| ("s", t)));
-            choices.push(("n", "No, tell nyq what to do instead"));
-            for (key, text) in choices {
+            for (i, (key, _, text)) in approval_choices(a).iter().enumerate() {
+                let sel = i == a.selected;
+                let label = truncate(&format!("{}. {text}", i + 1), w.saturating_sub(6));
                 rows.push(format!(
-                    "{}  {}",
-                    paint(fg(BRIGHT), key),
-                    paint(fg(MID), &truncate(text, w.saturating_sub(3)))
+                    "{}{}  {}",
+                    if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() },
+                    paint(fg(if sel { BRIGHT } else { GRAY }), &key.to_string()),
+                    if sel { paint(fg(BRIGHT).bold(), &label) } else { paint(fg(MID), &label) }
                 ));
             }
             rows.push(rule(w));
-            let mut keys = vec![("y", "Once"), ("a", "Always")];
-            if save.is_some() {
-                keys.push(("s", "Save"));
+            let mut keys = vec![("↑↓", "Select"), ("Enter", "Confirm")];
+            if scroll > 0 || more > 0 {
+                keys.push(("PgUp/PgDn", "Scroll"));
             }
-            keys.extend([("n", "Deny"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]);
+            if a.review.is_some() {
+                keys.push(("v", "Review"));
+            }
+            keys.push(("Esc", "Interrupt"));
             rows.push(hints(&keys));
         } else if let Some(sec) = &self.secret {
             for l in wrap(&sanitize_text(&sec.prompt), w.saturating_sub(2).max(1)) {
@@ -1587,6 +1620,7 @@ impl Screen {
             note: String::new(),
             detail: Vec::new(),
             status: Status::Running,
+            diff: None,
         });
         self.set_label(&format!("Running {}", tool.replace('_', " ")));
         self.redraw();
@@ -1610,6 +1644,9 @@ impl Screen {
         };
         if let Some(d) = output.display.as_deref().filter(|d| looks_like_diff(d)) {
             t.note = diff_stat(d);
+            if !output.is_error && matches!(t.tool.as_str(), "edit_file" | "write_file") {
+                t.diff = Some(sanitize_text(d));
+            }
         }
         let lines: Vec<&str> = output
             .content
@@ -1921,15 +1958,30 @@ impl Screen {
         // Mouse reporting only while the viewer is open, for the wheel.
         let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide, crossterm::event::EnableMouseCapture);
         self.viewer = Some(super::transcript::Viewer::new(
-            &self.log,
+            self.review.as_ref().unwrap_or(&self.log),
             self.width,
             self.height,
         ));
         self.draw_viewer(true);
     }
 
+    /// Show a long approval preview full screen, from its top.
+    fn open_review(&mut self, title: &str, text: &str) {
+        let mut log = super::transcript::Log::default();
+        let (verb, target) = title.split_once(' ').unwrap_or((title, ""));
+        log.tool_start(verb, target);
+        log.tool_end(text, Some(text), false);
+        self.review = Some(log);
+        self.open_transcript();
+        if let Some(v) = &mut self.viewer {
+            v.top = 0;
+        }
+        self.draw_viewer(true);
+    }
+
     /// Leave the viewer and restore the inline UI with anything printed meanwhile.
     pub fn close_transcript(&mut self) {
+        self.review = None;
         if self.viewer.take().is_none() {
             return;
         }
@@ -1950,7 +2002,8 @@ impl Screen {
 
     fn draw_viewer(&mut self, force: bool) {
         let Some(v) = &mut self.viewer else { return };
-        if !v.refresh(&self.log, self.width, self.height) && !force {
+        let log = self.review.as_ref().unwrap_or(&self.log);
+        if !v.refresh(log, self.width, self.height) && !force {
             return;
         }
         let frame = v.frame();
@@ -2066,6 +2119,10 @@ impl Screen {
         {
             return self.request_upgrade(commands);
         }
+        if self.approval.is_some() && self.viewer.is_some() {
+            // The full-screen review (or transcript) is over the prompt.
+            return self.on_viewer_key(key);
+        }
         if let Some(mut a) = self.approval.take() {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT);
@@ -2082,17 +2139,29 @@ impl Screen {
                 self.redraw();
                 return;
             }
-            if matches!(key.code, KeyCode::Up | KeyCode::Down) {
-                if key.code == KeyCode::Up {
-                    a.scroll = a.scroll.saturating_sub(1);
-                } else {
-                    a.scroll = a.scroll.saturating_add(1);
-                }
+            let choices = approval_choices(&a);
+            let n = choices.len();
+            let page = MAX_PREVIEW - 1;
+            let mut moved = true;
+            match key.code {
+                KeyCode::Up => a.selected = (a.selected + n - 1) % n,
+                KeyCode::Down => a.selected = (a.selected + 1) % n,
+                KeyCode::PageUp => a.scroll = a.scroll.saturating_sub(page),
+                KeyCode::PageDown => a.scroll = a.scroll.saturating_add(page),
+                _ => moved = false,
+            }
+            if moved {
                 self.approval = Some(a);
-                self.redraw();
-                return;
+                return self.redraw();
+            }
+            if a.review.is_some() && (key.code == KeyCode::Char('v') || (ctrl && key.code == KeyCode::Char('o'))) {
+                let (title, text) = (super::render::strip_ansi(&a.title), a.review.clone().unwrap_or_default());
+                self.approval = Some(a);
+                return self.open_review(&title, &text);
             }
             let answer = match key.code {
+                KeyCode::Enter => choices.get(a.selected).map(|c| c.1),
+                KeyCode::Char(d @ '1'..='9') => choices.get(d as usize - '1' as usize).map(|c| c.1),
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Approval::Yes),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(Approval::Always),
                 KeyCode::Char('s') | KeyCode::Char('S') if a.save_rule.is_some() => {
@@ -2729,6 +2798,7 @@ async fn approve_on(
         );
         let mut lines = Vec::new();
         let mut prewrapped = false;
+        let mut review = None;
         if let Some(p) = preview {
             let mut p = sanitize_text(p);
             const MAX_PREVIEW_CHARS: usize = 200_000;
@@ -2741,11 +2811,9 @@ async fn approve_on(
                 p.truncate(cut);
                 p.push_str("\n… [preview truncated; the rest is omitted from the display]");
             }
+            review = Some(p.clone());
             if looks_like_diff(&p) {
-                lines = diff(&p, true, usize::MAX, w, "  ")
-                    .lines()
-                    .map(str::to_string)
-                    .collect();
+                lines = numbered_diff(&p, true, w, "  ");
                 prewrapped = true;
             } else {
                 lines = p.lines().map(str::to_string).collect();
@@ -2768,6 +2836,7 @@ async fn approve_on(
             "Approve: {verb} {}",
             one_line(&target, 80)
         )));
+        let review = review.filter(|_| lines.len() > MAX_PREVIEW);
         s.approval = Some(PendingApproval {
             title,
             lines,
@@ -2776,6 +2845,8 @@ async fn approve_on(
             rule: req.rule.as_deref().map(|r| one_line(r, 300)),
             save_rule: req.save_rule.as_deref().map(|r| one_line(r, 300)),
             origin,
+            selected: 0,
+            review,
             reply: tx,
         });
         s.redraw();
@@ -3271,6 +3342,8 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
+            selected: 0,
+            review: None,
             reply: tx,
         });
         let (rows, _, _) = s.pane();
@@ -3301,6 +3374,7 @@ mod tests {
             note: note.into(),
             detail: Vec::new(),
             status: Status::Ok,
+            diff: None,
         };
         s.tools = vec![row("a.rs", ""), row("src/lib.rs", "+1")];
         let (rows, _, _) = s.pane();
@@ -3326,6 +3400,8 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
+            selected: 0,
+            review: None,
             reply: tx,
         });
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -3343,6 +3419,8 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
+            selected: 0,
+            review: None,
             reply: tx,
         });
         s.on_key(
@@ -3367,6 +3445,8 @@ mod tests {
             rule: Some("`mcp__wiki__ask`".into()),
             save_rule: save.map(str::to_string),
             origin: Some("subagent · Count files".into()),
+            selected: 0,
+            review: None,
             reply: tx,
         };
         let (tx, mut rx) = oneshot::channel();
@@ -3396,6 +3476,77 @@ mod tests {
         );
         assert_eq!(rx.try_recv().unwrap(), Approval::AlwaysSave);
         assert!(s.approval.is_none());
+    }
+
+    fn pending_approval(tx: oneshot::Sender<Approval>, review: Option<String>) -> PendingApproval {
+        PendingApproval {
+            title: "Edited a.rs".into(),
+            lines: (0..30).map(|i| format!("line {i}")).collect(),
+            prewrapped: false,
+            scroll: 0,
+            rule: Some("edits".into()),
+            save_rule: None,
+            origin: None,
+            selected: 0,
+            review,
+            reply: tx,
+        }
+    }
+
+    #[test]
+    fn approval_choices_take_arrows_numbers_and_review() {
+        let mut s = screen();
+        s.width = 100;
+        s.height = 50;
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(pending_approval(tx, Some("@@ -1 +1 @@\n-a\n+b".into())));
+        s.on_key(key(KeyCode::Down), &cmd_tx);
+        assert_eq!(s.approval.as_ref().unwrap().selected, 1);
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("› a  2. Always allow edits") && text.contains("v Review"), "{text}");
+        s.on_key(key(KeyCode::PageDown), &cmd_tx);
+        assert_eq!(s.approval.as_ref().unwrap().scroll, MAX_PREVIEW - 1);
+        // The review covers the prompt; its keys go to the viewer until it closes.
+        s.on_key(key(KeyCode::Char('v')), &cmd_tx);
+        assert!(s.viewer.is_some() && s.review.is_some());
+        s.on_key(key(KeyCode::Char('y')), &cmd_tx);
+        assert!(rx.try_recv().is_err());
+        s.on_key(key(KeyCode::Char('q')), &cmd_tx);
+        assert!(s.viewer.is_none() && s.review.is_none() && s.approval.is_some());
+        s.on_key(key(KeyCode::Enter), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), Approval::Always);
+
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(pending_approval(tx, None));
+        s.on_key(key(KeyCode::Char('v')), &cmd_tx);
+        assert!(s.viewer.is_none());
+        s.on_key(key(KeyCode::Char('3')), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), Approval::No);
+    }
+
+    #[test]
+    fn edits_show_a_folded_numbered_diff_and_groups_can_collapse() {
+        let mut s = screen();
+        s.width = 50;
+        s.height = 60;
+        s.tool_start("edit_file", "a.rs");
+        let d: String = "--- a/a.rs\n+++ b/a.rs\n@@ -1,20 +1,20 @@\n".to_string() + &(0..20).map(|i| format!("-old {i}\n+new {i}\n")).collect::<String>();
+        s.tool_end(&ToolOutput { content: "Edited a.rs.".into(), display: Some(d), ..ToolOutput::default() });
+        let mut rows = Vec::new();
+        s.tool_rows(&mut rows, false);
+        let plain: Vec<String> = rows.iter().map(|r| super::super::render::strip_ansi(r)).collect();
+        assert!(plain[0].contains("+20 / -20"), "{plain:?}");
+        assert_eq!(plain[1], "  │  1 - old 0");
+        assert_eq!(plain.last().unwrap(), "  │ … 28 more lines (ctrl+o to view)");
+        assert_eq!(plain.len(), 2 + INLINE_DIFF_ROWS);
+        s.tool_start("read_file", "b.rs");
+        crate::settings::install(crate::settings::Settings { collapse_tool_calls: true, ..Default::default() });
+        let mut rows = Vec::new();
+        s.tool_rows(&mut rows, false);
+        crate::settings::install(crate::settings::Settings::default());
+        assert_eq!(rows.len(), 1, "{rows:?}");
     }
 
     #[test]
@@ -3482,6 +3633,8 @@ mod tests {
                 rule: None,
                 save_rule: None,
                 origin: None,
+                selected: 0,
+                review: None,
                 reply: tx,
             });
         }
