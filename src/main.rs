@@ -13,7 +13,10 @@ mod hooks;
 mod login;
 mod mcp;
 mod mcp_cli;
+mod mcp_client;
 mod mcp_features;
+mod mcp_schema;
+mod mcp_sse;
 mod models;
 mod notify;
 mod permissions;
@@ -561,7 +564,10 @@ async fn run() -> Result<()> {
         if let Some(meta) = &resumed {
             ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
         }
-        connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
+        if let Err(e) = connect_profile_servers(&mut mcp, &mut agent, &servers, true).await {
+            mcp.shutdown().await;
+            return Err(e);
+        }
         mcp_features::sync(&mut agent, &mcp);
         hooks::session_start(
             &agent,
@@ -623,7 +629,17 @@ async fn run() -> Result<()> {
         ui::replay(&agent.items);
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     }
-    connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
+    // Prompt commands follow servers that connect or change later.
+    let screen = tui.screen.clone();
+    mcp.on_change(move |mcp| {
+        let commands = mcp_features::prompt_commands(mcp);
+        screen.lock().unwrap_or_else(|e| e.into_inner()).editor.set_mcp_commands(commands);
+    });
+    if let Err(e) = connect_profile_servers(&mut mcp, &mut agent, &servers, false).await {
+        drop(tui);
+        mcp.shutdown().await;
+        return Err(e);
+    }
     mcp_features::sync(&mut agent, &mcp);
     tui.screen()
         .editor
@@ -1014,15 +1030,38 @@ async fn connect_profile_servers(
     agent: &mut Agent,
     servers: &[ServerConfig],
     quiet: bool,
-) {
+) -> Result<()> {
+    mcp.attach(&mut agent.tools);
     // Project servers connect too once trusted (`nyq mcp trust`), unless a
     // profile server has the same name.
     let trusted = mcp_cli::trusted_project(&config::home(), &agent.cwd);
     let profile = |name: &str| servers.iter().any(|s| s.scope == Scope::Profile && s.name == name);
     let starts = |s: &ServerConfig| s.scope == Scope::Profile || (trusted.contains(&s.name) && !profile(&s.name));
-    for cfg in servers.iter().filter(|s| starts(s)) {
-        connect(mcp, agent, cfg, quiet).await;
+    // Print mode needs every server before its single turn; interactively
+    // only `required` servers hold up startup, the rest connect meanwhile.
+    let (now, later): (Vec<ServerConfig>, Vec<ServerConfig>) = servers
+        .iter()
+        .filter(|s| starts(s) && s.options.enabled)
+        .cloned()
+        .partition(|s| quiet || s.options.required);
+    for (cfg, result) in now.iter().zip(mcp.connect_all(&now).await) {
+        let result = result.and_then(|tools| {
+            let n = tools.len();
+            install_mcp_tools(agent, &cfg.name, tools).map(|()| n)
+        });
+        if result.is_err() {
+            let _ = mcp.disconnect(&cfg.name).await;
+        }
+        match result {
+            Ok(n) if !quiet => ui::info(&format!("MCP {}: {n} tools", cfg.name)),
+            Ok(_) => {}
+            Err(e) if cfg.options.required => {
+                anyhow::bail!("required MCP server '{}' did not start: {e:#} (set \"required\": false in its config to continue without it)", cfg.name)
+            }
+            Err(e) => ui::error(&format!("MCP {}: {e:#}", cfg.name)),
+        }
     }
+    mcp.start_background(later, !quiet);
     if !quiet {
         let project: Vec<_> = servers
             .iter()
@@ -1036,6 +1075,7 @@ async fn connect_profile_servers(
             ));
         }
     }
+    Ok(())
 }
 
 fn drop_server_tools(agent: &mut Agent, mcp: &McpManager, name: &str) {
