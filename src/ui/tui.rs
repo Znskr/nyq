@@ -806,8 +806,13 @@ impl Screen {
                 .save_rule
                 .as_ref()
                 .map(|r| format!("Always, and save `{r}` to permissions.json"));
+            let local = a
+                .save_rule
+                .as_ref()
+                .map(|r| format!("Always, and save `{r}` for this workspace only"));
             let mut choices = vec![("y", "Yes, once"), ("a", always.as_str())];
             choices.extend(save.as_deref().map(|t| ("s", t)));
+            choices.extend(local.as_deref().map(|t| ("l", t)));
             choices.push(("n", "No, tell nyq what to do instead"));
             for (key, text) in choices {
                 rows.push(format!(
@@ -819,7 +824,7 @@ impl Screen {
             rows.push(rule(w));
             let mut keys = vec![("y", "Once"), ("a", "Always")];
             if save.is_some() {
-                keys.push(("s", "Save"));
+                keys.extend([("s", "Save"), ("l", "Save here")]);
             }
             keys.extend([("n", "Deny"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]);
             rows.push(hints(&keys));
@@ -2151,6 +2156,9 @@ impl Screen {
                 KeyCode::Char('s') | KeyCode::Char('S') if a.save_rule.is_some() => {
                     Some(Approval::AlwaysSave)
                 }
+                KeyCode::Char('l') | KeyCode::Char('L') if a.save_rule.is_some() => {
+                    Some(Approval::AlwaysSaveLocal)
+                }
                 KeyCode::Char('n') | KeyCode::Char('N') => Some(Approval::No),
                 _ => None,
             };
@@ -3450,6 +3458,45 @@ mod tests {
         );
         assert_eq!(rx.try_recv().unwrap(), Approval::AlwaysSave);
         assert!(s.approval.is_none());
+
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(pending(Some("mcp__wiki__ask"), tx));
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("save `mcp__wiki__ask` for this workspace only"), "{text}");
+        s.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), Approval::AlwaysSaveLocal);
+    }
+
+    #[test]
+    fn help_menu_runs_and_slash_arguments_complete() {
+        let mut s = screen();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        s.editor = Editor::new(
+            vec![],
+            vec![("/help".into(), "show commands".into()), ("/permissions".into(), "perms".into())],
+        );
+        s.open_help();
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("Help 2") && text.contains("[All]") && text.contains("Security"), "{text}");
+        for ch in "perm".chars() {
+            s.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &cmd_tx);
+        }
+        s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &cmd_tx);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Command::Submit(c)) if c == "/permissions"));
+        assert!(s.help.is_none());
+
+        // Right after the space, Enter runs what was typed; after picking, the pick.
+        s.editor.set_text("/permissions ");
+        s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &cmd_tx);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Command::Submit(c)) if c == "/permissions "));
+        s.editor.set_text("/permissions ");
+        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &cmd_tx);
+        s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &cmd_tx);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Command::Submit(c)) if c == "/permissions auto"));
+        s.editor.set_text("/permissions rem");
+        s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &cmd_tx);
+        assert_eq!(s.editor.text(), "/permissions remember ", "options that need more input are inserted");
+        assert!(cmd_rx.try_recv().is_err());
     }
 
     #[test]
