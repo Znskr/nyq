@@ -56,6 +56,48 @@ pub trait Provider: Send + Sync {
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> anyhow::Result<Response>;
 }
 
+/// What a provider's live model listing said.
+#[derive(Clone, Debug, Default)]
+pub struct Listing {
+    /// Listed model ids, in listing order.
+    pub models: Vec<String>,
+    /// Models offering fast mode.
+    pub fast: Vec<String>,
+}
+
+/// Listings per provider id, absent until the provider was listed in this
+/// process.
+static LISTINGS: std::sync::Mutex<std::collections::BTreeMap<String, Listing>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Record (merge in) what `provider`'s model listing said.
+pub fn remember_listing(provider: &str, models: Vec<String>, fast: Vec<String>) {
+    let mut all = LISTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let known = all.entry(provider.to_string()).or_default();
+    for (list, new) in [(&mut known.models, models), (&mut known.fast, fast)] {
+        for m in new {
+            if !list.contains(&m) {
+                list.push(m);
+            }
+        }
+    }
+}
+
+/// `provider`'s listing, once it has been fetched.
+pub fn listing(provider: &str) -> Option<Listing> {
+    LISTINGS.lock().unwrap_or_else(|e| e.into_inner()).get(provider).cloned()
+}
+
+/// Whether the listing says `model` offers fast mode (false until listed).
+pub fn listed_fast(provider: &str, model: &str) -> bool {
+    listing(provider).is_some_and(|l| l.fast.iter().any(|m| m == model))
+}
+
+/// Providers whose listing says which models offer fast mode.
+pub fn lists_fast(provider: &str) -> bool {
+    matches!(provider, "codex" | "vercel")
+}
+
 /// Retries after the first attempt.
 const RETRIES: u32 = 3;
 /// Longest wait between attempts, including a server's `Retry-After`.
