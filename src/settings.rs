@@ -159,11 +159,12 @@ pub struct Settings {
     /// Default reasoning effort for Codex models (`auto` or absent = model default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Codex fast mode (the `priority` service tier) where the model offers it.
+    /// Fast mode where the model offers it (Codex `priority` tier, AI Gateway fast speed).
     pub fast_mode: bool,
     /// `ask` (default), `auto` (classifier), or `yolo` (never ask). Deny rules still block.
     pub permission_mode: String,
-    /// Model id for the auto-mode classifier. Empty uses the session model.
+    /// Model id for the auto-mode classifier. Empty picks the provider's
+    /// small model when it has one (Codex: a mini model), else the session model.
     /// A small or cheap model is the right choice when one is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classifier_model: Option<String>,
@@ -296,6 +297,9 @@ pub fn save(home: &Path, s: &Settings) -> Result<()> {
     if s.effort.is_none() {
         merged.remove("effort");
     }
+    if s.classifier_model.is_none() {
+        merged.remove("classifier_model");
+    }
     merged.extend(ours);
     let bytes = serde_json::to_vec_pretty(&Value::Object(merged))?;
     crate::session::write_private(&path, &bytes)
@@ -339,6 +343,7 @@ pub enum Id {
     Effort,
     Fast,
     Permission,
+    ClassifierModel,
     Sandbox,
     AutoCompact,
     Sound,
@@ -358,6 +363,8 @@ pub struct Live {
     pub efforts: Vec<String>,
     pub fast: bool,
     pub fast_supported: bool,
+    /// Models the current provider listed (classifier model choices).
+    pub models: Vec<String>,
     /// Session permission mode (`ask`, `auto`, or `yolo`).
     pub permission_mode: String,
 }
@@ -396,6 +403,13 @@ pub fn specs() -> Vec<Spec> {
             label: "Permission mode",
             description:
                 "Ask before risky calls, let a classifier decide (auto), or run them freely (yolo)",
+        },
+        Spec {
+            id: Id::ClassifierModel,
+            category: Category::Agent,
+            label: "Classifier model",
+            description:
+                "Model that reviews calls in auto mode; auto picks a small one (Codex: a mini) or the session model",
         },
         Spec {
             id: Id::Sandbox,
@@ -467,6 +481,7 @@ pub fn value(id: Id, s: &Settings, live: &Live) -> String {
                 live.permission_mode.clone()
             }
         }
+        Id::ClassifierModel => s.classifier_model.clone().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "auto".into()),
         Id::Sandbox => s.sandbox.clone(),
         Id::AutoCompact if s.auto_compact == 0 => "off".into(),
         Id::AutoCompact => format!("{}%", s.auto_compact),
@@ -490,6 +505,7 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
             .collect(),
         Id::Fast if !live.fast_supported && !live.fast => Vec::new(),
         Id::Permission => list(&["ask", "auto", "yolo"]),
+        Id::ClassifierModel => std::iter::once("auto".to_string()).chain(live.models.iter().cloned()).collect(),
         Id::Sandbox => list(&["workspace-write", "read-only", "off"]),
         Id::AutoCompact => list(&["off", "50%", "60%", "70%", "80%", "90%"]),
         Id::Sound => list(&["off", "on", "max"]),
@@ -520,6 +536,7 @@ pub fn cycle(id: Id, s: &Settings, live: &Live, delta: i32) -> Option<String> {
 pub fn apply(id: Id, value: &str, s: &mut Settings) -> bool {
     let on = value == "on";
     match id {
+        Id::ClassifierModel => s.classifier_model = Some(value.to_string()).filter(|v| v != "auto"),
         Id::Sandbox => s.sandbox = value.into(),
         Id::AutoCompact => s.auto_compact = value.trim_end_matches('%').parse().unwrap_or(0),
         Id::Sound => s.sound = value.into(),
@@ -624,6 +641,25 @@ mod tests {
         assert!(warn.is_some());
         assert_eq!(s, Settings::default());
         assert_eq!(load(&dir.path().join("missing")).0, Settings::default());
+    }
+
+    #[test]
+    fn classifier_model_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        let live = Live { models: vec!["gpt-mini".into(), "gpt-big".into()], ..Live::default() };
+        assert_eq!(value(Id::ClassifierModel, &s, &live), "auto");
+        assert_eq!(cycle(Id::ClassifierModel, &s, &live, 1).as_deref(), Some("gpt-mini"));
+        assert!(apply(Id::ClassifierModel, "gpt-mini", &mut s));
+        assert_eq!(value(Id::ClassifierModel, &s, &live), "gpt-mini");
+        assert_eq!(cycle(Id::ClassifierModel, &s, &live, -1).as_deref(), Some("auto"));
+        save(dir.path(), &s).unwrap();
+        assert_eq!(load(dir.path()).0.classifier_model.as_deref(), Some("gpt-mini"));
+        // Back to auto removes the key.
+        assert!(apply(Id::ClassifierModel, "auto", &mut s) && s.classifier_model.is_none());
+        save(dir.path(), &s).unwrap();
+        assert!(!std::fs::read_to_string(dir.path().join("settings.json")).unwrap().contains("classifier_model"));
+        assert_eq!(filtered(Category::Agent, "classifier model", &s, &live)[0].id, Id::ClassifierModel);
     }
 
     #[test]

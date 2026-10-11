@@ -15,7 +15,12 @@ use tokio::{
 use crate::provider::hosted::{self, Service};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const REDIRECT: &str = "http://localhost:1455/auth/callback";
+/// Callback ports registered for the client, in order of preference.
+const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
+
+fn redirect(port: u16) -> String {
+    format!("http://localhost:{port}/auth/callback")
+}
 
 fn secret() -> String {
     let mut bytes = Vec::with_capacity(32);
@@ -30,12 +35,12 @@ fn challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn authorize(issuer: &str, state: &str, verifier: &str) -> Result<Url> {
+fn authorize(issuer: &str, redirect_uri: &str, state: &str, verifier: &str) -> Result<Url> {
     let mut url = Url::parse(&format!("{}/oauth/authorize", issuer.trim_end_matches('/')))?;
     url.query_pairs_mut().extend_pairs([
         ("response_type", "code"),
         ("client_id", CLIENT_ID),
-        ("redirect_uri", REDIRECT),
+        ("redirect_uri", redirect_uri),
         ("scope", "openid profile email offline_access"),
         ("code_challenge", &challenge(verifier)),
         ("code_challenge_method", "S256"),
@@ -147,16 +152,27 @@ pub async fn login(home: &Path, open_browser: impl Fn(&str)) -> Result<String> {
     login_with_issuer(home, open_browser, &issuer).await
 }
 
+/// Listen on the first free callback port.
+async fn bind_callback(ports: &[u16]) -> Result<(TcpListener, u16)> {
+    for &port in ports {
+        if let Ok(listener) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            return Ok((listener, port));
+        }
+    }
+    let list = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(" and ");
+    anyhow::bail!("cannot listen for the ChatGPT sign-in callback on 127.0.0.1 ports {list}; close any other sign-in using them and retry")
+}
+
 async fn login_with_issuer(
     home: &Path,
     open_browser: impl Fn(&str),
     issuer: &str,
 ) -> Result<String> {
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 1455)).await
-        .context("cannot bind ChatGPT sign-in callback on 127.0.0.1:1455; close any other sign-in using this port and retry")?;
+    let (listener, port) = bind_callback(&CALLBACK_PORTS).await?;
+    let redirect_uri = redirect(port);
     let verifier = secret();
     let state = secret();
-    let url = authorize(issuer, &state, &verifier)?;
+    let url = authorize(issuer, &redirect_uri, &state, &verifier)?;
     open_browser(url.as_str());
     let code = tokio::time::timeout(Duration::from_secs(300), wait_callback(&listener, &state))
         .await
@@ -166,7 +182,7 @@ async fn login_with_issuer(
         ("grant_type", "authorization_code"),
         ("client_id", CLIENT_ID),
         ("code", &code),
-        ("redirect_uri", REDIRECT),
+        ("redirect_uri", &redirect_uri),
         ("code_verifier", &verifier),
     ]);
 
@@ -233,20 +249,31 @@ fn save(home: &Path, auth: &Value) -> Result<()> {
     result.context("saving ChatGPT sign-in")
 }
 
-/// Whether sign-in flows should launch a browser: not with
-/// `NYQ_NO_OPEN_BROWSER` set, nor when stdin is not a terminal.
-pub fn browser_allowed() -> bool {
+/// Whether sign-in flows must not launch a browser: `NYQ_NO_OPEN_BROWSER`
+/// (any non-empty value but `0`) is set, or stdin is not a terminal. Sign-in
+/// URLs are printed either way.
+pub fn browser_disabled() -> bool {
     use std::io::IsTerminal;
-    std::env::var_os("NYQ_NO_OPEN_BROWSER").is_none_or(|v| v.is_empty() || v == "0")
-        && std::io::stdin().is_terminal()
+    std::env::var("NYQ_NO_OPEN_BROWSER").is_ok_and(|v| !v.is_empty() && v != "0")
+        || !std::io::stdin().is_terminal()
 }
 
-/// Open the system browser; launch failures are intentionally ignored. The
-/// caller prints the URL, so skipping the launch (see [`browser_allowed`])
-/// leaves it to the user.
+/// What to print before a terminal sign-in opens `url`.
+pub fn sign_in_prompt(url: &str) -> String {
+    if browser_disabled() {
+        format!("Open this URL in a browser to sign in:
+  {url}")
+    } else {
+        format!("Opening your browser to sign in. If it doesn't open, visit:
+  {url}")
+    }
+}
+
+/// Open the system browser (unless [`browser_disabled`]); launch failures
+/// are intentionally ignored.
 #[allow(dead_code)]
 pub fn open_browser(url: &str) {
-    if !browser_allowed() {
+    if browser_disabled() {
         return;
     }
     #[cfg(target_os = "windows")]
@@ -305,10 +332,10 @@ fn open_browser_windows(url: &str) {
 
 /// `nyq login <service>`: read an API key from the terminal (hidden) or
 /// stdin and store it in `<home>/auth.json`.
-pub fn login_key(home: &Path, service: Service) -> Result<String> {
+pub async fn login_key(home: &Path, service: Service) -> Result<String> {
     eprintln!("Paste your {} API key from {} and press Enter:", service.title(), key_site(service));
     let key = read_secret()?;
-    store_key(home, service, &key)
+    store_key(home, service, &key).await
 }
 
 /// Where to get an API key for `service`.
@@ -320,10 +347,23 @@ pub fn key_site(service: Service) -> &'static str {
     }
 }
 
-/// Save `key` for `service`, noting when an environment key takes precedence.
-pub fn store_key(home: &Path, service: Service, key: &str) -> Result<String> {
+/// Check `key` with `service` and save it, noting when an environment key
+/// takes precedence. A rejected key is not saved; one that could not be
+/// checked is saved with a warning.
+pub async fn store_key(home: &Path, service: Service, key: &str) -> Result<String> {
+    store_key_at(home, service, key, &service.base_url()).await
+}
+
+async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) -> Result<String> {
+    anyhow::ensure!(!key.trim().is_empty(), "the API key is empty");
+    let warning = match hosted::check_key(service, base_url, key).await {
+        hosted::KeyCheck::Accepted => None,
+        hosted::KeyCheck::Refused(e) => anyhow::bail!("{} rejected this API key, so it was not saved: {e}", service.title()),
+        hosted::KeyCheck::Unknown(e) => Some(format!("\nWarning: could not check the key with {} ({e}); saved it anyway.", service.title())),
+    };
     hosted::save_key(home, service, key)?;
     let mut msg = format!("Saved your {} key in {}.", service.title(), home.join("auth.json").display());
+    msg.extend(warning);
     if hosted::api_key(home, service).as_deref() != Some(key.trim()) {
         let other = if service.key_env() == "OPENCODE_API_KEY" { "OPENCODE_API_KEY or the OpenCode CLI's login" } else { service.key_env() };
         msg.push_str(&format!("\nNote: {other} is set and takes precedence."));
@@ -435,14 +475,14 @@ mod tests {
 
     #[test]
     fn authorize_params() {
-        let url = authorize("https://auth.openai.com/", "state", "verifier").unwrap();
+        let url = authorize("https://auth.openai.com/", &redirect(1455), "state", "verifier").unwrap();
         assert_eq!(url.path(), "/oauth/authorize");
         let params: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(params.len(), 10);
         for (k, v) in [
             ("response_type", "code"),
             ("client_id", CLIENT_ID),
-            ("redirect_uri", REDIRECT),
+            ("redirect_uri", "http://localhost:1455/auth/callback"),
             ("scope", "openid profile email offline_access"),
             ("code_challenge_method", "S256"),
             ("id_token_add_organizations", "true"),
@@ -470,6 +510,54 @@ mod tests {
         assert!(callback("/auth/callback?code=c", "s").is_err());
         assert!(callback("/auth/callback?code=c&state=s&state=s", "s").is_err());
         assert_eq!(callback("/favicon.ico", "s").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn callback_port_falls_back() {
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = free();
+        let spare = free().local_addr().unwrap().port();
+        let ports = [busy.local_addr().unwrap().port(), spare];
+        let (_listener, port) = bind_callback(&ports).await.unwrap();
+        assert_eq!(port, spare);
+        let err = bind_callback(&ports).await.unwrap_err().to_string();
+        assert!(err.contains(&format!("ports {} and {spare}", ports[0])), "{err}");
+    }
+
+    #[tokio::test]
+    async fn keys_are_checked_before_saving() {
+        use crate::provider::sse::tests::server;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let stored = || hosted::read_own(home).unwrap().get("xai").map(|v| v["key"].clone());
+        let (url, mut requests, task) = server(vec![
+            (401, r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key"}}"#.into()),
+            (200, r#"{"data":[]}"#.into()),
+            (402, r#"{"error":{"code":"credit_card_required","message":"Buy credits"}}"#.into()),
+            (403, r#"{"error":{"code":"credit_card_required","message":"Buy credits"}}"#.into()),
+        ])
+        .await;
+        let err = store_key_at(home, Service::Xai, "bad", &url).await.unwrap_err().to_string();
+        assert!(err.contains("rejected") && err.contains("HTTP 401 · invalid_api_key: Incorrect API key"), "{err}");
+        assert_eq!(stored(), None);
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("get /models ") && request.contains("authorization: bearer bad"), "{request}");
+        let msg = store_key_at(home, Service::Xai, " good ", &url).await.unwrap();
+        assert!(msg.starts_with("Saved your xAI key") && !msg.contains("Warning"), "{msg}");
+        assert_eq!(stored(), Some(json!("good")));
+        // The gateway is checked through the credit balance; no credits is still a valid key.
+        let msg = store_key_at(home, Service::Vercel, "gw", &url).await.unwrap();
+        assert!(msg.contains("Warning: could not check the key") && msg.contains("HTTP 402"), "{msg}");
+        let msg = store_key_at(home, Service::Vercel, "gw", &url).await.unwrap();
+        assert!(msg.starts_with("Saved") && !msg.contains("Warning"), "{msg}");
+        requests.recv().await.unwrap();
+        assert!(requests.recv().await.unwrap().starts_with("GET /credits "));
+        task.await.unwrap();
+        // Unreachable: saved with a warning.
+        let msg = store_key_at(home, Service::Xai, "offline", "http://127.0.0.1:1").await.unwrap();
+        assert!(msg.contains("Warning"), "{msg}");
+        assert_eq!(stored(), Some(json!("offline")));
+        assert!(store_key_at(home, Service::Xai, " ", &url).await.is_err());
     }
 
     #[test]
@@ -540,7 +628,7 @@ mod tests {
             assert_eq!(fields["grant_type"], "authorization_code");
             assert_eq!(fields["code"], "fake-code");
             assert_eq!(fields["client_id"], CLIENT_ID);
-            assert_eq!(fields["redirect_uri"], REDIRECT);
+            assert!(CALLBACK_PORTS.map(redirect).contains(&fields["redirect_uri"]));
             let body = json!({"access_token":access,"refresh_token":"refresh-test",
                 "id_token":jwt(json!({"email":"test@example.com"})),"expires_in":3600})
             .to_string();
@@ -557,15 +645,16 @@ mod tests {
                 let fields: std::collections::BTreeMap<_, _> =
                     url.query_pairs().into_owned().collect();
                 *challenge_seen.lock().unwrap() = fields["code_challenge"].clone();
-                let mut callback = Url::parse(REDIRECT).unwrap();
+                let mut callback = Url::parse(&fields["redirect_uri"]).unwrap();
                 callback.set_host(Some("127.0.0.1")).unwrap();
                 callback
                     .query_pairs_mut()
                     .extend_pairs([("code", "fake-code"), ("state", fields["state"].as_str())]);
+                let favicon = callback.join("/favicon.ico").unwrap();
                 tokio::spawn(async move {
                     // Browsers may request unrelated resources before the callback.
                     assert_eq!(
-                        reqwest::get("http://127.0.0.1:1455/favicon.ico")
+                        reqwest::get(favicon)
                             .await
                             .unwrap()
                             .status(),

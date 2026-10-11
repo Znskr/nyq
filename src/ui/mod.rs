@@ -125,6 +125,9 @@ impl Ui for PlainUi {
         eprintln!("{}", sanitize_text(msg));
     }
     fn stream(&mut self, event: &StreamEvent) {
+        if let StreamEvent::Retrying(status) = event {
+            eprintln!("{}", sanitize_text(status));
+        }
         if let StreamEvent::Text(t) = event {
             if let Some(r) = &mut self.record {
                 r.output.push_str(t);

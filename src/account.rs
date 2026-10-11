@@ -369,14 +369,14 @@ pub async fn cli_login(home: &Path, id: &str) -> Result<String> {
     match id {
         "codex" => {
             crate::login::login(home, |url| {
-                eprintln!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}");
+                eprintln!("{}", crate::login::sign_in_prompt(url));
                 crate::login::open_browser(url);
             })
             .await
         }
         "openai" => Ok(OPENAI_HELP.into()),
         "ollama" => Ok(OLLAMA_HELP.into()),
-        other => crate::login::login_key(home, Service::parse(other).ok_or_else(|| unknown(other))?),
+        other => crate::login::login_key(home, Service::parse(other).ok_or_else(|| unknown(other))?).await,
     }
 }
 
@@ -467,7 +467,12 @@ async fn tui_login(home: &Path, tui: &Tui, name: Option<&str>) -> Result<()> {
             let service = Service::parse(other).ok_or_else(|| unknown(other))?;
             let prompt = format!("Paste your {} API key from {} (hidden)", service.title(), crate::login::key_site(service));
             match tui.secret(&prompt).await {
-                Some(key) => ui::info(&format!("{} Pick a model with /model.", crate::login::store_key(home, service, &key)?)),
+                Some(key) => {
+                    tui.screen().set_busy(Some("Checking the key"), None);
+                    let saved = crate::login::store_key(home, service, &key).await;
+                    tui.screen().idle();
+                    ui::info(&format!("{} Pick a model with /model.", saved?));
+                }
                 None => ui::info("No key saved."),
             }
         }
