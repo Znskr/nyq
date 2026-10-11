@@ -122,26 +122,173 @@ impl crate::tools::Tool for AskUserTool {
     fn spec(&self) -> crate::types::ToolSpec {
         crate::types::ToolSpec {
             name: ASK_USER.into(),
-            description: "Ask the user a multiple-choice question when you need a decision or missing \
-                information that you cannot reasonably infer. Offer 2-5 short, distinct options; the user \
-                may also type their own answer or skip. Do not use it for confirmation of routine steps."
+            description: "Ask the user up to 4 multiple-choice questions when you need decisions or missing \
+                information that you cannot reasonably infer. Give each question 2-6 short, distinct options, \
+                each with a one-line description of what choosing it means; the user may also type their own \
+                answer or skip. Do not use it for confirmation of routine steps."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "The question, one or two sentences."},
-                    "options": {"type": "array", "items": {"type": "string"}, "description": "2-5 answer choices."}
+                    "questions": {
+                        "type": "array",
+                        "description": "1-4 questions, asked in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string", "description": "The question, one or two sentences."},
+                                "options": {
+                                    "type": "array",
+                                    "description": "2-6 answer choices.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string", "description": "The choice, a few words."},
+                                            "description": {"type": "string", "description": "What choosing it means."}
+                                        },
+                                        "required": ["label"]
+                                    }
+                                }
+                            },
+                            "required": ["question", "options"]
+                        }
+                    }
                 },
-                "required": ["question", "options"]
+                "required": ["questions"]
             }),
         }
     }
     fn summary(&self, args: &Value) -> String {
-        args["question"].as_str().unwrap_or("").to_string()
+        questions(args).into_iter().next().map(|(q, _)| q).unwrap_or_default()
     }
     async fn run(&self, _args: Value, _ctx: &ToolCtx) -> ToolOutput {
         ToolOutput::err("ask_user_question is answered by the user interface")
     }
+}
+
+/// Appended to a reply the user interrupted while it streamed.
+const INTERRUPTED: &str = "[interrupted by the user]";
+
+/// A failing call repeated this many times gets told to change approach.
+const REPEAT_LIMIT: usize = 3;
+
+/// Nested instruction files are cut to this many characters.
+const NESTED_INSTRUCTIONS_MAX: usize = 64 * 1024;
+
+/// Tools that only read, so consecutive calls to them can run at once.
+const PARALLEL_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "view_image",
+    "web_fetch",
+    "web_search",
+    crate::tools::artifacts::TOOL,
+    "skill",
+];
+
+/// Whether this call may run alongside its read-only neighbours: read tools,
+/// and subagent runs (independent by contract).
+fn runs_in_parallel(name: &str, arguments: &str) -> bool {
+    if PARALLEL_TOOLS.contains(&name) {
+        return true;
+    }
+    if name != "subagent" {
+        return false;
+    }
+    let args: Value = serde_json::from_str(arguments).unwrap_or_default();
+    matches!(args.get("action").and_then(Value::as_str), None | Some("run"))
+}
+
+/// An approved call, ready to run.
+struct Ready {
+    name: String,
+    args: Value,
+    ctx: ToolCtx,
+    summary: String,
+    /// Arguments for the PostToolUse hook, when one observes this tool.
+    hook_args: Option<Value>,
+}
+
+enum Prepared {
+    /// Answered without running the tool.
+    Done(ToolOutput),
+    Run(Box<Ready>),
+}
+
+async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) -> ToolOutput {
+    let Some(tool) = tools.get(&ready.name) else {
+        return ToolOutput::err(format!("Unknown tool `{}`.", ready.name));
+    };
+    if tool.handles_cancel() {
+        tool.run(ready.args.clone(), &ready.ctx).await
+    } else {
+        tokio::select! {
+            out = tool.run(ready.args.clone(), &ready.ctx) => out,
+            _ = cancel.cancelled() => ToolOutput::err("Cancelled by user."),
+        }
+    }
+}
+
+/// The questions in an `ask_user_question` call: (question, [(label, description)]).
+/// The older single `question` with plain-string options is accepted too.
+fn questions(args: &Value) -> Vec<(String, Vec<(String, String)>)> {
+    let option = |o: &Value| match o {
+        Value::String(s) => Some((s.clone(), String::new())),
+        _ => Some((
+            o.get("label")?.as_str()?.to_string(),
+            o.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
+        )),
+    };
+    let one = |q: &Value| {
+        let text = q.get("question")?.as_str()?.trim().to_string();
+        let options = q
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(option).collect())
+            .unwrap_or_default();
+        (!text.is_empty()).then_some((text, options))
+    };
+    match args.get("questions").and_then(Value::as_array) {
+        Some(list) => list.iter().filter_map(one).take(MAX_QUESTIONS).collect(),
+        None => one(args).into_iter().collect(),
+    }
+}
+
+const MAX_QUESTIONS: usize = 4;
+
+/// Put each question to the user and report the answers.
+async fn ask_user(args: &Value, ui: &mut dyn Ui, cancel: &CancellationToken) -> ToolOutput {
+    let asked = questions(args);
+    if asked.is_empty() {
+        return ToolOutput::err("ask_user_question: give `questions`, each with a `question` and `options`.");
+    }
+    let mut answers = Vec::new();
+    for (question, options) in &asked {
+        let shown: Vec<String> = options
+            .iter()
+            .map(|(label, about)| if about.is_empty() { label.clone() } else { format!("{label} — {about}") })
+            .collect();
+        let answer = tokio::select! {
+            a = ui.ask(question, &shown) => a,
+            _ = cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
+        };
+        // A picked option is reported by its label.
+        let answer = answer.map(|a| shown.iter().position(|s| *s == a).map_or(a, |i| options[i].0.clone()));
+        answers.push((question, answer));
+    }
+    if answers.iter().all(|(_, a)| a.is_none()) {
+        return ToolOutput::ok("The user skipped the question. Use your best judgment or ask in your reply.");
+    }
+    if let [(_, Some(a))] = answers.as_slice() {
+        return ToolOutput::ok(format!("The user answered: {a}"));
+    }
+    let lines: Vec<String> = answers
+        .iter()
+        .map(|(q, a)| format!("- {q} → {}", a.as_deref().unwrap_or("(skipped)")))
+        .collect();
+    ToolOutput::ok(format!("The user answered:\n{}", lines.join("\n")))
 }
 
 pub enum TurnEnd {
@@ -275,21 +422,31 @@ impl Agent {
         cancel: CancellationToken,
         continue_note: bool,
     ) -> Result<TurnEnd> {
+        // Failing calls by (tool, arguments), to stop the model looping on one.
+        let mut failures: HashMap<(String, String), usize> = HashMap::new();
         for _ in 0..MAX_STEPS {
             self.sync_estimate();
             if !self.auto_compact(ui, &cancel).await? {
                 return Ok(TurnEnd::Cancelled);
             }
-            let specs = self.tools.advertised();
-            let note = continue_note.then(|| format!("{}{CONTINUE_NOTE}", self.system));
+            let specs = self.advertised();
+            let mut system = format!("{}{}", self.system, self.session_notes());
+            if continue_note {
+                system.push_str(CONTINUE_NOTE);
+            }
+            let mut partial = String::new();
             let result = {
-                let system = note.as_deref().unwrap_or(self.system.as_str());
                 let req = Request {
-                    system,
+                    system: &system,
                     items: &self.items,
                     tools: &specs,
                 };
-                let mut sink = |ev: StreamEvent| ui.stream(&ev);
+                let mut sink = |ev: StreamEvent| {
+                    if let StreamEvent::Text(text) = &ev {
+                        partial.push_str(text);
+                    }
+                    ui.stream(&ev)
+                };
                 tokio::select! {
                     r = self.provider.stream(req, &mut sink) => Some(r),
                     _ = cancel.cancelled() => None,
@@ -297,6 +454,12 @@ impl Agent {
             };
             ui.end_message();
             let Some(result) = result else {
+                // Keep what was said, so the next turn knows it was cut short.
+                if !partial.trim().is_empty() {
+                    self.push_counted(Item::Assistant {
+                        text: format!("{}\n\n{INTERRUPTED}", partial.trim_end()),
+                    });
+                }
                 return Ok(TurnEnd::Cancelled);
             };
             let response = result?;
@@ -349,7 +512,8 @@ impl Agent {
             }
 
             let mut images = Vec::new();
-            for (i, (id, name, arguments)) in calls.iter().enumerate() {
+            let mut i = 0;
+            while i < calls.len() {
                 if cancel.is_cancelled() {
                     // Every call needs a result or the next request is invalid.
                     for (id, ..) in &calls[i..] {
@@ -361,36 +525,37 @@ impl Agent {
                     }
                     return Ok(TurnEnd::Cancelled);
                 }
-                let mut out = self.call_tool(id, name, arguments, ui, &cancel).await;
-                // Credentials never reach the model or the session file.
-                if let std::borrow::Cow::Owned(clean) = crate::tools::redact::scrub(&out.content) {
-                    out.content = clean;
+                // Consecutive read-only calls (and subagents) run together.
+                let run = calls[i..]
+                    .iter()
+                    .take_while(|(_, name, arguments)| runs_in_parallel(name, arguments))
+                    .count()
+                    .max(1);
+                let batch = &calls[i..i + run];
+                let outs = if run > 1 {
+                    self.call_parallel(batch, ui, &cancel).await
+                } else {
+                    let (id, name, arguments) = &batch[0];
+                    vec![self.call_tool(id, name, arguments, ui, &cancel).await]
+                };
+                for ((id, name, arguments), mut out) in batch.iter().zip(outs) {
+                    if out.is_error {
+                        let n = failures
+                            .entry((name.clone(), arguments.clone()))
+                            .or_default();
+                        *n += 1;
+                        if *n >= REPEAT_LIMIT {
+                            out.content.push_str(&format!(
+                                "\n\n[This exact call has now failed {n} times. Do not repeat it: \
+                                 change your approach, or stop and explain the blocker.]"
+                            ));
+                        }
+                    } else {
+                        self.add_nested_instructions(name, arguments, &mut out);
+                    }
+                    images.extend(self.record_result(id, name, out));
                 }
-                // Oversized output is stored; the model gets head, tail and an id.
-                let key = crate::tools::artifacts::session_key(
-                    self.session.as_ref().map(|s| s.id.as_str()),
-                );
-                out.content = crate::tools::artifacts::spill(
-                    &crate::config::home(),
-                    &key,
-                    id,
-                    name,
-                    std::mem::take(&mut out.content),
-                );
-                // Usage precedes tool execution, so account for the new text
-                // before deciding whether the next step needs compaction.
-                // An estimate is replaced wholesale on the next sync.
-                if !self.context_estimated {
-                    self.context_tokens = self
-                        .context_tokens
-                        .saturating_add((out.content.len() as u64).div_ceil(4));
-                }
-                images.extend(out.images);
-                self.push(Item::ToolResult {
-                    id: id.clone(),
-                    output: out.content,
-                    is_error: out.is_error,
-                });
+                i += run;
             }
             self.submitted = self.items.len();
             // Tool results are text-only in both APIs, so images a tool
@@ -406,7 +571,134 @@ impl Agent {
                 self.push_counted(item);
             }
         }
-        anyhow::bail!("stopped after {MAX_STEPS} steps without a final answer")
+        // Not an error: the work so far is kept and the user can go on.
+        ui.notice(&format!(
+            "Stopped after {MAX_STEPS} model steps without a final answer. Send a message to continue."
+        ));
+        self.submitted = self.items.len();
+        Ok(TurnEnd::Done)
+    }
+
+    /// The tools offered on the next request.
+    fn advertised(&self) -> Vec<crate::types::ToolSpec> {
+        self.tools.advertised()
+    }
+
+    /// Store a tool result in the transcript (credentials scrubbed, large
+    /// output spilled) and return the images it carried.
+    fn record_result(&mut self, id: &str, name: &str, mut out: ToolOutput) -> Vec<crate::types::Image> {
+        // Credentials never reach the model or the session file.
+        if let std::borrow::Cow::Owned(clean) = crate::tools::redact::scrub(&out.content) {
+            out.content = clean;
+        }
+        // Oversized output is stored; the model gets head, tail and an id.
+        let key = crate::tools::artifacts::session_key(self.session.as_ref().map(|s| s.id.as_str()));
+        out.content = crate::tools::artifacts::spill(
+            &crate::config::home(),
+            &key,
+            id,
+            name,
+            std::mem::take(&mut out.content),
+        );
+        // Usage precedes tool execution, so account for the new text
+        // before deciding whether the next step needs compaction.
+        // An estimate is replaced wholesale on the next sync.
+        if !self.context_estimated {
+            self.context_tokens = self
+                .context_tokens
+                .saturating_add((out.content.len() as u64).div_ceil(4));
+        }
+        self.push(Item::ToolResult {
+            id: id.to_string(),
+            output: out.content,
+            is_error: out.is_error,
+        });
+        out.images
+    }
+
+    /// Per-request notes on the session's current state, appended to the
+    /// system prompt: permission mode, question UI, background processes.
+    fn session_notes(&self) -> String {
+        let mode = self.permission_mode;
+        let mut notes = vec![format!(
+            "- Permission mode: {} ({}). A call the user or a rule denies must not be retried as is.",
+            mode.as_str(),
+            mode.summary()
+        )];
+        // The root agent of a session without ask_user_question: print mode
+        // or an editor. Subagents have their own instructions.
+        if self.usage_session_id.is_none() && self.tools.get(ASK_USER).is_none() {
+            notes.push(
+                "- There is no question UI: do not stop mid-task to wait for answers. If you are blocked, \
+                 finish with a short description of the blocker and the options."
+                    .into(),
+            );
+        }
+        let procs = crate::tools::background::context_lines();
+        if !procs.is_empty() {
+            notes.push(format!(
+                "- Background processes (reuse a matching running server instead of starting a duplicate; \
+                 ended ones are no longer running):\n{}",
+                procs.join("\n")
+            ));
+        }
+        format!("\n\n# Session state\n{}", notes.join("\n"))
+    }
+
+    /// After a successful file or search call, append any `AGENTS.md` (or
+    /// `CLAUDE.md`) from workspace subdirectories it touched, once per
+    /// conversation (an earlier copy in the transcript counts).
+    fn add_nested_instructions(&self, name: &str, arguments: &str, out: &mut ToolOutput) {
+        let file_tool = matches!(name, "read_file" | "edit_file" | "write_file");
+        if !file_tool && !matches!(name, "list_dir" | "glob" | "grep") {
+            return;
+        }
+        let args: Value = serde_json::from_str(arguments).unwrap_or_default();
+        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let Some(full) = lexical(&self.cwd, path) else {
+            return;
+        };
+        if !inside(&self.cwd, path) {
+            return;
+        }
+        let dir = if file_tool || !full.is_dir() {
+            full.parent().map(Path::to_path_buf).unwrap_or_default()
+        } else {
+            full.clone()
+        };
+        let Ok(rel) = dir.strip_prefix(&self.cwd) else {
+            return;
+        };
+        let mut at = self.cwd.clone();
+        for part in rel.components() {
+            at.push(part);
+            for file in ["AGENTS.md", "CLAUDE.md"] {
+                let candidate = at.join(file);
+                if candidate == full || !candidate.is_file() {
+                    continue;
+                }
+                let shown = crate::tools::slash_path(candidate.strip_prefix(&self.cwd).unwrap_or(&candidate));
+                let marker = format!("[Instructions from {shown}");
+                let seen = self.items.iter().any(|item| match item {
+                    Item::ToolResult { output, .. } => output.contains(&marker),
+                    Item::Compaction { summary } => summary.contains(&marker),
+                    _ => false,
+                });
+                if seen {
+                    continue;
+                }
+                let Ok(text) = crate::tools::read_rooted_text(&self.cwd, &candidate) else {
+                    continue;
+                };
+                let text: String = text.trim().chars().take(NESTED_INSTRUCTIONS_MAX).collect();
+                if !text.is_empty() {
+                    let scope = crate::tools::slash_path(at.strip_prefix(&self.cwd).unwrap_or(&at));
+                    out.content.push_str(&format!(
+                        "\n\n{marker}, which apply to files under {scope}/; the narrowest scope wins:]\n{text}"
+                    ));
+                }
+            }
+        }
     }
 
     /// Ask the session provider whether one risky call may run.
@@ -486,31 +778,111 @@ impl Agent {
         ui: &mut dyn Ui,
         cancel: &CancellationToken,
     ) -> ToolOutput {
+        let ready = match self.prepare(id, name, arguments, ui, cancel).await {
+            Prepared::Done(out) => return out,
+            Prepared::Run(ready) => ready,
+        };
+        ui.tool_start(name, &ready.summary);
+        let before = self.undo.len();
+        self.undo
+            .snapshot(&self.cwd, self.sandbox.mode, name, &ready.args);
+        let mut out = run_ready(&self.tools, &ready, cancel).await;
+        if out.is_error && !out.changed && self.undo.len() > before {
+            self.undo.discard_last();
+        }
+        ui.tool_end(name, &out);
+        self.settle(&ready, &mut out, cancel).await;
+        out
+    }
+
+    /// Run a batch of read-only calls (and subagents) concurrently. They are
+    /// approved one by one first; the UI then sees each start and finish in
+    /// order while all of them make progress.
+    async fn call_parallel(
+        &mut self,
+        batch: &[(String, String, String)],
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> Vec<ToolOutput> {
+        use futures::StreamExt;
+        let mut prepared = Vec::new();
+        for (id, name, arguments) in batch {
+            prepared.push(self.prepare(id, name, arguments, ui, cancel).await);
+        }
+        let mut outs = Vec::new();
+        {
+            let tools = &self.tools;
+            let mut running: futures::stream::FuturesOrdered<_> = prepared
+                .iter()
+                .filter_map(|p| match p {
+                    Prepared::Run(ready) => Some(run_ready(tools, ready, cancel)),
+                    Prepared::Done(_) => None,
+                })
+                .collect();
+            for p in &prepared {
+                outs.push(match p {
+                    Prepared::Done(out) => out.clone(),
+                    Prepared::Run(ready) => {
+                        ui.tool_start(&ready.name, &ready.summary);
+                        let out = running
+                            .next()
+                            .await
+                            .unwrap_or_else(|| ToolOutput::err("The call did not run."));
+                        ui.tool_end(&ready.name, &out);
+                        out
+                    }
+                });
+            }
+        }
+        for (p, out) in prepared.iter().zip(outs.iter_mut()) {
+            if let Prepared::Run(ready) = p {
+                self.settle(ready, out, cancel).await;
+            }
+        }
+        outs
+    }
+
+    /// Bookkeeping after a call ran: undo snapshots, the memory section,
+    /// grants a subagent collected, and PostToolUse hooks.
+    async fn settle(&mut self, ready: &Ready, out: &mut ToolOutput, cancel: &CancellationToken) {
+        self.undo.append(std::mem::take(&mut out.undo));
+        if ready.name == "memory" && !out.is_error {
+            crate::tools::memory::refresh_section(&mut self.system, &crate::config::home());
+        }
+        // "Always" answers given for a subagent's calls belong to this session.
+        self.allowed.extend(
+            ready
+                .ctx
+                .granted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..),
+        );
+        if let Some(args) = &ready.hook_args {
+            self.hooks
+                .post_tool_use(&ready.name, args, out, &self.cwd, ready.ctx.session_id.as_deref(), cancel)
+                .await;
+        }
+    }
+
+    /// Hooks, permissions and approval for one call. `Done` carries the
+    /// result of a call that was answered without running (denied, blocked,
+    /// a question for the user, MCP tool search).
+    async fn prepare(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> Prepared {
         let meta = self.tools.is_meta(name);
         if !meta && self.tools.get(name).is_none() {
-            return ToolOutput::err(format!("Unknown tool `{name}`."));
+            return Prepared::Done(ToolOutput::err(format!("Unknown tool `{name}`.")));
         }
         if name == ASK_USER {
             let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-            let question = args["question"].as_str().unwrap_or("").to_string();
-            let options: Vec<String> = args["options"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|o| o.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let answer = tokio::select! {
-                a = ui.ask(&question, &options) => a,
-                _ = cancel.cancelled() => None,
-            };
-            return match answer {
-                Some(a) => ToolOutput::ok(format!("The user answered: {a}")),
-                None => ToolOutput::ok(
-                    "The user skipped the question. Use your best judgment or ask in your reply.",
-                ),
-            };
+            return Prepared::Done(ask_user(&args, ui, cancel).await);
         }
         let args: Value = match serde_json::from_str(if arguments.trim().is_empty() {
             "{}"
@@ -518,7 +890,7 @@ impl Agent {
             arguments
         }) {
             Ok(v) => v,
-            Err(e) => return ToolOutput::err(format!("Invalid JSON arguments: {e}")),
+            Err(e) => return Prepared::Done(ToolOutput::err(format!("Invalid JSON arguments: {e}"))),
         };
         let ctx = ToolCtx {
             cwd: self.cwd.clone(),
@@ -539,6 +911,7 @@ impl Agent {
                 .or_else(|| self.usage_session_id.clone()),
             hooks: self.hooks.clone(),
             subagent_dir: self.session.as_ref().map(|s| crate::subagents::store_dir(&s.path)),
+            shared_tools: self.tools.shared(),
         };
         let summary = if meta {
             args.get("query")
@@ -552,6 +925,12 @@ impl Agent {
                 .map(|tool| tool.summary(&args))
                 .unwrap_or_default()
         };
+        // Reported without running: shown as a finished row.
+        let done = |ui: &mut dyn Ui, out: ToolOutput| {
+            ui.tool_start(name, &summary);
+            ui.tool_end(name, &out);
+            Prepared::Done(out)
+        };
 
         let session_id = ctx.session_id.clone();
         if let Some(msg) = self
@@ -559,10 +938,7 @@ impl Agent {
             .pre_tool_use(name, &args, &self.cwd, session_id.as_deref(), cancel)
             .await
         {
-            ui.tool_start(name, &summary);
-            let out = ToolOutput::err(msg);
-            ui.tool_end(name, &out);
-            return out;
+            return done(ui, ToolOutput::err(msg));
         }
 
         let mut needs_approval = self
@@ -586,13 +962,13 @@ impl Agent {
         ) {
             Decision::Run => None,
             Decision::Deny(rule) => {
-                ui.tool_start(name, &summary);
-                let out = ToolOutput::err(format!(
-                    "This call was blocked by permissions.json rule `{rule}` and did not run. \
-                     Do not retry it; find another way or ask the user."
-                ));
-                ui.tool_end(name, &out);
-                return out;
+                return done(
+                    ui,
+                    ToolOutput::err(format!(
+                        "This call was blocked by permissions.json rule `{rule}` and did not run. \
+                         Do not retry it; find another way or ask the user."
+                    )),
+                );
             }
             Decision::Ask { forced } => Some(forced),
             Decision::Classify => {
@@ -601,22 +977,19 @@ impl Agent {
                     self.account_usage(Some(usage), ui);
                 }
                 if review.cancelled {
-                    ui.tool_start(name, &summary);
-                    let out = ToolOutput::err("Cancelled by user.");
-                    ui.tool_end(name, &out);
-                    return out;
+                    return done(ui, ToolOutput::err("Cancelled by user."));
                 }
                 match &review.verdict {
                     crate::classifier::Verdict::Allow { .. } => None,
                     crate::classifier::Verdict::Deny { .. } => {
                         let reason = review.verdict.reason();
-                        ui.tool_start(name, &summary);
-                        let out = ToolOutput::err(format!(
-                            "The permission classifier denied this call ({reason}) and it did not run. \
-                             Do not retry it; find another way or ask the user."
-                        ));
-                        ui.tool_end(name, &out);
-                        return out;
+                        return done(
+                            ui,
+                            ToolOutput::err(format!(
+                                "The permission classifier denied this call ({reason}) and it did not run. \
+                                 Do not retry it; find another way or ask the user."
+                            )),
+                        );
                     }
                     crate::classifier::Verdict::Ask { .. } => {
                         let reason = review.verdict.reason();
@@ -633,12 +1006,10 @@ impl Agent {
         // Hidden MCP tools are not callable by a remembered name. Deny rules
         // and hooks above still apply; this runs only once the call is allowed.
         if let Some(msg) = self.tools.deferred_block(name) {
-            ui.tool_start(name, &summary);
-            let out = ToolOutput::err(msg);
-            ui.tool_end(name, &out);
-            return out;
+            return done(ui, ToolOutput::err(msg));
         }
         let preview = self.tools.get(name).and_then(|tool| tool.preview(&args, &ctx));
+        let asked = forced.is_some();
         if let Some(forced) = forced {
             // A call that an `ask` rule forces can't be covered by a grant.
             let rule = if forced.is_some() {
@@ -662,10 +1033,7 @@ impl Agent {
                 answer = ui.approve(&req) => Some(answer),
             };
             let Some(answer) = decision else {
-                ui.tool_start(name, &summary);
-                let out = ToolOutput::err("Cancelled by user.");
-                ui.tool_end(name, &out);
-                return out;
+                return done(ui, ToolOutput::err("Cancelled by user."));
             };
             match answer {
                 Approval::Yes => {}
@@ -690,8 +1058,22 @@ impl Agent {
                         "The user denied this tool call. Ask what they want instead.",
                     );
                     ui.tool_end(name, &out);
-                    return out;
+                    return Prepared::Done(out);
                 }
+            }
+        }
+        // The user approved the diff they saw. If the file changed while the
+        // prompt was open, applying the call now would write something else.
+        if asked && is_file_tool(name) && preview.is_some() {
+            let now = self.tools.get(name).and_then(|tool| tool.preview(&args, &ctx));
+            if now != preview {
+                return done(
+                    ui,
+                    ToolOutput::err(
+                        "The file changed after the approval preview was shown, so nothing was written. \
+                         Read the file again and make a new call.",
+                    ),
+                );
             }
         }
 
@@ -707,49 +1089,16 @@ impl Agent {
                     .post_tool_use(name, &args, &out, &self.cwd, session_id.as_deref(), cancel)
                     .await;
             }
-            return out;
+            return Prepared::Done(out);
         }
-        let Some(tool) = self.tools.get(name) else {
-            return ToolOutput::err(format!("Unknown tool `{name}`."));
-        };
-
-        ui.tool_start(name, &summary);
-        let before = self.undo.len();
-        self.undo
-            .snapshot(&self.cwd, self.sandbox.mode, name, &args);
-        let hook_args = self
-            .hooks
-            .observes_post_tool_use(name)
-            .then(|| args.clone());
-        let mut out = if tool.handles_cancel() {
-            tool.run(args, &ctx).await
-        } else {
-            tokio::select! {
-                out = tool.run(args, &ctx) => out,
-                _ = cancel.cancelled() => ToolOutput::err("Cancelled by user."),
-            }
-        };
-        if out.is_error && !out.changed && self.undo.len() > before {
-            self.undo.discard_last();
-        }
-        self.undo.append(std::mem::take(&mut out.undo));
-        if name == "memory" && !out.is_error {
-            crate::tools::memory::refresh_section(&mut self.system, &crate::config::home());
-        }
-        // "Always" answers given for a subagent's calls belong to this session.
-        self.allowed.extend(
-            ctx.granted
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .drain(..),
-        );
-        ui.tool_end(name, &out);
-        if let Some(args) = hook_args {
-            self.hooks
-                .post_tool_use(name, &args, &out, &self.cwd, session_id.as_deref(), cancel)
-                .await;
-        }
-        out
+        let hook_args = self.hooks.observes_post_tool_use(name).then(|| args.clone());
+        Prepared::Run(Box::new(Ready {
+            name: name.to_string(),
+            args,
+            ctx,
+            summary,
+            hook_args,
+        }))
     }
 
     /// Replace the transcript with a model-written summary. Returns false if
@@ -3309,5 +3658,291 @@ mod tests {
             .unwrap();
         assert!(msg.contains("no"), "{msg}");
         assert_eq!(agent.items.len(), n);
+    }
+
+    fn call(id: &str, name: &str, arguments: Value) -> Item {
+        Item::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    fn reply(items: Vec<Item>) -> Response {
+        Response {
+            truncated: false,
+            items,
+            usage: None,
+        }
+    }
+
+    fn scripted(script: Vec<Response>) -> Agent {
+        let mut agent = agent(Response::default(), None);
+        agent.context_window = 0;
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(script)),
+        });
+        agent
+    }
+
+    /// A tool under any name that sleeps, tracks how many runs overlap, and
+    /// answers with its `n` argument (or fails when `fail` is set).
+    struct Probe {
+        name: &'static str,
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+        delay_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for Probe {
+        fn spec(&self) -> crate::types::ToolSpec {
+            crate::types::ToolSpec {
+                name: self.name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            }
+        }
+        fn summary(&self, _: &Value) -> String {
+            String::new()
+        }
+        async fn run(&self, args: Value, _: &ToolCtx) -> ToolOutput {
+            use std::sync::atomic::Ordering;
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            if self.fail {
+                return ToolOutput::err("nope");
+            }
+            ToolOutput::ok(format!("result {}", args["n"]))
+        }
+    }
+
+    fn probe(name: &'static str, fail: bool) -> (Probe, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = Probe {
+            name,
+            live: Default::default(),
+            peak: peak.clone(),
+            fail,
+            delay_ms: if name == "grep" { 100 } else { 1 },
+        };
+        (tool, peak)
+    }
+
+    #[tokio::test]
+    async fn consecutive_read_calls_run_together_in_order() {
+        let (grep, peak) = probe("grep", false);
+        let (other, _) = probe("mcp__x__write", false);
+        let mut agent = scripted(vec![
+            reply(vec![
+                call("a", "grep", serde_json::json!({"n": 1})),
+                call("b", "grep", serde_json::json!({"n": 2})),
+                call("c", "grep", serde_json::json!({"n": 3})),
+                call("d", "mcp__x__write", serde_json::json!({"n": 4})),
+            ]),
+            reply(vec![Item::Assistant { text: "done".into() }]),
+        ]);
+        agent.tools.add(Box::new(grep));
+        agent.tools.add(Box::new(other));
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(results(&agent), ["result 1", "result 2", "result 3", "result 4"]);
+        assert!(runs_in_parallel("subagent", r#"{"task": "x"}"#));
+        assert!(!runs_in_parallel("subagent", r#"{"action": "stop", "name": "x"}"#));
+        assert!(!runs_in_parallel("bash", "{}"));
+    }
+
+    #[tokio::test]
+    async fn a_call_that_keeps_failing_gets_a_nudge() {
+        let (tool, _) = probe("mcp__x__go", true);
+        let same = || reply(vec![call("a", "mcp__x__go", serde_json::json!({}))]);
+        let mut agent = scripted(vec![same(), same(), same(), reply(vec![Item::Assistant { text: "ok".into() }])]);
+        agent.tools.add(Box::new(tool));
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        let results = results(&agent);
+        assert!(!results[1].contains("failed"), "{}", results[1]);
+        assert!(results[2].contains("has now failed 3 times"), "{}", results[2]);
+    }
+
+    #[tokio::test]
+    async fn the_step_limit_ends_the_turn_with_a_notice() {
+        let (tool, _) = probe("mcp__x__go", false);
+        let script = (0..MAX_STEPS).map(|_| reply(vec![call("a", "mcp__x__go", serde_json::json!({}))])).collect();
+        let mut agent = scripted(script);
+        agent.tools.add(Box::new(tool));
+        let mut ui = NoticeCatch(Vec::new());
+        let end = agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        assert!(matches!(end, TurnEnd::Done));
+        assert!(ui.0.iter().any(|n| n.contains("Stopped after")), "{:?}", ui.0);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_reply_is_kept_with_a_marker() {
+        struct Stalls;
+        #[async_trait::async_trait]
+        impl Provider for Stalls {
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn model(&self) -> &str {
+                "fake"
+            }
+            fn set_model(&mut self, _: String) {}
+            fn fork(&self) -> Box<dyn Provider> {
+                Box::new(Stalls)
+            }
+            async fn stream(&self, _: Request<'_>, sink: EventSink<'_>) -> Result<Response> {
+                sink(StreamEvent::Text("Half an ans".into()));
+                std::future::pending().await
+            }
+        }
+        let mut agent = scripted(Vec::new());
+        agent.provider = Box::new(Stalls);
+        let cancel = CancellationToken::new();
+        let later = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            later.cancel();
+        });
+        let end = agent.turn(Item::user("go"), &mut QuietUi, cancel).await.unwrap();
+        assert!(matches!(end, TurnEnd::Cancelled));
+        assert_eq!(
+            agent.items.last(),
+            Some(&Item::Assistant {
+                text: format!("Half an ans\n\n{INTERRUPTED}")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_whose_file_changed_during_approval_is_refused() {
+        struct Edit {
+            content: std::sync::Arc<std::sync::Mutex<String>>,
+            ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Edit {
+            fn spec(&self) -> crate::types::ToolSpec {
+                crate::types::ToolSpec {
+                    name: "edit_file".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                }
+            }
+            fn needs_approval(&self, _: &Value) -> bool {
+                true
+            }
+            fn summary(&self, _: &Value) -> String {
+                String::new()
+            }
+            fn preview(&self, _: &Value, _: &ToolCtx) -> Option<String> {
+                Some(self.content.lock().unwrap().clone())
+            }
+            async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
+                self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                ToolOutput::ok("edited")
+            }
+        }
+        struct Meddler(std::sync::Arc<std::sync::Mutex<String>>);
+        #[async_trait::async_trait]
+        impl Ui for Meddler {
+            fn stream(&mut self, _: &StreamEvent) {}
+            fn end_message(&mut self) {}
+            fn tool_start(&mut self, _: &str, _: &str) {}
+            fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
+            async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval {
+                *self.0.lock().unwrap() = "changed on disk".into();
+                Approval::Yes
+            }
+        }
+        let content = std::sync::Arc::new(std::sync::Mutex::new("old".to_string()));
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut agent = scripted(vec![
+            reply(vec![call("a", "edit_file", serde_json::json!({"path": "x"}))]),
+            reply(vec![Item::Assistant { text: "ok".into() }]),
+        ]);
+        agent.permission_mode = crate::permissions::Mode::Ask;
+        agent.tools.add(Box::new(Edit {
+            content: content.clone(),
+            ran: ran.clone(),
+        }));
+        agent
+            .turn(Item::user("go"), &mut Meddler(content), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(results(&agent)[0].contains("changed after the approval preview"));
+    }
+
+    #[tokio::test]
+    async fn several_questions_with_described_options() {
+        struct Answers(Vec<Option<String>>, Vec<Vec<String>>);
+        #[async_trait::async_trait]
+        impl Ui for Answers {
+            fn stream(&mut self, _: &StreamEvent) {}
+            fn end_message(&mut self) {}
+            fn tool_start(&mut self, _: &str, _: &str) {}
+            fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
+            async fn approve(&mut self, _: &ApprovalRequest<'_>) -> Approval {
+                Approval::Yes
+            }
+            async fn ask(&mut self, _: &str, options: &[String]) -> Option<String> {
+                self.1.push(options.to_vec());
+                self.0.remove(0)
+            }
+        }
+        let args = serde_json::json!({"questions": [
+            {"question": "Which DB?", "options": [{"label": "SQLite", "description": "simplest, one file"}, {"label": "Postgres"}]},
+            {"question": "Add tests?", "options": [{"label": "Yes"}, {"label": "No"}]}
+        ]});
+        let mut ui = Answers(vec![Some("SQLite — simplest, one file".into()), None], Vec::new());
+        let out = ask_user(&args, &mut ui, &CancellationToken::new()).await;
+        assert_eq!(out.content, "The user answered:\n- Which DB? → SQLite\n- Add tests? → (skipped)");
+        assert_eq!(ui.1[0], ["SQLite — simplest, one file", "Postgres"]);
+        let legacy = serde_json::json!({"question": "Go?", "options": ["yes", "no"]});
+        let mut ui = Answers(vec![Some("typed answer".into())], Vec::new());
+        let out = ask_user(&legacy, &mut ui, &CancellationToken::new()).await;
+        assert_eq!(out.content, "The user answered: typed answer");
+        assert!(ask_user(&serde_json::json!({}), &mut ui, &CancellationToken::new()).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn nested_instructions_arrive_once_with_the_first_touch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
+        std::fs::write(dir.path().join("sub/AGENTS.md"), "Use tabs in sub.\n").unwrap();
+        let (tool, _) = probe("read_file", false);
+        let touch = |id: &str| reply(vec![call(id, "read_file", serde_json::json!({"path": "sub/deep/x.rs"}))]);
+        let mut agent = scripted(vec![touch("a"), touch("b"), reply(vec![Item::Assistant { text: "ok".into() }])]);
+        agent.cwd = dir.path().to_path_buf();
+        agent.tools.add(Box::new(tool));
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        let results = results(&agent);
+        assert!(results[0].contains("[Instructions from sub/AGENTS.md, which apply to files under sub/"), "{}", results[0]);
+        assert!(results[0].ends_with("Use tabs in sub."), "{}", results[0]);
+        assert!(!results[1].contains("Instructions"), "{}", results[1]);
+    }
+
+    #[test]
+    fn session_notes_describe_mode_and_question_ui() {
+        let mut agent = agent(Response::default(), None);
+        agent.permission_mode = crate::permissions::Mode::Ask;
+        let notes = agent.session_notes();
+        assert!(notes.contains("Permission mode: ask"), "{notes}");
+        assert!(notes.contains("no question UI"), "{notes}");
+        agent.tools.add(Box::new(AskUserTool));
+        assert!(!agent.session_notes().contains("no question UI"));
     }
 }

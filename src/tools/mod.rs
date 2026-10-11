@@ -25,6 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::types::ToolSpec;
 
+/// Session tools that are not MCP tools but still pass to subagents.
+const SHARED: &[&str] = &["skill", "install_skill", "mcp_list_resources", "mcp_read_resource"];
+
 /// Directories and files the read tools must not open: nyq's own tokens,
 /// the codex CLI login, SSH keys, cloud credentials, and `~/.netrc`.
 /// Installed skills (`~/.nyq/skills`) stay readable so their scripts and
@@ -255,6 +258,8 @@ pub struct ToolCtx {
     pub hooks: std::sync::Arc<crate::hooks::Hooks>,
     /// Where this session's named subagents are saved; None without a session.
     pub subagent_dir: Option<PathBuf>,
+    /// Session tools a subagent inherits: MCP tools and skills.
+    pub shared_tools: Vec<std::sync::Arc<dyn Tool>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -321,7 +326,7 @@ pub trait Tool: Send + Sync {
 
 #[derive(Default)]
 pub struct Registry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<std::sync::Arc<dyn Tool>>,
     /// MCP tools picked with `mcp_select_tool` while MCP tools are deferred.
     selected: HashSet<String>,
 }
@@ -350,12 +355,30 @@ impl Registry {
 
     /// Insert `tool`, refusing to replace an existing name.
     pub fn try_insert(&mut self, tool: Box<dyn Tool>) -> Result<(), String> {
+        self.try_insert_shared(std::sync::Arc::from(tool))
+    }
+
+    /// Like [`Registry::try_insert`], for a tool another registry also holds.
+    pub fn try_insert_shared(&mut self, tool: std::sync::Arc<dyn Tool>) -> Result<(), String> {
         let name = tool.spec().name.clone();
         if self.tools.iter().any(|t| t.spec().name == name) {
             return Err(format!("tool `{name}` collides with an existing tool"));
         }
         self.tools.push(tool);
         Ok(())
+    }
+
+    /// The session's own tools a subagent inherits: MCP tools (and MCP
+    /// resources) and skills.
+    pub fn shared(&self) -> Vec<std::sync::Arc<dyn Tool>> {
+        self.tools
+            .iter()
+            .filter(|t| {
+                let name = t.spec().name;
+                mcp_search::is_mcp(&name) || SHARED.contains(&name.as_str())
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn remove_names(&mut self, names: &[String]) {
