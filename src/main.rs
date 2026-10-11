@@ -14,6 +14,7 @@ mod login;
 mod mcp;
 mod mcp_cli;
 mod mcp_features;
+mod mcp_slash;
 mod models;
 mod notify;
 mod permissions;
@@ -46,7 +47,7 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 
 use agent::{Agent, TurnEnd};
-use mcp::{McpManager, Scope, ServerConfig};
+use mcp::{McpManager, ServerConfig};
 use session::Session;
 use tools::Registry;
 use types::Usage;
@@ -274,7 +275,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/logout", "remove nyq's stored sign-in: /logout [provider]"),
     ("/setup", "connections, default provider, credential source, AI Gateway"),
     ("/credits", "AI Gateway credit balance (also /balance)"),
-    ("/mcp", "MCP servers: /mcp [connect|disconnect|login|logout NAME] · /mcp trust …"),
+    ("/mcp", "MCP servers and tools: /mcp [list|add|remove|reload|path|connect|disconnect|login|logout|trust|resource|prompt]"),
     ("/memory", "saved memories; /memory remove N forgets one"),
     (
         "/background",
@@ -531,7 +532,7 @@ async fn run() -> Result<()> {
     }
 
     let mut mcp = McpManager::new(home.clone());
-    let (servers, warnings) = mcp::load_configs(&home, &cwd);
+    let (mut servers, warnings) = mcp::load_configs(&home, &cwd);
     for w in &warnings {
         ui::error(w);
     }
@@ -563,7 +564,7 @@ async fn run() -> Result<()> {
         if let Some(meta) = &resumed {
             ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
         }
-        connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
+        mcp_slash::connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
         mcp_features::sync(&mut agent, &mcp);
         hooks::session_start(
             &agent,
@@ -632,7 +633,7 @@ async fn run() -> Result<()> {
         ui::replay(&agent.items);
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     }
-    connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
+    mcp_slash::connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
     mcp_features::sync(&mut agent, &mcp);
     tui.screen()
         .editor
@@ -755,7 +756,7 @@ async fn run() -> Result<()> {
                 &line,
                 &mut agent,
                 &mut mcp,
-                &servers,
+                &mut servers,
                 &sessions_dir,
                 &tui,
                 &mut skills,
@@ -1034,75 +1035,6 @@ fn cancel_on_ctrl_c() -> CancellationToken {
     token
 }
 
-async fn connect_profile_servers(
-    mcp: &mut McpManager,
-    agent: &mut Agent,
-    servers: &[ServerConfig],
-    quiet: bool,
-) {
-    // Project servers connect too once trusted (`nyq mcp trust`), unless a
-    // profile server has the same name.
-    let trusted = mcp_cli::trusted_project(&config::home(), &agent.cwd);
-    let profile = |name: &str| servers.iter().any(|s| s.scope == Scope::Profile && s.name == name);
-    let starts = |s: &ServerConfig| s.scope == Scope::Profile || (trusted.contains(&s.name) && !profile(&s.name));
-    for cfg in servers.iter().filter(|s| starts(s)) {
-        connect(mcp, agent, cfg, quiet).await;
-    }
-    if !quiet {
-        let project: Vec<_> = servers
-            .iter()
-            .filter(|s| !starts(s))
-            .map(|s| s.name.as_str())
-            .collect();
-        if !project.is_empty() {
-            ui::info(&format!(
-                "Project MCP servers in .mcp.json: {} (connect with /mcp connect NAME, or trust with /mcp trust approve NAME)",
-                project.join(", ")
-            ));
-        }
-    }
-}
-
-fn drop_server_tools(agent: &mut Agent, mcp: &McpManager, name: &str) {
-    let names = mcp.registered_names(name);
-    agent.tools.remove_names(&names);
-    agent.tools.remove_prefix(&mcp::tool_prefix(name));
-}
-
-fn install_mcp_tools(
-    agent: &mut Agent,
-    name: &str,
-    tools: Vec<Box<dyn tools::Tool>>,
-) -> Result<()> {
-    let mut added = Vec::new();
-    for tool in tools {
-        let n = tool.spec().name.clone();
-        if let Err(e) = agent.tools.try_insert(tool) {
-            agent.tools.remove_names(&added);
-            agent.tools.remove_prefix(&mcp::tool_prefix(name));
-            anyhow::bail!("MCP {name}: {e}");
-        }
-        added.push(n);
-    }
-    Ok(())
-}
-
-async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig, quiet: bool) {
-    drop_server_tools(agent, mcp, &cfg.name);
-    match mcp.connect(cfg).await {
-        Ok(tools) => {
-            let n = tools.len();
-            if let Err(e) = install_mcp_tools(agent, &cfg.name, tools) {
-                ui::error(&format!("{e:#}"));
-                let _ = mcp.disconnect(&cfg.name).await;
-            } else if !quiet {
-                ui::info(&format!("MCP {}: {n} tools", cfg.name));
-            }
-        }
-        Err(e) => ui::error(&format!("MCP {}: {e:#}", cfg.name)),
-    }
-}
-
 /// `!cmd`: run a command yourself (unsandboxed) and show its output.
 async fn shell(cmd: &str, cwd: &Path, tui: &Tui) {
     let cancel = CancellationToken::new();
@@ -1190,7 +1122,7 @@ async fn slash(
     line: &str,
     agent: &mut Agent,
     mcp: &mut McpManager,
-    servers: &[ServerConfig],
+    servers: &mut Vec<ServerConfig>,
     sessions_dir: &std::path::Path,
     tui: &Tui,
     skills: &mut Vec<skills::Skill>,
@@ -1305,81 +1237,7 @@ async fn slash(
                 .collect();
             ui::list(&lines);
         }
-        "/mcp" => {
-            match (arg.first().copied(), arg.get(1).copied()) {
-                (Some("trust"), _) => ui::list(&mcp_cli::trust_slash(&config::home(), &agent.cwd, &arg[1..])?),
-                (Some("connect"), Some(name)) => {
-                    let cfg = servers
-                        .iter()
-                        .find(|s| s.name == name)
-                        .with_context(|| format!("no MCP server named `{name}`"))?;
-                    connect(mcp, agent, cfg, false).await;
-                }
-                (Some("login"), Some(name)) => {
-                    let cfg = servers
-                        .iter()
-                        .find(|s| s.name == name)
-                        .with_context(|| format!("no MCP server named `{name}`"))?;
-                    drop_server_tools(agent, mcp, name);
-                    let cancel = CancellationToken::new();
-                    tui.screen()
-                        .set_busy(Some("Signing in"), Some(cancel.clone()));
-                    let result = mcp
-                    .login(cfg, Some(&cancel), |url| {
-                        ui::info(&format!("Sign in to {name} in your browser (waiting up to 5 minutes):\n  {url}"));
-                        mcp::open_browser(url);
-                    })
-                    .await;
-                    tui.screen().idle();
-                    let tools = result?;
-                    let n = tools.len();
-                    install_mcp_tools(agent, name, tools)?;
-                    ui::info(&format!("MCP {name}: signed in · {n} tools"));
-                }
-                (Some("logout"), Some(name)) => {
-                    let cfg = servers
-                        .iter()
-                        .find(|s| s.name == name)
-                        .with_context(|| format!("no MCP server named `{name}`"))?;
-                    let endpoint = mcp::canonical_endpoint(&cfg.transport)?;
-                    drop_server_tools(agent, mcp, name);
-                    let existed = mcp.logout(name, &endpoint).await?;
-                    ui::info(&if existed {
-                        format!("Signed out of {name}.")
-                    } else {
-                        format!("No saved sign-in for {name}.")
-                    });
-                }
-                (Some("disconnect"), Some(name)) => {
-                    drop_server_tools(agent, mcp, name);
-                    mcp.disconnect(name).await?;
-                    ui::info(&format!("Disconnected {name}."));
-                }
-                _ => {
-                    let connected = mcp.connected();
-                    if servers.is_empty() {
-                        ui::info("No MCP servers configured (add them to mcp.json or .mcp.json).");
-                    }
-                    for s in servers {
-                        let state = match connected.iter().find(|(n, _)| n == &s.name) {
-                            Some((_, n)) => {
-                                let (action, specific) =
-                                    agent.permissions.server_default(&mcp::tool_prefix(&s.name));
-                                let more = if specific { " + tool rules" } else { "" };
-                                format!("connected · {n} tools · {}{more}", action.as_str())
-                            }
-                            None => "not connected".into(),
-                        };
-                        let scope = if s.scope == Scope::Project {
-                            "project"
-                        } else {
-                            "profile"
-                        };
-                        ui::info(&format!("  {:<20} {scope:<8} {state}", s.name));
-                    }
-                }
-            }
-        }
+        "/mcp" => mcp_slash::command(agent, mcp, servers, tui, &arg).await?,
         "/permissions" => commands::permissions(agent, tui, &config::home(), &arg),
         "/allowlist" => commands::allowlist(agent, &arg),
         "/hooks" => hooks::command(agent, arg.first().copied()),
