@@ -340,6 +340,28 @@ pub(crate) fn skill_files(dir: &Path, max: usize) -> (Vec<String>, usize) {
     (files, total)
 }
 
+/// A skill's instructions as the model sees them: name, base directory,
+/// the SKILL.md body and the other files in the skill.
+pub fn load_text(skill: &Skill) -> Result<String, String> {
+    let text = match crate::tools::read_rooted_text(&skill.root, &skill.path) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("reading {}: {e}", slash_path(&skill.path))),
+    };
+    let (_, body) = split_frontmatter(&text);
+    let mut out = format!("Skill: {}\nBase directory: {}\n\n{}\n", skill.name, slash_path(&skill.dir), body.trim());
+    let (files, total) = skill_files(&skill.dir, MAX_LISTED_FILES);
+    if !files.is_empty() {
+        out.push_str("\nOther files in this skill (relative to the base directory):\n");
+        for f in &files {
+            out.push_str(&format!("- {f}\n"));
+        }
+        if total > files.len() {
+            out.push_str(&format!("- ... and {} more\n", total - files.len()));
+        }
+    }
+    Ok(out)
+}
+
 #[async_trait::async_trait]
 impl Tool for SkillTool {
     fn spec(&self) -> ToolSpec {
@@ -367,23 +389,10 @@ impl Tool for SkillTool {
         let Some(skill) = self.find(name) else {
             return ToolOutput::err(self.unknown(name));
         };
-        let text = match crate::tools::read_rooted_text(&skill.root, &skill.path) {
-            Ok(t) => t,
-            Err(e) => return ToolOutput::err(format!("reading {}: {e}", slash_path(&skill.path))),
-        };
-        let (_, body) = split_frontmatter(&text);
-        let mut out = format!("Skill: {}\nBase directory: {}\n\n{}\n", skill.name, slash_path(&skill.dir), body.trim());
-        let (files, total) = skill_files(&skill.dir, MAX_LISTED_FILES);
-        if !files.is_empty() {
-            out.push_str("\nOther files in this skill (relative to the base directory):\n");
-            for f in &files {
-                out.push_str(&format!("- {f}\n"));
-            }
-            if total > files.len() {
-                out.push_str(&format!("- ... and {} more\n", total - files.len()));
-            }
+        match load_text(&skill) {
+            Ok(out) => ToolOutput::ok(out),
+            Err(e) => ToolOutput::err(e),
         }
-        ToolOutput::ok(out)
     }
 }
 

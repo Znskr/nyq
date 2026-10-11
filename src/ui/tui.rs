@@ -255,6 +255,7 @@ pub struct Screen {
     sessions: Option<SessionMenu>,
     settings: Option<super::settings::SettingsMenu>,
     modes: Option<super::mode_menu::ModeMenu>,
+    help: Option<super::help_menu::HelpMenu>,
     /// Everything shown so far, for the transcript viewer.
     pub log: super::transcript::Log,
     viewer: Option<super::transcript::Viewer>,
@@ -265,6 +266,8 @@ pub struct Screen {
     /// Ctrl+V asked for a clipboard image (read by the input task).
     clipboard_request: bool,
     slash_selected: usize,
+    /// Arrow keys moved the slash selection since the last edit.
+    slash_moved: bool,
     pub footer: Footer,
     cancel: Option<CancellationToken>,
     history: Vec<String>,
@@ -543,12 +546,14 @@ impl Screen {
             sessions: None,
             settings: None,
             modes: None,
+            help: None,
             log: Default::default(),
             viewer: None,
             deferred: Vec::new(),
             attachments: Vec::new(),
             clipboard_request: false,
             slash_selected: 0,
+            slash_moved: false,
             footer,
             cancel: None,
             history,
@@ -1114,6 +1119,50 @@ impl Screen {
                     m.selected,
                     vec![("↑↓", "Navigate"), ("Enter", "Use"), ("Esc", "Close")],
                 )
+            } else if let Some(m) = &self.help {
+                let visible = m.rows();
+                let tabs: Vec<String> = std::iter::once(None)
+                    .chain(crate::slash::Category::ALL.iter().copied().map(Some))
+                    .map(|c| {
+                        let label = c.map_or("All", |c| c.label());
+                        if c == m.category {
+                            paint(fg(BRIGHT), &format!("[{label}]"))
+                        } else {
+                            paint(fg(GRAY), label)
+                        }
+                    })
+                    .collect();
+                let prefix = format!(
+                    "{} {}  {}  ",
+                    paint(fg(BRIGHT).bold(), "Help"),
+                    paint(fg(GRAY), &visible.len().to_string()),
+                    tabs.join(" ")
+                );
+                let filter_text = if m.filter.is_empty() {
+                    "Type to filter"
+                } else {
+                    m.filter.as_str()
+                };
+                let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
+                let items = visible
+                    .iter()
+                    .map(|e| MenuItem {
+                        label: e.command.clone(),
+                        detail: sanitize_text(&e.description),
+                        tag: e.category.label().to_string(),
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    m.selected,
+                    vec![
+                        ("↑↓", "Navigate"),
+                        ("Tab", "Category"),
+                        ("Enter", "Run"),
+                        ("Esc", "Close"),
+                    ],
+                )
             } else if let Some(m) = &self.sessions {
                 let visible = m.visible();
                 let prefix = format!(
@@ -1161,10 +1210,10 @@ impl Screen {
                 );
                 let items = s
                     .into_iter()
-                    .map(|(c, d)| MenuItem {
-                        label: c,
-                        detail: d,
-                        tag: String::new(),
+                    .map(|s| MenuItem {
+                        label: s.label,
+                        detail: s.detail,
+                        tag: s.tag,
                     })
                     .collect();
                 (
@@ -1200,6 +1249,9 @@ impl Screen {
         }
         if self.modes.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No matching modes."));
+        }
+        if self.help.is_some() && items.is_empty() {
+            rows.push(paint(fg(GRAY), "  No matching commands."));
         }
         if self.sessions.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No saved sessions found."));
@@ -1660,6 +1712,7 @@ impl Screen {
         self.sessions = None;
         self.settings = None;
         self.modes = None;
+        self.help = None;
         self.menu = Some(ModelMenu {
             choices: Vec::new(),
             tabs: vec!["All".into()],
@@ -1696,6 +1749,7 @@ impl Screen {
         self.menu = None;
         self.settings = None;
         self.modes = None;
+        self.help = None;
         self.sessions = Some(SessionMenu {
             sessions: order_sessions(all, cwd, current),
             filter: String::new(),
@@ -1770,6 +1824,7 @@ impl Screen {
         self.menu = None;
         self.sessions = None;
         self.modes = None;
+        self.help = None;
         self.settings = Some(super::settings::SettingsMenu::new(category));
         self.redraw();
     }
@@ -1779,7 +1834,42 @@ impl Screen {
         self.menu = None;
         self.sessions = None;
         self.settings = None;
+        self.help = None;
         self.modes = Some(super::mode_menu::ModeMenu::new());
+        self.redraw();
+    }
+
+    /// Open the `/help` menu over every command the editor knows.
+    pub fn open_help(&mut self) {
+        self.menu = None;
+        self.sessions = None;
+        self.settings = None;
+        self.modes = None;
+        self.help = Some(super::help_menu::HelpMenu::new(self.editor.commands()));
+        self.redraw();
+    }
+
+    fn on_help_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        use super::help_menu::Action;
+        let Some(m) = &mut self.help else { return };
+        match m.on_key(key) {
+            Action::None => {}
+            Action::Close => self.help = None,
+            Action::Insert(text) => {
+                self.help = None;
+                self.editor.set_text(&text);
+            }
+            Action::Run(cmd) => {
+                self.help = None;
+                self.remember(&cmd);
+                if self.is_busy() {
+                    self.hint = Some(format!("{cmd} runs when the current task finishes"));
+                    self.queue.push((Queued::FollowUp, cmd));
+                } else {
+                    let _ = commands.send(Command::Submit(cmd));
+                }
+            }
+        }
         self.redraw();
     }
 
@@ -2088,6 +2178,9 @@ impl Screen {
         if self.modes.is_some() {
             return self.on_modes_key(key, commands);
         }
+        if self.help.is_some() {
+            return self.on_help_key(key, commands);
+        }
         if self.sessions.is_some() {
             return self.on_sessions_key(key, commands);
         }
@@ -2155,49 +2248,61 @@ impl Screen {
         // The slash menu takes arrows and Enter while it is showing.
         let suggestions = self.editor.suggestions();
         if !suggestions.is_empty() {
+            let pick = &suggestions[self.slash_selected.min(suggestions.len() - 1)];
             match key.code {
                 KeyCode::Up => {
                     self.slash_selected = self
                         .slash_selected
                         .checked_sub(1)
                         .unwrap_or(suggestions.len() - 1);
+                    self.slash_moved = true;
                     return self.redraw();
                 }
                 KeyCode::Down => {
                     self.slash_selected = (self.slash_selected + 1) % suggestions.len();
+                    self.slash_moved = true;
                     return self.redraw();
                 }
-                KeyCode::Enter if key.modifiers.is_empty() => {
-                    let cmd = suggestions[self.slash_selected.min(suggestions.len() - 1)]
-                        .0
-                        .clone();
-                    self.editor.set_text("");
+                // Right after the space that opened argument completion,
+                // Enter still runs what was typed unless an option was picked.
+                KeyCode::Enter
+                    if key.modifiers.is_empty()
+                        && !(pick.arg && self.editor.text().ends_with(' ') && !self.slash_moved) =>
+                {
+                    let fill = pick.fill.clone();
                     self.slash_selected = 0;
-                    self.remember(&cmd);
+                    self.slash_moved = false;
+                    if !pick.run {
+                        self.editor.set_text(&format!("{fill} "));
+                        return self.redraw();
+                    }
+                    self.editor.set_text("");
+                    self.remember(&fill);
                     if self.is_busy() {
-                        self.hint = Some(format!("{cmd} runs when the current task finishes"));
-                        self.queue.push((Queued::FollowUp, cmd));
+                        self.hint = Some(format!("{fill} runs when the current task finishes"));
+                        self.queue.push((Queued::FollowUp, fill));
                     } else {
-                        let _ = commands.send(Command::Submit(cmd));
+                        let _ = commands.send(Command::Submit(fill));
                     }
                     return self.redraw();
                 }
                 KeyCode::Tab => {
-                    let cmd = suggestions[self.slash_selected.min(suggestions.len() - 1)]
-                        .0
-                        .clone();
-                    self.editor.set_text(&format!("{cmd} "));
+                    let fill = pick.fill.clone();
+                    self.editor.set_text(&format!("{fill} "));
                     self.slash_selected = 0;
+                    self.slash_moved = false;
                     return self.redraw();
                 }
                 KeyCode::Esc => {
                     self.editor.set_text("");
                     self.slash_selected = 0;
+                    self.slash_moved = false;
                     return self.redraw();
                 }
                 _ => {}
             }
         }
+        self.slash_moved = false;
         let busy = self.is_busy();
         let was_empty = self.editor.is_empty();
         self.hint = None;
