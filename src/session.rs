@@ -2,7 +2,9 @@
 //!
 //! Line 1 is a header (`{"type":"session",...}`). A later
 //! `{"type":"title","title":...}` line is metadata from `/rename` (the latest
-//! one wins in listings). Every other line is one [`Item`]. Files are
+//! one wins in listings), and a `{"type":"permissions","state":...}` line holds
+//! the session's permission grants (the latest one wins on resume). Every
+//! other line is one [`Item`]. Files are
 //! append-only, so a crash can at worst truncate the last line, which loading
 //! tolerates.
 
@@ -113,7 +115,7 @@ pub fn recover(dir: &Path, which: &str, cwd: &Path) -> Result<(String, usize, us
             kept += 1;
         } else if is_title_line(line) {
             let value: serde_json::Value = serde_json::from_slice(line)?;
-            if value["title"].as_str().is_none() {
+            if value["type"] == "title" && value["title"].as_str().is_none() {
                 skipped += 1;
                 continue;
             }
@@ -202,6 +204,8 @@ pub struct Session {
     file: Option<File>,
     /// Held while the session is open (see `lock_session`).
     lock: Option<File>,
+    /// The latest permissions line: read on load, then what was last written.
+    permissions: Option<serde_json::Value>,
 }
 
 impl Session {
@@ -223,6 +227,7 @@ impl Session {
             queued: Vec::new(),
             file: None,
             lock: None,
+            permissions: None,
         })
     }
 
@@ -321,11 +326,30 @@ impl Session {
         self.flush_queue()
     }
 
+    /// Record the session's permission state (skipped when unchanged).
+    pub fn save_permissions(&mut self, state: serde_json::Value) -> Result<()> {
+        if self.permissions.as_ref() == Some(&state) {
+            return Ok(());
+        }
+        let line = serde_json::to_string(&serde_json::json!({ "type": "permissions", "state": state }))
+            .with_context(|| format!("encoding permissions for {}", self.id))?;
+        self.queued.push(line);
+        self.flush_queue()?;
+        self.permissions = Some(state);
+        Ok(())
+    }
+
+    /// The permission state saved with this session, if any.
+    pub fn saved_permissions(&self) -> Option<&serde_json::Value> {
+        self.permissions.as_ref()
+    }
+
     /// Replace the file with its header, keeping the session id and settings.
     /// The new header is written by rename, then the file is reopened for append,
     /// so a crash cannot leave a zero-length session.
     pub fn clear_transcript(&mut self) -> Result<()> {
         self.queued.clear();
+        self.permissions = None;
         let header = self.header_line()?;
         if self.file.is_none() && !self.path.exists() {
             self.pending_header = Some(header);
@@ -554,6 +578,7 @@ pub fn generated_title(raw: &str) -> Result<String> {
     validate_title(&title).map_err(|_| anyhow::anyhow!("the model did not return a usable title"))
 }
 
+/// A metadata line (`title` or `permissions`), not an item.
 fn is_title_line(line: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(line)
         .ok()
@@ -561,9 +586,17 @@ fn is_title_line(line: &[u8]) -> bool {
             value
                 .get("type")
                 .and_then(|kind| kind.as_str())
-                .map(|kind| kind == "title")
+                .map(|kind| kind == "title" || kind == "permissions")
         })
         .unwrap_or(false)
+}
+
+/// The state of the last `permissions` line.
+fn latest_permissions(data: &[u8]) -> Option<serde_json::Value> {
+    data.rsplit(|b| *b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .find(|v| v["type"] == "permissions")
+        .map(|mut v| v["state"].take())
 }
 
 fn title_of(text: &str) -> String {
@@ -746,6 +779,7 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
     file.read_to_end(&mut data)
         .with_context(|| format!("reading {}", meta.path.display()))?;
     let (mut items, good) = read_items(&data, &meta.path)?;
+    let permissions = latest_permissions(&data[..good]);
     if good < data.len() || !data[..good].ends_with(b"\n") {
         // Drop a half-written final record (including a torn UTF-8 byte) and
         // make sure appends start on a fresh line. The lock is already held.
@@ -764,6 +798,7 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         queued: Vec::new(),
         file: Some(file),
         lock: Some(lock),
+        permissions,
     };
     for item in repairs(&items) {
         session.append(&item)?;
