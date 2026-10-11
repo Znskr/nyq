@@ -14,7 +14,7 @@ mod search;
 pub mod subagent;
 pub mod web;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -302,11 +302,43 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// A change to a [`Registry`] made outside the agent loop (an MCP server
+/// connected in the background or changed its tool list).
+pub type ToolPatch = Box<dyn FnOnce(&mut Registry) + Send>;
+
+/// Shared between the MCP manager and the registry it serves: queued tool
+/// changes, applied before each model request, and per-server instructions.
+#[derive(Clone, Default)]
+pub struct LiveTools {
+    patches: std::sync::Arc<std::sync::Mutex<Vec<ToolPatch>>>,
+    notes: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+}
+
+impl LiveTools {
+    pub fn push(&self, patch: ToolPatch) {
+        self.patches.lock().unwrap_or_else(|e| e.into_inner()).push(patch);
+    }
+
+    /// Set (or with None, clear) a server's instructions for the model.
+    pub fn set_note(&self, server: &str, note: Option<String>) {
+        let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        match note.filter(|n| !n.trim().is_empty()) {
+            Some(n) => notes.insert(server.to_string(), n),
+            None => notes.remove(server),
+        };
+    }
+
+    pub fn notes(&self) -> BTreeMap<String, String> {
+        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 #[derive(Default)]
 pub struct Registry {
     tools: Vec<Box<dyn Tool>>,
     /// MCP tools picked with `mcp_select_tool` while MCP tools are deferred.
     selected: HashSet<String>,
+    live: Option<LiveTools>,
 }
 
 impl Registry {
@@ -325,6 +357,25 @@ impl Registry {
         web::register(&mut r);
         subagent::register(&mut r);
         r
+    }
+
+    /// Receive tool changes and server instructions from `live`.
+    pub fn attach(&mut self, live: LiveTools) {
+        self.live = Some(live);
+    }
+
+    /// Apply queued tool changes.
+    pub fn refresh(&mut self) {
+        let Some(live) = self.live.clone() else { return };
+        let patches = std::mem::take(&mut *live.patches.lock().unwrap_or_else(|e| e.into_inner()));
+        for patch in patches {
+            patch(self);
+        }
+    }
+
+    /// Instructions of connected MCP servers, by server name.
+    pub fn mcp_notes(&self) -> BTreeMap<String, String> {
+        self.live.as_ref().map(LiveTools::notes).unwrap_or_default()
     }
 
     pub fn add(&mut self, tool: Box<dyn Tool>) {
@@ -422,7 +473,7 @@ impl Registry {
         let args: Value = serde_json::from_str(arguments).unwrap_or_default();
         if name == mcp_search::SEARCH {
             return Some(
-                mcp_search::search(&mcp, &args).map_or_else(ToolOutput::err, ToolOutput::ok),
+                mcp_search::search(&mcp, &args, &self.mcp_notes()).map_or_else(ToolOutput::err, ToolOutput::ok),
             );
         }
         let wanted = args
