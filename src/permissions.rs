@@ -155,6 +155,12 @@ pub struct Permissions {
     pub deny: Vec<String>,
     pub project_ask: Vec<String>,
     pub project_deny: Vec<String>,
+    /// Allow rules saved for this workspace only (in the user file, under
+    /// `workspaces`); `workspace` is the key, empty when there is none.
+    pub local: Vec<String>,
+    pub workspace: String,
+    /// Exact-call rules for this session (`/permissions remember`).
+    pub session_rules: Vec<crate::grants::SessionRule>,
 }
 
 #[derive(Default)]
@@ -227,6 +233,8 @@ impl Permissions {
             Ok(None) => {}
             Err(e) => warnings.push(format!("ignoring {}: {e}", perms.path.display())),
         }
+        perms.workspace = crate::grants::workspace_key(cwd);
+        perms.local = crate::grants::read_local(&perms.path, &perms.workspace);
         let project = project_path(cwd);
         // The workspace may be the profile directory itself.
         if project != perms.path {
@@ -261,6 +269,11 @@ impl Permissions {
         let strict = action == Action::Allow;
         if let Some(r) = user.iter().find(|p| matches(p, tool, args, strict)) {
             return Some(format!("{} {r}", action.as_str()));
+        }
+        if action == Action::Allow {
+            if let Some(r) = self.local.iter().find(|p| matches(p, tool, args, strict)) {
+                return Some(format!("allow {r} (this workspace)"));
+            }
         }
         project
             .iter()
@@ -297,6 +310,10 @@ impl Permissions {
         if let Some(rule) = self.find(Action::Deny, tool, args) {
             return Decision::Deny(rule);
         }
+        let exact = self.session_rules.iter().find(|r| r.matches(tool, args));
+        if let Some(r) = exact.filter(|r| !r.allow) {
+            return Decision::Deny(format!("deny (session rule #{})", r.id));
+        }
         if let Some(rule) = self.find(Action::Ask, tool, args) {
             return if mode == Mode::Yolo {
                 Decision::Run
@@ -304,7 +321,7 @@ impl Permissions {
                 Decision::Ask { forced: Some(rule) }
             };
         }
-        if self.find(Action::Allow, tool, args).is_some() && allow_applies(tool, args, cwd, extra) {
+        if exact.is_some() || (self.find(Action::Allow, tool, args).is_some() && allow_applies(tool, args, cwd, extra)) {
             return Decision::Run;
         }
         if !needs_approval || crate::agent::is_allowed_in(session, tool, args, cwd, extra) {
@@ -628,7 +645,7 @@ impl TrustKind {
         }
     }
 
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "command" | "commands" => Some(TrustKind::Command),
             "tool" | "tools" => Some(TrustKind::Tool),
@@ -645,9 +662,11 @@ pub struct TrustEntry {
     pub display: String,
     pub session: bool,
     pub saved: bool,
+    /// Saved for this workspace only.
+    pub local: bool,
 }
 
-fn trust_kind(rule: &str) -> TrustKind {
+pub(crate) fn trust_kind(rule: &str) -> TrustKind {
     if rule.starts_with("bash:") {
         TrustKind::Command
     } else if rule.starts_with("web_fetch:") {
@@ -664,7 +683,7 @@ fn trust_display(rule: &str) -> String {
         .to_string()
 }
 
-fn canonical_rule(kind: TrustKind, raw: &str) -> String {
+pub(crate) fn canonical_rule(kind: TrustKind, raw: &str) -> String {
     let raw = raw.trim();
     match kind {
         TrustKind::Command => format!("bash:{}", raw.strip_prefix("bash:").unwrap_or(raw)),
@@ -681,6 +700,7 @@ pub fn trust_entries(perms: &Permissions, session: &HashSet<String>) -> Vec<Trus
     let mut rules: Vec<String> = perms
         .allow
         .iter()
+        .chain(&perms.local)
         .cloned()
         .chain(session.iter().cloned())
         .collect();
@@ -693,6 +713,7 @@ pub fn trust_entries(perms: &Permissions, session: &HashSet<String>) -> Vec<Trus
             display: trust_display(&rule),
             session: session.contains(&rule),
             saved: perms.allow.iter().any(|r| r == &rule),
+            local: perms.local.iter().any(|r| r == &rule),
             rule,
         })
         .collect();
@@ -711,11 +732,15 @@ fn kind_ord(kind: TrustKind) -> u8 {
 }
 
 fn source_label(entry: &TrustEntry) -> String {
-    match (entry.session, entry.saved) {
-        (true, true) => "session, permissions.json".into(),
-        (true, false) => "session".into(),
-        (false, true) => "permissions.json".into(),
-        (false, false) => "unknown".into(),
+    let sources: Vec<&str> = [(entry.session, "session"), (entry.saved, "permissions.json"), (entry.local, "this workspace")]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, label)| *label)
+        .collect();
+    if sources.is_empty() {
+        "unknown".into()
+    } else {
+        sources.join(", ")
     }
 }
 
@@ -747,7 +772,7 @@ pub fn allowlist_lines(perms: &Permissions, session: &HashSet<String>) -> Vec<St
         ));
     }
     out.push(
-        "Remove one with /allowlist remove N, or /allowlist remove command|tool|url PATTERN."
+        "Remove one with /allowlist remove N; add with /allowlist [local|user] add command|tool|url PATTERN."
             .into(),
     );
     out
@@ -767,7 +792,8 @@ pub fn allowlist_remove(
     let sources = source_label(&entry);
     let session_hit = session.remove(&rule);
     let saved = perms.remove_allow(&rule).map_err(|e| format!("{e:#}"))?;
-    if !session_hit && !saved {
+    let local = crate::grants::remove_local(perms, &rule).map_err(|e| format!("{e:#}"))?;
+    if !session_hit && !saved && !local {
         return Err(format!("no matching {} `{display}`", kind.label()));
     }
     Ok(format!("removed {} `{display}` ({sources})", kind.label()))

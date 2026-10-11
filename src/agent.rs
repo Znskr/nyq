@@ -55,6 +55,8 @@ pub enum Approval {
     /// Like `Always`, and also append the rule to permissions.json `allow`.
     /// Only offered when the request has a `save_rule`.
     AlwaysSave,
+    /// Like `AlwaysSave`, for this workspace only.
+    AlwaysSaveLocal,
     No,
 }
 
@@ -668,12 +670,18 @@ impl Agent {
                 Approval::Always => {
                     self.allowed.extend(rule);
                 }
-                Approval::AlwaysSave => {
+                Approval::AlwaysSave | Approval::AlwaysSaveLocal => {
                     self.allowed.extend(rule);
                     if let Some(r) = save_rule {
-                        match std::sync::Arc::make_mut(&mut self.permissions).save_allow(&r) {
-                            Ok(()) => ui.notice(&format!(
-                                "Saved `{r}` to the allow list in permissions.json."
+                        let perms = std::sync::Arc::make_mut(&mut self.permissions);
+                        let saved = if answer == Approval::AlwaysSaveLocal {
+                            crate::grants::save_local(perms, &r).map(|_| " for this workspace")
+                        } else {
+                            perms.save_allow(&r).map(|_| "")
+                        };
+                        match saved {
+                            Ok(scope) => ui.notice(&format!(
+                                "Saved `{r}` to the allow list in permissions.json{scope}."
                             )),
                             Err(e) => ui.notice(&format!(
                                 "Could not save `{r}` to permissions.json: {e:#}"

@@ -9,6 +9,7 @@ mod config;
 mod diagnostics;
 mod doctor;
 mod github;
+mod grants;
 mod hooks;
 mod login;
 mod mcp;
@@ -283,11 +284,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/permissions",
-        "permission mode and rules: /permissions [ask|auto|yolo|rules|reload]",
+        "permission mode and rules: /permissions [ask|auto|yolo|rules|reload|reset|remember|revoke]",
     ),
     (
         "/allowlist",
-        "trusted commands, tools and URLs: /allowlist [remove N | remove command|tool|url PATTERN]",
+        "trusted commands, tools and URLs: /allowlist [view|add|remove|reset], scoped with local|user",
     ),
     (
         "/hooks",
@@ -528,6 +529,7 @@ async fn run() -> Result<()> {
         agent.session = Some(s);
         agent.items = items;
         agent.adopt_transcript();
+        grants::restore(&mut agent);
         resumed = Some(meta);
     }
 
@@ -664,6 +666,7 @@ async fn run() -> Result<()> {
     let mut relaunch = None;
 
     loop {
+        grants::persist(&mut agent);
         sync_footer(&tui, &agent, current.as_ref());
         let line = match pending.pop_front() {
             Some(t) => t,
@@ -1096,6 +1099,7 @@ async fn resume_session(
     ui::replay(&items);
     agent.items = items;
     agent.adopt_transcript();
+    grants::restore(agent);
     ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     hooks::session_start(agent, "resume").await;
     Ok(())
@@ -1238,7 +1242,7 @@ async fn slash(
             ui::list(&lines);
         }
         "/mcp" => mcp_slash::command(agent, mcp, servers, tui, &arg).await?,
-        "/permissions" => commands::permissions(agent, tui, &config::home(), &arg),
+        "/permissions" => commands::permissions(agent, tui, &config::home(), &arg).await,
         "/allowlist" => commands::allowlist(agent, &arg),
         "/hooks" => hooks::command(agent, arg.first().copied()),
         "/login" | "/logout" | "/setup" | "/credits" | "/balance" => account::slash(cmd, &arg, agent, tui).await?,
