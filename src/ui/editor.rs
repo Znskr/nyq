@@ -38,6 +38,17 @@ pub struct Editor {
     draft: String,
     commands: Vec<(String, String)>,
     empty_ctrl_c: bool,
+    /// Ctrl+R reverse search through history, while active.
+    search: Option<Search>,
+}
+
+struct Search {
+    query: String,
+    /// History index of the current match.
+    at: Option<usize>,
+    /// The text from before the search, restored on Esc.
+    draft: String,
+    failed: bool,
 }
 
 impl Default for Editor {
@@ -57,6 +68,7 @@ impl Editor {
             draft: String::new(),
             commands,
             empty_ctrl_c: false,
+            search: None,
         }
     }
 
@@ -67,6 +79,9 @@ impl Editor {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
         let alt = key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if let Some(action) = self.search_key(key, ctrl, alt) {
+            return action;
+        }
         let double = self.empty_ctrl_c;
         self.empty_ctrl_c = false;
         match key.code {
@@ -348,6 +363,61 @@ impl Editor {
         self.set_text(&text);
         self.browsing = next;
     }
+    /// Ctrl+R starts (or steps) a reverse history search; typing refines it,
+    /// Esc restores the earlier text, any other key keeps the match and acts.
+    fn search_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool) -> Option<Action> {
+        let Some(search) = &mut self.search else {
+            if ctrl && key.code == KeyCode::Char('r') {
+                self.search = Some(Search { query: String::new(), at: None, draft: self.text(), failed: false });
+                return Some(Action::None);
+            }
+            return None;
+        };
+        let older = match key.code {
+            KeyCode::Char('r') if ctrl => true,
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                search.query.push(c);
+                false
+            }
+            KeyCode::Backspace => {
+                search.query.pop();
+                false
+            }
+            KeyCode::Esc | KeyCode::Char('c' | 'g') if key.code == KeyCode::Esc || ctrl => {
+                let draft = std::mem::take(&mut search.draft);
+                self.search = None;
+                self.set_text(&draft);
+                return Some(Action::None);
+            }
+            _ => {
+                self.search = None;
+                return None;
+            }
+        };
+        let before = if older { search.at.unwrap_or(self.history.len()) } else { self.history.len() };
+        let found = (!search.query.is_empty())
+            .then(|| self.history[..before].iter().rposition(|h| h.contains(&search.query)))
+            .flatten();
+        search.failed = found.is_none() && !search.query.is_empty();
+        if let Some(i) = found {
+            search.at = Some(i);
+            let text = self.history[i].clone();
+            self.set_text(&text);
+        }
+        Some(Action::None)
+    }
+
+    /// What the status line shows during a Ctrl+R search.
+    pub fn search_status(&self) -> Option<String> {
+        self.search.as_ref().map(|s| {
+            format!(
+                "reverse search: {}{}",
+                s.query,
+                if s.failed { " (no match)" } else { "" }
+            )
+        })
+    }
+
     /// Replace the commands that come and go with MCP servers (`/mcp:…`).
     pub fn set_mcp_commands(&mut self, extra: Vec<(String, String)>) {
         self.commands.retain(|(name, _)| !name.starts_with("/mcp:"));
@@ -576,6 +646,31 @@ mod tests {
         plain(&mut empty, Up);
         plain(&mut empty, Down);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn reverse_search_finds_older_matches() {
+        let mut e = Editor::new(vec!["cargo build".into(), "ls -la".into(), "cargo test".into()], Vec::new());
+        e.paste("draft");
+        ctrl(&mut e, 'r');
+        assert_eq!(e.search_status().unwrap(), "reverse search: ");
+        for c in "cargo".chars() {
+            plain(&mut e, Char(c));
+        }
+        assert_eq!(e.text(), "cargo test");
+        ctrl(&mut e, 'r');
+        assert_eq!(e.text(), "cargo build");
+        plain(&mut e, Char('x'));
+        assert_eq!(e.search_status().unwrap(), "reverse search: cargox (no match)");
+        assert_eq!(e.text(), "cargo build");
+        plain(&mut e, Esc);
+        assert_eq!((e.text().as_str(), e.search_status()), ("draft", None));
+        // Enter keeps the match and submits it.
+        ctrl(&mut e, 'r');
+        plain(&mut e, Char('l'));
+        plain(&mut e, Char('s'));
+        assert_eq!(plain(&mut e, Enter), Action::Submit("ls -la".into()));
+        assert!(e.search_status().is_none());
     }
 
     #[test]

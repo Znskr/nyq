@@ -283,7 +283,8 @@ pub struct Screen {
     slash_selected: usize,
     pub footer: Footer,
     cancel: Option<CancellationToken>,
-    history: Vec<String>,
+    /// The last prompt saved to the history file (repeats are not saved again).
+    last_prompt: Option<String>,
     /// A one-off hint shown in the status area until the next key.
     hint: Option<String>,
     home: PathBuf,
@@ -532,7 +533,7 @@ fn thinking_summary(text: &str, secs: u64, width: usize) -> String {
 }
 
 impl Screen {
-    fn new(footer: Footer, editor: Editor, history: Vec<String>, home: PathBuf) -> Self {
+    fn new(footer: Footer, editor: Editor, home: PathBuf) -> Self {
         let (w, h) = terminal::size().unwrap_or((80, 24));
         Screen {
             out: crate::record_tape::stdout(),
@@ -567,7 +568,7 @@ impl Screen {
             slash_selected: 0,
             footer,
             cancel: None,
-            history,
+            last_prompt: None,
             hint: None,
             home,
             upgrader: None,
@@ -1972,9 +1973,13 @@ impl Screen {
 
     fn remember(&mut self, text: &str) {
         self.editor.push_history(text);
-        if self.history.last().map(String::as_str) != Some(text) {
-            self.history.push(text.to_string());
+        let saving = crate::settings::current().prompt_history && !self.home.as_os_str().is_empty();
+        if saving && self.last_prompt.as_deref() != Some(text) {
+            if let Err(e) = super::history::append(&self.home.join("history"), text, &self.footer.cwd) {
+                self.hint = Some(format!("could not save prompt history: {e}"));
+            }
         }
+        self.last_prompt = Some(text.to_string());
     }
 
     fn on_secret_key(&mut self, key: KeyEvent) {
@@ -2267,6 +2272,9 @@ impl Screen {
             }
             Action::Dequeue => self.dequeue(),
         }
+        if let Some(status) = self.editor.search_status() {
+            self.hint = Some(status);
+        }
         self.slash_selected = self
             .slash_selected
             .min(self.editor.suggestions().len().saturating_sub(1));
@@ -2356,7 +2364,6 @@ pub struct Tui {
     pub commands: mpsc::UnboundedReceiver<Command>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     enhanced: bool,
-    history_path: PathBuf,
 }
 
 impl Tui {
@@ -2365,20 +2372,10 @@ impl Tui {
         home: PathBuf,
         commands: Vec<(String, String)>,
     ) -> io::Result<Self> {
-        let history_path = home.join("history");
-        // One JSON string per line (multi-line prompts); plain lines are accepted too.
-        let history: Vec<String> = std::fs::read_to_string(&history_path)
-            .map(|s| {
-                s.lines()
-                    .filter(|l| !l.is_empty())
-                    .map(|l| serde_json::from_str(l).unwrap_or_else(|_| l.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let history = super::history::load(&home.join("history"), &footer.cwd);
         let screen = Arc::new(Mutex::new(Screen::new(
             footer,
-            Editor::new(history.clone(), commands),
-            history,
+            Editor::new(history, commands),
             home,
         )));
         terminal::enable_raw_mode()?;
@@ -2495,7 +2492,6 @@ impl Tui {
             commands: rx,
             tasks: vec![input, ticker],
             enhanced,
-            history_path,
         })
     }
 
@@ -2578,17 +2574,6 @@ impl Drop for Tui {
             s.flush_all();
             s.clear_pane();
             let _ = s.out.flush();
-            let skip = s.history.len().saturating_sub(1000);
-            let history: Vec<String> = s.history[skip..]
-                .iter()
-                .map(|h| serde_json::to_string(h).unwrap_or_default())
-                .collect();
-            if crate::settings::current().prompt_history {
-                let _ = crate::session::write_private(
-                    &self.history_path,
-                    (history.join("\n") + "\n").as_bytes(),
-                );
-            }
         }
         *SCREEN.lock().unwrap() = None;
         if self.enhanced {
@@ -3067,7 +3052,6 @@ mod tests {
         let mut s = Screen::new(
             Footer::default(),
             Editor::new(Vec::new(), Vec::new()),
-            Vec::new(),
             PathBuf::new(),
         );
         s.width = 40;
@@ -3150,7 +3134,7 @@ mod tests {
             let (tx, _rx) = mpsc::unbounded_channel();
             m.on_sessions_key(KeyEvent::new(code, KeyModifiers::NONE), &tx);
         };
-        let mut s = Screen::new(Footer::default(), Editor::default(), Vec::new(), PathBuf::new());
+        let mut s = Screen::new(Footer::default(), Editor::default(), PathBuf::new());
         s.sessions = Some(SessionMenu::new(all.clone(), std::path::Path::new("/here"), None));
         key(&mut s, KeyCode::Tab);
         let menu = s.sessions.as_ref().unwrap();
