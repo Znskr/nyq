@@ -260,7 +260,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/model",
-        "switch model or provider (ctrl+l); /model NAME sets the model id",
+        "switch model or provider (ctrl+l); /model ID|QUERY [effort] [fast|normal]",
     ),
     ("/compact", "summarize the conversation to free up context"),
     ("/copy", "copy the last answer to the clipboard"),
@@ -722,6 +722,13 @@ async fn run() -> Result<()> {
                 tui.open_models();
                 continue;
             }
+            if let Some(rest) = line.strip_prefix("/model ") {
+                let args: Vec<&str> = rest.split_whitespace().collect();
+                if let Err(e) = model_command(&home, &mut agent, &tui, &mut current, &args).await {
+                    ui::error(&format!("{e:#}"));
+                }
+                continue;
+            }
             let cmd = line.split_whitespace().next().unwrap_or("");
             if commands::handles(cmd) {
                 let args: Vec<&str> = line.split_whitespace().skip(1).collect();
@@ -904,8 +911,75 @@ fn sandbox_label(policy: &sandbox::Policy) -> String {
     }
 }
 
-/// Switch provider and model, keeping the conversation.
-fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::ModelChoice) {
+/// `/model ID|QUERY [effort] [fast|normal]`: switch to the model `ID`, or to
+/// the only model matching `QUERY` (several open the switcher filtered by
+/// it). An id nobody lists is set on the current provider.
+async fn model_command(
+    home: &std::path::Path,
+    agent: &mut Agent,
+    tui: &Tui,
+    current: &mut Option<models::ModelChoice>,
+    args: &[&str],
+) -> Result<()> {
+    let wanted = models::parse_args(args);
+    let cancel = CancellationToken::new();
+    tui.screen().set_busy(Some("Listing models"), Some(cancel.clone()));
+    let listed = tokio::select! {
+        r = models::list(home) => Some(r),
+        _ = cancel.cancelled() => None,
+    };
+    tui.screen().idle();
+    let Some((choices, warnings)) = listed else {
+        return Ok(());
+    };
+    let found = models::find(&choices, &wanted.query, agent.provider.name());
+    let choice = match found.as_slice() {
+        [one] => (*one).clone(),
+        [] if !wanted.query.contains(char::is_whitespace) => {
+            // Not listed: keep the provider and take the id as given.
+            let choice = models::ModelChoice {
+                provider: agent.provider.name().into(),
+                model: wanted.query.clone(),
+                efforts: agent.provider.efforts(),
+                ..Default::default()
+            };
+            // Fast mode is checked against the provider when it is applied.
+            models::check_options(&choice, wanted.effort.as_deref(), None)?;
+            agent.provider.set_model(choice.model.clone());
+            agent.suppress_auto_compact = false;
+            ui::info(&format!("  Model set to {} (not in the model list).", choice.model));
+            apply_model_options(home, agent, None, &wanted);
+            return Ok(());
+        }
+        [] => anyhow::bail!("no model matches `{}`", wanted.query),
+        _ => {
+            tui.screen().show_models(choices, warnings, &wanted.query);
+            return Ok(());
+        }
+    };
+    models::check_options(&choice, wanted.effort.as_deref(), wanted.fast)?;
+    let same = choice.provider == agent.provider.name() && choice.model == agent.provider.model();
+    if !same && !switch_model(home, agent, &choice) {
+        return Ok(());
+    }
+    *current = Some(choice);
+    apply_model_options(home, agent, current.as_ref(), &wanted);
+    Ok(())
+}
+
+fn apply_model_options(home: &std::path::Path, agent: &mut Agent, current: Option<&models::ModelChoice>, wanted: &models::ModelArgs) {
+    if let Some(effort) = &wanted.effort {
+        commands::apply_setting(home, agent, current, settings::Id::Effort, effort);
+        ui::info(&format!("  Reasoning effort: {effort}."));
+    }
+    if let Some(fast) = wanted.fast {
+        commands::apply_setting(home, agent, current, settings::Id::Fast, if fast { "on" } else { "off" });
+    }
+}
+
+/// Switch provider and model, keeping the conversation. False on failure
+/// (already reported).
+fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::ModelChoice) -> bool {
     let effort = agent
         .provider
         .effort()
@@ -926,8 +1000,12 @@ fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::Mode
                 "  Switched to {} · {}",
                 choice.provider, choice.model
             ));
+            true
         }
-        Err(e) => ui::error(&format!("{e:#}")),
+        Err(e) => {
+            ui::error(&format!("{e:#}"));
+            false
+        }
     }
 }
 
@@ -1255,18 +1333,6 @@ async fn slash(
         "/resume" => match arg.first() {
             Some(which) => resume_session(agent, sessions_dir, which).await?,
             None => open_sessions(tui, sessions_dir, agent)?,
-        },
-        "/model" => match arg.first() {
-            Some(m) => {
-                agent.provider.set_model(m.to_string());
-                agent.suppress_auto_compact = false;
-                ui::info(&format!("Model set to {m}."));
-            }
-            None => ui::info(&format!(
-                "{} · {}",
-                agent.provider.name(),
-                agent.provider.model()
-            )),
         },
         "/tools" => {
             let lines: Vec<String> = agent
