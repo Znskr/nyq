@@ -15,7 +15,12 @@ use tokio::{
 use crate::provider::hosted::{self, Service};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const REDIRECT: &str = "http://localhost:1455/auth/callback";
+/// Callback ports registered for the client, in order of preference.
+const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
+
+fn redirect(port: u16) -> String {
+    format!("http://localhost:{port}/auth/callback")
+}
 
 fn secret() -> String {
     let mut bytes = Vec::with_capacity(32);
@@ -30,12 +35,12 @@ fn challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn authorize(issuer: &str, state: &str, verifier: &str) -> Result<Url> {
+fn authorize(issuer: &str, redirect_uri: &str, state: &str, verifier: &str) -> Result<Url> {
     let mut url = Url::parse(&format!("{}/oauth/authorize", issuer.trim_end_matches('/')))?;
     url.query_pairs_mut().extend_pairs([
         ("response_type", "code"),
         ("client_id", CLIENT_ID),
-        ("redirect_uri", REDIRECT),
+        ("redirect_uri", redirect_uri),
         ("scope", "openid profile email offline_access"),
         ("code_challenge", &challenge(verifier)),
         ("code_challenge_method", "S256"),
@@ -147,16 +152,27 @@ pub async fn login(home: &Path, open_browser: impl Fn(&str)) -> Result<String> {
     login_with_issuer(home, open_browser, &issuer).await
 }
 
+/// Listen on the first free callback port.
+async fn bind_callback(ports: &[u16]) -> Result<(TcpListener, u16)> {
+    for &port in ports {
+        if let Ok(listener) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            return Ok((listener, port));
+        }
+    }
+    let list = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(" and ");
+    anyhow::bail!("cannot listen for the ChatGPT sign-in callback on 127.0.0.1 ports {list}; close any other sign-in using them and retry")
+}
+
 async fn login_with_issuer(
     home: &Path,
     open_browser: impl Fn(&str),
     issuer: &str,
 ) -> Result<String> {
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 1455)).await
-        .context("cannot bind ChatGPT sign-in callback on 127.0.0.1:1455; close any other sign-in using this port and retry")?;
+    let (listener, port) = bind_callback(&CALLBACK_PORTS).await?;
+    let redirect_uri = redirect(port);
     let verifier = secret();
     let state = secret();
-    let url = authorize(issuer, &state, &verifier)?;
+    let url = authorize(issuer, &redirect_uri, &state, &verifier)?;
     open_browser(url.as_str());
     let code = tokio::time::timeout(Duration::from_secs(300), wait_callback(&listener, &state))
         .await
@@ -166,7 +182,7 @@ async fn login_with_issuer(
         ("grant_type", "authorization_code"),
         ("client_id", CLIENT_ID),
         ("code", &code),
-        ("redirect_uri", REDIRECT),
+        ("redirect_uri", &redirect_uri),
         ("code_verifier", &verifier),
     ]);
 
@@ -233,9 +249,28 @@ fn save(home: &Path, auth: &Value) -> Result<()> {
     result.context("saving ChatGPT sign-in")
 }
 
-/// Open the system browser; launch failures are intentionally ignored.
+/// `NYQ_NO_OPEN_BROWSER` (any non-empty value but `0`) keeps nyq from
+/// launching a browser; sign-in URLs are printed either way.
+pub fn browser_disabled() -> bool {
+    std::env::var("NYQ_NO_OPEN_BROWSER").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// What to print before a terminal sign-in opens `url`.
+pub fn sign_in_prompt(url: &str) -> String {
+    if browser_disabled() {
+        format!("Open this URL in a browser to sign in:\n  {url}")
+    } else {
+        format!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}")
+    }
+}
+
+/// Open the system browser (unless [`browser_disabled`]); launch failures
+/// are intentionally ignored.
 #[allow(dead_code)]
 pub fn open_browser(url: &str) {
+    if browser_disabled() {
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
         // `cmd /c start` splits on `&`, which OAuth URLs contain.
@@ -403,14 +438,14 @@ mod tests {
 
     #[test]
     fn authorize_params() {
-        let url = authorize("https://auth.openai.com/", "state", "verifier").unwrap();
+        let url = authorize("https://auth.openai.com/", &redirect(1455), "state", "verifier").unwrap();
         assert_eq!(url.path(), "/oauth/authorize");
         let params: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(params.len(), 10);
         for (k, v) in [
             ("response_type", "code"),
             ("client_id", CLIENT_ID),
-            ("redirect_uri", REDIRECT),
+            ("redirect_uri", "http://localhost:1455/auth/callback"),
             ("scope", "openid profile email offline_access"),
             ("code_challenge_method", "S256"),
             ("id_token_add_organizations", "true"),
@@ -438,6 +473,18 @@ mod tests {
         assert!(callback("/auth/callback?code=c", "s").is_err());
         assert!(callback("/auth/callback?code=c&state=s&state=s", "s").is_err());
         assert_eq!(callback("/favicon.ico", "s").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn callback_port_falls_back() {
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = free();
+        let spare = free().local_addr().unwrap().port();
+        let ports = [busy.local_addr().unwrap().port(), spare];
+        let (_listener, port) = bind_callback(&ports).await.unwrap();
+        assert_eq!(port, spare);
+        let err = bind_callback(&ports).await.unwrap_err().to_string();
+        assert!(err.contains(&format!("ports {} and {spare}", ports[0])), "{err}");
     }
 
     #[tokio::test]
@@ -544,7 +591,7 @@ mod tests {
             assert_eq!(fields["grant_type"], "authorization_code");
             assert_eq!(fields["code"], "fake-code");
             assert_eq!(fields["client_id"], CLIENT_ID);
-            assert_eq!(fields["redirect_uri"], REDIRECT);
+            assert!(CALLBACK_PORTS.map(redirect).contains(&fields["redirect_uri"]));
             let body = json!({"access_token":access,"refresh_token":"refresh-test",
                 "id_token":jwt(json!({"email":"test@example.com"})),"expires_in":3600})
             .to_string();
@@ -561,15 +608,16 @@ mod tests {
                 let fields: std::collections::BTreeMap<_, _> =
                     url.query_pairs().into_owned().collect();
                 *challenge_seen.lock().unwrap() = fields["code_challenge"].clone();
-                let mut callback = Url::parse(REDIRECT).unwrap();
+                let mut callback = Url::parse(&fields["redirect_uri"]).unwrap();
                 callback.set_host(Some("127.0.0.1")).unwrap();
                 callback
                     .query_pairs_mut()
                     .extend_pairs([("code", "fake-code"), ("state", fields["state"].as_str())]);
+                let favicon = callback.join("/favicon.ico").unwrap();
                 tokio::spawn(async move {
                     // Browsers may request unrelated resources before the callback.
                     assert_eq!(
-                        reqwest::get("http://127.0.0.1:1455/favicon.ico")
+                        reqwest::get(favicon)
                             .await
                             .unwrap()
                             .status(),

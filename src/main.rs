@@ -418,9 +418,7 @@ async fn run() -> Result<()> {
                 }
                 None => {
                     login::login(&home, |url| {
-                        eprintln!(
-                            "Opening your browser to sign in. If it doesn't open, visit:\n  {url}"
-                        );
+                        eprintln!("{}", login::sign_in_prompt(url));
                         login::open_browser(url);
                     })
                     .await?
