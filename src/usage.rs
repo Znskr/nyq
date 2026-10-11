@@ -207,9 +207,49 @@ pub fn read(home: &Path, period: Period) -> Result<Report> {
     }
     Ok(report)
 }
-pub fn show(home: &Path, period: Period) -> Result<()> {
-    crate::ui::list(&read(home, period)?.lines());
+pub fn show(home: &Path, period: Period, json: bool) -> Result<()> {
+    let report = read(home, period)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report.to_json(period))?);
+    } else {
+        crate::ui::list(&report.lines());
+    }
     Ok(())
+}
+
+impl Total {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requests": self.requests,
+            "input_tokens": self.input,
+            "output_tokens": self.output,
+            "cached_tokens": self.cached,
+            "estimated_cost_usd": self.cost,
+            "unknown_cost_requests": self.unknown,
+            "subscription_requests": self.subscription,
+        })
+    }
+}
+
+impl Report {
+    pub fn to_json(&self, period: Period) -> serde_json::Value {
+        let with = |mut v: serde_json::Value, extra: &[(&str, &str)]| {
+            for (k, val) in extra {
+                v[*k] = (*val).into();
+            }
+            v
+        };
+        serde_json::json!({
+            "period_hours": period.hours(),
+            "providers": self.providers.iter()
+                .map(|(p, t)| with(t.to_json(), &[("provider", p)]))
+                .collect::<Vec<_>>(),
+            "models": self.models.iter()
+                .map(|((p, m), t)| with(t.to_json(), &[("provider", p), ("model", m)]))
+                .collect::<Vec<_>>(),
+            "malformed_records": self.malformed,
+        })
+    }
 }
 
 pub struct Stats {

@@ -612,12 +612,31 @@ pub fn find(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
     }
 }
 
-/// Print a short transcript summary for `nyq session show`.
-pub fn print_summary(dir: &Path, which: &str, cwd: &Path) -> Result<()> {
+/// Print a short transcript summary for `nyq session show` (with `json`,
+/// the session's metadata and every stored item).
+pub fn print_summary(dir: &Path, which: &str, cwd: &Path, json: bool) -> Result<()> {
     let meta = find(dir, which, cwd)?;
     let items = read_stored_items(&meta.path)?;
-    println!("{}", format_summary(&meta, &items));
+    if json {
+        let mut value = meta.to_json();
+        value["items"] = serde_json::to_value(&items)?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{}", format_summary(&meta, &items));
+    }
     Ok(())
+}
+
+impl Meta {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "title": self.title,
+            "created": self.created.to_rfc3339(),
+            "cwd": self.cwd,
+            "model": self.model,
+        })
+    }
 }
 
 /// Delete one saved session. Does not open it for append.
@@ -635,7 +654,7 @@ pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
 
 /// Whether two working directories are the same place. Canonical paths match
 /// through symlinks; Windows and macOS also ignore ASCII case.
-fn same_cwd(saved: &Path, current: &Path) -> bool {
+pub fn same_cwd(saved: &Path, current: &Path) -> bool {
     if saved == current {
         return true;
     }
@@ -809,6 +828,44 @@ fn read_items(data: &[u8], path: &Path) -> Result<(Vec<Item>, usize)> {
         n += 1;
     }
     Ok((items, good))
+}
+
+/// `nyq doctor`: how many sessions are saved, and each one that can't be
+/// resumed as is, with the command that repairs it.
+pub fn health(dir: &Path) -> (usize, Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (0, Vec::new());
+    };
+    let mut count = 0;
+    let mut problems = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_none_or(|x| x != "jsonl") {
+            continue;
+        }
+        count += 1;
+        let id = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let Ok(data) = fs::read(&path) else {
+            problems.push(format!("{id}: unreadable"));
+            continue;
+        };
+        let first = data.split(|b| *b == b'\n').next().unwrap_or_default();
+        let header = serde_json::from_slice::<serde_json::Value>(first).ok();
+        let problem = if !header.as_ref().is_some_and(|v| v["type"] == "session")
+            || serde_json::from_slice::<Header>(first).is_err()
+        {
+            Some("missing or invalid header; run `nyq session recover ID`")
+        } else if read_items(&data, &path).is_err() {
+            Some("corrupt lines; run `nyq session recover ID`")
+        } else if header.is_some_and(|v| v.get("version").is_none()) {
+            Some("older format; run `nyq session migrate ID`")
+        } else {
+            None
+        };
+        if let Some(p) = problem {
+            problems.push(format!("{id}: {}", p.replace("ID", &id)));
+        }
+    }
+    (count, problems)
 }
 
 /// Synthetic results for trailing tool calls that never got one, so the next
@@ -1152,6 +1209,32 @@ mod tests {
             vec![user("one"), user("two")]
         );
         assert!(recover(tmp.path(), "../broken", Path::new("/w")).is_err());
+    }
+
+    #[test]
+    fn health_names_the_repair_for_each_broken_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert_eq!(health(&dir.join("missing")), (0, Vec::new()));
+        let mut good = Session::create(dir, Path::new("/w"), "m").unwrap();
+        good.append(&user("fine")).unwrap();
+        good.flush().unwrap();
+        fs::write(dir.join("headless.jsonl"), b"{broken}\n").unwrap();
+        let mut corrupt = fs::read(&good.path).unwrap();
+        corrupt.extend_from_slice(b"{bad}\n");
+        corrupt.extend_from_slice(serde_json::to_string(&user("later")).unwrap().as_bytes());
+        corrupt.push(b'\n');
+        fs::write(dir.join("corrupt.jsonl"), corrupt).unwrap();
+        let (count, mut problems) = health(dir);
+        problems.sort();
+        assert_eq!(count, 3);
+        assert_eq!(
+            problems,
+            [
+                "corrupt: corrupt lines; run `nyq session recover corrupt`",
+                "headless: missing or invalid header; run `nyq session recover headless`",
+            ]
+        );
     }
 
     #[test]

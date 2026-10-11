@@ -233,9 +233,22 @@ fn save(home: &Path, auth: &Value) -> Result<()> {
     result.context("saving ChatGPT sign-in")
 }
 
-/// Open the system browser; launch failures are intentionally ignored.
+/// Whether sign-in flows should launch a browser: not with
+/// `NYQ_NO_OPEN_BROWSER` set, nor when stdin is not a terminal.
+pub fn browser_allowed() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("NYQ_NO_OPEN_BROWSER").is_none_or(|v| v.is_empty() || v == "0")
+        && std::io::stdin().is_terminal()
+}
+
+/// Open the system browser; launch failures are intentionally ignored. The
+/// caller prints the URL, so skipping the launch (see [`browser_allowed`])
+/// leaves it to the user.
 #[allow(dead_code)]
 pub fn open_browser(url: &str) {
+    if !browser_allowed() {
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
         // `cmd /c start` splits on `&`, which OAuth URLs contain.
@@ -337,6 +350,24 @@ pub fn logout(home: &Path, provider: &str) -> Result<String> {
     })
 }
 
+/// `nyq logout` without a provider: forget every sign-in nyq stored.
+pub fn logout_all(home: &Path) -> Result<String> {
+    let mut done = Vec::new();
+    if home.join("chatgpt-auth.json").is_file() {
+        done.push(logout(home, "codex")?);
+    }
+    for service in Service::ALL {
+        if hosted::remove_key(home, service)? {
+            done.push(format!("Removed the stored {} key.", service.title()));
+        }
+    }
+    Ok(if done.is_empty() {
+        "No sign-ins stored by nyq.".into()
+    } else {
+        done.join("\n")
+    })
+}
+
 fn read_secret() -> Result<String> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
@@ -373,6 +404,20 @@ fn read_secret() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logout_all_forgets_every_stored_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        assert_eq!(logout_all(home).unwrap(), "No sign-ins stored by nyq.");
+        std::fs::write(home.join("chatgpt-auth.json"), "{}").unwrap();
+        hosted::save_key(home, Service::Xai, "xai-key").unwrap();
+        let msg = logout_all(home).unwrap();
+        assert!(msg.contains("Signed out of ChatGPT."), "{msg}");
+        assert!(msg.contains(Service::Xai.title()), "{msg}");
+        assert!(!home.join("chatgpt-auth.json").exists());
+        assert_eq!(logout_all(home).unwrap(), "No sign-ins stored by nyq.");
+    }
 
     #[test]
     fn pkce() {

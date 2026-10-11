@@ -14,8 +14,25 @@ use crate::session::Session;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
 use crate::types::{Item, Request, StreamEvent, Usage};
 
-/// Upper bound on model round-trips per user turn.
+/// Default upper bound on model round-trips per user turn.
 const MAX_STEPS: usize = 100;
+
+/// The step limit: `NYQ_MAX_AGENT_STEPS`, else `max_agent_steps` in
+/// settings, else [`MAX_STEPS`], with where it came from.
+pub fn step_limit() -> (usize, &'static str) {
+    let parse = |v: &str| v.trim().parse::<usize>().ok().filter(|n| *n > 0);
+    if let Some(n) = std::env::var("NYQ_MAX_AGENT_STEPS").ok().as_deref().and_then(parse) {
+        return (n, "NYQ_MAX_AGENT_STEPS");
+    }
+    match crate::settings::current().max_agent_steps.filter(|n| *n > 0) {
+        Some(n) => (n, "settings"),
+        None => (MAX_STEPS, "default"),
+    }
+}
+
+fn max_steps() -> usize {
+    step_limit().0
+}
 
 /// Compact automatically once a request uses this share of the context
 /// window (percent, from settings; 0 turns automatic compaction off).
@@ -275,13 +292,24 @@ impl Agent {
         cancel: CancellationToken,
         continue_note: bool,
     ) -> Result<TurnEnd> {
-        for _ in 0..MAX_STEPS {
+        let max_steps = max_steps();
+        for _ in 0..max_steps {
             self.sync_estimate();
             if !self.auto_compact(ui, &cancel).await? {
                 return Ok(TurnEnd::Cancelled);
             }
             let specs = self.tools.advertised();
             let note = continue_note.then(|| format!("{}{CONTINUE_NOTE}", self.system));
+            crate::trace::log("provider", || {
+                format!(
+                    "request {}/{} · {} items · {} tools",
+                    self.provider.name(),
+                    self.provider.model(),
+                    self.items.len(),
+                    specs.len()
+                )
+            });
+            let started = std::time::Instant::now();
             let result = {
                 let system = note.as_deref().unwrap_or(self.system.as_str());
                 let req = Request {
@@ -297,8 +325,19 @@ impl Agent {
             };
             ui.end_message();
             let Some(result) = result else {
+                crate::trace::log("provider", || "cancelled".into());
                 return Ok(TurnEnd::Cancelled);
             };
+            crate::trace::log("provider", || match &result {
+                Ok(r) => format!(
+                    "response in {}ms · {} items · usage {:?}{}",
+                    started.elapsed().as_millis(),
+                    r.items.len(),
+                    r.usage,
+                    if r.truncated { " · truncated" } else { "" }
+                ),
+                Err(e) => format!("error after {}ms: {e:#}", started.elapsed().as_millis()),
+            });
             let response = result?;
             if response.truncated {
                 ui.notice("The reply was cut off at the output limit.");
@@ -402,7 +441,7 @@ impl Agent {
                 self.push_counted(item);
             }
         }
-        anyhow::bail!("stopped after {MAX_STEPS} steps without a final answer")
+        anyhow::bail!("stopped after {max_steps} steps without a final answer (raise NYQ_MAX_AGENT_STEPS or max_agent_steps in settings)")
     }
 
     /// Ask the session provider whether one risky call may run.
@@ -739,6 +778,9 @@ impl Agent {
                 .unwrap_or_else(|e| e.into_inner())
                 .drain(..),
         );
+        crate::trace::log("tool", || {
+            format!("{name} {} · {} bytes", if out.is_error { "failed" } else { "ok" }, out.content.len())
+        });
         ui.tool_end(name, &out);
         if let Some(args) = hook_args {
             self.hooks

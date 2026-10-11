@@ -16,15 +16,26 @@ use crate::mcp::{self, McpManager, Scope, Transport};
 
 #[derive(clap::Subcommand)]
 pub enum McpCommand {
-    /// List configured servers (profile and project) without connecting.
-    List,
+    /// List configured servers (profile and project).
+    List {
+        /// Start profile and trusted project servers and report their tools or errors.
+        #[arg(long)]
+        connect: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Add a server to <home>/mcp.json: `nyq mcp add NAME -- CMD [ARGS…]`
-    /// (stdio) or `nyq mcp add NAME --url URL` (streamable HTTP).
+    /// (stdio) or `nyq mcp add NAME --url URL` (streamable HTTP; also
+    /// `nyq mcp add --transport http NAME URL`).
     Add {
         name: String,
         /// Streamable HTTP endpoint.
         #[arg(long)]
         url: Option<String>,
+        /// `http` takes the URL as the argument after NAME; `stdio` is the default.
+        #[arg(long, value_parser = ["http", "stdio"])]
+        transport: Option<String>,
         /// HTTP header, `NAME=VALUE` (values may use ${ENV}). Repeatable.
         #[arg(long = "header", value_name = "NAME=VALUE")]
         headers: Vec<String>,
@@ -47,6 +58,7 @@ pub enum McpCommand {
     /// Remove a server from <home>/mcp.json.
     Remove { name: String },
     /// Sign in to an HTTP server with OAuth (opens your browser).
+    #[command(alias = "auth")]
     Login { name: String },
     /// Forget a server's saved OAuth sign-in.
     Logout { name: String },
@@ -297,34 +309,82 @@ fn describe(t: &Transport) -> String {
     }
 }
 
-fn list_lines(home: &Path, cwd: &Path) -> Vec<String> {
+/// `nyq mcp list [--connect] [--json]`. Without `connect` it only reads the
+/// config; with it, profile and trusted project servers are started to
+/// report their tools or error (untrusted project servers never run).
+async fn list(home: &Path, cwd: &Path, connect: bool, json: bool) -> Result<()> {
     let (servers, warnings) = mcp::load_configs(home, cwd);
-    for w in &warnings {
-        crate::ui::error(w);
-    }
-    if servers.is_empty() {
-        return vec![format!("No MCP servers configured. Add one with `nyq mcp add NAME -- CMD ARGS…` or `nyq mcp add NAME --url URL` ({}).", config_path(home).display())];
+    if !json {
+        for w in &warnings {
+            crate::ui::error(w);
+        }
     }
     let trusted = trusted_project(home, cwd);
-    servers
-        .iter()
-        .map(|s| {
-            let mut notes = Vec::new();
-            if s.scope == Scope::Project {
-                notes.push(if trusted.contains(&s.name) { "trusted" } else { "not trusted" });
-            }
-            let signed_in = mcp::canonical_endpoint(&s.transport)
-                .ok()
-                .filter(|e| !e.is_empty())
-                .and_then(|e| mcp::credential_path(home, &s.name, &e).ok())
-                .is_some_and(|p| p.exists());
-            if signed_in {
-                notes.push("signed in");
-            }
-            let scope = if s.scope == Scope::Project { "project" } else { "profile" };
-            format!("{:<20} {scope:<8} {}{}", s.name, describe(&s.transport), if notes.is_empty() { String::new() } else { format!("  ({})", notes.join(", ")) })
-        })
-        .collect()
+    let mut manager = McpManager::new(home.to_path_buf());
+    let mut rows = Vec::new();
+    for s in &servers {
+        let project = s.scope == Scope::Project;
+        let signed_in = mcp::canonical_endpoint(&s.transport)
+            .ok()
+            .filter(|e| !e.is_empty())
+            .and_then(|e| mcp::credential_path(home, &s.name, &e).ok())
+            .is_some_and(|p| p.exists());
+        let mut row = json!({
+            "name": s.name,
+            "scope": if project { "project" } else { "profile" },
+            "transport": describe(&s.transport),
+            "signed_in": signed_in,
+        });
+        if project {
+            row["trusted"] = json!(trusted.contains(&s.name));
+        }
+        if connect {
+            row["health"] = if project && !trusted.contains(&s.name) {
+                json!({"status": "skipped", "error": "not trusted (nyq mcp trust approve NAME)"})
+            } else {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), manager.connect(s)).await {
+                    Ok(Ok(tools)) => json!({"status": "ok", "tools": tools.len()}),
+                    Ok(Err(e)) => json!({"status": "error", "error": format!("{e:#}")}),
+                    Err(_) => json!({"status": "error", "error": "timed out after 30s"}),
+                }
+            };
+        }
+        rows.push(row);
+    }
+    manager.shutdown().await;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&json!({"servers": rows, "warnings": warnings}))?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("No MCP servers configured. Add one with `nyq mcp add NAME -- CMD ARGS…` or `nyq mcp add NAME --url URL` ({}).", config_path(home).display());
+    }
+    for row in &rows {
+        let mut notes = Vec::new();
+        match row["trusted"].as_bool() {
+            Some(true) => notes.push("trusted".to_string()),
+            Some(false) => notes.push("not trusted".into()),
+            None => {}
+        }
+        if row["signed_in"] == true {
+            notes.push("signed in".into());
+        }
+        let health = &row["health"];
+        match health["status"].as_str() {
+            Some("ok") => notes.push(format!("connected · {} tools", health["tools"])),
+            Some("skipped") => notes.push("not connected".into()),
+            Some(_) => notes.push(format!("error: {}", health["error"].as_str().unwrap_or_default())),
+            None => {}
+        }
+        println!(
+            "{:<20} {:<8} {}{}",
+            row["name"].as_str().unwrap_or_default(),
+            row["scope"].as_str().unwrap_or_default(),
+            row["transport"].as_str().unwrap_or_default(),
+            if notes.is_empty() { String::new() } else { format!("  ({})", notes.join(", ")) }
+        );
+    }
+    Ok(())
 }
 
 fn find(home: &Path, cwd: &Path, name: &str) -> Result<mcp::ServerConfig> {
@@ -337,9 +397,17 @@ fn find(home: &Path, cwd: &Path, name: &str) -> Result<mcp::ServerConfig> {
 
 pub async fn run(home: &Path, cwd: &Path, command: McpCommand) -> Result<()> {
     match command {
-        McpCommand::List => list_lines(home, cwd).iter().for_each(|l| println!("{l}")),
+        McpCommand::List { connect, json } => list(home, cwd, connect, json).await?,
         McpCommand::Path => println!("{}", config_path(home).display()),
-        McpCommand::Add { name, url, headers, bearer_token_env, env, cwd: dir, force, command } => {
+        McpCommand::Add { name, mut url, transport, headers, bearer_token_env, env, cwd: dir, force, mut command } => {
+            if transport.as_deref() == Some("http") && url.is_none() {
+                anyhow::ensure!(command.len() == 1, "--transport http takes one URL: `nyq mcp add --transport http NAME URL`");
+                url = command.pop();
+            }
+            anyhow::ensure!(
+                transport.as_deref() != Some("stdio") || url.is_none(),
+                "--transport stdio takes a command, not --url"
+            );
             let entry = build_entry(url.as_deref(), &headers, bearer_token_env.as_deref(), &env, dir.as_deref(), &command)?;
             add_server(home, &name, entry, force)?;
             println!("Added MCP server `{name}` to {}.", config_path(home).display());

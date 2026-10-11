@@ -182,6 +182,10 @@ pub struct Settings {
     pub prompt_history: bool,
     /// Download and install new releases in the background (interactive sessions).
     pub auto_upgrade: bool,
+    /// Model round-trips per turn before nyq stops (default 100;
+    /// `NYQ_MAX_AGENT_STEPS` overrides it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_agent_steps: Option<usize>,
     /// Keys nyq doesn't manage here (`provider`, `models`, …), kept on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -208,6 +212,7 @@ impl Default for Settings {
             statusline: StatusLine::default(),
             prompt_history: true,
             auto_upgrade: true,
+            max_agent_steps: None,
             extra: Map::new(),
         }
     }
