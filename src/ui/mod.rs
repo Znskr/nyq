@@ -3,6 +3,7 @@
 
 pub mod clipboard;
 pub mod editor;
+mod files;
 pub mod help_menu;
 pub mod history;
 pub mod mode_menu;

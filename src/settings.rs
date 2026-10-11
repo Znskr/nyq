@@ -172,7 +172,7 @@ pub struct Settings {
     pub sandbox: String,
     /// Compact automatically at this share of the context window (percent; 0 = never).
     pub auto_compact: u8,
-    /// Terminal bell: `off`, `on` (long turns and prompts) or `max` (every turn).
+    /// Sound (a system chime where one can play, else the terminal bell): `off`, `on` (long turns and prompts) or `max` (every turn).
     pub sound: String,
     /// Desktop notifications for long turns and prompts.
     pub notifications: bool,
@@ -187,6 +187,8 @@ pub struct Settings {
     /// `NYQ_MAX_AGENT_STEPS` overrides it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_agent_steps: Option<usize>,
+    /// Show categories and skill sources in slash-command results.
+    pub slash_menu_categories: bool,
     /// Keys nyq doesn't manage here (`provider`, `models`, …), kept on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -214,6 +216,7 @@ impl Default for Settings {
             prompt_history: true,
             auto_upgrade: true,
             max_agent_steps: None,
+            slash_menu_categories: true,
             extra: Map::new(),
         }
     }
@@ -249,13 +252,281 @@ pub fn classifier_model() -> Option<String> {
         .filter(|model| !model.is_empty())
 }
 
-/// Change the settings in effect and save them to `home`.
-pub fn update(home: &Path, f: impl FnOnce(&mut Settings)) -> Result<Settings> {
-    let mut s = current();
-    f(&mut s);
-    install(s.clone());
-    save(home, &s)?;
-    Ok(s)
+/// Change the settings in effect and save them to `home`. Returns them with
+/// a notice when a project or workspace layer overrides a changed value.
+/// Only the changed keys are written to the user file; an overridden change
+/// is saved but the layer's value stays in effect here.
+pub fn update(
+    home: &Path,
+    f: impl FnOnce(&mut Settings),
+) -> Result<(Settings, Option<String>)> {
+    let before = serde_json::to_value(current())?;
+    let mut wanted = current();
+    f(&mut wanted);
+    let mut effective = serde_json::to_value(&wanted)?;
+    let mut changes = Vec::new();
+    diff(&before, &effective, &mut Vec::new(), &mut changes);
+    write_changes(home, &changes)?;
+    let overrides = overrides();
+    let mut shadowed = Vec::new();
+    for (path, _) in &changes {
+        if let Some(layer) = overrides.layer(path) {
+            shadowed.push(format!("{} ({})", path.join("."), layer.describe()));
+            set_path(&mut effective, path, get_path(&before, path).cloned());
+        }
+    }
+    let effective: Settings = serde_json::from_value(effective)?;
+    install(effective.clone());
+    let notice = (!shadowed.is_empty())
+        .then(|| format!("Saved, but overridden in this workspace by {}", shadowed.join(", ")));
+    Ok((effective, notice))
+}
+
+// ------------------------------------------------------------------ layers
+
+/// A settings layer above the user's `settings.json`. Later layers win:
+/// the user file, then the project's `.nyq/settings.json`, then the user's
+/// override for this workspace (`workspaces.<path>` in the user file).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layer {
+    Project,
+    Workspace,
+}
+
+impl Layer {
+    pub fn label(self) -> &'static str {
+        match self {
+            Layer::Project => "project",
+            Layer::Workspace => "workspace",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Layer::Project => ".nyq/settings.json",
+            Layer::Workspace => "workspaces in settings.json",
+        }
+    }
+}
+
+/// Keys a project file may set. Anything that loosens safety or picks
+/// providers (permission mode, sandbox, models) stays in the user's own file.
+const PROJECT_KEYS: &[&str] = &[
+    "effort",
+    "fast_mode",
+    "auto_compact",
+    "sound",
+    "notifications",
+    "notify_after_secs",
+    "statusline",
+    "prompt_history",
+    "slash_menu_categories",
+];
+
+#[derive(Clone, Debug, Default)]
+struct Overrides {
+    project: Map<String, Value>,
+    workspace: Map<String, Value>,
+}
+
+impl Overrides {
+    /// The highest layer that sets `path`.
+    fn layer(&self, path: &[String]) -> Option<Layer> {
+        let has = |m: &Map<String, Value>| {
+            get_path(&Value::Object(m.clone()), path).is_some()
+        };
+        if has(&self.workspace) {
+            Some(Layer::Workspace)
+        } else if has(&self.project) {
+            Some(Layer::Project)
+        } else {
+            None
+        }
+    }
+}
+
+static OVERRIDES: Mutex<Option<Overrides>> = Mutex::new(None);
+
+fn overrides() -> Overrides {
+    OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+}
+
+fn get_path<'a>(v: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(v, |v, k| v.get(k))
+}
+
+/// Set (or with `None`, remove) the value at `path`, creating objects on the way.
+fn set_path(v: &mut Value, path: &[String], new: Option<Value>) {
+    let Some((last, parents)) = path.split_last() else { return };
+    let mut cur = v;
+    for k in parents {
+        if !cur.get(k).is_some_and(Value::is_object) {
+            if new.is_none() {
+                return;
+            }
+            cur[k.as_str()] = Value::Object(Map::new());
+        }
+        cur = &mut cur[k.as_str()];
+    }
+    if let Value::Object(m) = cur {
+        match new {
+            Some(n) => {
+                m.insert(last.clone(), n);
+            }
+            None => {
+                m.remove(last);
+            }
+        }
+    }
+}
+
+/// The leaf paths that differ between `old` and `new`, with the new value
+/// (`None`: removed).
+fn diff(old: &Value, new: &Value, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, Option<Value>)>) {
+    match (old, new) {
+        (Value::Object(a), Value::Object(b)) => {
+            let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+            for k in keys {
+                path.push(k.clone());
+                match (a.get(k), b.get(k)) {
+                    (Some(x), Some(y)) => diff(x, y, path, out),
+                    (_, y) => out.push((path.clone(), y.cloned())),
+                }
+                path.pop();
+            }
+        }
+        _ if old != new => out.push((path.clone(), Some(new.clone()))),
+        _ => {}
+    }
+}
+
+/// Apply changed paths to the user file, keeping everything else in it.
+fn write_changes(home: &Path, changes: &[(Vec<String>, Option<Value>)]) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let path = home.join("settings.json");
+    let mut file = match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    {
+        Some(v @ Value::Object(_)) => v,
+        _ => Value::Object(Map::new()),
+    };
+    for (p, v) in changes {
+        set_path(&mut file, p, v.clone());
+    }
+    let bytes = serde_json::to_vec_pretty(&file)?;
+    crate::session::write_private(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn merge(into: &mut Map<String, Value>, over: &Map<String, Value>) {
+    for (k, v) in over {
+        match (into.get_mut(k), v) {
+            (Some(Value::Object(a)), Value::Object(b)) => merge(a, b),
+            _ => {
+                into.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => match serde_json::from_str::<Value>(&t) {
+            Ok(Value::Object(m)) => Ok(m),
+            Ok(_) => Err(format!("{}: expected a JSON object", path.display())),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+/// The user's overrides for `cwd` from `workspaces` (keys may start with `~/`).
+fn workspace_overrides(user: &Map<String, Value>, cwd: &Path) -> Map<String, Value> {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let cwd = canon(cwd);
+    user.get("workspaces")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .find(|(k, _)| {
+            let p = match k.strip_prefix("~/") {
+                Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+                None => k.into(),
+            };
+            canon(&p) == cwd
+        })
+        .and_then(|(_, v)| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Load the user file with the project and workspace layers for `cwd` on
+/// top, and remember the layers for [`source`] and [`update`].
+/// Problems come back as warnings; a broken layer is skipped.
+pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut read = |path: &Path| {
+        read_object(path).unwrap_or_else(|e| {
+            warnings.push(format!("{e} (ignored)"));
+            Map::new()
+        })
+    };
+    let user = read(&home.join("settings.json"));
+    let project_path = cwd.join(".nyq").join("settings.json");
+    let mut project = read(&project_path);
+    let workspace = workspace_overrides(&user, cwd);
+    let ignored: Vec<String> = project
+        .keys()
+        .filter(|k| !PROJECT_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    if !ignored.is_empty() {
+        project.retain(|k, _| PROJECT_KEYS.contains(&k.as_str()));
+        warnings.push(format!(
+            "{}: ignored {} (only your own settings.json may set these)",
+            project_path.display(),
+            ignored.join(", ")
+        ));
+    }
+    let mut merged = user.clone();
+    merge(&mut merged, &project);
+    merge(&mut merged, &workspace);
+    let settings = serde_json::from_value(Value::Object(merged))
+        .or_else(|e| {
+            warnings.push(format!("project or workspace settings: {e} (using your settings.json)"));
+            project.clear();
+            serde_json::from_value(Value::Object(user))
+        })
+        .unwrap_or_else(|e| {
+            warnings.push(format!("settings.json: {e} (using default settings)"));
+            Settings::default()
+        });
+    *OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()) = Some(Overrides { project, workspace });
+    (settings, warnings)
+}
+
+/// The layer that sets a setting's value, when it isn't the user file.
+pub fn source(id: Id) -> Option<Layer> {
+    let path: Vec<String> = match id {
+        Id::Model => return None,
+        Id::Effort => vec!["effort".into()],
+        Id::ClassifierModel => vec!["classifier_model".into()],
+        Id::Fast => vec!["fast_mode".into()],
+        Id::Permission => vec!["permission_mode".into()],
+        Id::Sandbox => vec!["sandbox".into()],
+        Id::AutoCompact => vec!["auto_compact".into()],
+        Id::Sound => vec!["sound".into()],
+        Id::Notifications => vec!["notifications".into()],
+        Id::NotifyAfter => vec!["notify_after_secs".into()],
+        Id::Segment(seg) => vec!["statusline".into(), seg.key().into()],
+        Id::PromptHistory => vec!["prompt_history".into()],
+        Id::AutoUpgrade => vec!["auto_upgrade".into()],
+        Id::SlashCategories => vec!["slash_menu_categories".into()],
+    };
+    overrides().layer(&path)
 }
 
 /// Read `<home>/settings.json`. Problems are returned as a warning and the
@@ -279,31 +550,6 @@ pub fn load(home: &Path) -> (Settings, Option<String>) {
             Some(format!("{}: {e} (using default settings)", path.display())),
         ),
     }
-}
-
-/// Write the settings atomically (0600), merged over the file's other keys.
-pub fn save(home: &Path, s: &Settings) -> Result<()> {
-    let path = home.join("settings.json");
-    let mut merged = match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-    {
-        Some(Value::Object(m)) => m,
-        _ => Map::new(),
-    };
-    let Value::Object(ours) = serde_json::to_value(s)? else {
-        unreachable!("settings serialize to an object")
-    };
-    if s.effort.is_none() {
-        merged.remove("effort");
-    }
-    if s.classifier_model.is_none() {
-        merged.remove("classifier_model");
-    }
-    merged.extend(ours);
-    let bytes = serde_json::to_vec_pretty(&Value::Object(merged))?;
-    crate::session::write_private(&path, &bytes)
-        .with_context(|| format!("writing {}", path.display()))
 }
 
 // ------------------------------------------------------------------ catalog
@@ -352,6 +598,7 @@ pub enum Id {
     Segment(Segment),
     PromptHistory,
     AutoUpgrade,
+    SlashCategories,
 }
 
 /// Session state the menu shows next to the saved settings.
@@ -427,7 +674,7 @@ pub fn specs() -> Vec<Spec> {
             id: Id::Sound,
             category: Category::Notifications,
             label: "Sound level",
-            description: "Terminal bell: off, on (long turns, prompts) or max",
+            description: "Chime or bell: off, on (long turns, prompts) or max",
         },
         Spec {
             id: Id::Notifications,
@@ -460,6 +707,12 @@ pub fn specs() -> Vec<Spec> {
         label: "Auto-upgrade",
         description: "Install new nyq releases in the background; ctrl+g reloads",
     });
+    v.push(Spec {
+        id: Id::SlashCategories,
+        category: Category::Advanced,
+        label: "Slash menu categories",
+        description: "Show categories and skill sources in slash-command results",
+    });
     v
 }
 
@@ -491,6 +744,7 @@ pub fn value(id: Id, s: &Settings, live: &Live) -> String {
         Id::Segment(seg) => on_off(s.statusline.get(seg)),
         Id::PromptHistory => on_off(s.prompt_history),
         Id::AutoUpgrade => on_off(s.auto_upgrade),
+        Id::SlashCategories => on_off(s.slash_menu_categories),
     }
 }
 
@@ -510,7 +764,12 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
         Id::AutoCompact => list(&["off", "50%", "60%", "70%", "80%", "90%"]),
         Id::Sound => list(&["off", "on", "max"]),
         Id::NotifyAfter => list(&["0s", "5s", "10s", "30s", "60s", "120s"]),
-        Id::Fast | Id::Notifications | Id::Segment(_) | Id::PromptHistory | Id::AutoUpgrade => {
+        Id::Fast
+        | Id::Notifications
+        | Id::Segment(_)
+        | Id::PromptHistory
+        | Id::AutoUpgrade
+        | Id::SlashCategories => {
             list(&["off", "on"])
         }
     }
@@ -545,6 +804,7 @@ pub fn apply(id: Id, value: &str, s: &mut Settings) -> bool {
         Id::Segment(seg) => s.statusline.set(seg, on),
         Id::PromptHistory => s.prompt_history = on,
         Id::AutoUpgrade => s.auto_upgrade = on,
+        Id::SlashCategories => s.slash_menu_categories = on,
         Id::Model | Id::Effort | Id::Fast | Id::Permission => return false,
     }
     true
@@ -578,6 +838,73 @@ pub fn sandbox_mode(s: &Settings) -> crate::sandbox::Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Save `s` the way `update` does: only what differs from the file.
+    fn save(home: &Path, s: &Settings) -> Result<()> {
+        let mut changes = Vec::new();
+        let old = serde_json::to_value(load(home).0)?;
+        diff(&old, &serde_json::to_value(s)?, &mut Vec::new(), &mut changes);
+        write_changes(home, &changes)
+    }
+
+    #[test]
+    fn project_and_workspace_layers() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let ws = cwd.path().canonicalize().unwrap();
+        std::fs::write(
+            home.path().join("settings.json"),
+            serde_json::json!({
+                "sound": "on",
+                "auto_compact": 70,
+                "statusline": {"tokens": false},
+                "workspaces": {ws.to_string_lossy(): {"auto_compact": 50}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(cwd.path().join(".nyq")).unwrap();
+        std::fs::write(
+            cwd.path().join(".nyq/settings.json"),
+            r#"{"sound": "max", "auto_compact": 60, "statusline": {"branch": false}, "permission_mode": "yolo"}"#,
+        )
+        .unwrap();
+        let (s, warnings) = load_layered(home.path(), cwd.path());
+        assert_eq!(s.sound, "max");
+        assert_eq!(s.auto_compact, 50);
+        assert!(!s.statusline.tokens && !s.statusline.branch && s.statusline.model);
+        // A project can't loosen permissions.
+        assert_eq!(s.permission_mode, "ask");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("permission_mode"));
+        assert_eq!(source(Id::Sound), Some(Layer::Project));
+        assert_eq!(source(Id::AutoCompact), Some(Layer::Workspace));
+        assert_eq!(source(Id::Segment(Segment::Branch)), Some(Layer::Project));
+        assert_eq!(source(Id::Segment(Segment::Tokens)), None);
+        assert_eq!(source(Id::Notifications), None);
+        // Saving writes only the changed key, and overridden keys are reported.
+        let o = overrides();
+        let mut changes = Vec::new();
+        let mut next = s.clone();
+        next.sound = "off".into();
+        next.notifications = true;
+        diff(&serde_json::to_value(&s).unwrap(), &serde_json::to_value(&next).unwrap(), &mut Vec::new(), &mut changes);
+        assert_eq!(changes.len(), 2);
+        write_changes(home.path(), &changes).unwrap();
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(home.path().join("settings.json")).unwrap()).unwrap();
+        assert_eq!(raw["sound"], "off");
+        assert_eq!(raw["notifications"], true);
+        assert_eq!(raw["auto_compact"], 70, "layer values stay out of the user file");
+        assert!(raw["statusline"].get("branch").is_none());
+        assert_eq!(o.layer(&["sound".to_string()]), Some(Layer::Project));
+        assert_eq!(o.layer(&["notifications".to_string()]), None);
+        // A broken project file is skipped with a warning.
+        std::fs::write(cwd.path().join(".nyq/settings.json"), "{").unwrap();
+        let (s, warnings) = load_layered(home.path(), cwd.path());
+        assert_eq!((s.sound.as_str(), s.auto_compact), ("off", 50));
+        assert_eq!(warnings.len(), 1);
+    }
 
     #[test]
     fn save_merges_and_round_trips() {
