@@ -21,7 +21,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/statusline", "toggle status line segments: /statusline [model|provider|context|tokens|sandbox|folder|branch]"),
     ("/sound", "terminal bell for long turns and prompts: /sound [on|off|max]"),
     ("/notifications", "desktop notifications: /notifications [on|off|after SECONDS]"),
-    ("/fast", "toggle fast mode (Codex priority processing) when the model supports it"),
+    ("/fast", "toggle fast mode (Codex priority processing, AI Gateway fast speed) when the model supports it"),
     ("/image", "attach an image to the next message: /image PATH"),
     ("/images", "pending image attachments: /images [clear|remove N]"),
     ("/paste", "attach an image from the clipboard (also ctrl+v)"),
@@ -51,11 +51,10 @@ pub fn efforts(agent: &Agent, current: Option<&ModelChoice>) -> Vec<String> {
 
 /// Fill the footer fields this module owns.
 pub fn sync_footer(footer: &mut ui::tui::Footer, agent: &Agent, current: Option<&ModelChoice>) {
-    let codex = agent.provider.name() == "codex";
     footer.fast = agent.provider.fast();
-    footer.fast_supported =
-        agent.provider.supports_fast() || (codex && !crate::provider::codex::fast_models_known());
+    footer.fast_supported = agent.provider.supports_fast() || fast_unknown(agent);
     footer.efforts = efforts(agent, current);
+    footer.models = crate::provider::listing(agent.provider.name()).map(|l| l.models).unwrap_or_default();
     footer.branch = ui::statusline::git_branch(&agent.cwd);
     footer.segments = settings::current().statusline;
 }
@@ -66,12 +65,21 @@ pub fn apply_startup(home: &Path, agent: &mut Agent) {
     crate::agent::set_auto_compact_percent(s.auto_compact);
     if s.fast_mode {
         agent.provider.set_fast(true);
-        learn_fast_models_in_background(home, agent);
+    }
+    // Fast-mode support and the default classifier model come from the listing.
+    if s.fast_mode || agent.permission_mode == crate::permissions::Mode::Auto {
+        learn_models_in_background(home, agent);
     }
 }
 
-fn learn_fast_models_in_background(home: &Path, agent: &Agent) {
-    if agent.provider.name() == "codex" && !crate::provider::codex::fast_models_known() {
+/// Fast-mode support for the provider is only known once its models are listed.
+fn fast_unknown(agent: &Agent) -> bool {
+    let name = agent.provider.name();
+    crate::provider::lists_fast(name) && crate::provider::listing(name).is_none()
+}
+
+fn learn_models_in_background(home: &Path, agent: &Agent) {
+    if fast_unknown(agent) {
         let home = home.to_path_buf();
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
@@ -116,6 +124,9 @@ pub fn apply_setting(
 
 fn apply_mode(home: &Path, agent: &mut Agent, mode: crate::permissions::Mode) {
     agent.permission_mode = mode;
+    if mode == crate::permissions::Mode::Auto {
+        learn_models_in_background(home, agent);
+    }
     save(home, |s| s.permission_mode = mode.as_str().into());
     ui::info(&format!(
         "  Permission mode: {} ({}).",
@@ -203,10 +214,10 @@ fn set_fast(home: &Path, agent: &mut Agent, on: bool) {
     }
     agent.provider.set_fast(on);
     save(home, |s| s.fast_mode = on);
-    ui::info(if on {
-        "  Fast mode on: priority processing, which uses more of your plan's usage."
-    } else {
-        "  Fast mode off."
+    ui::info(match (on, agent.provider.name()) {
+        (false, _) => "  Fast mode off.",
+        (true, "codex") => "  Fast mode on: priority processing, which uses more of your plan's usage.",
+        (true, _) => "  Fast mode on: faster inference, at the model's higher fast-mode price.",
     });
 }
 
@@ -299,15 +310,11 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
             });
         }
         "/fast" => {
-            if agent.provider.name() != "codex" {
-                ui::info("  This model does not come with a fast mode.");
-                return Ok(());
-            }
             if agent.provider.fast() {
                 set_fast(home, agent, false);
                 return Ok(());
             }
-            if !crate::provider::codex::fast_models_known() {
+            if fast_unknown(agent) {
                 let cancel = tokio_util::sync::CancellationToken::new();
                 tui.screen()
                     .set_busy(Some("Checking the model catalog"), Some(cancel.clone()));

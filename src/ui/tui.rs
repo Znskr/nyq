@@ -90,6 +90,8 @@ pub struct Footer {
     /// Efforts the current model supports, for the settings menu.
     pub efforts: Vec<String>,
     pub fast_supported: bool,
+    /// Models the current provider listed, for the classifier setting.
+    pub models: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -170,14 +172,10 @@ struct ModelMenu {
 impl ModelMenu {
     fn visible(&self) -> Vec<&ModelChoice> {
         let tab = &self.tabs[self.tab];
-        let f = self.filter.to_lowercase();
-        self.choices
-            .iter()
-            .filter(|c| tab == "All" || &c.provider == tab)
-            .filter(|c| {
-                f.is_empty() || c.model.to_lowercase().contains(&f) || c.provider.contains(&f)
-            })
-            .collect()
+        crate::models::search(
+            self.choices.iter().filter(|c| tab == "All" || &c.provider == tab),
+            &self.filter,
+        )
     }
 }
 
@@ -1691,6 +1689,17 @@ impl Screen {
         self.redraw();
     }
 
+    /// Open the model switcher on already listed models, filtered by `filter`.
+    pub fn show_models(&mut self, choices: Vec<ModelChoice>, warnings: Vec<String>, filter: &str) {
+        self.open_models();
+        self.set_models(choices, warnings);
+        if let Some(m) = &mut self.menu {
+            m.filter = filter.to_string();
+            m.selected = 0;
+        }
+        self.redraw();
+    }
+
     /// Open the session picker over `all` (as from `session::list`).
     pub fn open_sessions(&mut self, all: Vec<Meta>, cwd: &std::path::Path, current: Option<&str>) {
         self.menu = None;
@@ -1757,6 +1766,7 @@ impl Screen {
             efforts: f.efforts.clone(),
             fast: f.fast,
             fast_supported: f.fast_supported,
+            models: f.models.clone(),
             permission_mode: if f.permission_mode.is_empty() {
                 "ask".into()
             } else {
@@ -2798,6 +2808,12 @@ impl Ui for TuiUi {
                     "Preparing {}",
                     one_line(&name.replace('_', " "), 80)
                 ));
+                s.redraw();
+            }
+            // Shown until output arrives (which starts a new block and label).
+            StreamEvent::Retrying(status) => {
+                s.flush_live();
+                s.set_label(status);
                 s.redraw();
             }
         }

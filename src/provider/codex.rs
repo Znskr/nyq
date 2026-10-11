@@ -134,30 +134,6 @@ pub fn jwt_exp_ms(token: &str) -> Option<i64> {
         .and_then(|s| s.checked_mul(1000))
 }
 
-/// Models the catalog listed with a `fast` speed tier; None until the
-/// catalog has been fetched in this process.
-static FAST_MODELS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
-
-fn remember_fast_models(models: Vec<String>) {
-    let mut known = FAST_MODELS.lock().unwrap_or_else(|e| e.into_inner());
-    let list = known.get_or_insert_with(Vec::new);
-    for m in models {
-        if !list.contains(&m) {
-            list.push(m);
-        }
-    }
-}
-
-/// Whether the model catalog has been fetched (so fast-mode support is known).
-pub fn fast_models_known() -> bool {
-    FAST_MODELS.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-}
-
-/// Whether `model` offers fast mode (false until the catalog is known).
-pub fn supports_fast(model: &str) -> bool {
-    FAST_MODELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.iter().any(|s| s == model))
-}
-
 impl CodexProvider {
     pub fn new(auth_path: PathBuf, model: String, effort: Option<String>) -> Self {
         Self {
@@ -216,7 +192,11 @@ impl CodexProvider {
             .models
             .retain(|m| m.visibility == "list" && m.supported_in_api != Some(false));
         catalog.models.sort_by_key(|m| m.priority);
-        remember_fast_models(catalog.models.iter().filter(|m| m.additional_speed_tiers.iter().any(|t| t == "fast")).map(|m| m.slug.clone()).collect());
+        super::remember_listing(
+            "codex",
+            catalog.models.iter().map(|m| m.slug.clone()).collect(),
+            catalog.models.iter().filter(|m| m.additional_speed_tiers.iter().any(|t| t == "fast")).map(|m| m.slug.clone()).collect(),
+        );
         Ok(catalog
             .models
             .into_iter()
@@ -416,7 +396,11 @@ impl Provider for CodexProvider {
         self.fast = fast;
     }
     fn supports_fast(&self) -> bool {
-        supports_fast(&self.model)
+        super::listed_fast("codex", &self.model)
+    }
+    /// The first mini model in the live catalog (highest priority first).
+    fn reviewer_model(&self) -> Option<String> {
+        super::listing("codex")?.models.into_iter().find(|m| m.contains("-mini"))
     }
 
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
@@ -600,16 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_is_a_listed_mini_model() {
+        let provider = CodexProvider::new(PathBuf::new(), "big-review-test".into(), None);
+        crate::provider::remember_listing("codex", vec!["big-review-test".into(), "small-review-test-mini".into()], Vec::new());
+        assert_eq!(provider.reviewer_model().as_deref(), Some("small-review-test-mini"));
+    }
+
+    #[test]
     fn fast_mode_requests_priority_tier() {
         let empty = || Request { system: "", items: &[], tools: &[] };
         let mut provider = CodexProvider::new(PathBuf::new(), "fast-capable-test".into(), None);
         provider.set_fast(true);
         // Unknown support: no tier is requested.
-        if !supports_fast("fast-capable-test") {
+        if !crate::provider::listed_fast("codex", "fast-capable-test") {
             assert!(provider.body(empty()).get("service_tier").is_none());
         }
-        remember_fast_models(vec!["fast-capable-test".into()]);
-        assert!(fast_models_known() && provider.supports_fast() && provider.fast());
+        crate::provider::remember_listing("codex", Vec::new(), vec!["fast-capable-test".into()]);
+        assert!(crate::provider::listing("codex").is_some() && provider.supports_fast() && provider.fast());
         assert_eq!(provider.body(empty())["service_tier"], "priority");
         assert!(provider.fork().fast());
         provider.set_fast(false);

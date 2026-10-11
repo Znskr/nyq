@@ -355,7 +355,7 @@ pub async fn review(
         tools: std::slice::from_ref(&spec),
     };
     let mut sink = |_: crate::types::StreamEvent| {};
-    let pending = provider.stream(req, &mut sink);
+    let pending = crate::provider::stream_with_retry(provider, req, &mut sink);
     tokio::pin!(pending);
     let result = tokio::select! {
         biased;

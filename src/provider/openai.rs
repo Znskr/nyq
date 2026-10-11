@@ -24,6 +24,11 @@ pub struct OpenAiProvider {
     /// Assistant-message field that carries reasoning back to models with
     /// interleaved thinking (e.g. `reasoning_content`); None drops it.
     pub reasoning_field: Option<String>,
+    /// Top-level `providerOptions` (AI Gateway: `{"gateway":{"speed":"fast"}}`).
+    pub provider_options: Option<Value>,
+    /// Mark Anthropic prompt-cache breakpoints on messages the AI Gateway way
+    /// (`providerOptions.anthropic.cacheControl`).
+    pub anthropic_cache: bool,
 }
 
 /// How a chat-completions endpoint takes a reasoning effort.
@@ -41,6 +46,9 @@ pub enum EffortStyle {
 pub struct Listed {
     pub id: String,
     pub context_window: Option<u64>,
+    /// The listing offers a fast mode for this model (the AI Gateway's
+    /// `fast_options` toggle, fast pricing, or OpenAI's priority tier).
+    pub fast: bool,
 }
 
 impl OpenAiProvider {
@@ -63,6 +71,8 @@ impl OpenAiProvider {
             effort_style: EffortStyle::default(),
             headers: Vec::new(),
             reasoning_field: None,
+            provider_options: None,
+            anthropic_cache: false,
         }
     }
 
@@ -84,7 +94,19 @@ impl OpenAiProvider {
             kind: Option<String>,
             #[serde(default)]
             context_window: Option<u64>,
+            #[serde(default)]
+            owned_by: Option<String>,
+            #[serde(default)]
+            pricing: Value,
+            #[serde(default)]
+            fast_options: Value,
         }
+        let fast = |m: &Model| {
+            let toggle = m.fast_options.as_array().is_some_and(|o| o.iter().any(|o| o["type"] == "toggle"));
+            let priority = m.owned_by.as_deref().is_some_and(|o| o.eq_ignore_ascii_case("openai"))
+                && m.pricing["service_tiers"]["priority"].is_object();
+            toggle || m.pricing["fast"].is_object() || priority
+        };
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
@@ -101,7 +123,7 @@ impl OpenAiProvider {
             .data
             .into_iter()
             .filter(|m| m.kind.as_deref().is_none_or(|k| matches!(k, "language" | "chat" | "model")))
-            .map(|m| Listed { id: m.id, context_window: m.context_window })
+            .map(|m| Listed { fast: fast(&m), id: m.id, context_window: m.context_window })
             .collect())
     }
 
@@ -166,7 +188,20 @@ impl OpenAiProvider {
         if let Some(message) = assistant {
             messages.push(message);
         }
+        if self.anthropic_cache {
+            // The system prompt, plus the newest user or assistant message
+            // before the last one: the prefix the next request repeats.
+            let breakpoint = (1..messages.len().saturating_sub(1))
+                .rev()
+                .find(|&i| matches!(messages[i]["role"].as_str(), Some("user" | "assistant")));
+            for i in std::iter::once(0).chain(breakpoint) {
+                messages[i]["providerOptions"] = json!({"anthropic":{"cacheControl":{"type":"ephemeral"}}});
+            }
+        }
         let mut body = json!({"model":self.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
+        if let Some(options) = &self.provider_options {
+            body["providerOptions"] = options.clone();
+        }
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools.iter().map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})).collect::<Vec<_>>());
         }
@@ -490,7 +525,7 @@ mod tests {
         let provider = OpenAiProvider::new(url, None, "a".into());
         assert_eq!(
             provider.list_models_detailed().await.unwrap(),
-            vec![Listed { id: "a".into(), context_window: Some(1000) }, Listed { id: "b".into(), context_window: None }]
+            vec![Listed { id: "a".into(), context_window: Some(1000), fast: false }, Listed { id: "b".into(), context_window: None, fast: false }]
         );
         task.await.unwrap();
     }
