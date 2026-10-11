@@ -9,6 +9,7 @@ mod fs;
 pub mod image;
 pub(crate) mod mcp_search;
 pub(crate) mod memory;
+pub(crate) mod redact;
 pub(crate) mod safeio;
 mod search;
 pub mod subagent;
