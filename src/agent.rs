@@ -291,7 +291,7 @@ impl Agent {
                 };
                 let mut sink = |ev: StreamEvent| ui.stream(&ev);
                 tokio::select! {
-                    r = self.provider.stream(req, &mut sink) => Some(r),
+                    r = crate::provider::stream_with_retry(self.provider.as_ref(), req, &mut sink) => Some(r),
                     _ = cancel.cancelled() => None,
                 }
             };
@@ -784,7 +784,7 @@ impl Agent {
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(false),
-            r = self.provider.stream(req, &mut ignore) => r?,
+            r = crate::provider::stream_with_retry(self.provider.as_ref(), req, &mut ignore) => r?,
         };
         self.account_usage(response.usage, ui);
         if cancel.is_cancelled() {
@@ -892,7 +892,7 @@ impl Agent {
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => anyhow::bail!("Interrupted."),
-            r = self.provider.stream(req, &mut ignore) => r?,
+            r = crate::provider::stream_with_retry(self.provider.as_ref(), req, &mut ignore) => r?,
         };
         self.record_usage(response.usage);
         let raw: String = response
