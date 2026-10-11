@@ -183,6 +183,10 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
         }
     };
     let (codex, ollama, openai, hosted): (_, _, Result<_>, _) = tokio::join!(codex, ollama, openai, hosted(home));
+    crate::provider::remember_listing("ollama", ollama.clone(), Vec::new());
+    if let Ok((models, None)) = &openai {
+        crate::provider::remember_listing("openai", models.clone(), Vec::new());
+    }
     let mut warnings = Vec::new();
     let mut choices = match codex {
         Ok(models) => models,

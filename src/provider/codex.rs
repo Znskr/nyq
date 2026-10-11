@@ -398,6 +398,10 @@ impl Provider for CodexProvider {
     fn supports_fast(&self) -> bool {
         super::listed_fast("codex", &self.model)
     }
+    /// The first mini model in the live catalog (highest priority first).
+    fn reviewer_model(&self) -> Option<String> {
+        super::listing("codex")?.models.into_iter().find(|m| m.contains("-mini"))
+    }
 
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
         let body = self.body(req);
@@ -577,6 +581,13 @@ mod tests {
             })
             .get("reasoning")
             .is_none());
+    }
+
+    #[test]
+    fn reviewer_is_a_listed_mini_model() {
+        let provider = CodexProvider::new(PathBuf::new(), "big-review-test".into(), None);
+        crate::provider::remember_listing("codex", vec!["big-review-test".into(), "small-review-test-mini".into()], Vec::new());
+        assert_eq!(provider.reviewer_model().as_deref(), Some("small-review-test-mini"));
     }
 
     #[test]

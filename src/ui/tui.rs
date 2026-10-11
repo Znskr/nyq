@@ -90,6 +90,8 @@ pub struct Footer {
     /// Efforts the current model supports, for the settings menu.
     pub efforts: Vec<String>,
     pub fast_supported: bool,
+    /// Models the current provider listed, for the classifier setting.
+    pub models: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1764,6 +1766,7 @@ impl Screen {
             efforts: f.efforts.clone(),
             fast: f.fast,
             fast_supported: f.fast_supported,
+            models: f.models.clone(),
             permission_mode: if f.permission_mode.is_empty() {
                 "ask".into()
             } else {

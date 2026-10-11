@@ -54,6 +54,7 @@ pub fn sync_footer(footer: &mut ui::tui::Footer, agent: &Agent, current: Option<
     footer.fast = agent.provider.fast();
     footer.fast_supported = agent.provider.supports_fast() || fast_unknown(agent);
     footer.efforts = efforts(agent, current);
+    footer.models = crate::provider::listing(agent.provider.name()).map(|l| l.models).unwrap_or_default();
     footer.branch = ui::statusline::git_branch(&agent.cwd);
     footer.segments = settings::current().statusline;
 }
@@ -64,7 +65,10 @@ pub fn apply_startup(home: &Path, agent: &mut Agent) {
     crate::agent::set_auto_compact_percent(s.auto_compact);
     if s.fast_mode {
         agent.provider.set_fast(true);
-        learn_fast_models_in_background(home, agent);
+    }
+    // Fast-mode support and the default classifier model come from the listing.
+    if s.fast_mode || agent.permission_mode == crate::permissions::Mode::Auto {
+        learn_models_in_background(home, agent);
     }
 }
 
@@ -74,7 +78,7 @@ fn fast_unknown(agent: &Agent) -> bool {
     crate::provider::lists_fast(name) && crate::provider::listing(name).is_none()
 }
 
-fn learn_fast_models_in_background(home: &Path, agent: &Agent) {
+fn learn_models_in_background(home: &Path, agent: &Agent) {
     if fast_unknown(agent) {
         let home = home.to_path_buf();
         tokio::spawn(async move {
@@ -120,6 +124,9 @@ pub fn apply_setting(
 
 fn apply_mode(home: &Path, agent: &mut Agent, mode: crate::permissions::Mode) {
     agent.permission_mode = mode;
+    if mode == crate::permissions::Mode::Auto {
+        learn_models_in_background(home, agent);
+    }
     save(home, |s| s.permission_mode = mode.as_str().into());
     ui::info(&format!(
         "  Permission mode: {} ({}).",
