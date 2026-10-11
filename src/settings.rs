@@ -171,7 +171,7 @@ pub struct Settings {
     pub sandbox: String,
     /// Compact automatically at this share of the context window (percent; 0 = never).
     pub auto_compact: u8,
-    /// Terminal bell: `off`, `on` (long turns and prompts) or `max` (every turn).
+    /// Sound (a system chime where one can play, else the terminal bell): `off`, `on` (long turns and prompts) or `max` (every turn).
     pub sound: String,
     /// Desktop notifications for long turns and prompts.
     pub notifications: bool,
@@ -657,7 +657,7 @@ pub fn specs() -> Vec<Spec> {
             id: Id::Sound,
             category: Category::Notifications,
             label: "Sound level",
-            description: "Terminal bell: off, on (long turns, prompts) or max",
+            description: "Chime or bell: off, on (long turns, prompts) or max",
         },
         Spec {
             id: Id::Notifications,
