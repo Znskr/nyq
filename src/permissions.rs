@@ -5,7 +5,9 @@
 //!
 //! A pattern is a tool name with `*` wildcards (`web_fetch`, `mcp__deepwiki__*`,
 //! `mcp__*`), `subagent:explore` / `subagent:general`, `web_fetch:<url>` (with
-//! wildcards), or `bash:<prefix>` for shell commands. Precedence:
+//! wildcards), `bash:<prefix>` for shell commands, or a path-scoped rule
+//! (`edit_file:src/**`, `read_file:secrets/*`, `read:~/notes/**`; see
+//! [`path_rule_matches`]). Precedence:
 //! deny > ask > allow > session grants > the permission mode. Deny wins in
 //! every mode, including yolo. `auto` classifies whatever is still undecided.
 
@@ -250,7 +252,7 @@ impl Permissions {
     }
 
     /// The first rule of `action` that matches this call, with its source.
-    fn find(&self, action: Action, tool: &str, args: &Value) -> Option<String> {
+    fn find(&self, action: Action, tool: &str, args: &Value, cwd: &Path) -> Option<String> {
         let (user, project): (&[String], &[String]) = match action {
             Action::Allow => (&self.allow, &[]),
             Action::Ask => (&self.ask, &self.project_ask),
@@ -259,12 +261,15 @@ impl Permissions {
         // Allow rules for bash need an exact prefix match on a plain command;
         // ask/deny rules also catch the prefix inside chains and wrappers.
         let strict = action == Action::Allow;
-        if let Some(r) = user.iter().find(|p| matches(p, tool, args, strict)) {
+        let hit = |p: &&String| {
+            path_rule_matches(p, tool, args, cwd, strict) || matches(p, tool, args, strict)
+        };
+        if let Some(r) = user.iter().find(hit) {
             return Some(format!("{} {r}", action.as_str()));
         }
         project
             .iter()
-            .find(|p| matches(p, tool, args, strict))
+            .find(hit)
             .map(|r| format!("{} {r} (project .nyq/permissions.json)", action.as_str()))
     }
 
@@ -294,17 +299,28 @@ impl Permissions {
         needs_approval: bool,
         mode: Mode,
     ) -> Decision {
-        if let Some(rule) = self.find(Action::Deny, tool, args) {
+        if let Some(rule) = self.find(Action::Deny, tool, args, cwd) {
             return Decision::Deny(rule);
         }
-        if let Some(rule) = self.find(Action::Ask, tool, args) {
+        if let Some(rule) = self.find(Action::Ask, tool, args, cwd) {
             return if mode == Mode::Yolo {
                 Decision::Run
             } else {
                 Decision::Ask { forced: Some(rule) }
             };
         }
-        if self.find(Action::Allow, tool, args).is_some() && allow_applies(tool, args, cwd, extra) {
+        // A path-scoped allow names its paths, so it may cover reads and
+        // edits outside the workspace (never edits under `.git`).
+        let path_allow = || {
+            self.allow
+                .iter()
+                .any(|p| path_rule_matches(p, tool, args, cwd, true))
+                && !(is_file_tool(tool) && crate::agent::path_under_git(args, cwd))
+        };
+        if path_allow()
+            || (self.find(Action::Allow, tool, args, cwd).is_some()
+                && allow_applies(tool, args, cwd, extra))
+        {
             return Decision::Run;
         }
         if !needs_approval || crate::agent::is_allowed_in(session, tool, args, cwd, extra) {
@@ -498,6 +514,12 @@ fn call_keys(tool: &str, args: &Value) -> Vec<String> {
         "web_fetch" => {
             if let Some(url) = args.get("url").and_then(Value::as_str) {
                 keys.push(format!("web_fetch:{url}"));
+                // Also the parsed spelling (lowercase host, explicit `/`), so
+                // a site rule like `web_fetch:https://docs.rs/*` can't be
+                // dodged by writing the URL differently.
+                if let Some(norm) = crate::agent::normalize_url(url).filter(|n| n != url) {
+                    keys.push(format!("web_fetch:{norm}"));
+                }
             }
         }
         // Resource tools are not named `mcp__<server>__…`, but server-wide
@@ -528,6 +550,99 @@ pub fn matches(pattern: &str, tool: &str, args: &Value, strict: bool) -> bool {
         };
     }
     call_keys(tool, args).iter().any(|k| glob(pattern, k))
+}
+
+/// The path category of a tool: `read` for the read tools, `edit` for
+/// `write_file` / `edit_file`.
+fn path_kind(tool: &str) -> Option<&'static str> {
+    if is_read_tool(tool) {
+        Some("read")
+    } else if is_file_tool(tool) {
+        Some("edit")
+    } else {
+        None
+    }
+}
+
+/// Whether a path-scoped rule (`edit_file:src/**`, `read_file:secrets/*`,
+/// `read:~/notes/**`, `edit:/tmp/**`) covers this call. The prefix names a
+/// category: any read tool's rule covers every read tool, and `write_file` /
+/// `edit_file` cover each other. Relative patterns are relative to the
+/// workspace; `*` matches within one path segment and `**` any number of
+/// segments. `strict` (allow semantics) requires the path with symlinks
+/// resolved to match; otherwise either spelling does.
+pub(crate) fn path_rule_matches(rule: &str, tool: &str, args: &Value, cwd: &Path, strict: bool) -> bool {
+    let Some((prefix, pattern)) = rule.split_once(':') else {
+        return false;
+    };
+    let Some(kind) = path_kind(tool) else {
+        return false;
+    };
+    let wanted = match prefix {
+        "read" | "edit" => Some(prefix),
+        other => path_kind(other),
+    };
+    if wanted != Some(kind) || pattern.is_empty() {
+        return false;
+    }
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(p) if !p.is_empty() => p,
+        _ if kind == "read" => ".",
+        _ => return false,
+    };
+    let Some(lexical) = crate::agent::lexical(cwd, path) else {
+        return false;
+    };
+    let resolved = crate::agent::resolved(cwd, path).unwrap_or_else(|| lexical.clone());
+    let expanded = match pattern.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().map(|h| slash(&h.join(rest))),
+        None => Some(pattern.to_string()),
+    };
+    let Some(pattern) = expanded else {
+        return false;
+    };
+    let relative = !Path::new(&pattern).is_absolute() && !pattern.starts_with('/');
+    let hit = |full: &Path, root: &Path| {
+        if relative {
+            full.strip_prefix(root)
+                .is_ok_and(|rel| path_glob(&pattern, &slash(rel)))
+        } else {
+            path_glob(&pattern, &slash(full))
+        }
+    };
+    let lexical_root = crate::agent::lexical(cwd, ".").unwrap_or_else(|| cwd.to_path_buf());
+    let real_root = std::fs::canonicalize(cwd).unwrap_or_else(|_| lexical_root.clone());
+    let resolved_hit = hit(&resolved, &real_root);
+    resolved_hit || (!strict && hit(&lexical, &lexical_root))
+}
+
+fn slash(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// Path globbing by segment: `*` within a segment, `**` across segments.
+pub(crate) fn path_glob(pattern: &str, path: &str) -> bool {
+    fn go(p: &[&str], t: &[&str]) -> bool {
+        match p.split_first() {
+            None => t.is_empty(),
+            Some((&"**", rest)) => (0..=t.len()).any(|i| go(rest, &t[i..])),
+            Some((seg, rest)) => t
+                .split_first()
+                .is_some_and(|(x, tail)| glob(seg, x) && go(rest, tail)),
+        }
+    }
+    let split = |s: &str| -> Vec<String> {
+        s.trim_end_matches('/')
+            .split('/')
+            .enumerate()
+            .filter(|(i, seg)| *i == 0 || (!seg.is_empty() && *seg != "."))
+            .map(|(_, seg)| seg.to_string())
+            .collect()
+    };
+    let (p, t) = (split(pattern), split(path));
+    let p: Vec<&str> = p.iter().map(String::as_str).collect();
+    let t: Vec<&str> = t.iter().map(String::as_str).collect();
+    go(&p, &t)
 }
 
 /// Whether the words of `prefix` appear anywhere in `cmd`, after dropping
@@ -1116,6 +1231,70 @@ mod tests {
         assert!(!saveable("read_file", &json!({"path": "/etc/hosts"}), cwd));
         assert!(saveable("write_file", &json!({"path": "a.txt"}), cwd));
         assert!(saveable("bash", &json!({"command": "cargo test"}), cwd));
+    }
+
+    #[test]
+    fn path_globs() {
+        assert!(path_glob("src/**", "src/a/b.rs"));
+        assert!(path_glob("src/**", "src"));
+        assert!(path_glob("src/*.rs", "src/main.rs"));
+        assert!(!path_glob("src/*.rs", "src/a/main.rs"));
+        assert!(path_glob("**/*.env", "a/b/.env"));
+        assert!(path_glob("/etc/**", "/etc/hosts"));
+        assert!(!path_glob("/etc/**", "/etcetera/x"));
+    }
+
+    #[test]
+    fn path_scoped_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join("secrets")).unwrap();
+        let none = HashSet::new();
+        let p = perms(
+            &["edit_file:src/**"],
+            &["edit:Cargo.toml"],
+            &["read_file:secrets/*"],
+        );
+        let d = |tool: &str, path: &str| {
+            p.decide(&none, tool, &json!({ "path": path }), cwd, true, Mode::Ask)
+        };
+        // Allow: both file tools under src, nothing else.
+        assert_eq!(d("edit_file", "src/a.rs"), Decision::Run);
+        assert_eq!(d("write_file", "src/new/b.rs"), Decision::Run);
+        assert_eq!(d("write_file", "docs/a.md"), Decision::Ask { forced: None });
+        // Ask: forced even in auto; deny: every read tool, any spelling.
+        assert!(matches!(d("write_file", "Cargo.toml"), Decision::Ask { forced: Some(_) }));
+        assert!(matches!(d("read_file", "secrets/key"), Decision::Deny(_)));
+        assert!(matches!(d("grep", "./secrets/key"), Decision::Deny(_)));
+        assert!(matches!(
+            d("read_file", cwd.join("secrets/key").to_str().unwrap()),
+            Decision::Deny(_)
+        ));
+        assert_eq!(d("read_file", "src/a.rs"), Decision::Ask { forced: None });
+        // Absolute allows reach outside the workspace; never under .git.
+        let outside = tempfile::tempdir().unwrap();
+        let root = outside.path().to_str().unwrap();
+        let p = perms(&[&format!("read:{root}/**"), &format!("edit:{root}/**")], &[], &[]);
+        let d = |tool: &str, path: String| {
+            p.decide(&none, tool, &json!({ "path": path }), cwd, true, Mode::Ask)
+        };
+        assert_eq!(d("list_dir", root.to_string()), Decision::Run);
+        assert_eq!(d("write_file", format!("{root}/a.txt")), Decision::Run);
+        assert_eq!(
+            d("write_file", format!("{root}/.git/config")),
+            Decision::Ask { forced: None }
+        );
+        #[cfg(unix)]
+        {
+            // A link out of an allowed tree is judged by where it points.
+            let p = perms(&["edit:src/**"], &[], &[]);
+            std::os::unix::fs::symlink(outside.path(), cwd.join("src/out")).unwrap();
+            assert_eq!(
+                p.decide(&none, "write_file", &json!({"path": "src/out/x"}), cwd, true, Mode::Ask),
+                Decision::Ask { forced: None }
+            );
+        }
     }
 
     #[test]
