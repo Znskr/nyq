@@ -213,7 +213,7 @@ pub async fn ask_model(home: &Path, provider: &dyn Provider, prompt: &str, usage
     let items = [Item::user(prompt)];
     let req = Request { system: SYSTEM, items: &items, tools: &[] };
     let mut ignore = |_: StreamEvent| {};
-    let response = provider.stream(req, &mut ignore).await?;
+    let response = crate::provider::stream_with_retry(provider, req, &mut ignore).await?;
     if let Some(usage) = response.usage {
         if let Err(e) = crate::usage::append(
             home,
