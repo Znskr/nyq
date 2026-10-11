@@ -18,19 +18,20 @@ use crate::provider::hosted::{self, Service};
 use crate::ui::{self, tui::Tui};
 
 /// Every provider nyq can use, in menu order.
-pub const PROVIDERS: [&str; 7] = ["codex", "opencode-go", "opencode", "xai", "vercel", "openai", "ollama"];
+pub const PROVIDERS: [&str; 8] = ["codex", "grok", "opencode-go", "opencode", "xai", "vercel", "openai", "ollama"];
 /// Providers `/login` can sign in to (the rest are configured by endpoint).
-const LOGIN: [&str; 5] = ["codex", "opencode-go", "opencode", "xai", "vercel"];
+const LOGIN: [&str; 6] = ["codex", "grok", "opencode-go", "opencode", "xai", "vercel"];
 
 const OPENAI_HELP: &str = "OpenAI-compatible APIs need no sign-in: set NYQ_BASE_URL, NYQ_MODEL and NYQ_API_KEY, or base_url/model/api_key in ~/.nyq/model.json.";
 const OLLAMA_HELP: &str = "Ollama runs locally and needs no sign-in: start it (OLLAMA_HOST picks the address) and choose a model with /model.";
 pub const TEAMS_UNAVAILABLE: &str = "Choosing a Vercel team is not available: nyq reaches the AI Gateway with an API key, and each AI Gateway key belongs to exactly one team, so there is no team to switch. To use another team, create a key in that team (vercel.com → AI Gateway → API Keys) and run `nyq login vercel`.";
-const NO_GATEWAY_KEY: &str = "AI Gateway credits need an AI Gateway API key: run `nyq login vercel` (or /login vercel), or set AI_GATEWAY_API_KEY. ChatGPT, OpenCode and xAI accounts have no AI Gateway balance.";
+const NO_GATEWAY_KEY: &str = "AI Gateway credits need an AI Gateway API key: run `nyq login vercel` (or /login vercel), or set AI_GATEWAY_API_KEY. ChatGPT, Grok, OpenCode and xAI accounts have no AI Gateway balance.";
 
-/// The provider id for a name or alias (`chatgpt` → `codex`, `gateway` → `vercel`, …).
+/// The provider id for a name or alias (`chatgpt` → `codex`, `gateway` → `vercel`).
 pub fn canonical(name: &str) -> Option<&'static str> {
     match name.trim().to_ascii_lowercase().as_str() {
         "codex" | "chatgpt" => Some("codex"),
+        "grok" => Some("grok"),
         "openai" => Some("openai"),
         "ollama" => Some("ollama"),
         other => Service::parse(other).map(Service::id),
@@ -44,6 +45,7 @@ fn unknown(name: &str) -> anyhow::Error {
 pub fn title(id: &str) -> &'static str {
     match id {
         "codex" => "ChatGPT (Codex)",
+        "grok" => "Grok subscription",
         "openai" => "OpenAI-compatible API",
         "ollama" => "Ollama (local)",
         other => Service::parse(other).map_or("unknown", Service::title),
@@ -73,6 +75,11 @@ pub fn connection(home: &Path, id: &str) -> Connection {
                 ("signed in (codex CLI login)".into(), true)
             }
         }
+        "grok" => match crate::provider::grok::sign_in(home) {
+            crate::provider::grok::SignIn::Ready => ("signed in (nyq)".into(), true),
+            crate::provider::grok::SignIn::Unusable => ("unusable private file".into(), false),
+            crate::provider::grok::SignIn::Missing => ("not signed in".into(), false),
+        },
         "openai" => match config::openai_config(home).ok().and_then(|c| c.0) {
             Some(url) => (format!("endpoint {url}"), true),
             None => ("not configured".into(), false),
@@ -90,6 +97,9 @@ pub fn connection(home: &Path, id: &str) -> Connection {
 fn stored_by_nyq(home: &Path, id: &str) -> bool {
     if id == "codex" {
         return home.join("chatgpt-auth.json").exists();
+    }
+    if id == "grok" {
+        return crate::provider::grok::auth_path(home).exists();
     }
     std::fs::read(home.join("auth.json"))
         .ok()
@@ -111,6 +121,7 @@ fn default_model(home: &Path, id: &str) -> Option<String> {
     }
     match id {
         "codex" => Some(config::DEFAULT_CODEX_MODEL.into()),
+        "grok" => Some(crate::provider::grok::DEFAULT_MODEL.into()),
         "openai" => config::openai_config(home).ok().and_then(|c| c.2),
         "ollama" => None,
         other => Service::parse(other).map(|s| s.default_model().into()),
@@ -190,6 +201,7 @@ fn source_lines(home: &Path) -> Vec<String> {
     lines.extend(connection_lines(home));
     lines.push("API keys: the provider's environment variable, then the OpenCode CLI's login (OpenCode only), then nyq's auth.json.".into());
     lines.push("ChatGPT: NYQ_CODEX_AUTH, then a valid codex CLI login, then nyq's own sign-in.".into());
+    lines.push("Grok subscription: nyq's sign-in in grok-auth.json.".into());
     lines
 }
 
@@ -374,6 +386,7 @@ pub async fn cli_login(home: &Path, id: &str) -> Result<String> {
             })
             .await
         }
+        "grok" => crate::login::login_grok(home, crate::provider::grok::stdin_code()).await,
         "openai" => Ok(OPENAI_HELP.into()),
         "ollama" => Ok(OLLAMA_HELP.into()),
         other => crate::login::login_key(home, Service::parse(other).ok_or_else(|| unknown(other))?),
@@ -385,7 +398,7 @@ pub async fn cli_setup(home: &Path) -> Result<()> {
     use std::io::IsTerminal;
     summary_lines(home).iter().for_each(|l| println!("{l}"));
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        println!("\nSign in with `nyq login [codex|opencode-go|opencode|xai|vercel]`, choose the default with `nyq provider NAME`, or run /setup inside nyq.");
+        println!("\nSign in with `nyq login [codex|grok|opencode-go|opencode|xai|vercel]`, choose the default with `nyq provider NAME`, or run /setup inside nyq.");
         return Ok(());
     }
     let labels = |home: &Path| -> Vec<String> { PROVIDERS.iter().map(|id| format!("{:<24} {}", title(id), connection(home, id).status)).collect() };
@@ -405,7 +418,7 @@ pub async fn cli_setup(home: &Path) -> Result<()> {
                 if stored.is_empty() {
                     println!("No sign-ins stored by nyq.");
                 } else if let Some(i) = choose("Sign out of", &stored.iter().map(|id| title(id).to_string()).collect::<Vec<_>>())? {
-                    println!("{}", crate::login::logout(home, stored[i])?);
+                    println!("{}", crate::login::logout(home, stored[i]).await?);
                 }
             }
             Some(2) => {
@@ -430,6 +443,14 @@ pub async fn slash(cmd: &str, args: &[&str], agent: &mut Agent, tui: &Tui) -> Re
         "/logout" => tui_logout(&home, tui, args.first().copied()).await,
         "/setup" => tui_setup(&home, agent, tui).await,
         _ => tui_credits(&home, tui).await,
+    }
+}
+
+/// Clears a pasted-code prompt when browser sign-in finishes first.
+struct HideSecret<'a>(&'a Tui);
+impl Drop for HideSecret<'_> {
+    fn drop(&mut self) {
+        self.0.dismiss_secret();
     }
 }
 
@@ -463,6 +484,22 @@ async fn tui_login(home: &Path, tui: &Tui, name: Option<&str>) -> Result<()> {
                 None => ui::info("Sign-in cancelled."),
             }
         }
+        "grok" => {
+            let cancel = CancellationToken::new();
+            tui.screen().set_busy(Some("Signing in to Grok"), Some(cancel.clone()));
+            let _hide = HideSecret(tui);
+            let prompt = "Paste the Grok authorization code if the browser does not return (hidden)";
+            let result = tokio::select! {
+                r = crate::login::login_grok(home, async { Ok(tui.secret(prompt).await) }) => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            drop(_hide);
+            tui.screen().idle();
+            match result {
+                Some(r) => ui::info(&format!("{} Pick a Grok model with /model.", r?)),
+                None => ui::info("Sign-in cancelled."),
+            }
+        }
         other => {
             let service = Service::parse(other).ok_or_else(|| unknown(other))?;
             let prompt = format!("Paste your {} API key from {} (hidden)", service.title(), crate::login::key_site(service));
@@ -492,7 +529,7 @@ async fn tui_logout(home: &Path, tui: &Tui, name: Option<&str>) -> Result<()> {
         }
     };
     anyhow::ensure!(LOGIN.contains(&id), "{} has no sign-in to remove", title(id));
-    ui::info(&crate::login::logout(home, id)?);
+    ui::info(&crate::login::logout(home, id).await?);
     Ok(())
 }
 
@@ -557,7 +594,7 @@ async fn tui_connections(home: &Path, tui: &Tui) -> Result<()> {
     if !stored_by_nyq(home, id) {
         return tui_login(home, tui, Some(id)).await;
     }
-    let again = if id == "codex" { "Sign in again" } else { "Replace the API key" };
+    let again = if id == "codex" || id == "grok" { "Sign in again" } else { "Replace the API key" };
     match tui.pick(title(id), "Stored by nyq", &[again.to_string(), "Sign out".to_string()]).await {
         Some(0) => tui_login(home, tui, Some(id)).await,
         Some(_) => tui_logout(home, tui, Some(id)).await,
@@ -599,7 +636,8 @@ mod tests {
     fn provider_names() {
         assert_eq!(canonical("ChatGPT"), Some("codex"));
         assert_eq!(canonical("gateway"), Some("vercel"));
-        assert_eq!(canonical("grok"), Some("xai"));
+        assert_eq!(canonical("grok"), Some("grok"));
+        assert_eq!(title("grok"), "Grok subscription");
         assert_eq!(canonical("ollama"), Some("ollama"));
         assert_eq!(canonical("nope"), None);
         assert!(PROVIDERS.iter().all(|p| canonical(p) == Some(*p) && title(p) != "unknown"));
