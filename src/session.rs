@@ -751,7 +751,8 @@ fn clip(line: &str, max: usize) -> String {
     }
 }
 
-fn title_of(text: &str) -> String {
+/// The title a session gets from its first prompt.
+pub fn title_of(text: &str) -> String {
     first_line(text, TITLE_MAX)
 }
 
