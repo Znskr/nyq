@@ -51,6 +51,8 @@ pub struct RunRecord {
     /// Assistant text after the last tool call: the final answer.
     pub final_output: String,
     pub tool_calls: Vec<Value>,
+    /// Notices from the loop (e.g. reaching the step limit).
+    pub notices: Vec<String>,
 }
 
 impl RunRecord {
@@ -127,6 +129,9 @@ fn can_prompt(prompt: bool) -> bool {
 #[async_trait::async_trait]
 impl Ui for PlainUi {
     fn notice(&mut self, msg: &str) {
+        if let Some(r) = &mut self.record {
+            r.notices.push(msg.to_string());
+        }
         eprintln!("{}", sanitize_text(msg));
     }
     fn stream(&mut self, event: &StreamEvent) {
