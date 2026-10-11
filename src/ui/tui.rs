@@ -2794,6 +2794,12 @@ impl Ui for TuiUi {
                 ));
                 s.redraw();
             }
+            // Shown until output arrives (which starts a new block and label).
+            StreamEvent::Retrying(status) => {
+                s.flush_live();
+                s.set_label(status);
+                s.redraw();
+            }
         }
     }
 
