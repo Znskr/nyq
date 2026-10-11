@@ -103,6 +103,8 @@ struct State {
     list_models: bool,
     catalog: tokio::sync::OnceCell<Vec<ModelChoice>>,
     sessions: Mutex<HashMap<String, Arc<Live>>>,
+    /// What the editor can show for MCP elicitation (from `initialize`).
+    elicitation: Mutex<Option<acp::ElicitationCapabilities>>,
 }
 
 /// One open ACP session.
@@ -141,6 +143,7 @@ impl State {
             list_models,
             catalog: tokio::sync::OnceCell::new(),
             sessions: Mutex::new(HashMap::new()),
+            elicitation: Mutex::new(None),
         })
     }
 
@@ -204,6 +207,7 @@ async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyh
             async move |req: acp::InitializeRequest,
                         responder: Responder<acp::InitializeResponse>,
                         _cx: ConnectionTo<Client>| {
+                *lock(&s1.elicitation) = req.client_capabilities.elicitation.clone();
                 if s1.list_models {
                     // Warm the model catalog so the first session can offer it soon.
                     let st = s1.clone();
@@ -344,7 +348,7 @@ fn initialize(req: acp::InitializeRequest) -> acp::InitializeResponse {
                         .image(true)
                         .embedded_context(true),
                 )
-                .mcp_capabilities(acp::McpCapabilities::new().http(true))
+                .mcp_capabilities(acp::McpCapabilities::new().http(true).sse(true))
                 .session_capabilities(
                     acp::SessionCapabilities::new()
                         .list(acp::SessionListCapabilities::new())
@@ -376,6 +380,7 @@ async fn new_session(
         Session::create(&state.sessions_dir(), &req.cwd, provider.model()).map_err(anyhow_error)?;
     let live = open(
         state,
+        cx,
         req.cwd,
         provider,
         session,
@@ -426,7 +431,7 @@ async fn load_session(
         old.inner.lock().await.mcp.shutdown().await;
     }
     let provider = (state.make_provider)().map_err(anyhow_error)?;
-    let live = open(state, req.cwd, provider, session, items, &req.mcp_servers).await;
+    let live = open(state, cx, req.cwd, provider, session, items, &req.mcp_servers).await;
     {
         let inner = live.inner.lock().await;
         replay(cx, &live.id, &inner.agent);
@@ -440,6 +445,7 @@ async fn load_session(
 /// Build the agent for a session, connect MCP servers and register it.
 async fn open(
     state: &Arc<State>,
+    cx: &ConnectionTo<Client>,
     cwd: PathBuf,
     provider: Box<dyn Provider>,
     session: Session,
@@ -496,14 +502,20 @@ async fn open(
         agent.adopt_transcript();
     }
 
-    let mut mcp = McpManager::new(state.home.clone());
+    let mcp = McpManager::new(state.home.clone());
+    mcp.attach(&mut agent.tools);
+    let session_id = acp::SessionId::new(agent.session.as_ref().map(|s| s.id.clone()).unwrap_or_default());
+    let elicitation = lock(&state.elicitation).clone();
+    if let Some(caps) = elicitation {
+        mcp.set_elicitor(Arc::new(Elicit { cx: cx.clone(), session: session_id.clone(), caps }));
+    }
     let (servers, warnings) = mcp::load_configs(&state.home, &cwd);
     for w in warnings {
         eprintln!("nyq: {w}");
     }
     let mut wanted: Vec<ServerConfig> = servers
         .into_iter()
-        .filter(|s| s.scope == Scope::Profile)
+        .filter(|s| s.scope == Scope::Profile && s.options.enabled)
         .collect();
     for server in client_servers {
         match server_config(server, &cwd) {
@@ -515,20 +527,15 @@ async fn open(
             Err(e) => eprintln!("nyq: {e}"),
         }
     }
-    for cfg in &wanted {
-        connect_server(&mut mcp, &mut agent, cfg).await;
+    // All at once; the session starts with every server that came up.
+    for (cfg, result) in wanted.iter().zip(mcp.connect_all(&wanted).await) {
+        install_server(&mcp, &mut agent, cfg, result).await;
     }
     crate::mcp_features::sync(&mut agent, &mcp);
     crate::hooks::session_start(&agent, source).await;
 
     let live = Arc::new(Live {
-        id: acp::SessionId::new(
-            agent
-                .session
-                .as_ref()
-                .map(|s| s.id.clone())
-                .unwrap_or_default(),
-        ),
+        id: session_id,
         cwd,
         inner: tokio::sync::Mutex::new(Inner { agent, mcp }),
         cancels: Mutex::new(Vec::new()),
@@ -567,27 +574,33 @@ fn server_config(server: &acp::McpServer, cwd: &Path) -> Result<ServerConfig, St
                     .collect(),
             },
         ),
-        acp::McpServer::Sse(s) => {
-            return Err(format!(
-                "MCP {}: SSE servers are not supported (use streamable HTTP)",
-                s.name
-            ))
-        }
+        acp::McpServer::Sse(s) => (
+            s.name.clone(),
+            Transport::Sse {
+                url: s.url.clone(),
+                headers: s
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.value.clone()))
+                    .collect(),
+            },
+        ),
         #[allow(unreachable_patterns)]
         _ => return Err("MCP: unsupported server transport".into()),
     };
     if name.trim().is_empty() {
         return Err("MCP: a server without a name was skipped".into());
     }
-    Ok(ServerConfig {
-        name,
-        transport,
-        scope: Scope::Profile,
-    })
+    Ok(ServerConfig::new(name, transport, Scope::Profile))
 }
 
-async fn connect_server(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig) {
-    match mcp.connect(cfg).await {
+async fn install_server(
+    mcp: &McpManager,
+    agent: &mut Agent,
+    cfg: &ServerConfig,
+    result: anyhow::Result<Vec<Box<dyn crate::tools::Tool>>>,
+) {
+    match result {
         Ok(tools) => {
             let mut added = Vec::new();
             for tool in tools {
@@ -603,6 +616,55 @@ async fn connect_server(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerCon
             }
         }
         Err(e) => eprintln!("nyq: MCP {}: {e:#}", cfg.name),
+    }
+}
+
+/// Forwards MCP servers' elicitation requests to the editor
+/// (`elicitation/create`) when it supports them; declines otherwise.
+struct Elicit {
+    cx: ConnectionTo<Client>,
+    session: acp::SessionId,
+    caps: acp::ElicitationCapabilities,
+}
+
+impl Elicit {
+    async fn ask(&self, mode: acp::ElicitationMode, message: String) -> crate::mcp_client::Elicited {
+        use crate::mcp_client::Elicited;
+        match self.cx.send_request(acp::CreateElicitationRequest::new(mode, message)).block_task().await {
+            Ok(r) => match r.action {
+                acp::ElicitationAction::Accept(a) => {
+                    Elicited::Accept(a.content.map(|c| serde_json::to_value(c).unwrap_or_default()).unwrap_or_else(|| serde_json::json!({})))
+                }
+                acp::ElicitationAction::Decline => Elicited::Decline,
+                _ => Elicited::Cancel,
+            },
+            Err(e) => {
+                eprintln!("nyq: elicitation request failed: {e}");
+                Elicited::Decline
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mcp_client::Elicitor for Elicit {
+    async fn form(&self, server: &str, message: &str, schema: &serde_json::Value) -> crate::mcp_client::Elicited {
+        let parsed = serde_json::from_value::<acp::ElicitationSchema>(schema.clone());
+        let (true, Ok(schema)) = (self.caps.supports_form(), parsed) else {
+            return crate::mcp_client::Elicited::Decline;
+        };
+        let scope = acp::ElicitationSessionScope::new(self.session.clone());
+        let mode = acp::ElicitationMode::Form(acp::ElicitationFormMode::new(scope, schema));
+        self.ask(mode, format!("MCP server {server}: {message}")).await
+    }
+
+    async fn url(&self, server: &str, message: &str, url: &str, id: &str) -> crate::mcp_client::Elicited {
+        if !self.caps.supports_url() {
+            return crate::mcp_client::Elicited::Decline;
+        }
+        let scope = acp::ElicitationSessionScope::new(self.session.clone());
+        let mode = acp::ElicitationMode::Url(acp::ElicitationUrlMode::new(scope, id.to_string(), url));
+        self.ask(mode, format!("MCP server {server}: {message}")).await
     }
 }
 
