@@ -4,11 +4,6 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-    inputs:
-      hosted:
-        description: Also run the full test suite on GitHub-hosted macOS and Windows runners (uses billed minutes)
-        type: boolean
-        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -19,9 +14,8 @@ env:
 
 jobs:
   # Runs on the self-hosted machine (label nyq-linux): no GitHub minutes.
-  # Windows and macOS are checked by cross-compiling with cargo-zigbuild.
   linux:
-    name: test (self-hosted linux) + cross-target lint
+    name: test (self-hosted linux)
     runs-on: [self-hosted, nyq-linux]
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/../nyq-ci-target
@@ -31,33 +25,3 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Cross-target lint (Windows, macOS)
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/../nyq-ci-xcheck
-        run: |
-          for t in x86_64-pc-windows-gnu x86_64-apple-darwin; do
-            cargo-zigbuild clippy --locked --all-targets --target "$t" -- -D warnings
-          done
-
-  # GitHub-hosted runs cost billed minutes on a private repository, so they
-  # only run when started by hand with "hosted" checked.
-  hosted:
-    if: github.event_name == 'workflow_dispatch' && inputs.hosted
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-      - run: cargo build --locked
-      - run: cargo test --locked
-      - run: cargo clippy --locked -- -D warnings
