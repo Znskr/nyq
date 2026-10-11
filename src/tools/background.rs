@@ -122,7 +122,7 @@ fn duration(d: Duration) -> String {
 
 /// Start `command` in the background (sandboxed like `bash`). Returns its id.
 pub(crate) fn start(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy) -> Result<u32, String> {
-    let (mut child, job) = spawn(command, cwd, sandbox).map_err(|e| e.to_string())?;
+    let (mut child, job) = spawn(command, cwd, sandbox, false).map_err(|e| e.to_string())?;
     let pid = child.id().unwrap_or(0);
     let job = job.map(Arc::new);
     let id = {
