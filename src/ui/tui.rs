@@ -35,6 +35,8 @@ use crate::types::{Item, StreamEvent, Usage};
 
 const MAX_PREVIEW: usize = 14;
 const MENU_ROWS: usize = 8;
+/// Rows of a running command's output shown live.
+const LIVE_OUTPUT_ROWS: usize = 5;
 /// Diff rows shown under an edit before the rest is folded.
 const INLINE_DIFF_ROWS: usize = 12;
 /// Rows kept for repainting after a resize.
@@ -267,6 +269,13 @@ pub struct Screen {
     /// depend on every row); a lone line with `|` is a candidate header.
     table: Vec<String>,
     busy: Option<(String, Instant)>,
+    /// Time this turn spent waiting on an approval or question (the clock
+    /// stops), and when the current wait began.
+    paused: Duration,
+    pause_start: Option<Instant>,
+    /// This turn's tool calls by kind, and its tokens (in, out).
+    tally: Vec<(&'static str, usize)>,
+    turn_tokens: (u64, u64),
     thinking_since: Option<Instant>,
     frame: usize,
     pub editor: Editor,
@@ -516,6 +525,22 @@ fn diff_stat(d: &str) -> String {
     format!("+{add} / -{del}")
 }
 
+/// "3 read · 1 edited · 2 commands": a turn's tool calls by kind.
+fn tally_text(tally: &[(&str, usize)]) -> String {
+    tally
+        .iter()
+        .map(|(kind, n)| match (*kind, *n) {
+            ("read", n) => format!("{n} read"),
+            ("edit", n) => format!("{n} edited"),
+            ("command", 1) => "1 command".into(),
+            ("command", n) => format!("{n} commands"),
+            (_, 1) => "1 tool".into(),
+            (_, n) => format!("{n} tools"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One collapsed line for a reasoning block.
 fn thinking_summary(text: &str, secs: u64, width: usize) -> String {
     let first = text
@@ -554,6 +579,10 @@ impl Screen {
             recent: Default::default(),
             table: Vec::new(),
             busy: None,
+            paused: Duration::ZERO,
+            pause_start: None,
+            tally: Vec::new(),
+            turn_tokens: (0, 0),
             thinking_since: None,
             frame: 0,
             editor,
@@ -737,10 +766,27 @@ impl Screen {
             }
         }
 
+        // The tail of a running command's output.
+        let shell = self.busy.as_ref().is_some_and(|(l, _)| l == "Running");
+        if shell || self.tools.iter().any(|t| t.status == Status::Running && t.tool == "bash") {
+            for line in crate::tools::live_tail(LIVE_OUTPUT_ROWS) {
+                let text = truncate(&sanitize_text(&line), w.saturating_sub(4).max(1));
+                rows.push(format!("{}{}", paint(fg(FAINT), "  │ "), paint(fg(FAINT), &text)));
+            }
+        }
+
         // Status: what the agent is doing.
         if let Some((label, start)) = &self.busy {
-            let secs = start.elapsed().as_secs();
-            let suffix = format!(" ({secs}s · esc to interrupt)");
+            let secs = self.working_time(*start).as_secs();
+            let mut parts = vec![format!("{secs}s")];
+            if self.turn_tokens != (0, 0) {
+                parts.push(format!("↑{} ↓{}", tokens(self.turn_tokens.0), tokens(self.turn_tokens.1)));
+            }
+            if !self.tally.is_empty() {
+                parts.push(tally_text(&self.tally));
+            }
+            parts.push("esc to interrupt".into());
+            let suffix = format!(" ({})", parts.join(" · "));
             let label = truncate(label, w.saturating_sub(suffix.chars().count() + 4).max(1));
             let detail = if self.live_block == Block::Reasoning {
                 let last = self
@@ -1312,7 +1358,27 @@ impl Screen {
         self.cursor_row = row;
     }
 
+    /// Busy time without the waits for the user.
+    fn working_time(&self, start: Instant) -> Duration {
+        let waiting = self.pause_start.map_or(Duration::ZERO, |t| t.elapsed());
+        start.elapsed().saturating_sub(self.paused + waiting)
+    }
+
+    /// Stop the turn clock while an approval or question waits for the user.
+    fn sync_clock(&mut self) {
+        let waiting = self.busy.is_some() && (self.approval.is_some() || self.question.is_some());
+        match (waiting, self.pause_start) {
+            (true, None) => self.pause_start = Some(Instant::now()),
+            (false, Some(t)) => {
+                self.paused += t.elapsed();
+                self.pause_start = None;
+            }
+            _ => {}
+        }
+    }
+
     pub fn redraw(&mut self) {
+        self.sync_clock();
         if self.viewer.is_some() {
             // The viewer covers the screen; it follows new output.
             return self.draw_viewer(false);
@@ -1612,6 +1678,13 @@ impl Screen {
     fn tool_start(&mut self, tool: &str, summary: &str) {
         self.flush_live();
         self.log.tool_start(tool, summary);
+        if self.busy.is_some() {
+            let kind = tool_kind(tool);
+            match self.tally.iter_mut().find(|(k, _)| *k == kind) {
+                Some((_, n)) => *n += 1,
+                None => self.tally.push((kind, 1)),
+            }
+        }
         let (verb, target) = describe_tool(tool, summary);
         self.tools.push(ToolRow {
             tool: tool.into(),
@@ -1683,6 +1756,10 @@ impl Screen {
             self.question.take();
         }
         self.busy = label.map(|l| (l.to_string(), Instant::now()));
+        self.paused = Duration::ZERO;
+        self.pause_start = None;
+        self.tally.clear();
+        self.turn_tokens = (0, 0);
         self.cancel = cancel;
         self.redraw();
     }
@@ -2960,6 +3037,8 @@ impl Ui for TuiUi {
         s.footer.usage.input_tokens += usage.input_tokens;
         s.footer.usage.output_tokens += usage.output_tokens;
         s.footer.usage.cached_tokens += usage.cached_tokens;
+        s.turn_tokens.0 += usage.input_tokens;
+        s.turn_tokens.1 += usage.output_tokens;
         s.footer.context_tokens = usage.input_tokens + usage.output_tokens;
         s.redraw();
     }
@@ -3547,6 +3626,31 @@ mod tests {
         s.tool_rows(&mut rows, false);
         crate::settings::install(crate::settings::Settings::default());
         assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    #[test]
+    fn working_line_tallies_and_pauses_for_prompts() {
+        let mut s = screen();
+        s.width = 120;
+        s.height = 40;
+        s.set_busy(Some("Working"), None);
+        s.tool_start("read_file", "a");
+        s.tool_start("grep", "x");
+        s.tool_start("bash", "ls");
+        s.turn_tokens = (1500, 20);
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("(0s · ↑1.5k ↓20 · 2 read, 1 command · esc to interrupt)"), "{text}");
+        let (tx, _rx) = oneshot::channel();
+        s.approval = Some(pending_approval(tx, None));
+        s.redraw();
+        assert!(s.pause_start.is_some());
+        s.busy.as_mut().unwrap().1 -= Duration::from_secs(5);
+        s.pause_start = Some(Instant::now() - Duration::from_secs(4));
+        assert_eq!(s.working_time(s.busy.as_ref().unwrap().1).as_secs(), 1);
+        s.approval = None;
+        s.redraw();
+        assert!(s.pause_start.is_none() && s.paused >= Duration::from_secs(4));
+        assert_eq!(tally_text(&[("edit", 2), ("tool", 1)]), "2 edited, 1 tool");
     }
 
     #[test]
