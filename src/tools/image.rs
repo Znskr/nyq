@@ -14,6 +14,162 @@ const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
 pub fn register(r: &mut Registry) {
     r.add(Box::new(ViewImage));
+    r.add(Box::new(Vision));
+}
+
+pub(crate) const VISION: &str = "vision";
+
+/// Whether the catalog says `model` cannot read images (unknown models are
+/// assumed to). Looked up once per model.
+pub(crate) fn text_only(provider: &str, model: &str) -> bool {
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(String, String), bool>>> =
+        std::sync::LazyLock::new(Default::default);
+    let key = (provider.to_string(), model.to_string());
+    if let Some(known) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return *known;
+    }
+    let text_only = crate::catalog::lookup(&crate::config::home(), provider, model)
+        .is_some_and(|meta| meta.image_input == Some(false));
+    SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(key, text_only);
+    text_only
+}
+
+/// Where images shown to a text-only model are kept for `vision`.
+fn attachments(home: &Path, session_key: &str) -> PathBuf {
+    home.join("artifacts").join(session_key).join("images")
+}
+
+/// Store images for a text-only model and say how to look at them.
+pub(crate) fn park_images(home: &Path, session_key: &str, images: &[Image]) -> String {
+    let mut paths = Vec::new();
+    for image in images {
+        let ext = image.media_type.rsplit('/').next().unwrap_or("png");
+        let path = attachments(home, session_key).join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()));
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) else { continue };
+        if crate::session::write_private(&path, &bytes).is_ok() {
+            paths.push(super::slash_path(&path));
+        }
+    }
+    if paths.is_empty() {
+        return "[Image(s) were attached, but the current model cannot read images and they could not be stored.]".into();
+    }
+    format!(
+        "[Image(s) attached: {}. The current model cannot see images; call {VISION} with these paths and a question to learn what they show.]",
+        paths.join(", ")
+    )
+}
+
+const VISION_SYSTEM: &str = "\
+You describe images for a coding agent that cannot see them. Answer the question precisely and \
+factually: quote visible text verbatim (code, errors, labels), describe layout, state, colors and \
+anything unusual that bears on the question. Say when something is unreadable; never guess.";
+
+/// `vision`: show images to a vision-capable model of the same provider and
+/// return its textual description. Offered only while the session model is
+/// text-only.
+struct Vision;
+
+impl Vision {
+    /// Images in this session's attachment store are always readable.
+    fn parked(raw: &str) -> bool {
+        let artifacts = crate::config::home().join("artifacts");
+        let (Ok(root), Ok(path)) = (std::fs::canonicalize(artifacts), std::fs::canonicalize(raw)) else {
+            return false;
+        };
+        path.starts_with(root) && path.parent().is_some_and(|p| p.ends_with("images"))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for Vision {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: VISION.into(),
+            description: "Look at images (PNG, JPEG, GIF, WebP) through a vision-capable model, since the current \
+                model cannot see them: screenshots, diagrams, attached images. Returns a textual description \
+                focused on your question."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Image file paths (workspace files or attached-image paths)."},
+                    "question": {"type": "string", "description": "What you need to know from the images."}
+                },
+                "required": ["paths", "question"]
+            }),
+        }
+    }
+
+    fn summary(&self, args: &Value) -> String {
+        args["question"].as_str().unwrap_or("").to_string()
+    }
+
+    fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
+        args["paths"].as_array().is_some_and(|paths| {
+            paths.iter().filter_map(Value::as_str).any(|raw| {
+                let path = resolve(cwd, raw);
+                !Self::parked(&path.to_string_lossy()) && !crate::agent::inside(cwd, &path.to_string_lossy())
+            })
+        })
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
+        let paths: Vec<&str> = args["paths"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let Some(question) = args["question"].as_str().filter(|q| !q.trim().is_empty()) else {
+            return ToolOutput::err("vision: missing `question`");
+        };
+        if paths.is_empty() {
+            return ToolOutput::err("vision: give at least one image path in `paths`");
+        }
+        let mut images = Vec::new();
+        for raw in &paths {
+            let path = resolve(&ctx.cwd, raw);
+            if !Self::parked(&path.to_string_lossy()) {
+                if let Some(msg) = super::SecretRoots::load().reject(raw, &path) {
+                    return ToolOutput::err(format!("vision: {msg}"));
+                }
+            }
+            match load(&path) {
+                Ok(image) => images.push(image),
+                Err(e) => return ToolOutput::err(format!("vision: {e:#}")),
+            }
+        }
+        let Some(parent) = &ctx.provider else {
+            return ToolOutput::err("vision: no model provider in this context");
+        };
+        let Some(model) = crate::catalog::vision_model(&crate::config::home(), parent.pricing_provider(), parent.model()) else {
+            return ToolOutput::err(
+                "vision: no vision-capable model is known for this provider. Set NYQ_VISION_MODEL to one, or ask the user to describe the image.",
+            );
+        };
+        let mut provider = parent.fork();
+        provider.set_model(model.clone());
+        provider.set_effort(None);
+        let items = [Item::User { text: question.to_string(), images }];
+        let req = crate::types::Request { system: VISION_SYSTEM, items: &items, tools: &[] };
+        let mut ignore = |_: crate::types::StreamEvent| {};
+        let response = tokio::select! {
+            r = provider.stream(req, &mut ignore) => r,
+            _ = ctx.cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
+        };
+        match response {
+            Ok(response) => {
+                let text: String = response
+                    .items
+                    .iter()
+                    .filter_map(|i| match i {
+                        Item::Assistant { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if text.trim().is_empty() {
+                    return ToolOutput::err(format!("vision: {model} returned no description"));
+                }
+                ToolOutput::ok(format!("[{model} describes the image(s)]\n{}", text.trim()))
+            }
+            Err(e) => ToolOutput::err(format!("vision: {model}: {e:#}")),
+        }
+    }
 }
 
 /// Media type from the file's magic bytes.
@@ -185,6 +341,63 @@ mod tests {
             let err = load(Path::new("/dev/zero")).unwrap_err();
             assert!(format!("{err:#}").contains("regular"), "{err:#}");
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Serializes env-var mutation.
+    async fn vision_asks_a_vision_model_and_parks_images() {
+        use crate::provider::{EventSink, Provider};
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Seen(Arc<Mutex<Vec<(String, usize)>>>, Arc<Mutex<String>>);
+        #[async_trait::async_trait]
+        impl Provider for Seen {
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn model(&self) -> &str {
+                "text-model"
+            }
+            fn set_model(&mut self, m: String) {
+                *self.1.lock().unwrap() = m;
+            }
+            fn fork(&self) -> Box<dyn Provider> {
+                Box::new(self.clone())
+            }
+            async fn stream(&self, req: crate::types::Request<'_>, _: EventSink<'_>) -> anyhow::Result<crate::types::Response> {
+                let Item::User { text, images } = &req.items[0] else { panic!() };
+                self.0.lock().unwrap().push((text.clone(), images.len()));
+                Ok(crate::types::Response {
+                    items: vec![Item::Assistant { text: "A red error banner reading \"boom\".".into() }],
+                    ..Default::default()
+                })
+            }
+        }
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("NYQ_VISION_MODEL");
+        std::env::set_var("NYQ_VISION_MODEL", "seeing-model");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), PNG).unwrap();
+        let seen = Seen::default();
+        let ctx = ToolCtx { cwd: dir.path().into(), provider: Some(Arc::new(seen.clone())), ..Default::default() };
+        let out = Vision.run(json!({"paths": ["a.png"], "question": "What does it say?"}), &ctx).await;
+        match old {
+            Some(v) => std::env::set_var("NYQ_VISION_MODEL", v),
+            None => std::env::remove_var("NYQ_VISION_MODEL"),
+        }
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("seeing-model") && out.content.contains("boom"), "{}", out.content);
+        assert_eq!(*seen.0.lock().unwrap(), vec![("What does it say?".to_string(), 1)]);
+        assert_eq!(*seen.1.lock().unwrap(), "seeing-model");
+        assert!(!Vision.needs_approval_for(&json!({"paths": ["a.png"]}), dir.path()));
+        assert!(Vision.needs_approval_for(&json!({"paths": ["/etc/x.png"]}), dir.path()));
+
+        let home = tempfile::tempdir().unwrap();
+        let image = load(&dir.path().join("a.png")).unwrap();
+        let note = park_images(home.path(), "s1", &[image]);
+        let path = note.split("attached: ").nth(1).unwrap().split(". The").next().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), PNG);
+        assert!(note.contains("call vision"), "{note}");
     }
 
     #[tokio::test]

@@ -36,6 +36,8 @@ pub struct ModelMeta {
     pub interleaved: Option<String>,
     /// False for image/video/embedding models.
     pub text_output: bool,
+    /// Whether the model reads images; None when the catalog doesn't say.
+    pub image_input: Option<bool>,
     /// USD per million tokens: input, output.
     pub cost: Option<(f64, f64)>,
     /// USD per million cached input tokens, when listed.
@@ -106,6 +108,8 @@ enum RawInterleaved {
 #[derive(Deserialize)]
 struct RawModalities {
     #[serde(default)]
+    input: Vec<String>,
+    #[serde(default)]
     output: Vec<String>,
 }
 #[derive(Deserialize)]
@@ -141,13 +145,36 @@ pub fn parse(bytes: &[u8], provider: &str) -> anyhow::Result<Models> {
                     Some(RawInterleaved::Field { field }) => Some(field),
                     _ => None,
                 },
-                text_output: m.modalities.is_none_or(|x| x.output.iter().any(|o| o == "text")),
+                text_output: m.modalities.as_ref().is_none_or(|x| x.output.iter().any(|o| o == "text")),
+                image_input: m.modalities.as_ref().map(|x| x.input.iter().any(|i| i == "image")),
                 cached_cost: m.cost.as_ref().and_then(|c| c.cache_read),
                 cost: m.cost.and_then(|c| Some((c.input?, c.output?))),
             };
             (id, meta)
         })
         .collect())
+}
+
+/// A model's metadata; a `provider/model` id (as on aggregators) is looked
+/// up under that provider first.
+pub fn lookup(home: &Path, provider: &str, model: &str) -> Option<ModelMeta> {
+    let find = |p: &str, m: &str| load(home, p).remove(m);
+    model.split_once('/').and_then(|(p, m)| find(p, m)).or_else(|| find(provider, model))
+}
+
+/// A model on `provider` that reads images, for describing images to a
+/// text-only `current` model: `NYQ_VISION_MODEL` if set, else the catalog
+/// model sharing the longest name prefix with `current`.
+pub fn vision_model(home: &Path, provider: &str, current: &str) -> Option<String> {
+    if let Some(model) = std::env::var("NYQ_VISION_MODEL").ok().filter(|m| !m.trim().is_empty()) {
+        return Some(model.trim().to_string());
+    }
+    let shared = |id: &str| id.chars().zip(current.chars()).take_while(|(a, b)| a == b).count();
+    load(home, provider)
+        .into_iter()
+        .filter(|(_, m)| m.image_input == Some(true) && m.text_output)
+        .map(|(id, _)| id)
+        .max_by(|a, b| shared(a).cmp(&shared(b)).then_with(|| b.cmp(a)))
 }
 
 fn own(home: &Path) -> PathBuf {
@@ -195,6 +222,36 @@ pub async fn refresh(home: &Path) {
 }
 
 #[cfg(test)]
+mod vision_tests {
+    use super::*;
+
+    #[test]
+    fn picks_the_closest_vision_model() {
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let doc = serde_json::json!({"p": {"models": {
+            "glm-5.3": {"modalities": {"input": ["text"], "output": ["text"]}},
+            "glm-5.3v": {"modalities": {"input": ["text", "image"], "output": ["text"]}},
+            "qwen-vl": {"modalities": {"input": ["text", "image"], "output": ["text"]}},
+            "painter": {"modalities": {"input": ["text", "image"], "output": ["image"]}}
+        }}});
+        std::fs::write(home.path().join("models.json"), doc.to_string()).unwrap();
+        let old = std::env::var_os("NYQ_VISION_MODEL");
+        std::env::remove_var("NYQ_VISION_MODEL");
+        assert_eq!(vision_model(home.path(), "p", "glm-5.3").as_deref(), Some("glm-5.3v"));
+        assert_eq!(vision_model(home.path(), "p", "zzz").as_deref(), Some("glm-5.3v"));
+        assert_eq!(vision_model(home.path(), "none", "glm-5.3"), None);
+        assert_eq!(lookup(home.path(), "x", "p/glm-5.3").and_then(|m| m.image_input), Some(false));
+        std::env::set_var("NYQ_VISION_MODEL", "picked");
+        assert_eq!(vision_model(home.path(), "none", "glm").as_deref(), Some("picked"));
+        match old {
+            Some(v) => std::env::set_var("NYQ_VISION_MODEL", v),
+            None => std::env::remove_var("NYQ_VISION_MODEL"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
@@ -227,6 +284,7 @@ mod tests {
         assert_eq!((glm.context, glm.output), (Some(1_000_000), Some(131_072)));
         assert_eq!(glm.price().as_deref(), Some("$1.4/$4.4 per 1M"));
         assert!(glm.text_output && !models["imagine"].text_output);
+        assert_eq!((glm.image_input, models["imagine"].image_input), (None, Some(false)));
         assert!(parse(doc().to_string().as_bytes(), "missing").unwrap().is_empty());
         assert_eq!(ModelMeta::default().protocol(), Protocol::Chat);
     }
