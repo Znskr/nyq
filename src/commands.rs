@@ -18,7 +18,7 @@ use crate::workspace;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/settings", "browse and change settings"),
-    ("/statusline", "toggle status line segments: /statusline [model|provider|context|tokens|sandbox|folder|branch]"),
+    ("/statusline", "toggle status line segments: /statusline [model|session|provider|context|tokens|sandbox|folder|branch]"),
     ("/sound", "terminal bell for long turns and prompts: /sound [on|off|max]"),
     ("/notifications", "desktop notifications: /notifications [on|off|after SECONDS]"),
     ("/fast", "toggle fast mode (Codex priority processing, AI Gateway fast speed) when the model supports it"),
@@ -590,6 +590,7 @@ pub async fn rename(agent: &mut Agent, tui: &Tui, explicit: Option<&str>) -> Res
         .context("no active session to rename")?
         .set_title(&title)?;
     ui::info(&format!("Renamed: {title}"));
+    ui::set_session_title(&title);
     Ok(())
 }
 

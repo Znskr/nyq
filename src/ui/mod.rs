@@ -7,7 +7,9 @@ mod files;
 pub mod help_menu;
 pub mod history;
 pub mod mode_menu;
+mod highlight;
 mod render;
+pub mod theme;
 pub mod settings;
 pub mod statusline;
 pub mod transcript;
@@ -270,12 +272,12 @@ fn banner_text(version: &str) -> String {
         "{} {}",
         paint(
             true,
-            Style::new().bold().fg(Color::Rgb(238, 238, 238)),
+            theme::fg(theme::BRIGHT).bold(),
             "𝒏yq"
         ),
         paint(
             true,
-            Style::new().fg(Color::Rgb(138, 138, 138)),
+            theme::fg(theme::GRAY),
             &format!(
                 "v{} · Run /help for commands · ctrl+l models · ctrl+d quit",
                 sanitize_text(version)
@@ -310,6 +312,15 @@ pub fn list(lines: &[String]) {
             .unwrap_or_else(|e| e.into_inner())
             .print_list(lines),
         None => lines.iter().for_each(|l| eprintln!("{}", sanitize_text(l))),
+    }
+}
+
+/// The session title shown in the status line and the window title.
+pub fn set_session_title(title: &str) {
+    if let Some(screen) = tui::active() {
+        let mut s = screen.lock().unwrap_or_else(|e| e.into_inner());
+        s.footer.title = one_line(title, 200);
+        s.redraw();
     }
 }
 

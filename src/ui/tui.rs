@@ -15,31 +15,32 @@ use crossterm::event::{
 };
 use crossterm::{cursor, execute, queue, terminal};
 use futures::StreamExt;
-use nu_ansi_term::{Color, Style};
+use nu_ansi_term::Style;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::{Action, Editor};
 use super::render::{
-    diff, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells, truncate,
-    visible_width, Markdown,
+    escape_len, is_table_sep, numbered_diff, looks_like_diff, one_line, sanitize_text, table, table_cells,
+    truncate, visible_width, wrap_row, file_url, link, Fence, Markdown, RULE,
 };
 use super::statusline::{tilde, tokens};
+use super::theme::{fg, BRIGHT, FAINT, GRAY, MID, RED, YELLOW};
 use crate::agent::{Approval, ApprovalRequest, Approver, Ui};
 use crate::models::ModelChoice;
 use crate::session::Meta;
 use crate::tools::ToolOutput;
 use crate::types::{Item, StreamEvent, Usage};
 
-const BRIGHT: Color = Color::Rgb(238, 238, 238);
-const MID: Color = Color::Rgb(208, 208, 208);
-const GRAY: Color = Color::Rgb(138, 138, 138);
-const FAINT: Color = Color::Rgb(88, 88, 88);
-const RED: Color = Color::Rgb(215, 95, 95);
-const YELLOW: Color = Color::Rgb(215, 175, 95);
 const MAX_PREVIEW: usize = 14;
 const MENU_ROWS: usize = 8;
+/// Rows of a running command's output shown live.
+const LIVE_OUTPUT_ROWS: usize = 5;
+/// Diff rows shown under an edit before the rest is folded.
+const INLINE_DIFF_ROWS: usize = 12;
+/// Rows kept for repainting after a resize.
+const RECENT_ROWS: usize = 1000;
 
 /// What the app loop receives from the input task.
 pub enum Command {
@@ -100,6 +101,8 @@ pub struct Footer {
     pub fast_supported: bool,
     /// Models the current provider listed, for the classifier setting.
     pub models: Vec<String>,
+    /// The session title (renamed, or the first prompt); also the window title.
+    pub title: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,6 +129,8 @@ struct ToolRow {
     note: String,
     detail: Vec<String>,
     status: Status,
+    /// The change an edit or write made (a unified diff), shown inline.
+    diff: Option<String>,
 }
 
 struct PendingApproval {
@@ -145,7 +150,27 @@ struct PendingApproval {
     note: String,
     /// Keys go to `note` (Tab or Enter returns to the choices).
     noting: bool,
+    /// The choice picked with the arrows; Enter confirms it. None at first,
+    /// so a stray Enter never approves.
+    selected: Option<usize>,
+    /// The whole preview for the full-screen review, when it doesn't fit.
+    review: Option<String>,
     reply: oneshot::Sender<(Approval, Option<String>)>,
+}
+
+/// The approval choices: key, answer and label.
+fn approval_choices(a: &PendingApproval) -> Vec<(char, Approval, String)> {
+    let always = match &a.rule {
+        Some(r) => format!("Always allow {r}"),
+        None => "Always: can't be scoped to a rule here, approves once".into(),
+    };
+    let mut choices = vec![('y', Approval::Yes, "Yes, once".to_string()), ('a', Approval::Always, always)];
+    if let Some(r) = &a.save_rule {
+        choices.push(('s', Approval::AlwaysSave, format!("Always, and save `{r}` to permissions.json")));
+        choices.push(('l', Approval::AlwaysSaveLocal, format!("Always, and save `{r}` for this workspace only")));
+    }
+    choices.push(('n', Approval::No, "No, tell nyq what to do instead".into()));
+    choices
 }
 
 struct PendingQuestion {
@@ -264,11 +289,23 @@ pub struct Screen {
     live_block: Block,
     last_block: Block,
     md: Markdown,
-    fence: Option<String>,
+    fence: Option<Fence>,
+    /// The latest rows printed to the scrollback, unwrapped, for repainting
+    /// the screen at a new width after a resize.
+    recent: std::collections::VecDeque<String>,
+    /// The window title last set, to send it only when it changes.
+    window_title: String,
     /// Markdown table lines held back until the table ends (column widths
     /// depend on every row); a lone line with `|` is a candidate header.
     table: Vec<String>,
     busy: Option<(String, Instant)>,
+    /// Time this turn spent waiting on an approval or question (the clock
+    /// stops), and when the current wait began.
+    paused: Duration,
+    pause_start: Option<Instant>,
+    /// This turn's tool calls by kind, and its tokens (in, out).
+    tally: Vec<(&'static str, usize)>,
+    turn_tokens: (u64, u64),
     thinking_since: Option<Instant>,
     frame: usize,
     pub editor: Editor,
@@ -285,6 +322,8 @@ pub struct Screen {
     /// Everything shown so far, for the transcript viewer.
     pub log: super::transcript::Log,
     viewer: Option<super::transcript::Viewer>,
+    /// What the viewer shows instead of the log: an approval's full preview.
+    review: Option<super::transcript::Log>,
     /// Scrollback rows held while the viewer covers the screen.
     deferred: Vec<String>,
     /// Images for the next message.
@@ -321,10 +360,6 @@ fn lock(s: &Arc<Mutex<Screen>>) -> MutexGuard<'_, Screen> {
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn fg(c: Color) -> Style {
-    Style::new().fg(c)
-}
-
 fn paint(style: Style, s: &str) -> String {
     if s.is_empty() {
         String::new()
@@ -346,16 +381,12 @@ fn clip_width(s: &str, width: usize) -> String {
     let limit = width - 1;
     let mut out = String::new();
     let mut w = 0;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
         if c == '\x1b' {
-            out.push(c);
-            for c in chars.by_ref() {
-                out.push(c);
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+            let n = escape_len(rest);
+            out.push_str(&rest[..n]);
+            rest = &rest[n..];
             continue;
         }
         let cw = c.width().unwrap_or(0);
@@ -364,10 +395,14 @@ fn clip_width(s: &str, width: usize) -> String {
         }
         w += cw;
         out.push(c);
+        rest = &rest[c.len_utf8()..];
     }
     out.push('…');
-    // A cut can land inside a styled span and drop its reset, so later rows
-    // keep the last color. Put the reset back when the source used escapes.
+    // A cut can land inside a styled span or link and drop its end, so later
+    // rows keep the last color. Put the resets back when the source used escapes.
+    if s.contains("\x1b]8;") {
+        out.push_str("\x1b]8;;\x1b\\");
+    }
     if s.contains('\x1b') {
         out.push_str("\x1b[0m");
     }
@@ -529,6 +564,22 @@ fn diff_stat(d: &str) -> String {
     format!("+{add} / -{del}")
 }
 
+/// "3 read · 1 edited · 2 commands": a turn's tool calls by kind.
+fn tally_text(tally: &[(&str, usize)]) -> String {
+    tally
+        .iter()
+        .map(|(kind, n)| match (*kind, *n) {
+            ("read", n) => format!("{n} read"),
+            ("edit", n) => format!("{n} edited"),
+            ("command", 1) => "1 command".into(),
+            ("command", n) => format!("{n} commands"),
+            (_, 1) => "1 tool".into(),
+            (_, n) => format!("{n} tools"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One collapsed line for a reasoning block.
 fn thinking_summary(text: &str, secs: u64, width: usize) -> String {
     let first = text
@@ -564,8 +615,14 @@ impl Screen {
             last_block: Block::None,
             md: Markdown::default(),
             fence: None,
+            recent: Default::default(),
+            window_title: String::new(),
             table: Vec::new(),
             busy: None,
+            paused: Duration::ZERO,
+            pause_start: None,
+            tally: Vec::new(),
+            turn_tokens: (0, 0),
             thinking_since: None,
             frame: 0,
             editor,
@@ -581,6 +638,7 @@ impl Screen {
             help: None,
             log: Default::default(),
             viewer: None,
+            review: None,
             deferred: Vec::new(),
             attachments: Vec::new(),
             clipboard_request: false,
@@ -637,11 +695,13 @@ impl Screen {
             } else {
                 paint(verb_style, &t.verb)
             };
-            format!(
-                "{lead}{verb} {}{}",
-                paint(fg(GRAY), &target),
-                paint(fg(GRAY), &note)
-            )
+            let mut target = paint(fg(GRAY), &target);
+            if matches!(t.tool.as_str(), "read_file" | "write_file" | "edit_file") {
+                if let Some(url) = file_url(&self.footer.cwd, &t.target) {
+                    target = link(&url, &target);
+                }
+            }
+            format!("{lead}{verb} {target}{}", paint(fg(GRAY), &note))
         };
         let detail = |t: &ToolRow, rows: &mut Vec<String>, bar: &str| {
             let style = if t.status == Status::Failed {
@@ -655,6 +715,16 @@ impl Screen {
                     paint(fg(FAINT), bar),
                     paint(style, &truncate(d, w.saturating_sub(4)))
                 ));
+            }
+            if let Some(d) = &t.diff {
+                let bar = paint(fg(FAINT), bar);
+                let mut shown = numbered_diff(d, true, w, &bar);
+                if shown.len() > INLINE_DIFF_ROWS {
+                    let more = shown.len() - INLINE_DIFF_ROWS;
+                    shown.truncate(INLINE_DIFF_ROWS);
+                    shown.push(format!("{bar}{}", paint(fg(FAINT), &format!("… {more} more lines (ctrl+o to view)"))));
+                }
+                rows.extend(shown);
             }
         };
         if n == 1 {
@@ -694,6 +764,9 @@ impl Screen {
             paint(fg(BRIGHT), "●"),
             paint(fg(GRAY), &format!("{n} tool calls · {}", parts.join(" · ")))
         ));
+        if !live && crate::settings::current().collapse_tool_calls {
+            return;
+        }
         for (i, t) in self.tools.iter().enumerate() {
             let last = i + 1 == n;
             rows.push(row_text(
@@ -738,10 +811,27 @@ impl Screen {
             }
         }
 
+        // The tail of a running command's output.
+        let shell = self.busy.as_ref().is_some_and(|(l, _)| l == "Running");
+        if shell || self.tools.iter().any(|t| t.status == Status::Running && t.tool == "bash") {
+            for line in crate::tools::live_tail(LIVE_OUTPUT_ROWS) {
+                let text = truncate(&sanitize_text(&line), w.saturating_sub(4).max(1));
+                rows.push(format!("{}{}", paint(fg(FAINT), "  │ "), paint(fg(FAINT), &text)));
+            }
+        }
+
         // Status: what the agent is doing.
         if let Some((label, start)) = &self.busy {
-            let secs = start.elapsed().as_secs();
-            let suffix = format!(" ({secs}s · esc to interrupt)");
+            let secs = self.working_time(*start).as_secs();
+            let mut parts = vec![format!("{secs}s")];
+            if self.turn_tokens != (0, 0) {
+                parts.push(format!("↑{} ↓{}", tokens(self.turn_tokens.0), tokens(self.turn_tokens.1)));
+            }
+            if !self.tally.is_empty() {
+                parts.push(tally_text(&self.tally));
+            }
+            parts.push("esc to interrupt".into());
+            let suffix = format!(" ({})", parts.join(" · "));
             let label = truncate(label, w.saturating_sub(suffix.chars().count() + 4).max(1));
             let detail = if self.live_block == Block::Reasoning {
                 let last = self
@@ -818,27 +908,14 @@ impl Screen {
             if !a.lines.is_empty() {
                 rows.push(String::new());
             }
-            let always = match &a.rule {
-                Some(r) => format!("Always allow {r}"),
-                None => "Always: can't be scoped to a rule here, approves once".into(),
-            };
-            let save = a
-                .save_rule
-                .as_ref()
-                .map(|r| format!("Always, and save `{r}` to permissions.json"));
-            let local = a
-                .save_rule
-                .as_ref()
-                .map(|r| format!("Always, and save `{r}` for this workspace only"));
-            let mut choices = vec![("y", "Yes, once"), ("a", always.as_str())];
-            choices.extend(save.as_deref().map(|t| ("s", t)));
-            choices.extend(local.as_deref().map(|t| ("l", t)));
-            choices.push(("n", "No, tell nyq what to do instead"));
-            for (key, text) in choices {
+            for (i, (key, _, text)) in approval_choices(a).iter().enumerate() {
+                let sel = Some(i) == a.selected;
+                let label = truncate(&format!("{}. {text}", i + 1), w.saturating_sub(6));
                 rows.push(format!(
-                    "{}  {}",
-                    paint(fg(BRIGHT), key),
-                    paint(fg(MID), &truncate(text, w.saturating_sub(3)))
+                    "{}{}  {}",
+                    if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() },
+                    paint(fg(if sel { BRIGHT } else { GRAY }), &key.to_string()),
+                    if sel { paint(fg(BRIGHT).bold(), &label) } else { paint(fg(MID), &label) }
                 ));
             }
             if a.noting || !a.note.is_empty() {
@@ -858,11 +935,14 @@ impl Screen {
             let keys = if a.noting {
                 vec![("Enter", "Done"), ("Esc", "Clear note")]
             } else {
-                let mut keys = vec![("y", "Once"), ("a", "Always")];
-                if save.is_some() {
-                    keys.extend([("s", "Save"), ("l", "Save here")]);
+                let mut keys = vec![("↑↓", "Select"), ("Enter", "Confirm"), ("Tab", "Note")];
+                if scroll > 0 || more > 0 {
+                    keys.push(("PgUp/PgDn", "Scroll"));
                 }
-                keys.extend([("n", "Deny"), ("Tab", "Note"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]);
+                if a.review.is_some() {
+                    keys.push(("v", "Review"));
+                }
+                keys.push(("Esc", "Interrupt"));
                 keys
             };
             rows.push(hints(&keys));
@@ -1409,7 +1489,46 @@ impl Screen {
         self.cursor_row = row;
     }
 
+    /// Busy time without the waits for the user.
+    fn working_time(&self, start: Instant) -> Duration {
+        let waiting = self.pause_start.map_or(Duration::ZERO, |t| t.elapsed());
+        start.elapsed().saturating_sub(self.paused + waiting)
+    }
+
+    /// Stop the turn clock while an approval or question waits for the user.
+    fn sync_clock(&mut self) {
+        let waiting = self.busy.is_some() && (self.approval.is_some() || self.question.is_some());
+        match (waiting, self.pause_start) {
+            (true, None) => self.pause_start = Some(Instant::now()),
+            (false, Some(t)) => {
+                self.paused += t.elapsed();
+                self.pause_start = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// "• title · nyq" while working, "title · nyq" otherwise; the title is
+    /// the session's, else the workspace folder.
+    fn window_title(&self) -> String {
+        let folder = std::path::Path::new(&self.footer.cwd).file_name().map(|f| f.to_string_lossy().to_string());
+        let base = Some(self.footer.title.clone()).filter(|t| !t.trim().is_empty()).or(folder).unwrap_or_default();
+        let base = one_line(&base, 60);
+        let state = if self.busy.is_some() { "• " } else { "" };
+        if base.is_empty() { format!("{state}nyq") } else { format!("{state}{base} · nyq") }
+    }
+
+    fn sync_window_title(&mut self) {
+        let title = self.window_title();
+        if title != self.window_title {
+            let _ = write!(self.out, "\x1b]0;{title}\x07");
+            self.window_title = title;
+        }
+    }
+
     pub fn redraw(&mut self) {
+        self.sync_clock();
+        self.sync_window_title();
         if self.viewer.is_some() {
             // The viewer covers the screen; it follows new output.
             return self.draw_viewer(false);
@@ -1418,7 +1537,8 @@ impl Screen {
         self.draw_pane();
     }
 
-    /// Print finished rows into the scrollback above the pane.
+    /// Print finished rows into the scrollback above the pane, wrapped to
+    /// the width with a hanging indent.
     fn emit(&mut self, rows: &[String]) {
         if self.viewer.is_some() {
             self.deferred.extend_from_slice(rows);
@@ -1426,9 +1546,48 @@ impl Screen {
         }
         self.clear_pane();
         for r in rows {
+            for line in wrap_row(r, self.width) {
+                let _ = self.out.write_all(line.as_bytes());
+                let _ = self.out.write_all(b"\r\n");
+            }
+        }
+        self.recent.extend(rows.iter().cloned());
+        let excess = self.recent.len().saturating_sub(RECENT_ROWS);
+        self.recent.drain(..excess);
+        self.draw_pane();
+    }
+
+    /// The screen after a resize: the latest rows wrapped to the new width
+    /// and the pane below them, painted from the top. Rows the terminal
+    /// reflowed (or tore) on screen are overwritten instead of left behind.
+    fn reflow(&mut self) {
+        if self.viewer.is_some() {
+            return self.draw_viewer(false);
+        }
+        let room = self.height.saturating_sub(self.pane().0.len());
+        let mut rows = std::collections::VecDeque::new();
+        for r in self.recent.iter().rev() {
+            if rows.len() >= room {
+                break;
+            }
+            for line in wrap_row(r, self.width).into_iter().rev() {
+                rows.push_front(line);
+            }
+        }
+        let excess = rows.len().saturating_sub(room);
+        rows.drain(..excess);
+        let _ = queue!(
+            self.out,
+            terminal::BeginSynchronizedUpdate,
+            cursor::MoveTo(0, 0),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        );
+        for r in rows {
             let _ = self.out.write_all(r.as_bytes());
             let _ = self.out.write_all(b"\r\n");
         }
+        self.pane_rows = 0;
+        self.cursor_row = 0;
         self.draw_pane();
     }
 
@@ -1490,16 +1649,13 @@ impl Screen {
         let text = sanitize_text(text);
         self.log.user(&text);
         self.flush_all();
-        let w = self.width;
         let mut rows = self.begin(Block::User);
         for line in text.trim().lines() {
-            for r in wrap(line, w.saturating_sub(2)) {
-                rows.push(format!(
-                    "{} {}",
-                    paint(fg(BRIGHT), "┃"),
-                    paint(Style::new().bold(), &r)
-                ));
-            }
+            rows.push(format!(
+                "{} {}",
+                paint(fg(BRIGHT), "┃"),
+                paint(Style::new().bold(), line)
+            ));
         }
         self.emit(&rows);
     }
@@ -1574,29 +1730,24 @@ impl Screen {
             .collect()
     }
 
-    /// Markdown line, indented, with framed code blocks.
+    /// Markdown line, indented, with framed and highlighted code blocks.
     fn render_line(&mut self, line: &str) -> String {
-        let t = line.trim_start();
-        if let Some(lang) = t.strip_prefix("```").or_else(|| t.strip_prefix("~~~")) {
-            return if self.fence.take().is_some() {
-                format!("  {}", paint(fg(FAINT), &"─".repeat(34)))
-            } else {
-                let lang = if lang.trim().is_empty() {
-                    "code"
-                } else {
-                    lang.trim()
-                };
-                self.fence = Some(lang.to_string());
-                format!(
-                    "  {} {} {}",
-                    paint(fg(FAINT), "─"),
-                    paint(fg(GRAY), lang),
-                    paint(fg(FAINT), &"─".repeat(32usize.saturating_sub(lang.len())))
-                )
-            };
+        if let Some(f) = &mut self.fence {
+            if f.closes(line) {
+                self.fence = None;
+                return format!("  {}", paint(fg(FAINT), &"─".repeat(RULE)));
+            }
+            return format!("  {}", f.code_line(line, true));
         }
-        if self.fence.is_some() {
-            return format!("  {}", paint(fg(MID), line));
+        if let Some(f) = Fence::open(line) {
+            let lang = if f.lang.is_empty() { "code".to_string() } else { f.lang.clone() };
+            self.fence = Some(f);
+            return format!(
+                "  {} {} {}",
+                paint(fg(FAINT), "─"),
+                paint(fg(GRAY), &lang),
+                paint(fg(FAINT), &"─".repeat((RULE - 2).saturating_sub(lang.chars().count())))
+            );
         }
         format!("  {}", self.md.line(line, true))
     }
@@ -1677,6 +1828,13 @@ impl Screen {
     fn tool_start(&mut self, tool: &str, summary: &str) {
         self.flush_live();
         self.log.tool_start(tool, summary);
+        if self.busy.is_some() {
+            let kind = tool_kind(tool);
+            match self.tally.iter_mut().find(|(k, _)| *k == kind) {
+                Some((_, n)) => *n += 1,
+                None => self.tally.push((kind, 1)),
+            }
+        }
         let (verb, target) = describe_tool(tool, summary);
         self.tools.push(ToolRow {
             tool: tool.into(),
@@ -1685,6 +1843,7 @@ impl Screen {
             note: String::new(),
             detail: Vec::new(),
             status: Status::Running,
+            diff: None,
         });
         self.set_label(&format!("Running {}", tool.replace('_', " ")));
         self.redraw();
@@ -1708,6 +1867,9 @@ impl Screen {
         };
         if let Some(d) = output.display.as_deref().filter(|d| looks_like_diff(d)) {
             t.note = diff_stat(d);
+            if !output.is_error && matches!(t.tool.as_str(), "edit_file" | "write_file") {
+                t.diff = Some(sanitize_text(d));
+            }
         }
         let lines: Vec<&str> = output
             .content
@@ -1744,6 +1906,10 @@ impl Screen {
             self.question.take();
         }
         self.busy = label.map(|l| (l.to_string(), Instant::now()));
+        self.paused = Duration::ZERO;
+        self.pause_start = None;
+        self.tally.clear();
+        self.turn_tokens = (0, 0);
         self.cancel = cancel;
         self.redraw();
     }
@@ -2035,6 +2201,9 @@ impl Screen {
                         }
                         Err(e) => self.hint = Some(format!("Could not save settings: {e:#}")),
                     }
+                    if id == Id::Theme {
+                        super::theme::apply_setting(&value);
+                    }
                     if id == Id::Sandbox {
                         self.hint = Some("The default sandbox applies from the next start.".into());
                     }
@@ -2111,22 +2280,38 @@ impl Screen {
         let _ = self.out.flush();
         // Set before entering so a panic in the viewer still leaves the alt screen.
         TRANSCRIPT_ALT_SCREEN.store(true, Ordering::SeqCst);
-        let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide);
+        // Mouse reporting only while the viewer is open, for the wheel.
+        let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide, crossterm::event::EnableMouseCapture);
         self.viewer = Some(super::transcript::Viewer::new(
-            &self.log,
+            self.review.as_ref().unwrap_or(&self.log),
             self.width,
             self.height,
         ));
         self.draw_viewer(true);
     }
 
+    /// Show a long approval preview full screen, from its top.
+    fn open_review(&mut self, title: &str, text: &str) {
+        let mut log = super::transcript::Log::default();
+        let (verb, target) = title.split_once(' ').unwrap_or((title, ""));
+        log.tool_start(verb, target);
+        log.tool_end(text, Some(text), false);
+        self.review = Some(log);
+        self.open_transcript();
+        if let Some(v) = &mut self.viewer {
+            v.top = 0;
+        }
+        self.draw_viewer(true);
+    }
+
     /// Leave the viewer and restore the inline UI with anything printed meanwhile.
     pub fn close_transcript(&mut self) {
+        self.review = None;
         if self.viewer.take().is_none() {
             return;
         }
         if TRANSCRIPT_ALT_SCREEN.swap(false, Ordering::SeqCst) {
-            let _ = execute!(self.out, terminal::LeaveAlternateScreen, cursor::Show);
+            let _ = execute!(self.out, crossterm::event::DisableMouseCapture, terminal::LeaveAlternateScreen, cursor::Show);
         } else {
             let _ = execute!(self.out, cursor::Show);
         }
@@ -2142,7 +2327,8 @@ impl Screen {
 
     fn draw_viewer(&mut self, force: bool) {
         let Some(v) = &mut self.viewer else { return };
-        if !v.refresh(&self.log, self.width, self.height) && !force {
+        let log = self.review.as_ref().unwrap_or(&self.log);
+        if !v.refresh(log, self.width, self.height) && !force {
             return;
         }
         let frame = v.frame();
@@ -2262,6 +2448,10 @@ impl Screen {
         {
             return self.request_upgrade(commands);
         }
+        if self.approval.is_some() && self.viewer.is_some() {
+            // The full-screen review (or transcript) is over the prompt.
+            return self.on_viewer_key(key);
+        }
         if let Some(mut a) = self.approval.take() {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT);
@@ -2301,17 +2491,29 @@ impl Screen {
                 self.redraw();
                 return;
             }
-            if matches!(key.code, KeyCode::Up | KeyCode::Down) {
-                if key.code == KeyCode::Up {
-                    a.scroll = a.scroll.saturating_sub(1);
-                } else {
-                    a.scroll = a.scroll.saturating_add(1);
-                }
+            let choices = approval_choices(&a);
+            let n = choices.len();
+            let page = MAX_PREVIEW - 1;
+            let mut moved = true;
+            match key.code {
+                KeyCode::Up => a.selected = Some(a.selected.map_or(n - 1, |i| (i + n - 1) % n)),
+                KeyCode::Down => a.selected = Some(a.selected.map_or(0, |i| (i + 1) % n)),
+                KeyCode::PageUp => a.scroll = a.scroll.saturating_sub(page),
+                KeyCode::PageDown => a.scroll = a.scroll.saturating_add(page),
+                _ => moved = false,
+            }
+            if moved {
                 self.approval = Some(a);
-                self.redraw();
-                return;
+                return self.redraw();
+            }
+            if a.review.is_some() && (key.code == KeyCode::Char('v') || (ctrl && key.code == KeyCode::Char('o'))) {
+                let (title, text) = (super::render::strip_ansi(&a.title), a.review.clone().unwrap_or_default());
+                self.approval = Some(a);
+                return self.open_review(&title, &text);
             }
             let answer = match key.code {
+                KeyCode::Enter => a.selected.and_then(|i| choices.get(i)).map(|c| c.1),
+                KeyCode::Char(d @ '1'..='9') => choices.get(d as usize - '1' as usize).map(|c| c.1),
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Approval::Yes),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(Approval::Always),
                 KeyCode::Char('s') | KeyCode::Char('S') if a.save_rule.is_some() => {
@@ -2683,9 +2885,22 @@ impl Tui {
         )));
         terminal::enable_raw_mode()?;
         let mut setup = TerminalSetup::arm();
+        // Before anything else reads input: the background query's reply arrives there.
+        super::theme::init(&crate::settings::current().theme, true);
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
         let mut out = crate::record_tape::stdout();
         execute!(out, crossterm::event::EnableBracketedPaste)?;
+        // Save the window title (xterm title stack); Drop restores it.
+        let _ = out.write_all(b"\x1b[22;0t");
+        if crate::settings::current().startup_scrollback {
+            // Scroll the shell output on screen (and the prompt line) into
+            // the scrollback, so the session starts at the top.
+            if let (Ok((_, row)), Ok((_, h))) = (cursor::position(), terminal::size()) {
+                let _ = queue!(out, cursor::MoveTo(0, h.saturating_sub(1)));
+                let _ = out.write_all("\n".repeat(row as usize + 1).as_bytes());
+                let _ = execute!(out, cursor::MoveTo(0, 0));
+            }
+        }
         setup.bracketed = true;
         if enhanced {
             execute!(
@@ -2767,10 +2982,22 @@ impl Tui {
                             }
                             s.redraw();
                         }
+                        Event::Mouse(m) => {
+                            use crossterm::event::MouseEventKind;
+                            let up = match m.kind {
+                                MouseEventKind::ScrollUp => true,
+                                MouseEventKind::ScrollDown => false,
+                                _ => continue,
+                            };
+                            if let Some(v) = &mut s.viewer {
+                                v.wheel(up);
+                                s.draw_viewer(true);
+                            }
+                        }
                         Event::Resize(w, h) => {
                             s.width = (w as usize).max(1);
                             s.height = (h as usize).max(1);
-                            s.redraw();
+                            s.reflow();
                         }
                         _ => {}
                     }
@@ -2886,6 +3113,11 @@ impl Drop for Tui {
             let _ = s.out.flush();
         }
         *SCREEN.lock().unwrap() = None;
+        {
+            let mut out = crate::record_tape::stdout();
+            let _ = out.write_all(b"\x1b]0;\x07\x1b[23;0t");
+            let _ = out.flush();
+        }
         if self.enhanced {
             pop_keyboard_enhancement();
         }
@@ -2954,7 +3186,7 @@ fn restore_terminal() {
     let (alt, enhanced) = take_terminal_fixes();
     let mut out = crate::record_tape::stdout();
     if alt {
-        let _ = execute!(out, terminal::LeaveAlternateScreen);
+        let _ = execute!(out, crossterm::event::DisableMouseCapture, terminal::LeaveAlternateScreen);
     }
     if enhanced {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
@@ -3002,6 +3234,7 @@ async fn approve_on(
         );
         let mut lines = Vec::new();
         let mut prewrapped = false;
+        let mut review = None;
         if let Some(p) = preview {
             let mut p = sanitize_text(p);
             const MAX_PREVIEW_CHARS: usize = 200_000;
@@ -3014,11 +3247,9 @@ async fn approve_on(
                 p.truncate(cut);
                 p.push_str("\n… [preview truncated; the rest is omitted from the display]");
             }
+            review = Some(p.clone());
             if looks_like_diff(&p) {
-                lines = diff(&p, true, usize::MAX, w, "  ")
-                    .lines()
-                    .map(str::to_string)
-                    .collect();
+                lines = numbered_diff(&p, true, w, "  ");
                 prewrapped = true;
             } else {
                 lines = p.lines().map(str::to_string).collect();
@@ -3041,6 +3272,7 @@ async fn approve_on(
             "Approve: {verb} {}",
             one_line(&target, 80)
         )));
+        let review = review.filter(|_| lines.len() > MAX_PREVIEW);
         s.approval = Some(PendingApproval {
             title,
             lines,
@@ -3051,6 +3283,8 @@ async fn approve_on(
             origin,
             note: String::new(),
             noting: false,
+            selected: None,
+            review,
             reply: tx,
         });
         s.redraw();
@@ -3180,6 +3414,8 @@ impl Ui for TuiUi {
         s.footer.usage.input_tokens += usage.input_tokens;
         s.footer.usage.output_tokens += usage.output_tokens;
         s.footer.usage.cached_tokens += usage.cached_tokens;
+        s.turn_tokens.0 += usage.input_tokens;
+        s.turn_tokens.1 += usage.output_tokens;
         s.footer.context_tokens = usage.input_tokens + usage.output_tokens;
         s.redraw();
     }
@@ -3605,6 +3841,8 @@ mod tests {
             origin: None,
             note: String::new(),
             noting: false,
+            selected: None,
+            review: None,
             reply: tx,
         });
         let (rows, _, _) = s.pane();
@@ -3635,6 +3873,7 @@ mod tests {
             note: note.into(),
             detail: Vec::new(),
             status: Status::Ok,
+            diff: None,
         };
         s.tools = vec![row("a.rs", ""), row("src/lib.rs", "+1")];
         let (rows, _, _) = s.pane();
@@ -3662,6 +3901,8 @@ mod tests {
             origin: None,
             note: String::new(),
             noting: false,
+            selected: None,
+            review: None,
             reply: tx,
         });
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -3681,6 +3922,8 @@ mod tests {
             origin: None,
             note: String::new(),
             noting: false,
+            selected: None,
+            review: None,
             reply: tx,
         });
         s.on_key(
@@ -3707,6 +3950,8 @@ mod tests {
             origin: Some("subagent · Count files".into()),
             note: String::new(),
             noting: false,
+            selected: None,
+            review: None,
             reply: tx,
         };
         let (tx, mut rx) = oneshot::channel();
@@ -3795,6 +4040,8 @@ mod tests {
             origin: None,
             note: String::new(),
             noting: false,
+            selected: None,
+            review: None,
             reply: tx,
         });
         s.on_key(key(KeyCode::Tab), &cmd_tx);
@@ -3824,6 +4071,8 @@ mod tests {
             origin: None,
             note: String::new(),
             noting: false,
+            selected: None,
+            review: None,
             reply: tx,
         });
         s.on_key(key(KeyCode::Tab), &cmd_tx);
@@ -3831,6 +4080,120 @@ mod tests {
         s.on_key(key(KeyCode::Esc), &cmd_tx);
         s.on_key(key(KeyCode::Char('y')), &cmd_tx);
         assert_eq!(rx.try_recv().unwrap(), (Approval::Yes, None));
+    }
+
+    fn pending_approval(tx: oneshot::Sender<(Approval, Option<String>)>, review: Option<String>) -> PendingApproval {
+        PendingApproval {
+            title: "Edited a.rs".into(),
+            lines: (0..30).map(|i| format!("line {i}")).collect(),
+            prewrapped: false,
+            scroll: 0,
+            rule: Some("edits".into()),
+            save_rule: None,
+            origin: None,
+            note: String::new(),
+            noting: false,
+            selected: None,
+            review,
+            reply: tx,
+        }
+    }
+
+    #[test]
+    fn approval_choices_take_arrows_numbers_and_review() {
+        let mut s = screen();
+        s.width = 100;
+        s.height = 50;
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(pending_approval(tx, Some("@@ -1 +1 @@\n-a\n+b".into())));
+        s.on_key(key(KeyCode::Enter), &cmd_tx);
+        assert!(rx.try_recv().is_err(), "Enter alone never approves");
+        s.on_key(key(KeyCode::Down), &cmd_tx);
+        s.on_key(key(KeyCode::Down), &cmd_tx);
+        assert_eq!(s.approval.as_ref().unwrap().selected, Some(1));
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("› a  2. Always allow edits") && text.contains("v Review"), "{text}");
+        s.on_key(key(KeyCode::PageDown), &cmd_tx);
+        assert_eq!(s.approval.as_ref().unwrap().scroll, MAX_PREVIEW - 1);
+        // The review covers the prompt; its keys go to the viewer until it closes.
+        s.on_key(key(KeyCode::Char('v')), &cmd_tx);
+        assert!(s.viewer.is_some() && s.review.is_some());
+        s.on_key(key(KeyCode::Char('y')), &cmd_tx);
+        assert!(rx.try_recv().is_err());
+        s.on_key(key(KeyCode::Char('q')), &cmd_tx);
+        assert!(s.viewer.is_none() && s.review.is_none() && s.approval.is_some());
+        s.on_key(key(KeyCode::Enter), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), (Approval::Always, None));
+
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(pending_approval(tx, None));
+        s.on_key(key(KeyCode::Char('v')), &cmd_tx);
+        assert!(s.viewer.is_none());
+        s.on_key(key(KeyCode::Char('3')), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), (Approval::No, None));
+    }
+
+    #[test]
+    fn edits_show_a_folded_numbered_diff_and_groups_can_collapse() {
+        let mut s = screen();
+        s.width = 50;
+        s.height = 60;
+        s.tool_start("edit_file", "a.rs");
+        let d: String = "--- a/a.rs\n+++ b/a.rs\n@@ -1,20 +1,20 @@\n".to_string() + &(0..20).map(|i| format!("-old {i}\n+new {i}\n")).collect::<String>();
+        s.tool_end(&ToolOutput { content: "Edited a.rs.".into(), display: Some(d), ..ToolOutput::default() });
+        let mut rows = Vec::new();
+        s.tool_rows(&mut rows, false);
+        let plain: Vec<String> = rows.iter().map(|r| super::super::render::strip_ansi(r)).collect();
+        assert!(plain[0].contains("+20 / -20"), "{plain:?}");
+        assert_eq!(plain[1], "  │  1 - old 0");
+        assert_eq!(plain.last().unwrap(), "  │ … 28 more lines (ctrl+o to view)");
+        assert_eq!(plain.len(), 2 + INLINE_DIFF_ROWS);
+        s.tool_start("read_file", "b.rs");
+        crate::settings::install(crate::settings::Settings { collapse_tool_calls: true, ..Default::default() });
+        let mut rows = Vec::new();
+        s.tool_rows(&mut rows, false);
+        crate::settings::install(crate::settings::Settings::default());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    #[test]
+    fn working_line_tallies_and_pauses_for_prompts() {
+        let mut s = screen();
+        s.width = 120;
+        s.height = 40;
+        s.set_busy(Some("Working"), None);
+        s.tool_start("read_file", "a");
+        s.tool_start("grep", "x");
+        s.tool_start("bash", "ls");
+        s.turn_tokens = (1500, 20);
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("(0s · ↑1.5k ↓20 · 2 read, 1 command · esc to interrupt)"), "{text}");
+        let (tx, _rx) = oneshot::channel();
+        s.approval = Some(pending_approval(tx, None));
+        s.redraw();
+        assert!(s.pause_start.is_some());
+        s.busy.as_mut().unwrap().1 -= Duration::from_secs(5);
+        s.pause_start = Some(Instant::now() - Duration::from_secs(4));
+        assert_eq!(s.working_time(s.busy.as_ref().unwrap().1).as_secs(), 1);
+        s.approval = None;
+        s.redraw();
+        assert!(s.pause_start.is_none() && s.paused >= Duration::from_secs(4));
+        assert_eq!(tally_text(&[("edit", 2), ("tool", 1)]), "2 edited, 1 tool");
+    }
+
+    #[test]
+    fn window_title_follows_session_and_work() {
+        let mut s = screen();
+        s.footer.cwd = "/work/proj".into();
+        assert_eq!(s.window_title(), "proj · nyq");
+        s.footer.title = "Fix login\x07 bug".into();
+        s.busy = Some(("Working".into(), Instant::now()));
+        assert_eq!(s.window_title(), "• Fix login bug · nyq");
+        s.footer.cwd.clear();
+        s.footer.title.clear();
+        assert_eq!(s.window_title(), "• nyq");
     }
 
     #[test]
@@ -3920,6 +4283,8 @@ mod tests {
                 origin: None,
                 note: String::new(),
                 noting: false,
+                selected: None,
+                review: None,
                 reply: tx,
             });
         }
