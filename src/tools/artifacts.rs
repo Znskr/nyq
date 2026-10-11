@@ -91,6 +91,15 @@ pub(crate) fn spill(home: &Path, key: &str, call_id: &str, tool: &str, content: 
     )
 }
 
+/// Keep a downloaded file (a PDF or image from `web_fetch`) with the session's
+/// artifacts, named by its content. Returns where it was saved.
+pub(crate) fn store_file(home: &Path, key: &str, ext: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let digest: String = Sha256::digest(bytes).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let path = dir(home, key).join(format!("fetch-{digest}.{}", safe(ext)));
+    crate::session::write_private(&path, bytes)?;
+    Ok(path)
+}
+
 /// A byte range of a stored result, or the lines containing `query`.
 pub(crate) fn read(home: &Path, key: &str, id: &str, offset: usize, limit: usize, query: Option<&str>) -> Result<String, String> {
     let id = id.trim().trim_end_matches(".txt");
