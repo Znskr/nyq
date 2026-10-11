@@ -102,6 +102,140 @@ pub async fn prompt_turn(mcp: &McpManager, line: &str) -> Result<String> {
     Ok(cap_parts(parts))
 }
 
+fn connected_peer(mcp: &McpManager, server: &str) -> Result<Peer<RoleClient>> {
+    mcp.peer(server).ok_or_else(|| anyhow!("MCP server '{server}' is not connected (see /mcp)"))
+}
+
+async fn timed<T, E: std::fmt::Display>(what: &str, f: impl std::future::Future<Output = Result<T, E>>) -> Result<T> {
+    tokio::time::timeout(TIMEOUT, f)
+        .await
+        .map_err(|_| anyhow!("{what} timed out"))?
+        .map_err(|e| anyhow!("{what} failed: {e}"))
+}
+
+/// `/mcp resource list|templates SERVER`, `read SERVER URI`,
+/// `complete SERVER URI-TEMPLATE VAR [VALUE]`: browse resources yourself.
+pub async fn resource_command(mcp: &McpManager, args: &[&str]) -> Result<Vec<String>> {
+    const USAGE: &str = "usage: /mcp resource list|templates SERVER | read SERVER URI | complete SERVER URI-TEMPLATE VAR [VALUE]";
+    match args {
+        ["list", server] => {
+            let list = timed("listing resources", connected_peer(mcp, server)?.list_all_resources()).await?;
+            let mut lines = vec![format!("{server}: {} resource(s)", list.len())];
+            for r in list {
+                let mut line = format!("  {}  {}", r.uri, r.title.as_deref().unwrap_or(&r.name));
+                if let Some(m) = &r.mime_type {
+                    line.push_str(&format!(" ({m})"));
+                }
+                if let Some(d) = r.description.as_deref().filter(|d| !d.is_empty()) {
+                    line.push_str(&format!(" — {}", first_line(d)));
+                }
+                lines.push(line);
+            }
+            Ok(lines)
+        }
+        ["templates", server] => {
+            let list = timed("listing resource templates", connected_peer(mcp, server)?.list_all_resource_templates()).await?;
+            let mut lines = vec![format!("{server}: {} resource template(s)", list.len())];
+            for t in list {
+                let d = t.description.as_deref().map(|d| format!(" — {}", first_line(d))).unwrap_or_default();
+                lines.push(format!("  {}  {}{d}", t.uri_template, t.name));
+            }
+            Ok(lines)
+        }
+        ["read", server, uri] => {
+            let peer = connected_peer(mcp, server)?;
+            let result = timed(&format!("reading {uri}"), peer.read_resource(ReadResourceRequestParams::new(*uri))).await?;
+            let parts: Vec<String> = result
+                .contents
+                .iter()
+                .map(|c| match c {
+                    ResourceContents::TextResourceContents { uri, text, .. } => format!("[resource {uri}]\n{text}"),
+                    ResourceContents::BlobResourceContents { uri, mime_type, blob, .. } => format!(
+                        "[resource {uri}: binary {}, {} base64 chars, not shown]",
+                        mime_type.as_deref().unwrap_or("application/octet-stream"),
+                        blob.len()
+                    ),
+                    #[allow(unreachable_patterns)]
+                    _ => "[unsupported resource content]".into(),
+                })
+                .collect();
+            if parts.is_empty() {
+                return Ok(vec!["(empty resource)".into()]);
+            }
+            Ok(cap_parts(parts).lines().map(str::to_string).collect())
+        }
+        ["complete", server, template, var, value @ ..] if value.len() <= 1 => {
+            let peer = connected_peer(mcp, server)?;
+            let value = value.first().copied().unwrap_or("");
+            let values = timed("completion", peer.complete_resource_simple(*template, *var, value)).await?;
+            Ok(completion_lines(values))
+        }
+        _ => bail!(USAGE),
+    }
+}
+
+/// `/mcp prompt list SERVER`, `get SERVER NAME [ARGS-JSON]`,
+/// `complete SERVER NAME ARG [VALUE]`: look at prompts without sending them.
+pub async fn prompt_command(mcp: &McpManager, args: &[&str]) -> Result<Vec<String>> {
+    const USAGE: &str = "usage: /mcp prompt list SERVER | get SERVER NAME [ARGS-JSON] | complete SERVER NAME ARG [VALUE]";
+    match args {
+        ["list", server] => {
+            connected_peer(mcp, server)?;
+            let prompts: Vec<_> = mcp.prompts().into_iter().filter(|(s, _)| s == server).map(|(_, p)| p).collect();
+            let mut lines = vec![format!("{server}: {} prompt(s) (* marks required arguments)", prompts.len())];
+            for p in prompts {
+                let args: Vec<String> = p
+                    .arguments
+                    .iter()
+                    .flatten()
+                    .map(|a| if a.required == Some(true) { format!("{}*", a.name) } else { a.name.clone() })
+                    .collect();
+                let d = p.description.as_deref().map(|d| format!(" — {}", first_line(d))).unwrap_or_default();
+                let a = if args.is_empty() { String::new() } else { format!(" ({})", args.join(", ")) };
+                lines.push(format!("  {}{a}{d}", p.name));
+            }
+            Ok(lines)
+        }
+        ["get", server, name, json @ ..] => {
+            let peer = connected_peer(mcp, server)?;
+            let mut params = GetPromptRequestParams::new(*name);
+            if !json.is_empty() {
+                let raw = json.join(" ");
+                let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw) else {
+                    bail!("prompt arguments must be a JSON object, like {{\"lang\":\"rust\"}}");
+                };
+                let map: Map<String, Value> =
+                    map.into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| Value::String(v.to_string()), |s| Value::String(s.into())))).collect();
+                params = params.with_arguments(map);
+            }
+            let result = timed(&format!("getting prompt {name}"), peer.get_prompt(params)).await?;
+            let parts: Vec<String> = result
+                .messages
+                .iter()
+                .map(|m| {
+                    let role = if m.role == Role::Assistant { "assistant" } else { "user" };
+                    format!("[{role}]\n{}", block_text(&m.content))
+                })
+                .collect();
+            Ok(cap_parts(parts).lines().map(str::to_string).collect())
+        }
+        ["complete", server, name, arg, value @ ..] if value.len() <= 1 => {
+            let peer = connected_peer(mcp, server)?;
+            let value = value.first().copied().unwrap_or("");
+            let values = timed("completion", peer.complete_prompt_simple(*name, *arg, value)).await?;
+            Ok(completion_lines(values))
+        }
+        _ => bail!(USAGE),
+    }
+}
+
+fn completion_lines(values: Vec<String>) -> Vec<String> {
+    if values.is_empty() {
+        return vec!["No completions.".into()];
+    }
+    values.into_iter().map(|v| format!("  {v}")).collect()
+}
+
 /// `key=value` words set that argument; other words fill the declared
 /// arguments in order, the last one taking the rest of the line.
 fn parse_args(declared: &[(String, bool)], rest: &str) -> Result<Map<String, Value>> {
@@ -408,6 +542,17 @@ for line in sys.stdin:
         assert_eq!(text, "Review this rust code, focusing on error handling.");
         assert!(prompt_turn(&mcp, "/mcp:docs:review").await.unwrap_err().to_string().contains("lang"));
         assert!(prompt_turn(&mcp, "/mcp:docs:other").await.is_err());
+        let lines = resource_command(&mcp, &["list", "docs"]).await.unwrap();
+        assert_eq!(lines, ["docs: 1 resource(s)", "  mem://notes  notes (text/plain) — Team notes"]);
+        let lines = resource_command(&mcp, &["read", "docs", "mem://notes"]).await.unwrap();
+        assert_eq!(lines, ["[resource mem://notes]", "contents of mem://notes"]);
+        assert!(resource_command(&mcp, &["list", "nope"]).await.unwrap_err().to_string().contains("not connected"));
+        assert!(resource_command(&mcp, &["bogus"]).await.is_err());
+        let lines = prompt_command(&mcp, &["list", "docs"]).await.unwrap();
+        assert_eq!(lines[1], "  review (lang*, focus) — Review code");
+        let lines = prompt_command(&mcp, &["get", "docs", "review", r#"{"lang":"go"}"#]).await.unwrap();
+        assert_eq!(lines, ["[user]", "Review this go code, focusing on anything."]);
+        assert!(prompt_command(&mcp, &["get", "docs", "review", "not-json"]).await.is_err());
         mcp.shutdown().await;
         assert!(prompt_commands(&mcp).is_empty());
     }

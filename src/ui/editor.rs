@@ -37,7 +37,23 @@ pub struct Editor {
     browsing: Option<usize>,
     draft: String,
     commands: Vec<(String, String)>,
+    /// User-invocable skills: (name, description), offered as `$name`.
+    skills: Vec<(String, String)>,
     empty_ctrl_c: bool,
+}
+
+/// One row of the `/` (or `$`) popup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    pub label: String,
+    pub detail: String,
+    pub tag: String,
+    /// The editor text once this is chosen (without a trailing space).
+    pub fill: String,
+    /// Enter runs `fill`; otherwise Enter puts it in the editor to type more.
+    pub run: bool,
+    /// An argument of the command already typed (not a command or skill).
+    pub arg: bool,
 }
 
 impl Default for Editor {
@@ -56,6 +72,7 @@ impl Editor {
             browsing: None,
             draft: String::new(),
             commands,
+            skills: Vec::new(),
             empty_ctrl_c: false,
         }
     }
@@ -221,9 +238,78 @@ impl Editor {
         }
         view
     }
-    /// Slash-command suggestions for the current text: (command, description).
-    pub fn suggestions(&self) -> Vec<(String, String)> {
-        self.matches().take(8).cloned().collect()
+    /// Popup rows for the current text: commands (ranked exact, prefix,
+    /// then substring, aliases included) and skills after `/`, skills after
+    /// `$`, or the arguments of the command already typed.
+    pub fn suggestions(&self) -> Vec<Suggestion> {
+        if self.lines.len() != 1 {
+            return Vec::new();
+        }
+        let line = &self.lines[0];
+        if line.starts_with('$') && !line.chars().any(char::is_whitespace) {
+            return self.skill_suggestions(line);
+        }
+        if !line.starts_with('/') {
+            return Vec::new();
+        }
+        if line.chars().any(char::is_whitespace) {
+            return arg_suggestions(line);
+        }
+        let mut ranked: Vec<(u8, usize, &(String, String))> = self
+            .commands
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let names = std::iter::once(c.0.as_str()).chain(crate::slash::aliases(&c.0));
+                names.filter_map(|n| crate::slash::rank(n, line)).min().map(|r| (r, i, c))
+            })
+            .collect();
+        ranked.sort_by_key(|(r, i, _)| (*r, *i));
+        let mut out: Vec<Suggestion> = ranked
+            .into_iter()
+            .map(|(_, _, (name, desc))| Suggestion {
+                label: name.clone(),
+                detail: desc.clone(),
+                tag: crate::slash::category(name).label().to_string(),
+                fill: name.clone(),
+                run: true,
+                arg: false,
+            })
+            .collect();
+        if line.len() > 1 {
+            out.extend(self.skill_suggestions(line));
+        }
+        out
+    }
+
+    fn skill_suggestions(&self, query: &str) -> Vec<Suggestion> {
+        let mut ranked: Vec<(u8, &(String, String))> = self
+            .skills
+            .iter()
+            .filter_map(|s| crate::slash::rank(&s.0, query).map(|r| (r, s)))
+            .collect();
+        ranked.sort_by_key(|(r, _)| *r);
+        ranked
+            .into_iter()
+            .map(|(_, (name, desc))| Suggestion {
+                label: format!("${name}"),
+                detail: desc.lines().next().unwrap_or("").to_string(),
+                tag: "skill".into(),
+                fill: format!("${name}"),
+                run: false,
+                arg: false,
+            })
+            .collect()
+    }
+
+    /// Every command and its description (for the `/help` menu).
+    pub fn commands(&self) -> &[(String, String)] {
+        &self.commands
+    }
+
+    /// Replace the skills offered after `/` and `$`.
+    pub fn set_skills(&mut self, skills: Vec<(String, String)>) {
+        self.skills = skills;
     }
 
     fn len(&self) -> usize {
@@ -353,6 +439,7 @@ impl Editor {
         self.commands.retain(|(name, _)| !name.starts_with("/mcp:"));
         self.commands.extend(extra);
     }
+    /// Commands that start with the text (Tab completion in the editor).
     fn matches(&self) -> impl Iterator<Item = &(String, String)> {
         let prefix = &self.lines[0];
         let eligible = self.lines.len() == 1
@@ -376,6 +463,30 @@ impl Editor {
             self.set_text(&prefix);
         }
     }
+}
+
+/// Completions for the word being typed after a command.
+fn arg_suggestions(line: &str) -> Vec<Suggestion> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let open = line.ends_with(char::is_whitespace);
+    let (prior, partial) = if open {
+        (&words[1..], "")
+    } else {
+        (&words[1..words.len() - 1], words[words.len() - 1])
+    };
+    let head = &line[..line.len() - partial.len()];
+    crate::slash::arg_options(words[0], prior)
+        .iter()
+        .filter(|(name, _, _)| name.starts_with(&partial.to_lowercase()))
+        .map(|(name, desc, more)| Suggestion {
+            label: name.to_string(),
+            detail: desc.to_string(),
+            tag: String::new(),
+            fill: format!("{head}{name}"),
+            run: !more,
+            arg: true,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -590,13 +701,14 @@ mod tests {
         );
         e.set_text("/h");
         assert_eq!(e.suggestions().len(), 2);
+        assert_eq!(e.suggestions()[0].tag, "General");
         plain(&mut e, Tab);
         assert_eq!(e.text(), "/hel");
         e.set_text("/help");
         plain(&mut e, Tab);
         assert_eq!(e.text(), "/help ");
         assert!(e.suggestions().is_empty());
-        for text in ["/missing", "word", "/h x", "/h\n", "/h\t"] {
+        for text in ["/missing", "word", "/h x", "/h\n", "/h\t", "$x"] {
             e.set_text(text);
             plain(&mut e, Tab);
             assert_eq!(e.text(), text);
@@ -606,12 +718,50 @@ mod tests {
             .map(|i| (format!("/c{i}"), format!("desc{i}")))
             .collect();
         e.set_text("/");
-        assert_eq!(e.suggestions(), e.commands[..8]);
+        let all: Vec<String> = e.suggestions().into_iter().map(|s| s.fill).collect();
+        assert_eq!(all.len(), 12, "every command is reachable");
         plain(&mut e, Tab);
         assert_eq!(e.text(), "/c");
         e.set_text("/c11");
         plain(&mut e, Tab);
         assert_eq!(e.text(), "/c11 ");
+    }
+
+    #[test]
+    fn ranked_matches_aliases_arguments_and_skills() {
+        let mut e = Editor::new(
+            vec![],
+            vec![
+                ("/models-x".into(), "x".into()),
+                ("/model".into(), "model".into()),
+                ("/usage".into(), "usage".into()),
+                ("/permissions".into(), "perms".into()),
+            ],
+        );
+        e.set_skills(vec![("pdf-tools".into(), "Work with PDFs\nmore".into())]);
+        let fills = |e: &Editor| e.suggestions().into_iter().map(|s| s.fill).collect::<Vec<_>>();
+        e.set_text("/model");
+        assert_eq!(fills(&e), ["/model", "/models-x"]);
+        e.set_text("/ode");
+        assert_eq!(fills(&e), ["/models-x", "/model"]);
+        e.set_text("/cost");
+        assert_eq!(fills(&e), ["/usage"]);
+        e.set_text("/pdf");
+        let s = e.suggestions();
+        assert_eq!((s[0].label.as_str(), s[0].detail.as_str(), s[0].run), ("$pdf-tools", "Work with PDFs", false));
+        e.set_text("$p");
+        assert_eq!(fills(&e), ["$pdf-tools"]);
+        e.set_text("/permissions re");
+        let s = e.suggestions();
+        let labels: Vec<_> = s.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["reload", "remember", "revoke", "reset"]);
+        assert!(s.iter().all(|s| s.arg));
+        assert_eq!((s[3].fill.as_str(), s[3].run), ("/permissions reset", true));
+        assert!(!s[1].run);
+        e.set_text("/permissions ");
+        assert_eq!(e.suggestions()[0].fill, "/permissions ask");
+        e.set_text("/usage 7");
+        assert_eq!(fills(&e), ["/usage 7d"]);
     }
 
     #[test]

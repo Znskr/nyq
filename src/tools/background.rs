@@ -247,6 +247,103 @@ pub(crate) fn kill_all() {
     }
 }
 
+/// Stop every background process and forget them (`/reset`).
+pub(crate) fn forget_all() -> usize {
+    kill_all();
+    let mut t = table();
+    let n = t.procs.len();
+    t.procs.clear();
+    n
+}
+
+/// Drop ANSI escape sequences (colors, cursor moves) from terminal output.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.next_if_eq(&'[').is_some() {
+            for n in chars.by_ref() {
+                if ('@'..='~').contains(&n) {
+                    break;
+                }
+            }
+        } else if chars.next_if_eq(&']').is_some() {
+            // OSC: up to BEL or ESC \.
+            while let Some(n) = chars.next() {
+                if n == '\x07' || (n == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                    break;
+                }
+            }
+        } else {
+            chars.next();
+        }
+    }
+    out
+}
+
+/// The last local server URL (`http://localhost:3000`, `http://127.0.0.1:8080/`,
+/// `http://0.0.0.0:5173`) the output mentions, ready to open.
+fn server_url(text: &str) -> Option<String> {
+    let mut found = None;
+    for (i, _) in text.match_indices("http") {
+        let rest = &text[i..];
+        if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+            continue;
+        }
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '`' | ','))
+            .unwrap_or(rest.len());
+        let url = rest[..end].trim_end_matches(['.', ';', ':']);
+        let host = url.split("://").nth(1).unwrap_or("").split(['/', '?', '#']).next().unwrap_or("");
+        let name = host.rsplit_once(':').map_or(host, |(h, _)| h);
+        if matches!(name, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "[::]") {
+            found = Some(url.replacen("0.0.0.0", "localhost", 1).replacen("[::]", "localhost", 1));
+        }
+    }
+    found
+}
+
+/// Summary lines for `/background logs`: status, the first and last 20
+/// lines of output, and a detected server URL.
+fn log_lines(id: u32) -> Result<Vec<String>, String> {
+    with_proc(id, |p| {
+        let text = strip_ansi(&String::from_utf8_lossy(&p.buf));
+        let cmd: String = p.command.lines().next().unwrap_or("").chars().take(80).collect();
+        let mut out = vec![format!("#{} {} · {cmd}", p.id, p.status())];
+        if p.base > 0 {
+            out.push(format!("[{} earlier bytes were dropped]", p.base));
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            out.push("(no output yet)".into());
+        } else if lines.len() <= 40 {
+            out.extend(lines.iter().map(|l| l.to_string()));
+        } else {
+            out.extend(lines[..20].iter().map(|l| l.to_string()));
+            out.push(format!("… {} more lines …", lines.len() - 40));
+            out.extend(lines[lines.len() - 20..].iter().map(|l| l.to_string()));
+        }
+        if let Some(url) = server_url(&text) {
+            out.push(format!("url: {url}"));
+        }
+        out
+    })
+    .ok_or_else(|| format!("no background process with id {id}"))
+}
+
+/// The server URL process `id` printed, and whether it is still running.
+fn url_of(id: u32) -> Result<(String, bool), String> {
+    with_proc(id, |p| {
+        let url = server_url(&strip_ansi(&String::from_utf8_lossy(&p.buf)));
+        url.map(|u| (u, p.state == State::Running)).ok_or_else(|| format!("process {id} has not printed a local server URL"))
+    })
+    .ok_or_else(|| format!("no background process with id {id}"))?
+}
+
 /// `id`, `#id`, or `last` (the most recent process).
 fn parse_id(v: &Value) -> Option<u32> {
     if let Some(n) = v.as_u64() {
@@ -271,15 +368,33 @@ pub(crate) fn list_lines() -> Vec<String> {
         .iter()
         .map(|p| {
             let cmd: String = p.command.lines().next().unwrap_or("").chars().take(80).collect();
-            format!("  #{:<3} {:<10} {:>7}  {cmd}", p.id, p.short_state(), duration(p.runtime()))
+            let url = server_url(&strip_ansi(&String::from_utf8_lossy(&p.buf)))
+                .map(|u| format!("  url: {u}"))
+                .unwrap_or_default();
+            format!("  #{:<3} {:<10} {:>7}  {cmd}{url}", p.id, p.short_state(), duration(p.runtime()))
         })
         .collect()
 }
 
-/// `/background` and `/background kill ID|last`.
+/// `/background`, `/background logs|open|kill ID|last`.
 pub(crate) async fn slash(args: &[&str]) {
+    let id = |which: &str| parse_id(&Value::String(which.to_string()));
     match args {
         [] | ["list"] => crate::ui::list(&list_lines()),
+        ["logs" | "log", which] => match id(which).ok_or_else(|| "usage: /background logs ID|last".to_string()).and_then(log_lines) {
+            Ok(lines) => crate::ui::list(&lines),
+            Err(e) => crate::ui::error(&e),
+        },
+        ["open", which] => match id(which).ok_or_else(|| "usage: /background open ID|last".to_string()).and_then(url_of) {
+            Ok((url, running)) => {
+                crate::login::open_browser(&url);
+                crate::ui::info(&format!("  Opened {url}"));
+                if !running {
+                    crate::ui::info("  That process has stopped, so the page may not load.");
+                }
+            }
+            Err(e) => crate::ui::error(&e),
+        },
         ["kill" | "stop", which] => match parse_id(&Value::String(which.to_string())) {
             Some(id) => match kill(id).await {
                 Ok(msg) => crate::ui::info(&format!("  Stopped {msg}")),
@@ -287,7 +402,7 @@ pub(crate) async fn slash(args: &[&str]) {
             },
             None => crate::ui::error("usage: /background kill ID|last"),
         },
-        _ => crate::ui::error("usage: /background [list] | /background kill ID|last"),
+        _ => crate::ui::error("usage: /background [list] | /background logs|open|kill ID|last"),
     }
 }
 
@@ -403,6 +518,31 @@ mod tests {
         assert!(third.ends_with("(no new output)"), "{third}");
         assert!(kill(id).await.unwrap_err().contains("not running"));
         assert!(list_lines().iter().any(|l| l.contains(&format!("#{id}")) && l.contains("exit 3")));
+    }
+
+    #[test]
+    fn server_urls_and_escapes() {
+        assert_eq!(strip_ansi("\x1b[1;32mready\x1b[0m \x1b]8;;x\x07link"), "ready link");
+        let out = "Local:   \x1b[36mhttp://localhost:5173/\x1b[39m\n  Network: http://192.168.1.4:5173/";
+        assert_eq!(server_url(&strip_ansi(out)).as_deref(), Some("http://localhost:5173/"));
+        assert_eq!(server_url("Listening on http://0.0.0.0:8000.").as_deref(), Some("http://localhost:8000"));
+        assert_eq!(server_url("see https://example.com/docs").as_deref(), None);
+        assert_eq!(server_url("a http://127.0.0.1:1 then http://localhost:2/x").as_deref(), Some("http://localhost:2/x"));
+    }
+
+    #[tokio::test]
+    async fn logs_show_head_tail_and_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = start("for i in $(seq 1 60); do echo line$i; done; echo 'at http://localhost:4321'", dir.path(), &policy()).unwrap();
+        wait_until(id, |p| p.state != State::Running).await;
+        let lines = log_lines(id).unwrap();
+        assert!(lines[0].starts_with(&format!("#{id} exited with code 0")), "{lines:?}");
+        assert_eq!(lines[1], "line1");
+        assert!(lines.contains(&"… 21 more lines …".to_string()), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "url: http://localhost:4321");
+        assert_eq!(url_of(id).unwrap(), ("http://localhost:4321".to_string(), false));
+        assert!(list_lines().iter().any(|l| l.contains(&format!("#{id}")) && l.ends_with("url: http://localhost:4321")));
+        assert!(log_lines(999_999).is_err());
     }
 
     #[tokio::test]
