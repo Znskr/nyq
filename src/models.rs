@@ -10,7 +10,7 @@ use crate::provider::Provider;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelChoice {
     /// Provider group shown as a tab: "codex", "ollama", "openai", or a
-    /// hosted service ("opencode-go", "opencode", "xai", "vercel").
+    /// hosted service ("opencode-go", "opencode", "xai").
     pub provider: String,
     pub model: String,
     /// Tokens, when the provider reports it.
@@ -273,7 +273,7 @@ pub fn build(
                 choice.model.clone(),
                 effort,
             )?)),
-            None => anyhow::bail!("unknown provider `{other}`"),
+            None => Err(crate::config::unknown_provider(other)),
         },
     }
 }
@@ -324,18 +324,18 @@ mod tests {
             choice("codex", "gpt-5.5", &["low", "high"]),
             choice("codex", "gpt-5.5-mini", &[]),
             choice("openai", "gpt-5.5", &[]),
-            choice("vercel", "anthropic/claude-sonnet-5", &[]),
-            choice("vercel", "anthropic/claude-opus-5", &[]),
+            choice("opencode", "claude-sonnet-5", &[]),
+            choice("opencode", "claude-opus-5", &[]),
         ];
         let ids = |found: Vec<&ModelChoice>| found.iter().map(|c| format!("{}/{}", c.provider, c.model)).collect::<Vec<_>>();
         assert_eq!(ids(find(&all, "GPT-5.5", "openai")), ["openai/gpt-5.5"]);
-        assert_eq!(ids(find(&all, "gpt-5.5", "vercel")), ["codex/gpt-5.5", "openai/gpt-5.5"]);
+        assert_eq!(ids(find(&all, "gpt-5.5", "opencode")), ["codex/gpt-5.5", "openai/gpt-5.5"]);
         assert_eq!(ids(find(&all, "codex/gpt-5.5", "openai")), ["codex/gpt-5.5"]);
-        assert_eq!(ids(find(&all, "sonnet", "codex")), ["vercel/anthropic/claude-sonnet-5"]);
+        assert_eq!(ids(find(&all, "sonnet", "codex")), ["opencode/claude-sonnet-5"]);
         assert_eq!(ids(find(&all, "claude 5", "codex")).len(), 2);
         assert_eq!(ids(find(&all, "mini", "codex")), ["codex/gpt-5.5-mini"]);
         // Letters in order when no word matches.
-        assert_eq!(ids(find(&all, "clop", "codex")), ["vercel/anthropic/claude-opus-5"]);
+        assert_eq!(ids(find(&all, "clop", "codex")), ["opencode/claude-opus-5"]);
         assert_eq!(ids(find(&all, "gpt55mini", "codex")), ["codex/gpt-5.5-mini"]);
         assert!(find(&all, "llama", "codex").is_empty());
         assert_eq!(search(&all, "").len(), all.len());
@@ -359,6 +359,14 @@ mod tests {
     fn endpoint_equivalence() {
         assert!(same_url("http://localhost:80/v1/", "http://localhost/v1"));
         assert!(!same_url("http://localhost/v1", "http://localhost/v2"));
+    }
+
+    #[test]
+    fn unknown_saved_provider_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let choice = ModelChoice { provider: "vercel".into(), model: "m".into(), ..Default::default() };
+        let err = build(dir.path(), &choice, None).err().unwrap().to_string();
+        assert!(err.starts_with("unknown provider `vercel`") && err.contains("nyq provider NAME"), "{err}");
     }
 
     #[test]

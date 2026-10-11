@@ -4,14 +4,14 @@
 //!
 //! Provider resolution, first match wins:
 //! 1. `--provider` flag or `NYQ_PROVIDER` (`codex` | `openai` | `ollama` |
-//!    `opencode-go` | `opencode` | `xai` | `vercel`)
+//!    `opencode-go` | `opencode` | `xai`)
 //! 2. `NYQ_BASE_URL` set → `openai`
 //! 3. last-model.json (unless explicit model/provider flags or env are set)
 //! 4. `settings.json` `"provider"`
 //! 5. a ChatGPT login present (codex CLI or `chatgpt-auth.json`) → `codex`
 //! 6. `model.json` present → `openai`
-//! 7. an API key for a hosted service (OpenCode Go, OpenCode Zen, xAI,
-//!    Vercel AI Gateway) → that service
+//! 7. an API key for a hosted service (OpenCode Go, OpenCode Zen, xAI) →
+//!    that service
 
 use std::path::{Path, PathBuf};
 
@@ -167,6 +167,15 @@ pub(crate) fn codex_auth_path(home: &Path) -> PathBuf {
     }
 }
 
+/// The error for a provider name nyq does not know, which may come from a
+/// flag, the environment, or a saved setting (settings.json, last-model.json).
+pub fn unknown_provider(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "unknown provider `{name}` (expected codex, ollama, openai, opencode-go, opencode or xai). \
+         If it is saved in settings.json or last-model.json, choose another with `nyq provider NAME` or /model."
+    )
+}
+
 pub fn provider(
     home: &Path,
     provider_flag: Option<&str>,
@@ -243,9 +252,7 @@ pub fn provider(
             Ok(Box::new(OpenAiProvider::with_label("ollama".into(), ollama_url(), None, model)))
         }
         Some(other) => {
-            let service = Service::parse(other).with_context(|| {
-                format!("unknown provider `{other}` (expected codex, ollama, openai, opencode-go, opencode, xai or vercel)")
-            })?;
+            let service = Service::parse(other).ok_or_else(|| unknown_provider(other))?;
             let model = model_flag
                 .map(str::to_string)
                 .or_else(|| env("NYQ_MODEL"))
@@ -255,7 +262,7 @@ pub fn provider(
             Ok(Box::new(HostedProvider::configured(home, service, model, effort)?))
         }
         None => bail!(
-            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • OpenCode Go/Zen, xAI or Vercel AI Gateway: run `nyq login opencode-go|opencode|xai|vercel` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
+            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • OpenCode Go/Zen or xAI: run `nyq login opencode-go|opencode|xai` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
         ),
     }
 }
