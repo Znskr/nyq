@@ -2442,9 +2442,12 @@ impl Screen {
     }
 
     fn on_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        // Ctrl+G aborts a Ctrl+R history search (it restores the draft).
+        // Otherwise it asks to reload an installed upgrade.
         if key.code == KeyCode::Char('g')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
+            && !self.editor.searching()
         {
             return self.request_upgrade(commands);
         }
@@ -4133,6 +4136,29 @@ mod tests {
         assert!(s.viewer.is_none());
         s.on_key(key(KeyCode::Char('3')), &cmd_tx);
         assert_eq!(rx.try_recv().unwrap(), (Approval::No, None));
+    }
+
+    #[test]
+    fn ctrl_g_aborts_history_search_instead_of_upgrading() {
+        let mut s = screen();
+        s.editor = Editor::new(vec!["cargo build".into()], Vec::new());
+        s.editor.set_text("draft");
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        s.on_key(ctrl('r'), &cmd_tx);
+        assert!(s.editor.searching());
+        for c in "cargo".chars() {
+            s.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &cmd_tx);
+        }
+        assert_eq!(s.editor.text(), "cargo build");
+        s.on_key(ctrl('g'), &cmd_tx);
+        assert!(!s.editor.searching());
+        assert_eq!(s.editor.text(), "draft");
+        assert!(cmd_rx.try_recv().is_err());
+        assert_ne!(
+            s.hint.as_deref(),
+            Some("submit or clear the current prompt before upgrading")
+        );
     }
 
     #[test]
