@@ -91,6 +91,16 @@ pub(crate) fn spill(home: &Path, key: &str, call_id: &str, tool: &str, content: 
     )
 }
 
+/// Start a stored result for output that is still arriving: writes `first`
+/// and returns the id and the file to append the rest to.
+pub(crate) fn store_open(home: &Path, key: &str, tool: &str, first: &[u8]) -> std::io::Result<(String, std::fs::File)> {
+    let id = format!("{}-{}", safe(tool), &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let path = dir(home, key).join(format!("{id}.txt"));
+    crate::session::write_private(&path, first)?;
+    let file = std::fs::OpenOptions::new().append(true).open(&path)?;
+    Ok((id, file))
+}
+
 /// A byte range of a stored result, or the lines containing `query`.
 pub(crate) fn read(home: &Path, key: &str, id: &str, offset: usize, limit: usize, query: Option<&str>) -> Result<String, String> {
     let id = id.trim().trim_end_matches(".txt");
