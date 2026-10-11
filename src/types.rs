@@ -96,6 +96,28 @@ pub struct Usage {
     pub output_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+    /// Reasoning tokens, already counted in `output_tokens`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u64,
+    /// Input tokens written to the prompt cache (Anthropic), already counted
+    /// in `input_tokens` and billed at the cache-write rate.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Usage {
+    /// Add another response's usage to this running total.
+    pub fn add(&mut self, u: &Usage) {
+        self.input_tokens += u.input_tokens;
+        self.output_tokens += u.output_tokens;
+        self.cached_tokens += u.cached_tokens;
+        self.reasoning_tokens += u.reasoning_tokens;
+        self.cache_write_tokens += u.cache_write_tokens;
+    }
 }
 
 /// A request for one model response.

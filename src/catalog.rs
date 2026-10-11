@@ -40,6 +40,8 @@ pub struct ModelMeta {
     pub cost: Option<(f64, f64)>,
     /// USD per million cached input tokens, when listed.
     pub cached_cost: Option<f64>,
+    /// USD per million input tokens written to the prompt cache, when listed.
+    pub cache_write_cost: Option<f64>,
 }
 
 impl ModelMeta {
@@ -113,6 +115,7 @@ struct RawCost {
     input: Option<f64>,
     output: Option<f64>,
     cache_read: Option<f64>,
+    cache_write: Option<f64>,
 }
 
 /// The models of `provider` in a models.dev document.
@@ -143,6 +146,7 @@ pub fn parse(bytes: &[u8], provider: &str) -> anyhow::Result<Models> {
                 },
                 text_output: m.modalities.is_none_or(|x| x.output.iter().any(|o| o == "text")),
                 cached_cost: m.cost.as_ref().and_then(|c| c.cache_read),
+                cache_write_cost: m.cost.as_ref().and_then(|c| c.cache_write),
                 cost: m.cost.and_then(|c| Some((c.input?, c.output?))),
             };
             (id, meta)
