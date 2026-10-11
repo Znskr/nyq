@@ -331,17 +331,7 @@ pub async fn doctor(
         settings_warning.unwrap_or_else(|| "settings.json parses (or is absent)".into()),
         "fix settings.json; nyq uses the defaults until then",
     ));
-    let (count, problems) = crate::session::health(facts.sessions_dir);
-    checks.push(info(
-        "sessions",
-        problems.is_empty(),
-        if problems.is_empty() {
-            format!("{count} saved, all readable")
-        } else {
-            format!("{count} saved, {} need repair: {}", problems.len(), problems.join("; "))
-        },
-        "repair with the command shown for each session",
-    ));
+    checks.push(sessions_check(facts.sessions_dir));
     let (steps, steps_source) = crate::agent::step_limit();
     checks.push(info(
         "agent",
@@ -419,6 +409,21 @@ pub async fn doctor(
     anyhow::ensure!(passed, "doctor found failing checks");
     Ok(())
 }
+/// Saved sessions: how many, and which need repair (with the command for
+/// each) or are large enough to load slowly.
+fn sessions_check(dir: &Path) -> Check {
+    let (count, problems) = crate::session::health(dir);
+    info(
+        "sessions",
+        problems.is_empty(),
+        if problems.is_empty() {
+            format!("{count} saved, all readable")
+        } else {
+            format!("{count} saved, {} need attention: {}", problems.len(), problems.join("; "))
+        },
+        "repair with the command shown for each session",
+    )
+}
 pub async fn models(home: &Path, json: bool) -> Result<()> {
     let (choices, warnings) = crate::models::list(home).await;
     if json {
@@ -487,6 +492,21 @@ mod tests {
             "✗ auth: expired — run nyq login"
         );
         assert_eq!(check("test", false, "failed", "").line(), "✗ test: failed");
+    }
+    #[test]
+    fn session_check_reports_unreadable_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let c = sessions_check(&dir);
+        assert!(c.ok && c.detail == "0 saved, all readable", "{c:?}");
+        let mut s = crate::session::Session::create(&dir, tmp.path(), "m").unwrap();
+        s.append(&crate::types::Item::user("hi")).unwrap();
+        s.flush().unwrap();
+        std::fs::write(dir.join("deadbeef-broken.jsonl"), "not json\n").unwrap();
+        let c = sessions_check(&dir);
+        assert!(!c.ok && !c.required, "{c:?}");
+        assert!(c.detail.starts_with("2 saved, 1 need attention: deadbeef-broken:"), "{c:?}");
+        assert!(c.line().contains("nyq session recover"));
     }
     #[tokio::test]
     async fn endpoint_probe_accepts_http_errors_as_reachable() {

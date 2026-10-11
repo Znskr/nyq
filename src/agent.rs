@@ -220,9 +220,7 @@ impl Agent {
     fn record_usage(&mut self, usage: Option<Usage>) -> Option<Usage> {
         self.stats.requests += 1;
         let u = usage?;
-        self.usage.input_tokens += u.input_tokens;
-        self.usage.output_tokens += u.output_tokens;
-        self.usage.cached_tokens += u.cached_tokens;
+        self.usage.add(&u);
         // Permissions are loaded from the active profile, including in ACP and subagents.
         if let Some(home) = self
             .permissions
@@ -249,8 +247,24 @@ impl Agent {
         Some(u)
     }
 
+    /// Save the model settings in use with the session, so resuming restores
+    /// them. Only changes are written.
+    pub fn sync_prefs(&mut self) {
+        let Some(s) = &mut self.session else { return };
+        let prefs = crate::session::Prefs {
+            provider: self.provider.name().into(),
+            model: self.provider.model().into(),
+            effort: self.provider.effort().map(Into::into),
+            fast: self.provider.fast(),
+        };
+        if let Err(e) = s.set_prefs(&prefs) {
+            crate::ui::error(&format!("could not save session settings: {e:#}"));
+        }
+    }
+
     pub fn push(&mut self, item: Item) {
         self.stats.item(&item);
+        self.sync_prefs();
         if let Some(s) = &mut self.session {
             if let Err(e) = s.append(&item) {
                 crate::ui::error(&format!("could not save session: {e:#}"));
@@ -320,10 +334,12 @@ impl Agent {
                     tools: &specs,
                 };
                 let mut sink = |ev: StreamEvent| ui.stream(&ev);
-                tokio::select! {
+                let r = tokio::select! {
                     r = crate::provider::stream_with_retry(self.provider.as_ref(), req, &mut sink) => Some(r),
                     _ = cancel.cancelled() => None,
-                }
+                };
+                self.stats.api_time += started.elapsed();
+                r
             };
             ui.end_message();
             let Some(result) = result else {
@@ -764,6 +780,7 @@ impl Agent {
             .hooks
             .observes_post_tool_use(name)
             .then(|| args.clone());
+        let change_args = matches!(name, "write_file" | "edit_file").then(|| args.clone());
         let mut out = if tool.handles_cancel() {
             tool.run(args, &ctx).await
         } else {
@@ -776,6 +793,9 @@ impl Agent {
             self.undo.discard_last();
         }
         self.undo.append(std::mem::take(&mut out.undo));
+        if let Some(args) = change_args.filter(|_| !out.is_error) {
+            self.stats.file_change(name, &args, out.display.as_deref());
+        }
         if name == "memory" && !out.is_error {
             crate::tools::memory::refresh_section(&mut self.system, &crate::config::home());
         }
@@ -831,11 +851,13 @@ impl Agent {
             tools: &[],
         };
         let mut ignore = |_: StreamEvent| {};
+        let started = std::time::Instant::now();
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(false),
             r = crate::provider::stream_with_retry(self.provider.as_ref(), req, &mut ignore) => r?,
         };
+        self.stats.api_time += started.elapsed();
         self.account_usage(response.usage, ui);
         if cancel.is_cancelled() {
             return Ok(false);
@@ -939,11 +961,13 @@ impl Agent {
             tools: &specs,
         };
         let mut ignore = |_: StreamEvent| {};
+        let started = std::time::Instant::now();
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => anyhow::bail!("Interrupted."),
             r = crate::provider::stream_with_retry(self.provider.as_ref(), req, &mut ignore) => r?,
         };
+        self.stats.api_time += started.elapsed();
         self.record_usage(response.usage);
         let raw: String = response
             .items
@@ -1657,6 +1681,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sessions_save_and_restore_model_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = agent(Response::default(), None);
+        a.session = Some(Session::create(dir.path(), dir.path(), "fake").unwrap());
+        a.push(Item::user("hi"));
+        let id = a.session.as_ref().unwrap().id.clone();
+        let meta = crate::session::find(dir.path(), &id, dir.path()).unwrap();
+        let saved = meta.prefs.clone().unwrap();
+        assert_eq!((saved.provider.as_str(), saved.model.as_str(), saved.fast), ("fake", "fake", false));
+
+        let prefs = crate::session::Prefs {
+            provider: "ollama".into(),
+            model: "llama3".into(),
+            ..Default::default()
+        };
+        crate::commands::restore_prefs(dir.path(), &mut a, Some(&prefs));
+        assert_eq!((a.provider.name(), a.provider.model()), ("ollama", "llama3"));
+        a.sync_prefs();
+        drop(a);
+        let meta = crate::session::find(dir.path(), &id, dir.path()).unwrap();
+        assert_eq!(meta.prefs, Some(prefs));
+        // An unusable provider keeps the current model.
+        let mut b = agent(Response::default(), None);
+        let bad = crate::session::Prefs { provider: "nope".into(), model: "x".into(), ..Default::default() };
+        crate::commands::restore_prefs(dir.path(), &mut b, Some(&bad));
+        assert_eq!(b.provider.name(), "fake");
+    }
+
     fn agent(response: Response, cancel: Option<CancellationToken>) -> Agent {
         Agent {
             provider: Box::new(SummaryProvider { response, cancel }),
@@ -1723,6 +1776,7 @@ mod tests {
                     input_tokens: 100,
                     output_tokens: 10,
                     cached_tokens: 5,
+                    ..Default::default()
                 }),
             },
             Some(cancel.clone()),
@@ -1749,7 +1803,8 @@ mod tests {
             Usage {
                 input_tokens: 100,
                 output_tokens: 10,
-                cached_tokens: 5
+                cached_tokens: 5,
+                ..Default::default()
             }
         );
         assert_eq!(agent.stats.requests, 1);
@@ -1768,6 +1823,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 20,
             cached_tokens: 40,
+            ..Default::default()
         };
         let mut agent = agent(
             Response {
@@ -1805,6 +1861,7 @@ mod tests {
             input_tokens: 900,
             output_tokens: 20,
             cached_tokens: 40,
+            ..Default::default()
         };
         let mut agent = agent(
             Response {
@@ -2226,6 +2283,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 1000,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 },
                 Response {
@@ -2237,6 +2295,7 @@ mod tests {
                         input_tokens: 900,
                         output_tokens: 50,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 },
                 Response {
@@ -2248,6 +2307,7 @@ mod tests {
                         input_tokens: 900,
                         output_tokens: 10,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 },
             ])),
@@ -2313,6 +2373,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 1,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 })
             }
@@ -2386,6 +2447,7 @@ mod tests {
                             input_tokens: 1,
                             output_tokens: 1,
                             cached_tokens: 0,
+                            ..Default::default()
                         }),
                     },
                     Response {
@@ -2397,6 +2459,7 @@ mod tests {
                             input_tokens: 2,
                             output_tokens: 1,
                             cached_tokens: 0,
+                            ..Default::default()
                         }),
                     },
                 ])),
@@ -2779,6 +2842,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 1,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 })
             }
@@ -2870,6 +2934,7 @@ mod tests {
                             input_tokens: 10,
                             output_tokens: 1,
                             cached_tokens: 0,
+                            ..Default::default()
                         }),
                     });
                 }
@@ -2884,6 +2949,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 1,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                 })
             }
@@ -3233,6 +3299,7 @@ mod tests {
                     input_tokens: 9,
                     output_tokens: 2,
                     cached_tokens: 0,
+                    ..Default::default()
                 }),
             }])),
         });

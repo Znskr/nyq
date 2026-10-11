@@ -139,6 +139,8 @@ pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSi
                         input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
                         cached_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+                        reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
+                        ..Default::default()
                     });
                 }
                 completed = true;
