@@ -278,7 +278,7 @@ fn managed(skill: &Skill, home: &Path, cwd: &Path) -> bool {
 
 /// Remove an installed skill by name (only from a managed directory).
 pub fn remove(name: &str, skills: &[Skill], home: &Path, cwd: &Path) -> Result<String> {
-    let Some(skill) = skills.iter().find(|s| s.name == name || s.dir.file_name().is_some_and(|d| d == name)) else {
+    let Some(skill) = skills.iter().find(|s| s.id == name).or_else(|| skills.iter().find(|s| s.name == name || s.dir.file_name().is_some_and(|d| d == name))) else {
         bail!("Skill '{name}' not found.");
     };
     if !managed(skill, home, cwd) {
@@ -295,11 +295,12 @@ pub fn remove(name: &str, skills: &[Skill], home: &Path, cwd: &Path) -> Result<S
 
 /// Lines describing one skill for `/skills info`.
 pub fn info(name: &str, skills: &[Skill], home: &Path, cwd: &Path) -> Result<Vec<String>> {
-    let Some(skill) = skills.iter().find(|s| s.name == name).or_else(|| skills.iter().find(|s| s.name.eq_ignore_ascii_case(name))) else {
+    let Some(skill) = skills.iter().find(|s| s.id == name || s.name == name).or_else(|| skills.iter().find(|s| s.name.eq_ignore_ascii_case(name))) else {
         bail!("Skill '{name}' not found.");
     };
     let mut lines = vec![
-        format!("{} ({})", skill.name, skill.scope),
+        format!("{} ({})", skill.id, skill.scope),
+        format!("  location: {}", skill.location),
         format!("  path: {}", slash_path(&skill.path)),
         format!("  managed: {}", if managed(skill, home, cwd) { "yes (/skills remove works)" } else { "no" }),
     ];
@@ -344,7 +345,48 @@ pub enum Command {
     Usage,
 }
 
+/// A pasted `npx|bunx|pnpx skills add owner/repo [--skill x] [-g] [-y]`
+/// line (optionally after `install`), as `/skills install` arguments: `-g`
+/// installs for the user, otherwise into the project, like that tool does.
+fn from_pasted<'a>(args: &[&'a str]) -> Option<Vec<&'a str>> {
+    let args = match args.first() {
+        Some(&"install" | &"add") => &args[1..],
+        _ => args,
+    };
+    let [runner, tool, "add", rest @ ..] = args else {
+        return None;
+    };
+    let tool = tool.split('@').next().unwrap_or(tool);
+    if !matches!(*runner, "npx" | "bunx" | "pnpx") || tool != "skills" {
+        return None;
+    }
+    let mut out = vec!["install"];
+    let mut global = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "-g" | "--global" => global = true,
+            "-y" | "--yes" => {}
+            "-s" | "--skill" => {
+                out.push("--skill");
+                out.extend(rest.get(i + 1));
+                i += 1;
+            }
+            // Which agents to install for: nyq reads every skills directory.
+            "-a" | "--agent" => i += 1,
+            a => out.push(a),
+        }
+        i += 1;
+    }
+    if !global {
+        out.push("--project");
+    }
+    Some(out)
+}
+
 pub fn parse(args: &[&str]) -> Command {
+    let pasted = from_pasted(args);
+    let args = pasted.as_deref().unwrap_or(args);
     let project = args.contains(&"--project");
     let mut filter = None;
     let mut rest = Vec::new();
@@ -391,12 +433,19 @@ pub async fn command(
     let home = crate::config::home();
     let cwd = agent.cwd.clone();
     match parse(args) {
-        Command::List => ui::list(&skills::list_lines(skills)),
+        Command::List => {
+            ui::list(&skills::list_lines(skills));
+            let (_, problems) = skills::discover_report(&home, &cwd);
+            if !problems.is_empty() {
+                ui::error(&format!("{} SKILL.md problem(s):", problems.len()));
+                ui::list(&problems.iter().map(|p| format!("  {p}")).collect::<Vec<_>>());
+            }
+        }
         Command::Usage => ui::info(USAGE),
         Command::Path => ui::list(&[
             format!("user skills: {}", slash_path(&managed_dir(&home, &cwd, false))),
             format!("project skills: {}", slash_path(&managed_dir(&home, &cwd, true))),
-            "also read: .agents/skills, .codex/skills, .claude/skills (project and home)".into(),
+            "also read: skills/, .agents/skills, .codex/skills, .claude/skills, .opencode/skills (project) and ~/.agents/skills, ~/.codex/skills, ~/.claude/skills, ~/.config/opencode/skills".into(),
         ]),
         Command::Info(name) => ui::list(&info(&name, skills, &home, &cwd)?),
         Command::Remove(name) => {
@@ -543,6 +592,21 @@ mod tests {
         assert_eq!(parse(&["info", "pdf"]), Command::Info("pdf".into()));
         assert_eq!(parse(&["create", "x", "--project"]), Command::Create { name: "x".into(), project: true });
         assert_eq!(parse(&["install"]), Command::Usage);
+        // A pasted install line from a skills page.
+        let line = |s: &str| parse(&s.split_whitespace().collect::<Vec<_>>());
+        assert_eq!(
+            line("install npx skills add owner/repo --skill pdf -g -y"),
+            Command::Install { source: "owner/repo".into(), project: false, filter: Some("pdf".into()) }
+        );
+        assert_eq!(
+            line("bunx skills@latest add owner/repo -a claude-code"),
+            Command::Install { source: "owner/repo".into(), project: true, filter: None }
+        );
+        assert_eq!(
+            line("add npx skills add o/r -s fmt --yes"),
+            Command::Install { source: "o/r".into(), project: true, filter: Some("fmt".into()) }
+        );
+        assert_eq!(line("install npx other add o/r"), Command::Usage);
         assert_eq!(parse(&["bogus"]), Command::Usage);
     }
 
