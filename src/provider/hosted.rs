@@ -218,6 +218,8 @@ pub struct HostedProvider {
     pub api_key: String,
     pub model: String,
     pub effort: Option<String>,
+    /// Fast mode, where the model offers it (AI Gateway `speed: fast`).
+    pub fast: bool,
     session: String,
     models: Arc<Models>,
 }
@@ -230,6 +232,7 @@ impl HostedProvider {
             api_key,
             model,
             effort: effort.filter(|e| e != "auto"),
+            fast: false,
             session: uuid::Uuid::new_v4().to_string(),
             models,
         }
@@ -276,6 +279,8 @@ impl HostedProvider {
             effort_style: if self.service == Service::Vercel { EffortStyle::ReasoningObject } else { EffortStyle::ReasoningEffort },
             headers: self.headers(),
             reasoning_field: self.meta().and_then(|m| m.interleaved.clone()),
+            anthropic_cache: self.service == Service::Vercel && self.model.starts_with("anthropic/"),
+            provider_options: self.fast().then(|| json!({"gateway":{"speed":"fast"}})),
             ..OpenAiProvider::with_label(self.service.id().into(), self.base_url.clone(), Some(self.api_key.clone()), self.model.clone())
         }
     }
@@ -287,6 +292,11 @@ impl HostedProvider {
         let listed = tokio::time::timeout(std::time::Duration::from_secs(6), self.chat().list_models_detailed())
             .await
             .context("timed out listing models")??;
+        super::remember_listing(
+            self.service.id(),
+            listed.iter().map(|m| m.id.clone()).collect(),
+            listed.iter().filter(|m| m.fast).map(|m| m.id.clone()).collect(),
+        );
         Ok(listed
             .into_iter()
             .filter_map(|m| {
@@ -341,12 +351,22 @@ impl Provider for HostedProvider {
     fn context_window(&self) -> Option<u64> {
         self.meta().and_then(|m| m.context)
     }
+    fn fast(&self) -> bool {
+        self.fast && self.supports_fast()
+    }
+    fn set_fast(&mut self, fast: bool) {
+        self.fast = fast;
+    }
+    fn supports_fast(&self) -> bool {
+        self.service == Service::Vercel && super::listed_fast(self.service.id(), &self.model)
+    }
     fn set_conversation(&mut self, id: &str) {
         self.session = id.to_string();
     }
     fn fork(&self) -> Box<dyn Provider> {
         let mut fork = Self::new(self.service, self.base_url.clone(), self.api_key.clone(), self.model.clone(), self.effort.clone(), Arc::clone(&self.models));
         fork.session = uuid::Uuid::new_v4().to_string();
+        fork.fast = self.fast;
         Box::new(fork)
     }
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
@@ -499,6 +519,41 @@ mod tests {
         let second = requests.recv().await.unwrap();
         assert!(second.starts_with("POST /chat/completions ") && !second.to_lowercase().contains("x-opencode-session"));
         assert_eq!(body_of(&second)["reasoning"], json!({"effort":"low"}));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vercel_prompt_caching_and_fast_mode() {
+        let listing = json!({"data":[
+            {"id":"anthropic/claude-fast-test","type":"language","fast_options":[{"type":"toggle"}]},
+            {"id":"openai/gpt-tier-test","type":"language","owned_by":"openai","pricing":{"service_tiers":{"priority":{"input":"1"}}}},
+            {"id":"zai/glm-priced-test","type":"language","pricing":{"fast":{"input":"1"}}},
+            {"id":"zai/glm-slow-test","type":"language","pricing":{"input":"1"}}
+        ]});
+        let chat = || events(&[json!({"choices":[{"index":0,"delta":{"content":"v"},"finish_reason":"stop"}]})]);
+        let (url, mut requests, task) = server(vec![(200, listing.to_string()), (200, chat()), (200, chat())]).await;
+        let mut p = provider(Service::Vercel, &url, "anthropic/claude-fast-test");
+        p.set_fast(true);
+        assert!(!p.supports_fast() && !p.fast(), "unknown until listed");
+        p.list_models().await.unwrap();
+        assert!(p.supports_fast() && p.fast());
+        for (model, fast) in [("openai/gpt-tier-test", true), ("zai/glm-priced-test", true), ("zai/glm-slow-test", false)] {
+            assert_eq!(super::super::listed_fast("vercel", model), fast, "{model}");
+        }
+        let items = [Item::user("one"), Item::Assistant { text: "two".into() }, Item::user("three")];
+        p.stream(Request { system: "sys", items: &items, tools: &[] }, &mut |_| {}).await.unwrap();
+        p.set_model("zai/glm-slow-test".into());
+        p.stream(Request { system: "sys", items: &items, tools: &[] }, &mut |_| {}).await.unwrap();
+        requests.recv().await.unwrap();
+        let cache = json!({"anthropic":{"cacheControl":{"type":"ephemeral"}}});
+        let body = body_of(&requests.recv().await.unwrap());
+        assert_eq!(body["providerOptions"], json!({"gateway":{"speed":"fast"}}));
+        let marked: Vec<bool> = body["messages"].as_array().unwrap().iter().map(|m| m["providerOptions"] == cache).collect();
+        assert_eq!(marked, [true, false, true, false]);
+        // Neither for other models (or without fast support).
+        let body = body_of(&requests.recv().await.unwrap());
+        assert!(body.get("providerOptions").is_none());
+        assert!(body["messages"].as_array().unwrap().iter().all(|m| m.get("providerOptions").is_none()));
         task.await.unwrap();
     }
 
