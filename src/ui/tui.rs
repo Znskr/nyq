@@ -1068,7 +1068,10 @@ impl Screen {
                     .iter()
                     .map(|spec| MenuItem {
                         label: spec.label.to_string(),
-                        detail: sanitize_text(&crate::settings::value(spec.id, &s, &live)),
+                        detail: sanitize_text(&match crate::settings::source(spec.id) {
+                            Some(layer) => format!("{} · {}", crate::settings::value(spec.id, &s, &live), layer.label()),
+                            None => crate::settings::value(spec.id, &s, &live),
+                        }),
                         tag: spec.description.to_string(),
                     })
                     .collect();
@@ -1868,9 +1871,10 @@ impl Screen {
                 let mut next = current.clone();
                 if crate::settings::apply(id, &value, &mut next) {
                     match crate::settings::update(&self.home, |s| *s = next.clone()) {
-                        Ok(saved) => {
+                        Ok((saved, notice)) => {
                             self.footer.segments = saved.statusline;
                             crate::agent::set_auto_compact_percent(saved.auto_compact);
+                            self.hint = notice;
                         }
                         Err(e) => self.hint = Some(format!("Could not save settings: {e:#}")),
                     }
