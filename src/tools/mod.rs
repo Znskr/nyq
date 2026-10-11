@@ -31,7 +31,7 @@ const SHARED: &[&str] = &["skill", "install_skill", "mcp_list_resources", "mcp_r
 /// Directories and files the read tools must not open: nyq's own tokens,
 /// the codex CLI login, SSH keys, cloud credentials, and `~/.netrc`.
 /// Installed skills (`~/.nyq/skills`) stay readable so their scripts and
-/// references can be opened.
+/// documents can be opened.
 #[derive(Clone)]
 pub(crate) struct SecretRoots {
     roots: Vec<PathBuf>,
