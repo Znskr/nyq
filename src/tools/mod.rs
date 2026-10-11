@@ -4,7 +4,7 @@
 pub(crate) mod artifacts;
 pub(crate) mod background;
 mod bash;
-pub(crate) use bash::run_shell;
+pub(crate) use bash::{live_tail, run_shell};
 mod fs;
 pub mod image;
 pub(crate) mod mcp_search;
