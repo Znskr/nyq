@@ -524,6 +524,7 @@ pub async fn rename(agent: &mut Agent, tui: &Tui, explicit: Option<&str>) -> Res
         .context("no active session to rename")?
         .set_title(&title)?;
     ui::info(&format!("Renamed: {title}"));
+    ui::set_session_title(&title);
     Ok(())
 }
 

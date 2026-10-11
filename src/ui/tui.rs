@@ -265,6 +265,8 @@ pub struct Screen {
     /// The latest rows printed to the scrollback, unwrapped, for repainting
     /// the screen at a new width after a resize.
     recent: std::collections::VecDeque<String>,
+    /// The window title last set, to send it only when it changes.
+    window_title: String,
     /// Markdown table lines held back until the table ends (column widths
     /// depend on every row); a lone line with `|` is a candidate header.
     table: Vec<String>,
@@ -577,6 +579,7 @@ impl Screen {
             md: Markdown::default(),
             fence: None,
             recent: Default::default(),
+            window_title: String::new(),
             table: Vec::new(),
             busy: None,
             paused: Duration::ZERO,
@@ -1377,8 +1380,27 @@ impl Screen {
         }
     }
 
+    /// "• title · nyq" while working, "title · nyq" otherwise; the title is
+    /// the session's, else the workspace folder.
+    fn window_title(&self) -> String {
+        let folder = std::path::Path::new(&self.footer.cwd).file_name().map(|f| f.to_string_lossy().to_string());
+        let base = Some(self.footer.title.clone()).filter(|t| !t.trim().is_empty()).or(folder).unwrap_or_default();
+        let base = one_line(&base, 60);
+        let state = if self.busy.is_some() { "• " } else { "" };
+        if base.is_empty() { format!("{state}nyq") } else { format!("{state}{base} · nyq") }
+    }
+
+    fn sync_window_title(&mut self) {
+        let title = self.window_title();
+        if title != self.window_title {
+            let _ = write!(self.out, "\x1b]0;{title}\x07");
+            self.window_title = title;
+        }
+    }
+
     pub fn redraw(&mut self) {
         self.sync_clock();
+        self.sync_window_title();
         if self.viewer.is_some() {
             // The viewer covers the screen; it follows new output.
             return self.draw_viewer(false);
@@ -2543,6 +2565,17 @@ impl Tui {
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
         let mut out = crate::record_tape::stdout();
         execute!(out, crossterm::event::EnableBracketedPaste)?;
+        // Save the window title (xterm title stack); Drop restores it.
+        let _ = out.write_all(b"\x1b[22;0t");
+        if crate::settings::current().startup_scrollback {
+            // Scroll the shell output on screen (and the prompt line) into
+            // the scrollback, so the session starts at the top.
+            if let (Ok((_, row)), Ok((_, h))) = (cursor::position(), terminal::size()) {
+                let _ = queue!(out, cursor::MoveTo(0, h.saturating_sub(1)));
+                let _ = out.write_all("\n".repeat(row as usize + 1).as_bytes());
+                let _ = execute!(out, cursor::MoveTo(0, 0));
+            }
+        }
         setup.bracketed = true;
         if enhanced {
             execute!(
@@ -2760,6 +2793,11 @@ impl Drop for Tui {
             }
         }
         *SCREEN.lock().unwrap() = None;
+        {
+            let mut out = crate::record_tape::stdout();
+            let _ = out.write_all(b"\x1b]0;\x07\x1b[23;0t");
+            let _ = out.flush();
+        }
         if self.enhanced {
             pop_keyboard_enhancement();
         }
@@ -3651,6 +3689,19 @@ mod tests {
         s.redraw();
         assert!(s.pause_start.is_none() && s.paused >= Duration::from_secs(4));
         assert_eq!(tally_text(&[("edit", 2), ("tool", 1)]), "2 edited, 1 tool");
+    }
+
+    #[test]
+    fn window_title_follows_session_and_work() {
+        let mut s = screen();
+        s.footer.cwd = "/work/proj".into();
+        assert_eq!(s.window_title(), "proj · nyq");
+        s.footer.title = "Fix login\x07 bug".into();
+        s.busy = Some(("Working".into(), Instant::now()));
+        assert_eq!(s.window_title(), "• Fix login bug · nyq");
+        s.footer.cwd.clear();
+        s.footer.title.clear();
+        assert_eq!(s.window_title(), "• nyq");
     }
 
     #[test]

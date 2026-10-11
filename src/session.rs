@@ -566,7 +566,7 @@ fn is_title_line(line: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn title_of(text: &str) -> String {
+pub fn title_of(text: &str) -> String {
     let line = text
         .lines()
         .map(str::trim)
