@@ -10,7 +10,10 @@
 //!
 //! [`known_reversible`] admits `&&` chains of ordinary development commands
 //! (`git status`/`fetch`, package installs and tests, `cargo build`…) that
-//! auto mode runs without asking the classifier.
+//! auto mode runs without asking the classifier. An install or `run` that
+//! passes a global flag, a config file, `--config.*`, or a directory
+//! (`--prefix`, `--dir`, `-C`, `--modules-dir`) is not included: those can
+//! write outside the project.
 //!
 //! Anything else — redirections, substitutions, variables, globs, `~`,
 //! backslashes, assignments, unknown programs or options, and paths that leave
@@ -434,13 +437,6 @@ fn reversible_stage(w: &[&str]) -> bool {
     if matches!(args, ["--version"]) || (matches!(args, ["-v"]) && matches!(program, "node" | "npm" | "pnpm" | "bun")) {
         return VERSIONED.contains(&program);
     }
-    let global = |rest: &[&str]| {
-        rest.iter().any(|a| {
-            matches!(*a, "-g" | "--global" | "--location" | "--prefix")
-                || a.starts_with("--location=")
-                || a.starts_with("--prefix=")
-        })
-    };
     match (program, args) {
         ("git", ["status", rest @ ..]) => rest.iter().all(|a| is_flag(a)),
         ("git", ["remote", "-v"]) => true,
@@ -450,9 +446,9 @@ fn reversible_stage(w: &[&str]) -> bool {
                 || a.strip_prefix("--depth=").is_some_and(digits)
                 || (!is_flag(a) && !a.contains("::"))
         }),
-        ("npm", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test" | "t") => !global(rest),
-        ("pnpm" | "bun", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test") => !global(rest),
-        ("npm" | "pnpm" | "bun", ["run", script, rest @ ..]) => !is_flag(script) && !global(rest),
+        ("npm", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test" | "t") => !install_escapes(rest),
+        ("pnpm" | "bun", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test") => !install_escapes(rest),
+        ("npm" | "pnpm" | "bun", ["run", script, rest @ ..]) => !is_flag(script) && !install_escapes(rest),
         ("cargo", [sub, rest @ ..]) => {
             let outside = rest.iter().any(|a| {
                 ["--config", "-Z", "--manifest-path", "--target-dir", "--out-dir", "--artifact-dir"]
@@ -466,6 +462,39 @@ fn reversible_stage(w: &[&str]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether an `npm`/`pnpm`/`bun` install or `run` argument can leave the
+/// project. `--global=true` is a global install; a config file or
+/// `--config.*` can set `global`, `prefix`, or a script shell; `--dir`,
+/// `-C` and `--modules-dir` write another directory.
+fn install_escapes(args: &[&str]) -> bool {
+    args.iter().any(|a| {
+        matches!(
+            *a,
+            "-g" | "--global"
+                | "--location"
+                | "--prefix"
+                | "--userconfig"
+                | "--globalconfig"
+                | "--config"
+                | "-C"
+                | "--dir"
+                | "--modules-dir"
+        ) || [
+            "--location=",
+            "--prefix=",
+            "--global=",
+            "--userconfig=",
+            "--globalconfig=",
+            "--config.",
+            "--config=",
+            "--dir=",
+            "--modules-dir=",
+        ]
+        .iter()
+        .any(|p| a.starts_with(p))
+    })
 }
 
 #[cfg(test)]
@@ -617,6 +646,15 @@ mod tests {
             "git push origin HEAD",
             "npm install -g x",
             "npm install --prefix=/tmp/g",
+            "npm install --global=true left-pad",
+            "npm install --userconfig=.npmrc left-pad",
+            "npm install --globalconfig=/tmp/npmrc left-pad",
+            "pnpm install --global=true left-pad",
+            "pnpm install --config.global=true left-pad",
+            "pnpm install --dir /tmp/other left-pad",
+            "pnpm install -C /tmp/other left-pad",
+            "pnpm install --modules-dir=/tmp/mods left-pad",
+            "pnpm run build --config.script-shell=/tmp/evil",
             "npm exec -- rm -rf .",
             "npm run",
             "cargo fmt",
