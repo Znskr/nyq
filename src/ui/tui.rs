@@ -3189,39 +3189,7 @@ impl Ui for TuiUi {
     }
 
     async fn ask(&mut self, question: &str, options: &[String]) -> Option<String> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut s = self.s();
-            s.flush_all();
-            crate::notify::notify(&crate::notify::Event::Attention(&format!(
-                "Question: {}",
-                one_line(question, 120)
-            )));
-            s.question = Some(PendingQuestion {
-                question: sanitize_text(question),
-                options: options.iter().map(|o| one_line(o, 200)).collect(),
-                selected: 0,
-                menu: None,
-                reply: tx,
-            });
-            s.redraw();
-        }
-        // Dropped on cancel: clear the pane so the next key isn't answered into a closed channel.
-        let guard = ClearQuestion(Arc::clone(&self.screen));
-        let answer = rx.await.ok().flatten();
-        drop(guard);
-        let mut s = self.s();
-        let shown = answer.clone().unwrap_or_else(|| "(skipped)".into());
-        s.print_info(
-            &format!(
-                "{} {}\n  {}",
-                paint(fg(BRIGHT), "?"),
-                paint(fg(MID), question),
-                paint(fg(GRAY), &shown)
-            ),
-            Style::new(),
-        );
-        answer
+        ask_on(&self.screen, question, options).await
     }
 
     fn take_steering(&mut self) -> Vec<Item> {
@@ -3239,6 +3207,62 @@ impl Ui for TuiUi {
         };
         Some(self.deliver(text))
     }
+}
+
+/// Ask on the interactive screen, if there is one: `None` when no terminal
+/// is attached (print mode, ACP), else the answer (`None` inside if skipped).
+/// Works while the agent loop is blocked inside a tool (MCP elicitation).
+pub async fn ask_active(question: &str, options: &[String]) -> Option<Option<String>> {
+    let screen = active()?;
+    Some(ask_on(&screen, question, options).await)
+}
+
+/// Show `text` on the running tool's row and in the busy label (MCP progress).
+pub fn tool_progress(text: &str) {
+    let Some(screen) = active() else { return };
+    let mut s = lock(&screen);
+    let text = one_line(&sanitize_text(text), 80);
+    let Some(t) = s.tools.iter_mut().rev().find(|t| t.status == Status::Running) else { return };
+    t.note = text.clone();
+    let label = format!("Running {} · {text}", t.tool.replace('_', " "));
+    s.set_label(&label);
+    s.redraw();
+}
+
+async fn ask_on(screen: &Arc<Mutex<Screen>>, question: &str, options: &[String]) -> Option<String> {
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut s = lock(screen);
+        s.flush_all();
+        crate::notify::notify(&crate::notify::Event::Attention(&format!(
+            "Question: {}",
+            one_line(question, 120)
+        )));
+        s.question = Some(PendingQuestion {
+            question: sanitize_text(question),
+            options: options.iter().map(|o| one_line(o, 200)).collect(),
+            selected: 0,
+            menu: None,
+            reply: tx,
+        });
+        s.redraw();
+    }
+    // Dropped on cancel: clear the pane so the next key isn't answered into a closed channel.
+    let guard = ClearQuestion(Arc::clone(screen));
+    let answer = rx.await.ok().flatten();
+    drop(guard);
+    let mut s = lock(screen);
+    let shown = answer.clone().unwrap_or_else(|| "(skipped)".into());
+    s.print_info(
+        &format!(
+            "{} {}\n  {}",
+            paint(fg(BRIGHT), "?"),
+            paint(fg(MID), question),
+            paint(fg(GRAY), &shown)
+        ),
+        Style::new(),
+    );
+    answer
 }
 
 /// A slash command is a barrier: a later follow-up does not run before it.
