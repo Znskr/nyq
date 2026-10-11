@@ -369,7 +369,7 @@ pub async fn cli_login(home: &Path, id: &str) -> Result<String> {
     match id {
         "codex" => {
             crate::login::login(home, |url| {
-                eprintln!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}");
+                eprintln!("{}", crate::login::sign_in_prompt(url));
                 crate::login::open_browser(url);
             })
             .await
