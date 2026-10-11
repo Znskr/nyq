@@ -37,8 +37,16 @@ fn sandbox_guidance(policy: &crate::sandbox::Policy) -> String {
     }
 }
 
+static BASE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Replace the built-in base prompt for this run (`ask --system`); tool,
+/// skill, project and environment context are still added.
+pub fn set_base(text: String) {
+    let _ = BASE_OVERRIDE.set(text);
+}
+
 pub fn system(cwd: &Path, sandbox: &crate::sandbox::Policy) -> String {
-    let mut s = String::from(BASE);
+    let mut s = String::from(BASE_OVERRIDE.get().map_or(BASE, String::as_str));
     s.push_str(&format!("\n- {}", sandbox_guidance(sandbox)));
     s.push_str(&format!(
         "\n\nEnvironment:\n- Working directory: {}\n- Platform: {}\n- Date: {}",
@@ -58,15 +66,17 @@ Relative paths still resolve from the working directory. Project instructions ar
             s.push_str(&format!("- {}\n", dir.display()));
         }
     }
+    let mut project = String::new();
     for name in INSTRUCTION_FILES {
         let path = cwd.join(name);
         if let Ok(text) = crate::tools::read_rooted_text(cwd, &path) {
-            let text = text.trim();
+            let text = crate::limits::clip("project_instruction_file_bytes", text.trim());
             if !text.is_empty() {
-                s.push_str(&format!("\n\n# Project instructions ({name})\n\n{text}"));
+                project.push_str(&format!("\n\n# Project instructions ({name})\n\n{text}"));
             }
         }
     }
+    s.push_str(&crate::limits::clip("project_instructions_total_bytes", &project));
     let facts = crate::tools::memory::load(&crate::config::home()).unwrap_or_default();
     s.push_str(&crate::tools::memory::prompt_section(&facts));
     s

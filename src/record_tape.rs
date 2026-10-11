@@ -16,6 +16,8 @@ struct Tape {
     size: (u16, u16),
     pending: Vec<u8>,
     failure: Option<String>,
+    /// Also record keystrokes (`NYQ_RECORD_INPUT`).
+    input: bool,
 }
 impl Tape {
     fn event(&mut self, time: f64, kind: &str, data: &str) -> io::Result<()> {
@@ -46,10 +48,60 @@ impl Tape {
     }
 }
 
+/// `NYQ_RECORD`: record the interactive session to this tape file.
+pub fn env_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("NYQ_RECORD")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// `NYQ_RECORD_INPUT=1`: also record keystrokes as input (`i`) events.
+fn records_input() -> bool {
+    std::env::var_os("NYQ_RECORD_INPUT").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Record typed input (when `NYQ_RECORD_INPUT` is set and a tape is open).
+pub fn input(text: &str) {
+    let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tape) = active.as_mut().filter(|t| t.input && t.failure.is_none()) {
+        let time = tape.start.elapsed().as_secs_f64();
+        if let Err(e) = tape.event(time, "i", text) {
+            tape.failure = Some(e.to_string());
+        }
+    }
+}
+
+/// The bytes a terminal would send for a key, for input events.
+pub fn key_text(key: &crossterm::event::KeyEvent) -> Option<String> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let text = match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic() => {
+            ((c.to_ascii_lowercase() as u8 - b'a' + 1) as char).to_string()
+        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => format!("\x1b{c}"),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "\r".into(),
+        KeyCode::Tab => "\t".into(),
+        KeyCode::BackTab => "\x1b[Z".into(),
+        KeyCode::Backspace => "\x7f".into(),
+        KeyCode::Esc => "\x1b".into(),
+        KeyCode::Up => "\x1b[A".into(),
+        KeyCode::Down => "\x1b[B".into(),
+        KeyCode::Right => "\x1b[C".into(),
+        KeyCode::Left => "\x1b[D".into(),
+        KeyCode::Home => "\x1b[H".into(),
+        KeyCode::End => "\x1b[F".into(),
+        KeyCode::Delete => "\x1b[3~".into(),
+        _ => return None,
+    };
+    Some(text)
+}
+
 pub struct Capture;
 impl Capture {
-    pub fn start(home: &Path, session: &str) -> Result<Self> {
-        let path = home.join("tapes").join(format!("{session}.cast"));
+    /// Start recording to `path`, or `<home>/tapes/<session>.cast`.
+    pub fn start(home: &Path, session: &str, path: Option<std::path::PathBuf>) -> Result<Self> {
+        let path = path.unwrap_or_else(|| home.join("tapes").join(format!("{session}.cast")));
         ensure!(!path.exists(), "tape already exists: {}", path.display());
         let size = crossterm::terminal::size()
             .ok()
@@ -65,6 +117,7 @@ impl Capture {
             size,
             pending: Vec::new(),
             failure: None,
+            input: records_input(),
         });
         Ok(Self)
     }
@@ -176,7 +229,7 @@ mod tests {
     #[test]
     fn capture_creates_private_asciicast() {
         let tmp = tempfile::tempdir().unwrap();
-        let capture = Capture::start(tmp.path(), "test-session").unwrap();
+        let capture = Capture::start(tmp.path(), "test-session", None).unwrap();
         ACTIVE
             .lock()
             .unwrap()
@@ -199,6 +252,16 @@ mod tests {
         }
     }
     #[test]
+    fn keys_become_terminal_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |code, mods| key_text(&KeyEvent::new(code, mods));
+        assert_eq!(key(KeyCode::Char('a'), KeyModifiers::NONE).as_deref(), Some("a"));
+        assert_eq!(key(KeyCode::Char('c'), KeyModifiers::CONTROL).as_deref(), Some("\x03"));
+        assert_eq!(key(KeyCode::Enter, KeyModifiers::NONE).as_deref(), Some("\r"));
+        assert_eq!(key(KeyCode::Up, KeyModifiers::NONE).as_deref(), Some("\x1b[A"));
+        assert_eq!(key(KeyCode::F(5), KeyModifiers::NONE), None);
+    }
+    #[test]
     fn tape_roundtrip_and_timing() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.cast");
@@ -209,6 +272,7 @@ mod tests {
             size: (80, 24),
             pending: Vec::new(),
             failure: None,
+            input: false,
         };
         tape.event(0.25, "o", "hello\r\n\u{1b}[31m").unwrap();
         tape.event(1.0, "r", "100x30").unwrap();

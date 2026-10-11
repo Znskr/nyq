@@ -53,7 +53,9 @@ pub fn status(
         "auth_sources": auth_sources(home), "sandbox": sandbox::describe(policy),
         "mcp": servers.iter().map(|s| json!({"name": s.name, "connected": connected.iter().any(|(name, _)| name == &s.name)})).collect::<Vec<_>>(),
         "skills_count": skills_count, "permissions_file": crate::permissions::user_path(home),
-        "project_permissions_file": crate::permissions::project_path(cwd), "context_window": context})
+        "project_permissions_file": crate::permissions::project_path(cwd), "context_window": context,
+        "max_agent_steps": crate::agent::step_limit().0, "trace": crate::trace::describe(),
+        "context_limits": crate::limits::report()})
 }
 pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
     if as_json {
@@ -75,6 +77,8 @@ pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
             "permissions_file",
             "project_permissions_file",
             "context_window",
+            "max_agent_steps",
+            "trace",
         ] {
             let v = &value[key];
             lines.push(format!(
@@ -83,6 +87,17 @@ pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
                     .map(str::to_owned)
                     .unwrap_or_else(|| v.to_string())
             ));
+        }
+        // Only limits that differ from their defaults.
+        let changed: Vec<String> = value["context_limits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|l| l["source"] != "default")
+            .map(|l| format!("{}={} ({})", l["name"].as_str().unwrap_or_default(), l["bytes"].as_u64().map_or("off".into(), |b| b.to_string()), l["source"].as_str().unwrap_or_default()))
+            .collect();
+        if !changed.is_empty() {
+            lines.push(format!("  context_limits: {}", changed.join(", ")));
         }
         ui::list(&lines);
     }
@@ -192,11 +207,41 @@ async fn reachable(endpoint: &str) -> bool {
     .await
     .unwrap_or(false)
 }
+/// Run-time facts doctor reports alongside its checks.
+pub struct Facts<'a> {
+    pub permission_mode: crate::permissions::Mode,
+    pub sessions_dir: &'a Path,
+}
+
+/// Whether `program --version` runs within five seconds.
+async fn runs(program: &str) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(program)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .is_some_and(|o| o.status.success())
+}
+
+fn info(name: &'static str, ok: bool, detail: impl Into<String>, hint: &'static str) -> Check {
+    Check {
+        required: false,
+        ..check(name, ok, detail, hint)
+    }
+}
+
 pub async fn doctor(
     home: &Path,
     cwd: &Path,
     provider: Option<&dyn Provider>,
     policy: &sandbox::Policy,
+    facts: &Facts<'_>,
+    json: bool,
 ) -> Result<()> {
     let configured = provider.is_some();
     let auth = match provider.map(Provider::name) {
@@ -279,16 +324,35 @@ pub async fn doctor(
         },
         "check mcp.json and .mcp.json syntax and referenced environment variables",
     ));
-    let git = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::process::Command::new("git")
-            .arg("--version")
-            .output(),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .is_some_and(|o| o.status.success());
+    let (_, settings_warning) = crate::settings::load(home);
+    checks.push(info(
+        "settings",
+        settings_warning.is_none(),
+        settings_warning.unwrap_or_else(|| "settings.json parses (or is absent)".into()),
+        "fix settings.json; nyq uses the defaults until then",
+    ));
+    let (count, problems) = crate::session::health(facts.sessions_dir);
+    checks.push(info(
+        "sessions",
+        problems.is_empty(),
+        if problems.is_empty() {
+            format!("{count} saved, all readable")
+        } else {
+            format!("{count} saved, {} need repair: {}", problems.len(), problems.join("; "))
+        },
+        "repair with the command shown for each session",
+    ));
+    let (steps, steps_source) = crate::agent::step_limit();
+    checks.push(info(
+        "agent",
+        true,
+        format!(
+            "permission mode {} · step limit {steps} ({steps_source})",
+            facts.permission_mode.as_str()
+        ),
+        "",
+    ));
+    let git = runs("git").await;
     checks.push(check(
         "git",
         git,
@@ -298,6 +362,32 @@ pub async fn doctor(
             "git unavailable"
         },
         "install git and add it to PATH",
+    ));
+    let repo = git
+        && tokio::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .is_ok_and(|o| o.status.success());
+    checks.push(info(
+        "git repository",
+        repo,
+        if repo {
+            "the working directory is in a git repository"
+        } else {
+            "not a git repository"
+        },
+        "nyq pr and nyq issue need a git repository",
+    ));
+    let gh = runs("gh").await;
+    checks.push(info(
+        "gh",
+        gh,
+        if gh { "GitHub CLI available" } else { "GitHub CLI unavailable" },
+        "install gh to publish with nyq pr and nyq issue",
     ));
     let terminal = std::io::stdin().is_terminal()
         && std::io::stderr().is_terminal()
@@ -312,12 +402,36 @@ pub async fn doctor(
         },
         "run in an interactive terminal with TERM set appropriately; print mode remains available",
     ) });
+    let passed = checks.iter().all(|c| c.ok || !c.required);
+    if json {
+        let list: Vec<Value> = checks
+            .iter()
+            .map(|c| json!({"name": c.name, "ok": c.ok, "required": c.required, "detail": c.detail, "hint": c.hint}))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json!({"ok": passed, "checks": list}))?);
+        if !passed {
+            // The JSON already says what failed.
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     ui::list(&checks.iter().map(Check::line).collect::<Vec<_>>());
-    anyhow::ensure!(checks.iter().all(|c| c.ok || !c.required), "doctor found failing checks");
+    anyhow::ensure!(passed, "doctor found failing checks");
     Ok(())
 }
-pub async fn models(home: &Path) {
+pub async fn models(home: &Path, json: bool) -> Result<()> {
     let (choices, warnings) = crate::models::list(home).await;
+    if json {
+        let list: Vec<Value> = choices
+            .iter()
+            .map(|c| {
+                json!({"provider": c.provider, "model": c.model, "context_window": c.context_window,
+                    "efforts": c.efforts, "price": c.price})
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json!({"models": list, "warnings": warnings}))?);
+        return Ok(());
+    }
     let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
     for c in choices {
         groups.entry(c.provider).or_default().push(c.model);
@@ -336,6 +450,7 @@ pub async fn models(home: &Path) {
     for w in warnings {
         ui::error(&w);
     }
+    Ok(())
 }
 pub fn cli_status(
     home: &Path,

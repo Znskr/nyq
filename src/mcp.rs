@@ -369,7 +369,10 @@ impl McpManager {
             }
             tools.push(Box::new(McpTool {
                 name,
-                description: t.description.as_deref().unwrap_or_default().to_string(),
+                description: crate::limits::clip(
+                    "mcp_description_bytes",
+                    t.description.as_deref().unwrap_or_default(),
+                ),
                 schema,
                 tool: t.name.to_string(),
                 peer: peer.clone(),

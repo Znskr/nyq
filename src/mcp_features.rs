@@ -18,8 +18,11 @@ use crate::types::ToolSpec;
 const LIST: &str = "mcp_list_resources";
 const READ: &str = "mcp_read_resource";
 const TIMEOUT: Duration = Duration::from_secs(60);
-/// One text block, and the joined prompt or resource, stay under these caps.
+/// The default caps for one text block and a joined prompt or resource
+/// (`mcp_content_block_bytes`, `mcp_content_total_bytes` in `crate::limits`).
+#[cfg(test)]
 const BLOCK_CAP: usize = 8 * 1024;
+#[cfg(test)]
 const TOTAL_CAP: usize = 32 * 1024;
 
 /// Re-install the resource tools for the servers connected now.
@@ -164,8 +167,10 @@ fn cap_text(text: &str, cap: usize) -> String {
 }
 
 fn cap_parts(parts: Vec<String>) -> String {
-    let capped: Vec<String> = parts.into_iter().map(|part| cap_text(&part, BLOCK_CAP)).collect();
-    cap_text(&capped.join("\n\n"), TOTAL_CAP)
+    let cap = |name| crate::limits::get(name).unwrap_or(usize::MAX);
+    let block = cap("mcp_content_block_bytes");
+    let capped: Vec<String> = parts.into_iter().map(|part| cap_text(&part, block)).collect();
+    cap_text(&capped.join("\n\n"), cap("mcp_content_total_bytes"))
 }
 
 fn block_text(c: &ContentBlock) -> String {

@@ -85,6 +85,16 @@ pub fn escape(osc: Osc, title: &str, body: &str, tmux: bool) -> String {
     }
 }
 
+/// `NYQ_SOUND=off|on|max` overrides the sound setting; other values are ignored.
+fn sound_override(value: Option<&str>) -> Option<&'static str> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" => Some("off"),
+        "on" | "1" => Some("on"),
+        "max" => Some("max"),
+        _ => None,
+    }
+}
+
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_default()
 }
@@ -107,7 +117,11 @@ pub fn emit(out: &mut impl Write, plan: &Plan) {
 
 /// Plan and emit `event` on stdout.
 pub fn notify(event: &Event) {
-    let plan = plan(&crate::settings::current(), event);
+    let mut settings = crate::settings::current();
+    if let Some(sound) = sound_override(std::env::var("NYQ_SOUND").ok().as_deref()) {
+        settings.sound = sound.into();
+    }
+    let plan = plan(&settings, event);
     if plan != Plan::default() {
         emit(&mut std::io::stdout(), &plan);
     }
@@ -193,5 +207,13 @@ mod tests {
         let mut out = Vec::new();
         emit(&mut out, &Plan { bell: true, desktop: None });
         assert_eq!(out, b"\x07");
+    }
+
+    #[test]
+    fn sound_env_overrides() {
+        assert_eq!(sound_override(Some("MAX")), Some("max"));
+        assert_eq!(sound_override(Some("off")), Some("off"));
+        assert_eq!(sound_override(Some("loud")), None);
+        assert_eq!(sound_override(None), None);
     }
 }

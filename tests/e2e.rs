@@ -105,13 +105,37 @@ fn print_mode_runs_tools_and_answers() {
     assert!(second.contains("hello from the workspace"), "{second}");
     assert!(second.contains("call_1"));
 
-    // The conversation was saved and is listed.
-    let list = Command::new(env!("CARGO_BIN_EXE_nyq"))
-        .arg("sessions")
-        .env("NYQ_HOME", home.path()).env("HOME", home.path())
+    // The conversation was saved and is listed for its directory.
+    let sessions = |dir: &std::path::Path, args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
+            .arg("sessions")
+            .args(args)
+            .current_dir(dir)
+            .env("NYQ_HOME", home.path())
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(sessions(work.path(), &[]).contains("copy the notes"));
+    let elsewhere = tempfile::tempdir().unwrap();
+    assert!(sessions(elsewhere.path(), &[]).contains("No saved conversations in this directory"));
+    assert!(sessions(elsewhere.path(), &["--all"]).contains("copy the notes"));
+    let listed: Value = serde_json::from_str(&sessions(work.path(), &["--json", "--limit", "1"])).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["title"], "copy the notes");
+    // `nyq session ID` is short for `nyq session show ID`.
+    let id = listed[0]["id"].as_str().unwrap();
+    let show = Command::new(env!("CARGO_BIN_EXE_nyq"))
+        .args(["session", &id[..8], "--json"])
+        .current_dir(work.path())
+        .env("NYQ_HOME", home.path())
+        .env("HOME", home.path())
         .output()
         .unwrap();
-    assert!(String::from_utf8_lossy(&list.stdout).contains("copy the notes"));
+    let shown: Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(shown["id"], id);
+    assert!(shown["items"].as_array().unwrap().len() >= 4);
 }
 
 #[test]
@@ -491,4 +515,183 @@ fn print_mode_ignores_a_saved_yolo_mode() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("saved yolo permission mode does not apply"));
     assert!(!work.path().join("x.txt").exists(), "a saved yolo must not let print mode write files");
+}
+
+/// `nyq ask` against `url` from `work`, without the --yolo of `print_command`.
+fn ask_command(work: &std::path::Path, home: &std::path::Path, url: &str) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nyq"));
+    cmd.args(["ask", "--sandbox", "off", "--provider", "openai"])
+        .current_dir(work)
+        .env("NYQ_HOME", home)
+        .env("HOME", home)
+        .env("NYQ_BASE_URL", url)
+        .env("NYQ_MODEL", "fake-model")
+        .env_remove("NYQ_API_KEY")
+        .env_remove("NYQ_PERMISSION_MODE")
+        .env_remove("NYQ_MAX_AGENT_STEPS");
+    cmd
+}
+
+#[test]
+fn ask_json_reports_answer_tools_and_session() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("notes.txt"), "hello\n").unwrap();
+    write_png(work.path());
+    let (url, seen) = fake_server(vec![
+        vec![
+            delta(json!({"content": "Let me look."})),
+            tool_call("read_file", json!({"path": "notes.txt"})),
+        ],
+        vec![delta(json!({"content": "It says hello."}))],
+    ]);
+    let out = ask_command(work.path(), home.path(), &url)
+        .args(["--json", "--system", "You are a terse test bot.", "--image", "shot.png", "what is in notes"])
+        .output()
+        .unwrap();
+    assert_success(&out);
+    // Only the JSON object is on stdout.
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["exit_code"], 0);
+    assert_eq!(v["model"], "fake-model");
+    assert_eq!(v["steps"], 2);
+    assert_eq!(v["final_output"], "It says hello.");
+    assert!(v["output"].as_str().unwrap().contains("Let me look."));
+    assert_eq!(v["tool_calls"][0]["name"], "read_file");
+    assert_eq!(v["tool_calls"][0]["status"], "ok");
+    assert!(v["error"].is_null());
+    let id = v["session_id"].as_str().unwrap();
+    assert!(home.path().join("sessions").join(format!("{id}.jsonl")).exists());
+
+    let seen = seen.lock().unwrap();
+    let system = seen[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(system.starts_with("You are a terse test bot."), "{system}");
+    assert!(!system.contains("You are nyq"));
+    assert!(system.contains("Working directory"), "context still applies: {system}");
+    assert_image(&seen[0]["messages"][1]);
+}
+
+#[test]
+fn ask_json_reports_startup_errors_and_no_save_keeps_nothing() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let out = ask_command(work.path(), home.path(), "http://127.0.0.1:1/v1")
+        .args(["--json", "--context-limit", "bogus=1", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["exit_code"], 1);
+    assert!(v["error"].as_str().unwrap().contains("unknown context limit"), "{v}");
+
+    let (url, _seen) = fake_server(vec![vec![delta(json!({"content": "Hi."}))]]);
+    let out = ask_command(work.path(), home.path(), &url)
+        .args(["--no-save", "--quiet", "hi"])
+        .output()
+        .unwrap();
+    assert_success(&out);
+    assert!(out.stdout.is_empty(), "--quiet prints nothing");
+    let saved = std::fs::read_dir(home.path().join("sessions"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(saved, 0, "--no-save must not create a session");
+    let out = ask_command(work.path(), home.path(), &url)
+        .args(["--no-save", "-c", "hi"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn env_sets_permission_mode_and_step_limit() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (url, _seen) = fake_server(vec![
+        vec![tool_call("write_file", json!({"path": "x.txt", "content": "x"}))],
+        vec![delta(json!({"content": "Done."}))],
+    ]);
+    let out = ask_command(work.path(), home.path(), &url)
+        .env("NYQ_PERMISSION_MODE", "yolo")
+        .arg("write x")
+        .output()
+        .unwrap();
+    assert_success(&out);
+    assert!(work.path().join("x.txt").exists(), "NYQ_PERMISSION_MODE=yolo allows writes");
+
+    let (url, _seen) = fake_server(vec![vec![tool_call("read_file", json!({"path": "x.txt"}))]]);
+    let out = ask_command(work.path(), home.path(), &url)
+        .env("NYQ_MAX_AGENT_STEPS", "1")
+        .args(["--json", "read x"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["error"].as_str().unwrap().contains("stopped after 1 steps"), "{v}");
+    assert_eq!(v["tool_calls"][0]["status"], "ok");
+}
+
+/// A model endpoint that accepts connections and never answers.
+fn silent_server() -> (String, std::sync::mpsc::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+            let _ = tx.send(());
+        }
+    });
+    (url, rx)
+}
+
+#[test]
+#[cfg(unix)]
+fn signals_interrupt_print_mode_with_conventional_exit_codes() {
+    for (signal, code) in [("-INT", 130), ("-TERM", 143)] {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let (url, connected) = silent_server();
+        let child = ask_command(work.path(), home.path(), &url)
+            .args(["--json", "wait"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        connected.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+        let status = Command::new("kill")
+            .args([signal, &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(code), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["exit_code"], code);
+    }
+}
+
+#[test]
+fn continue_recovery_resumes_the_cut_off_answer() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (url, seen) = fake_server(vec![
+        vec![delta(json!({"content": "Part one"}))],
+        vec![delta(json!({"content": " and part two."}))],
+    ]);
+    assert_success(&ask_command(work.path(), home.path(), &url).arg("write it").output().unwrap());
+    let out = ask_command(work.path(), home.path(), &url)
+        .args(["-c", "--continue-recovery"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_success(&out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("part two"));
+    let seen = seen.lock().unwrap();
+    let system = seen[1]["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("Continue from where you stopped"), "{system}");
+    // No new user message was added.
+    let users = seen[1]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "user").count();
+    assert_eq!(users, 1);
 }

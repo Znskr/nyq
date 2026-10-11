@@ -348,27 +348,36 @@ impl Runtime {
     }
 }
 
-/// `nyq workspace …` (stdout for the listing, stderr for warnings).
-pub fn run_cli(home: &Path, primary: &Path, request: CliRequest<'_>) -> Result<()> {
+/// `nyq workspace …` (stdout for the listing, stderr for warnings; with
+/// `json`, one object on stdout).
+pub fn run_cli(home: &Path, primary: &Path, request: CliRequest<'_>, json: bool) -> Result<()> {
     let mut runtime = Runtime::open(home, primary);
-    match request {
-        CliRequest::List => {}
-        CliRequest::Add(path) => match runtime.add(path)? {
-            Change::Added(path) => println!("Added {}", path.display()),
-            Change::Already(path) => {
-                println!("Already an additional directory: {}", path.display())
-            }
-        },
-        CliRequest::Remove(path) => {
-            let path = runtime.remove(path)?;
-            println!("Removed {}", path.display());
-        }
+    let change = match request {
+        CliRequest::List => None,
+        CliRequest::Add(path) => Some(match runtime.add(path)? {
+            Change::Added(path) => format!("Added {}", path.display()),
+            Change::Already(path) => format!("Already an additional directory: {}", path.display()),
+        }),
+        CliRequest::Remove(path) => Some(format!("Removed {}", runtime.remove(path)?.display())),
         CliRequest::Clear => {
             runtime.clear()?;
-            println!("Cleared saved additional directories.");
+            Some("Cleared saved additional directories.".into())
         }
-    }
+    };
     let view = runtime.view()?;
+    if json {
+        let value = serde_json::json!({
+            "primary": primary,
+            "additional": view.active,
+            "change": change,
+            "warnings": view.warnings,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    if let Some(change) = change {
+        println!("{change}");
+    }
     for warning in view.warnings {
         eprintln!("warning: {warning}");
     }
