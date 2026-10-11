@@ -8,80 +8,81 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  ZIG_VERSION: 0.16.0
+  ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+  MACOS_SDK: MacOSX14.5.sdk
+  MACOS_SDK_SHA256: 6e146275d19f027faa2e8354da5e0267513abf013b8f16ad65a231653a2b1c5d
 
 jobs:
-  build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --target "$TARGET"
-      - name: Package (tar.gz)
-        if: runner.os != 'Windows'
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          mkdir -p dist pkg
-          cp "target/$TARGET/release/nyq" pkg/
-          cp README.md pkg/
-          tar -czf "dist/nyq-$TARGET.tar.gz" -C pkg nyq README.md
-      - name: Package (zip)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          $ErrorActionPreference = 'stop'
-          New-Item -ItemType Directory -Force -Path dist, pkg | Out-Null
-          Copy-Item "target/$env:TARGET/release/nyq.exe" -Destination pkg
-          Copy-Item README.md -Destination pkg
-          Compress-Archive -Path pkg/nyq.exe, pkg/README.md -DestinationPath "dist/nyq-$env:TARGET.zip" -Force
-      - uses: actions/upload-artifact@v7
-        with:
-          name: nyq-${{ matrix.target }}
-          path: dist/*
-          if-no-files-found: error
-
+  # Cross-compiles every target on the AWS runner with cargo-zigbuild (no
+  # GitHub-hosted minutes): Linux against glibc 2.17, macOS against a pinned
+  # SDK, Windows through MinGW-w64 as provided by zig.
   release:
-    name: release
-    needs: build
-    if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    name: build and release
+    runs-on: [self-hosted, Linux, X64, nyq-aws]
+    timeout-minutes: 120
     permissions:
       contents: write
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../nyq-release-target
+      TOOLS: ${{ github.workspace }}/../release-tools
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Generate SHA256SUMS
+      - uses: actions/checkout@v4
+      - name: Toolchain
         run: |
-          cd dist
-          sha256sum nyq-*.tar.gz nyq-*.zip > SHA256SUMS
-          cat SHA256SUMS
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-gnu
+          mkdir -p "$TOOLS"
+          zig="$TOOLS/zig-x86_64-linux-$ZIG_VERSION"
+          if [ ! -x "$zig/zig" ]; then
+            curl -fsSL -o "$TOOLS/zig.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+            echo "$ZIG_SHA256  $TOOLS/zig.tar.xz" | sha256sum -c -
+            tar -xJf "$TOOLS/zig.tar.xz" -C "$TOOLS" && rm "$TOOLS/zig.tar.xz"
+          fi
+          echo "$zig" >> "$GITHUB_PATH"
+          if [ ! -d "$TOOLS/$MACOS_SDK" ]; then
+            curl -fsSL -o "$TOOLS/sdk.tar.xz" "https://github.com/joseluisq/macosx-sdks/releases/download/14.5/$MACOS_SDK.tar.xz"
+            echo "$MACOS_SDK_SHA256  $TOOLS/sdk.tar.xz" | sha256sum -c -
+            tar -xJf "$TOOLS/sdk.tar.xz" -C "$TOOLS" && rm "$TOOLS/sdk.tar.xz"
+          fi
+          echo "SDKROOT=$TOOLS/$MACOS_SDK" >> "$GITHUB_ENV"
+          command -v cargo-zigbuild >/dev/null || cargo install --locked cargo-zigbuild
+      - name: Build
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir -p dist
+          package() { # target-dir binary archive
+            rm -rf pkg && mkdir pkg
+            cp "$CARGO_TARGET_DIR/$1/release/$2" README.md pkg/
+            case "$3" in
+              *.zip) python3 -c 'import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+              for f in sys.argv[2:]: z.write("pkg/" + f, f)' "dist/$3" "$2" README.md ;;
+              *) tar -czf "dist/$3" -C pkg "$2" README.md ;;
+            esac
+          }
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            cargo zigbuild --release --locked --target "$t.2.17"
+            package "$t" nyq "nyq-$t.tar.gz"
+          done
+          for t in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo zigbuild --release --locked --target "$t"
+            package "$t" nyq "nyq-$t.tar.gz"
+          done
+          # Published under the existing Windows asset name so installs and
+          # self-upgrades keep finding it.
+          cargo zigbuild --release --locked --target x86_64-pc-windows-gnu
+          package x86_64-pc-windows-gnu nyq.exe nyq-x86_64-pc-windows-msvc.zip
+          (cd dist && sha256sum nyq-*.tar.gz nyq-*.zip > SHA256SUMS && cat SHA256SUMS)
+      - name: Smoke test
+        run: |
+          tar -xzf dist/nyq-x86_64-unknown-linux-gnu.tar.gz -O nyq > "$RUNNER_TEMP/nyq" && chmod +x "$RUNNER_TEMP/nyq"
+          "$RUNNER_TEMP/nyq" --version
+          if [ "$GITHUB_REF_TYPE" = tag ]; then "$RUNNER_TEMP/nyq" --version | grep -F " ${GITHUB_REF_NAME#v}"; fi
       - uses: softprops/action-gh-release@v3
+        if: github.ref_type == 'tag'
         with:
           files: |
             dist/*.tar.gz
