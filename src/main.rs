@@ -815,6 +815,7 @@ async fn run() -> Result<()> {
     if let Some(meta) = &resumed {
         ui::replay(&agent.items);
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+        ui::set_session_title(&meta.title);
     }
     // Prompt commands follow servers that connect or change later.
     let screen = tui.screen.clone();
@@ -990,9 +991,12 @@ async fn run() -> Result<()> {
         if !chosen.is_empty() {
             let (text, errors) = skill_invoke::turn_text(&chosen, &turn_text);
             errors.iter().for_each(|e| ui::error(e));
-            let names: Vec<&str> = chosen.iter().map(|s| s.name.as_str()).collect();
+            let names: Vec<&str> = chosen.iter().map(|s| s.id.as_str()).collect();
             ui::info(&format!("Using skill {}", names.join(", ")));
             turn_text = text;
+        }
+        if tui.screen().footer.title.is_empty() {
+            ui::set_session_title(&session::title_of(&line));
         }
         // UserPromptSubmit sees the text the model gets (templates and MCP
         // prompts expanded); a blocked prompt keeps its pending attachments.
@@ -1050,6 +1054,11 @@ async fn run() -> Result<()> {
         pending.extend(queue_leftovers(leftover));
     }
     drop(tui);
+    if relaunch.is_none() {
+        if let Some(id) = agent.session.as_ref().filter(|s| s.is_saved()).map(|s| s.id.clone()) {
+            eprintln!("Resume with: nyq -r {id}");
+        }
+    }
     if let Some(u) = &upgrader {
         u.stop();
     }
@@ -1316,6 +1325,7 @@ async fn print_mode(
     }
     if let Some(meta) = resumed {
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+        ui::set_session_title(&meta.title);
     }
     if let Err(e) = mcp_slash::connect_profile_servers(mcp, agent, servers, true).await {
         mcp.shutdown().await;
@@ -1483,6 +1493,7 @@ async fn resume_session(
     agent.adopt_transcript();
     grants::restore(agent);
     ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+    ui::set_session_title(&meta.title);
     hooks::session_start(agent, "resume").await;
     Ok(())
 }
@@ -1544,6 +1555,7 @@ async fn slash(
         }
         "/new" | "/clear" => {
             commands::fresh(agent, sessions_dir)?;
+            ui::set_session_title("");
             hooks::session_start(agent, "new").await;
         }
         "/reset" => commands::reset(agent)?,

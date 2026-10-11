@@ -109,6 +109,7 @@ async fn run_command(
         let pid = child.id().unwrap_or(0);
 
         let tail = std::sync::Arc::new(std::sync::Mutex::new(Tail::default()));
+        let _running = Running::new(&tail);
         let mut pumps = Vec::new();
         if let Some(out) = child.stdout.take() {
             let tail = tail.clone();
@@ -198,6 +199,47 @@ impl Tail {
             self.dropped += extra;
         }
     }
+}
+
+type SharedTail = std::sync::Arc<std::sync::Mutex<Tail>>;
+
+/// Output of the commands running now, newest last, for the UI to show.
+static RUNNING: std::sync::Mutex<Vec<SharedTail>> = std::sync::Mutex::new(Vec::new());
+
+/// Lists a command's output in `RUNNING` while it runs.
+struct Running(SharedTail);
+
+impl Running {
+    fn new(tail: &SharedTail) -> Self {
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).push(tail.clone());
+        Running(tail.clone())
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| !std::sync::Arc::ptr_eq(t, &self.0));
+    }
+}
+
+/// The last `n` non-blank output lines of the newest running command (raw
+/// text: the caller sanitizes). A carriage return keeps what was written last.
+pub(crate) fn live_tail(n: usize) -> Vec<String> {
+    let Some(tail) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).last().cloned() else {
+        return Vec::new();
+    };
+    let tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+    tail_lines(&tail.buf[tail.buf.len().saturating_sub(8192)..], n)
+}
+
+fn tail_lines(bytes: &[u8], n: usize) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.split('\r').rfind(|p| !p.trim().is_empty()))
+        .map(str::to_string)
+        .collect();
+    lines.split_off(lines.len().saturating_sub(n))
 }
 
 pub(super) fn spawn(command: &str, cwd: &std::path::Path, sandbox: &crate::sandbox::Policy) -> io::Result<(Child, Option<WinJob>)> {
@@ -501,6 +543,12 @@ pub fn register(r: &mut Registry) {
 // These use POSIX commands and process groups.
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn live_tail_keeps_the_last_lines() {
+        assert_eq!(super::tail_lines(b"a\n\nb\r\n10%\r50%\r\nc", 3), ["b", "50%", "c"]);
+        assert!(super::tail_lines(b"", 3).is_empty());
+    }
+
     use super::*;
     use std::time::Instant;
     use tokio_util::sync::CancellationToken;
