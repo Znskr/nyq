@@ -35,10 +35,12 @@ const DESCRIPTION: &str = "\
 Delegate a self-contained task to a subagent: a fresh agent with its own context that works \
 on its own and returns only its final report. Use it for broad codebase searches, independent \
 research, or investigations that would otherwise fill your context with file dumps; several \
-independent subagent calls can run in parallel. The subagent sees NOTHING of this conversation, \
-so `task` must contain complete instructions: the goal, relevant paths and names, constraints, \
-and what to report back. Modes: \"explore\" (default) gets read-only tools (read, list, glob, \
-grep, view images) and needs no approval; \"general\" may also edit files and run commands. \
+subagent calls in one response run in parallel, so only batch independent tasks. The subagent \
+sees NOTHING of this conversation, so `task` must contain complete instructions: the goal, \
+relevant paths and names, constraints, and what to report back. Modes: \"explore\" (default) gets \
+read-only tools (read, list, glob, grep, view images, skills) and needs no approval; \"general\" \
+may also edit files, run commands and use MCP tools. `model`, `effort` and `permission_mode` \
+override yours for this subagent (the permission mode can only be stricter). \
 Without `name` the subagent is one-shot. Give a `name` to keep it for this session: the first \
 call creates it, and later calls with the same name send `task` to it as a follow-up message, \
 with everything it already learned still in its context. `action` manages named subagents: \
@@ -88,8 +90,9 @@ fn label(args: &Value) -> &str {
         .trim()
 }
 
-/// The child's tools: builtins (minus mutating ones for explore), never itself.
-fn child_tools(general: bool) -> Registry {
+/// The child's tools: builtins (minus mutating ones for explore), never
+/// itself, plus the session's skills and (for general) MCP tools.
+fn child_tools(general: bool, shared: &[Arc<dyn Tool>]) -> Registry {
     let mut tools = Registry::builtin();
     let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
     let keep: Vec<&str> = if general {
@@ -111,7 +114,28 @@ fn child_tools(general: bool) -> Registry {
             tools.remove_prefix(name);
         }
     }
+    for tool in shared {
+        let name = tool.spec().name;
+        if general || READ_ONLY_SHARED.contains(&name.as_str()) {
+            let _ = tools.try_insert_shared(tool.clone());
+        }
+    }
     tools
+}
+
+/// Inherited session tools an explore subagent may use.
+const READ_ONLY_SHARED: &[&str] = &["skill", "mcp_list_resources", "mcp_read_resource"];
+
+/// One approval prompt at a time: parallel subagents may ask together.
+static APPROVALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How permissive a mode is; a subagent can't exceed its parent.
+fn mode_rank(mode: crate::permissions::Mode) -> u8 {
+    match mode {
+        crate::permissions::Mode::Ask => 0,
+        crate::permissions::Mode::Auto => 1,
+        crate::permissions::Mode::Yolo => 2,
+    }
 }
 
 #[async_trait::async_trait]
@@ -127,7 +151,10 @@ impl Tool for Subagent {
                     "description": {"type": "string", "description": "Short 3-6 word label for the task, shown to the user."},
                     "mode": {"type": "string", "enum": ["explore", "general"], "description": "explore (default): read-only tools. general: may also edit files and run commands. Fixed when a named subagent is created."},
                     "name": {"type": "string", "description": "Keep the subagent under this name (letters, digits, - and _) so later calls can send it follow-ups."},
-                    "action": {"type": "string", "enum": ["run", "list", "inspect", "stop", "resume"], "description": "run (default): run `task`. list: named subagents. inspect/stop/resume: act on `name`."}
+                    "action": {"type": "string", "enum": ["run", "list", "inspect", "stop", "resume"], "description": "run (default): run `task`. list: named subagents. inspect/stop/resume: act on `name`."},
+                    "model": {"type": "string", "description": "Model for this subagent (default: yours), e.g. a faster one for simple searches."},
+                    "effort": {"type": "string", "description": "Reasoning effort for this subagent (e.g. low, medium, high)."},
+                    "permission_mode": {"type": "string", "enum": ["ask", "auto", "yolo"], "description": "Permission mode for this subagent; never more permissive than yours."}
                 }
             }),
         }
@@ -190,12 +217,28 @@ impl Tool for Subagent {
     }
 }
 
-/// A child agent with `items` as its transcript.
-fn child(ctx: &ToolCtx, general: bool, persistent: bool, items: Vec<Item>) -> Result<Agent, ToolOutput> {
+/// A child agent with `items` as its transcript. `args` may override the
+/// model, effort and (only towards stricter) permission mode.
+fn child(ctx: &ToolCtx, general: bool, persistent: bool, items: Vec<Item>, args: &Value) -> Result<Agent, ToolOutput> {
     let Some(provider) = &ctx.provider else {
         return Err(ToolOutput::err("Subagents are unavailable: no model provider in this context."));
     };
-    let provider = provider.fork();
+    let mut provider = provider.fork();
+    if let Some(model) = str_arg(args, "model") {
+        provider.set_model(model.to_string());
+    }
+    if let Some(effort) = str_arg(args, "effort") {
+        provider.set_effort(Some(effort.to_string()));
+    }
+    let parent_mode = if ctx.yolo { crate::permissions::Mode::Yolo } else { ctx.permission_mode };
+    let permission_mode = match str_arg(args, "permission_mode") {
+        None => parent_mode,
+        Some(raw) => match crate::permissions::Mode::parse(raw) {
+            Some(mode) if mode_rank(mode) <= mode_rank(parent_mode) => mode,
+            Some(_) => parent_mode,
+            None => return Err(ToolOutput::err(format!("Unknown permission_mode `{raw}` (ask, auto, yolo)."))),
+        },
+    };
     let context_window = crate::config::context_window_for(provider.name(), None);
     let mut system = format!("{}\n\n{PREAMBLE}", crate::prompt::system(&ctx.cwd, &ctx.sandbox));
     if persistent {
@@ -203,22 +246,18 @@ fn child(ctx: &ToolCtx, general: bool, persistent: bool, items: Vec<Item>) -> Re
     }
     Ok(Agent {
         provider,
-        tools: child_tools(general),
+        tools: child_tools(general, &ctx.shared_tools),
         system,
         items,
         session: None,
         usage_session_id: ctx.session_id.clone(),
         cwd: ctx.cwd.clone(),
-        // Inherit the parent's mode, "always" grants and rules.
-        // Calls that still need approval are forwarded to the parent's
-        // approver, or denied when there is none: approving this call
-        // does not auto-approve them. A yolo flag set on the context
+        // Inherit the parent's mode (or a stricter one), "always" grants
+        // and rules. Calls that still need approval are forwarded to the
+        // parent's approver, or denied when there is none: approving this
+        // call does not auto-approve them. A yolo flag set on the context
         // wins so older callers that only set `yolo` still skip prompts.
-        permission_mode: if ctx.yolo {
-            crate::permissions::Mode::Yolo
-        } else {
-            ctx.permission_mode
-        },
+        permission_mode,
         review_cache: std::sync::Arc::clone(&ctx.review_cache),
         allowed: ctx.allowed.clone(),
         permissions: ctx.permissions.clone(),
@@ -310,7 +349,7 @@ async fn one_shot(args: &Value, ctx: &ToolCtx) -> ToolOutput {
     let Some(task) = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) else {
         return ToolOutput::err("Missing required argument `task`.");
     };
-    let mut agent = match child(ctx, is_general(args), false, Vec::new()) {
+    let mut agent = match child(ctx, is_general(args), false, Vec::new(), args) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -338,7 +377,7 @@ async fn named_run(args: &Value, name: &str, dir: &Path, ctx: &ToolCtx) -> ToolO
         Ok(None) => Record::new(name, if is_general(args) { "general" } else { "explore" }, label(args)),
         Err(e) => return ToolOutput::err(format!("{e:#}")),
     };
-    run_named(record, Some(Item::user(task)), dir, ctx).await
+    run_named(record, Some(Item::user(task)), dir, ctx, args).await
 }
 
 /// `resume`: reopen a stopped subagent, and finish a message it was
@@ -366,11 +405,11 @@ async fn resume(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
             "Subagent `{name}` is ready for follow-up messages (call subagent with name \"{name}\" and a task).{last}"
         ));
     }
-    run_named(record, None, dir, ctx).await
+    run_named(record, None, dir, ctx, &Value::Null).await
 }
 
 /// Run a turn of a saved subagent and save it again.
-async fn run_named(mut record: Record, input: Option<Item>, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
+async fn run_named(mut record: Record, input: Option<Item>, dir: &Path, ctx: &ToolCtx, args: &Value) -> ToolOutput {
     let name = record.name.clone();
     let cancel = ctx.cancel.child_token();
     let live_label = if record.description.is_empty() { name.clone() } else { format!("{name}: {}", one_line(&record.description)) };
@@ -381,7 +420,7 @@ async fn run_named(mut record: Record, input: Option<Item>, dir: &Path, ctx: &To
     let mut items = std::mem::take(&mut record.items);
     let repairs = crate::session::repairs(&items);
     items.extend(repairs);
-    let mut agent = match child(ctx, record.mode == "general", true, items) {
+    let mut agent = match child(ctx, record.mode == "general", true, items, args) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -484,7 +523,10 @@ impl Ui for Collector {
     fn tool_end(&mut self, _: &str, _: &ToolOutput) {}
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
         match &self.approver {
-            Some(approver) => approver.approve(&self.origin, req).await,
+            Some(approver) => {
+                let _turn = APPROVALS.lock().await;
+                approver.approve(&self.origin, req).await
+            }
             None => Approval::No,
         }
     }
@@ -603,11 +645,43 @@ mod tests {
         }
     }
 
+    /// A stand-in session tool (skill or MCP) under `name`.
+    struct Named(&'static str);
+    #[async_trait::async_trait]
+    impl Tool for Named {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec { name: self.0.into(), description: String::new(), parameters: json!({}) }
+        }
+        fn summary(&self, _: &Value) -> String {
+            String::new()
+        }
+        async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
+            ToolOutput::ok("")
+        }
+    }
+
+    #[test]
+    fn children_inherit_skills_mcp_and_at_most_the_parent_mode() {
+        let shared: Vec<Arc<dyn Tool>> = vec![Arc::new(Named("skill")), Arc::new(Named("mcp__wiki__ask"))];
+        let names = |general| -> Vec<String> { child_tools(general, &shared).specs().into_iter().map(|s| s.name).collect() };
+        assert!(names(false).contains(&"skill".into()) && !names(false).contains(&"mcp__wiki__ask".into()));
+        assert!(names(true).contains(&"skill".into()) && names(true).contains(&"mcp__wiki__ask".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = ctx(&Fake::default(), dir.path());
+        parent.permission_mode = crate::permissions::Mode::Auto;
+        let mode = |args: Value| child(&parent, false, false, Vec::new(), &args).map(|a| a.permission_mode);
+        assert_eq!(mode(json!({})).ok(), Some(crate::permissions::Mode::Auto));
+        assert_eq!(mode(json!({"permission_mode": "ask"})).ok(), Some(crate::permissions::Mode::Ask));
+        assert_eq!(mode(json!({"permission_mode": "yolo"})).ok(), Some(crate::permissions::Mode::Auto));
+        assert!(mode(json!({"permission_mode": "bogus"})).is_err());
+    }
+
     #[test]
     fn general_mode_needs_approval_and_has_write_tools() {
         assert!(!Subagent.needs_approval(&json!({"task": "x"})));
         assert!(Subagent.needs_approval(&json!({"task": "x", "mode": "general"})));
-        let names: Vec<String> = child_tools(true)
+        let names: Vec<String> = child_tools(true, &[])
             .specs()
             .into_iter()
             .map(|s| s.name)
