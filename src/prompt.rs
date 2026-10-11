@@ -58,6 +58,7 @@ Relative paths still resolve from the working directory. Project instructions ar
             s.push_str(&format!("- {}\n", dir.display()));
         }
     }
+    s.push_str(&instructions_above(cwd, &crate::config::home()));
     for name in INSTRUCTION_FILES {
         let path = cwd.join(name);
         if let Ok(text) = crate::tools::read_rooted_text(cwd, &path) {
@@ -69,6 +70,39 @@ Relative paths still resolve from the working directory. Project instructions ar
     }
     let facts = crate::tools::memory::load(&crate::config::home()).unwrap_or_default();
     s.push_str(&crate::tools::memory::prompt_section(&facts));
+    s
+}
+
+/// Instruction files outside the working directory: the user's global
+/// `<home>/AGENTS.md`, then `AGENTS.md`/`CLAUDE.md` in each parent directory
+/// from the repository root down (none when the workspace is not inside a
+/// repository). Each file is read only from its own directory.
+fn instructions_above(cwd: &Path, home: &Path) -> String {
+    let mut s = String::new();
+    let mut add = |dir: &Path, name: &str, label: String| {
+        if let Ok(text) = crate::tools::read_rooted_text(dir, &dir.join(name)) {
+            let text = text.trim();
+            if !text.is_empty() {
+                s.push_str(&format!("\n\n# {label}\n\n{text}"));
+            }
+        }
+    };
+    add(home, "AGENTS.md", "User instructions (all projects)".into());
+    let root = cwd.ancestors().skip(1).find(|dir| dir.join(".git").exists());
+    if let Some(root) = root {
+        let parents: Vec<&Path> = cwd.ancestors().skip(1).take_while(|dir| dir.starts_with(root)).collect();
+        for (up, dir) in parents.iter().enumerate().rev() {
+            for name in ["AGENTS.md", "CLAUDE.md"] {
+                add(dir, name, format!("Project instructions ({}{name})", "../".repeat(up + 1)));
+            }
+        }
+    }
+    if !s.is_empty() {
+        s.push_str(
+            "\n\n(When instructions conflict, the user's direct requests come first, then the file closest to \
+             the files being changed.)",
+        );
+    }
     s
 }
 
@@ -123,6 +157,30 @@ mod tests {
             "{listed}"
         );
         assert!(listed.contains("Relative paths still resolve"), "{listed}");
+    }
+
+    #[test]
+    fn global_and_parent_instructions_are_included() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        let cwd = repo.join("crates/app");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(home.join("AGENTS.md"), "Global rule.").unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "Repo rule.").unwrap();
+        std::fs::write(repo.join("crates/CLAUDE.md"), "Crates rule.").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Outside the repo.").unwrap();
+        let text = instructions_above(&cwd, &home);
+        let global = text.find("Global rule.").unwrap();
+        let top = text.find("# Project instructions (../../AGENTS.md)\n\nRepo rule.").unwrap();
+        let mid = text.find("# Project instructions (../CLAUDE.md)\n\nCrates rule.").unwrap();
+        assert!(global < top && top < mid, "{text}");
+        assert!(!text.contains("Outside the repo."), "{text}");
+        // Outside a repository only the global file applies.
+        let text = instructions_above(dir.path(), &dir.path().join("none"));
+        assert!(text.is_empty(), "{text}");
     }
 
     #[test]
