@@ -1,5 +1,6 @@
-//! Signing in: the ChatGPT browser flow for the Codex provider, and API keys
-//! for hosted services (`nyq login opencode-go|opencode|xai|vercel`).
+//! Signing in: the ChatGPT browser flow for the Codex provider, the Grok
+//! subscription browser flow, and API keys for hosted services
+//! (`nyq login opencode-go|opencode|xai|vercel`).
 use std::{io::Write, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
@@ -318,8 +319,31 @@ pub fn store_key(home: &Path, service: Service, key: &str) -> Result<String> {
     Ok(msg)
 }
 
+/// Browser sign-in for a Grok subscription. `manual` is a pasted code, or
+/// `None` when stdin closes without one. The URL is always printed;
+/// `NYQ_NO_OPEN_BROWSER` skips opening it.
+pub async fn login_grok(
+    home: &Path,
+    manual: impl std::future::Future<Output = Result<Option<String>>>,
+) -> Result<String> {
+    crate::provider::grok::login(
+        home,
+        |url| {
+            crate::ui::info(&format!(
+                "Sign in to Grok in your browser (waiting up to 5 minutes):\n  {url}"
+            ));
+        },
+        open_browser,
+        manual,
+    )
+    .await
+}
+
 /// `nyq logout <provider>`: forget nyq's stored credentials.
-pub fn logout(home: &Path, provider: &str) -> Result<String> {
+pub async fn logout(home: &Path, provider: &str) -> Result<String> {
+    if provider.eq_ignore_ascii_case("grok") {
+        return crate::provider::grok::logout(home).await;
+    }
     if provider == "codex" {
         let path = home.join("chatgpt-auth.json");
         return Ok(match std::fs::remove_file(&path) {
@@ -329,7 +353,7 @@ pub fn logout(home: &Path, provider: &str) -> Result<String> {
         });
     }
     let service = Service::parse(provider)
-        .with_context(|| format!("unknown provider `{provider}` (expected codex, opencode-go, opencode, xai or vercel)"))?;
+        .with_context(|| format!("unknown provider `{provider}` (expected codex, grok, opencode-go, opencode, xai or vercel)"))?;
     Ok(if hosted::remove_key(home, service)? {
         format!("Removed the stored {} key.", service.title())
     } else {
