@@ -346,11 +346,10 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                     let lines: Vec<String> = s
                         .attachments
                         .iter()
-                        .enumerate()
-                        .map(|(i, a)| {
+                        .map(|a| {
                             format!(
-                                "[Image #{}] {}  {} · {} KB",
-                                i + 1,
+                                "{} {}  {} · {} KB",
+                                a.token(),
                                 a.label,
                                 a.image.media_type,
                                 a.image.data.len() * 3 / 4 / 1024
@@ -362,21 +361,19 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                     ui::info("  They go with your next message. /images remove N or /images clear drops them.");
                 }
                 ["clear"] => {
-                    s.attachments.clear();
+                    let ids: Vec<usize> = s.attachments.iter().map(|a| a.id).collect();
+                    for id in ids {
+                        s.detach(id);
+                    }
                     s.redraw();
                     drop(s);
                     ui::info("  cleared pending images");
                 }
                 ["remove" | "rm", n] => {
-                    let i = n
-                        .trim_start_matches('#')
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|i| (1..=s.attachments.len()).contains(i));
-                    let Some(i) = i else {
+                    let a = n.trim_start_matches('#').parse::<usize>().ok().and_then(|id| s.detach(id));
+                    let Some(a) = a else {
                         anyhow::bail!("no pending image #{n}")
                     };
-                    let a = s.attachments.remove(i - 1);
                     s.redraw();
                     drop(s);
                     ui::info(&format!("  removed image: {}", a.label));
