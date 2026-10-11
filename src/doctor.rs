@@ -25,6 +25,7 @@ fn auth_sources(home: &Path) -> Vec<String> {
     for (label, path) in [
         ("selected Codex auth", config::codex_auth_path(home)),
         ("profile ChatGPT auth", home.join("chatgpt-auth.json")),
+        ("Grok subscription", crate::provider::grok::auth_path(home)),
         (
             "Codex CLI auth",
             dirs::home_dir()
@@ -201,6 +202,7 @@ pub async fn doctor(
     let configured = provider.is_some();
     let auth = match provider.map(Provider::name) {
         Some("codex") => codex_auth_valid(home),
+        Some("grok") => crate::provider::grok::has_session(home),
         Some("ollama") => true,
         Some(_) => config::openai_config(home)
             .ok()

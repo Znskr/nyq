@@ -119,7 +119,7 @@ impl Total {
         self.input += r.input;
         self.output += r.output;
         self.cached += r.cached;
-        if r.provider == "codex" {
+        if r.provider == "codex" || r.provider == "grok" {
             self.subscription += 1;
         } else if let Some(c) = r.cost_usd {
             self.cost += c;
