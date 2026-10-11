@@ -723,7 +723,7 @@ impl Agent {
             let rule = if forced.is_some() {
                 None
             } else {
-                grant_rule(name, &args)
+                grant_rule_in(name, &args, &self.cwd, &self.sandbox.writable)
             };
             let save_rule = rule.clone().filter(|_| {
                 crate::permissions::saveable_in(name, &args, &self.cwd, &self.sandbox.writable)
@@ -1389,8 +1389,17 @@ pub(crate) fn subagent_mode(args: &Value) -> &'static str {
     }
 }
 
-/// The rule "always" would grant for this call, as stored in `Agent::allowed`.
+/// The rule "always" would grant for this call (no workspace context).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn grant_rule(tool: &str, args: &Value) -> Option<String> {
+    grant_rule_in(tool, args, &std::env::current_dir().unwrap_or_default(), &[])
+}
+
+/// The rule "always" would grant for this call, as stored in
+/// `Agent::allowed`: a bash prefix, the tool, a subagent mode, a site for
+/// `web_fetch`, and for paths outside the workspace that directory tree
+/// (`read_file:/data/**`, `write_file:/tmp/out/**`).
+pub fn grant_rule_in(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) -> Option<String> {
     if tool == "bash" {
         let cmd = args.get("command").and_then(Value::as_str)?;
         return bash_prefix(cmd).map(|p| format!("bash:{p}"));
@@ -1403,16 +1412,49 @@ pub fn grant_rule(tool: &str, args: &Value) -> Option<String> {
             .get("url")
             .and_then(Value::as_str)
             .filter(|u| !u.is_empty())?;
-        return Some(format!("web_fetch:{url}"));
+        return Some(match site(url) {
+            Some(origin) => format!("web_fetch:{origin}/*"),
+            None => format!("web_fetch:{url}"),
+        });
     }
-    if matches!(
-        tool,
-        "read_file" | "list_dir" | "glob" | "grep" | "view_image"
-    ) {
-        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        return Some(format!("{tool}:{path}"));
+    let read = crate::permissions::is_read_tool(tool);
+    if read || is_file_tool(tool) {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or(if read { "." } else { "" });
+        if !read && file_grant_ok_in(path, cwd, extra) {
+            return Some(tool.to_string());
+        }
+        if path.is_empty() || (!read && path_under_git(args, cwd)) {
+            return None;
+        }
+        let full = resolved(cwd, path)?;
+        // A file grants its directory; a searched or listed directory itself.
+        let dir = if matches!(tool, "read_file" | "view_image") || !read {
+            full.parent()?.to_path_buf()
+        } else {
+            full
+        };
+        // Never the whole filesystem.
+        dir.parent()?;
+        return Some(format!(
+            "{tool}:{}/**",
+            dir.to_string_lossy().replace('\\', "/").trim_end_matches('/')
+        ));
     }
     Some(tool.to_string())
+}
+
+/// `scheme://host[:port]` of a URL, when it has one.
+fn site(url: &str) -> Option<String> {
+    let origin = reqwest::Url::parse(url).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+/// A URL as parsed (lowercase host, explicit path).
+pub(crate) fn normalize_url(url: &str) -> Option<String> {
+    reqwest::Url::parse(url).ok().map(|u| u.to_string())
 }
 
 /// How a rule reads in the approval menu.
@@ -1424,12 +1466,17 @@ pub fn rule_label(rule: &str) -> String {
         return format!("`subagent` ({mode})");
     }
     if let Some(url) = rule.strip_prefix("web_fetch:") {
-        return format!("`web_fetch` {url}");
+        return match url.strip_suffix("/*") {
+            Some(origin) => format!("`web_fetch` on {origin}"),
+            None => format!("`web_fetch` {url}"),
+        };
     }
-    for name in ["read_file", "list_dir", "glob", "grep", "view_image"] {
-        if let Some(path) = rule.strip_prefix(&format!("{name}:")) {
-            return format!("`{name}` {path}");
+    if let Some((name, path)) = rule.split_once(':') {
+        if let Some(dir) = path.strip_suffix("/**") {
+            let what = if is_file_tool(name) { "edits" } else { "reads" };
+            return format!("{what} under {dir} (this session)");
         }
+        return format!("`{name}` {path}");
     }
     if is_file_tool(rule) {
         return format!("{} in this workspace", rule.replace('_', " "));
@@ -1437,8 +1484,37 @@ pub fn rule_label(rule: &str) -> String {
     format!("`{rule}`")
 }
 
+/// Whether a file tool's path (with symlinks resolved) is under a `.git`
+/// directory.
+pub(crate) fn path_under_git(args: &Value, cwd: &Path) -> bool {
+    let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+    let is_git = |p: &Path| {
+        p.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| s.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"))
+        })
+    };
+    is_git(Path::new(path)) || resolved(cwd, path).is_none_or(|p| is_git(&p))
+}
+
+/// `base.join(path)` normalized, with symlinks along its existing part
+/// resolved; None if it escapes via `..`.
+pub(crate) fn resolved(base: &Path, path: &str) -> Option<PathBuf> {
+    let full = lexical(base, path)?;
+    Some(
+        match full
+            .ancestors()
+            .find_map(|a| std::fs::canonicalize(a).ok().map(|real| (a, real)))
+        {
+            Some((existing, real)) => real.join(full.strip_prefix(existing).unwrap_or(Path::new(""))),
+            None => full.clone(),
+        },
+    )
+}
+
 /// Lexical normalization of `base.join(path)`, or None if it escapes via `..`.
-fn lexical(base: &Path, path: &str) -> Option<PathBuf> {
+pub(crate) fn lexical(base: &Path, path: &str) -> Option<PathBuf> {
     let mut full = PathBuf::new();
     for c in base.join(path).components() {
         match c {
@@ -1570,23 +1646,34 @@ pub fn is_allowed_in(
             .filter_map(|r| r.strip_prefix("bash:"))
             .any(|p| bash_matches(p, cmd));
     }
+    // Directory-tree grants for paths outside the workspace.
+    let tree = || {
+        allowed
+            .iter()
+            .any(|r| crate::permissions::path_rule_matches(r, tool, args, cwd, true))
+    };
     if is_file_tool(tool) {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-        return allowed.contains(tool) && file_grant_ok_in(path, cwd, extra);
+        return (allowed.contains(tool) && file_grant_ok_in(path, cwd, extra))
+            || (tree() && !path_under_git(args, cwd));
     }
     if tool == "subagent" {
         return allowed.contains(&format!("subagent:{}", subagent_mode(args)));
     }
     if tool == "web_fetch" {
         let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-        return allowed.contains(&format!("web_fetch:{url}"));
+        let norm = normalize_url(url);
+        return allowed.iter().filter_map(|r| r.strip_prefix("web_fetch:")).any(|p| {
+            // A site grant must match the parsed URL, so `https://a.com/*`
+            // never covers `https://a.com.evil/` or `https://a.com@evil/`.
+            match &norm {
+                Some(n) => crate::permissions::glob(p, n),
+                None => p == url,
+            }
+        });
     }
-    if matches!(
-        tool,
-        "read_file" | "list_dir" | "glob" | "grep" | "view_image"
-    ) {
-        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        return allowed.contains(&format!("{tool}:{path}"));
+    if crate::permissions::is_read_tool(tool) {
+        return tree();
     }
     allowed.contains(tool)
 }
@@ -2102,8 +2189,28 @@ mod tests {
         );
         assert_eq!(
             grant_rule("web_fetch", &json!({"url": "https://example.com/a"})).as_deref(),
-            Some("web_fetch:https://example.com/a")
+            Some("web_fetch:https://example.com/*")
         );
+        assert_eq!(
+            rule_label("web_fetch:https://example.com/*"),
+            "`web_fetch` on https://example.com"
+        );
+        // A site grant covers the whole site, however the URL is spelled,
+        // and nothing else.
+        let site: HashSet<String> = ["web_fetch:https://example.com/*".into()].into();
+        for url in ["https://example.com/a?x=1", "https://EXAMPLE.com", "https://example.com/b/c"] {
+            assert!(is_allowed(&site, "web_fetch", &json!({ "url": url }), cwd), "{url}");
+        }
+        for url in [
+            "https://example.com.evil.net/",
+            "https://example.com@evil.net/",
+            "http://example.com/",
+            "https://example.com:8443/",
+            "https://sub.example.com/",
+        ] {
+            assert!(!is_allowed(&site, "web_fetch", &json!({ "url": url }), cwd), "{url}");
+        }
+        // An exact-URL rule (as saved before) still matches only that URL.
         assert!(!is_allowed(
             &["web_fetch:https://example.com/a".into()].into(),
             "web_fetch",
@@ -3025,6 +3132,49 @@ mod tests {
         ));
         let git = extra.join(".git").join("config");
         assert!(!file_grant_ok_in(git.to_str().unwrap(), &primary, &[extra]));
+    }
+
+    #[test]
+    fn always_outside_the_workspace_grants_the_directory_tree() {
+        use serde_json::json;
+        let work = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cwd = work.path();
+        let real = std::fs::canonicalize(data.path()).unwrap();
+        let root = real.to_str().unwrap().replace('\\', "/");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let file = format!("{root}/notes.txt");
+        let rule = grant_rule_in("read_file", &json!({ "path": file }), cwd, &[]).unwrap();
+        assert_eq!(rule, format!("read_file:{root}/**"));
+        assert!(rule_label(&rule).starts_with(&format!("reads under {root}")));
+        let granted: HashSet<String> = [rule].into();
+        let ok = |tool: &str, path: &str| is_allowed(&granted, tool, &json!({ "path": path }), cwd);
+        assert!(ok("read_file", &format!("{root}/sub/deep.txt")));
+        assert!(ok("list_dir", &root));
+        assert!(ok("grep", &format!("{root}/sub")));
+        assert!(!ok("read_file", "/etc/hosts"));
+        assert!(!ok("write_file", &file), "a read grant never covers edits");
+
+        // Edits outside the workspace: the file's directory tree, not .git.
+        let rule = grant_rule_in("write_file", &json!({ "path": format!("{root}/sub/a.txt") }), cwd, &[]).unwrap();
+        assert_eq!(rule, format!("write_file:{root}/sub/**"));
+        let granted: HashSet<String> = [rule].into();
+        let ok = |tool: &str, path: &str| is_allowed(&granted, tool, &json!({ "path": path }), cwd);
+        assert!(ok("edit_file", &format!("{root}/sub/b.txt")));
+        assert!(!ok("edit_file", &format!("{root}/c.txt")));
+        assert!(!ok("write_file", &format!("{root}/sub/.git/config")));
+        assert_eq!(
+            grant_rule_in("write_file", &json!({ "path": format!("{root}/.git/x") }), cwd, &[]),
+            None
+        );
+        // Inside the workspace a write grant stays the plain tool grant; the
+        // filesystem root is never granted as a tree.
+        assert_eq!(
+            grant_rule_in("write_file", &json!({"path": "src/a.rs"}), cwd, &[]).as_deref(),
+            Some("write_file")
+        );
+        #[cfg(unix)]
+        assert_eq!(grant_rule_in("list_dir", &json!({"path": "/"}), cwd, &[]), None);
     }
 
     #[tokio::test]
