@@ -579,9 +579,18 @@ impl Agent {
         Ok(TurnEnd::Done)
     }
 
-    /// The tools offered on the next request.
+    /// Whether the session model cannot read images (see `tools::image::VISION`).
+    fn text_only(&self) -> bool {
+        crate::tools::image::text_only(self.provider.pricing_provider(), self.provider.model())
+    }
+
+    /// The tools offered on the next request: `vision` replaces `view_image`
+    /// for a text-only model.
     fn advertised(&self) -> Vec<crate::types::ToolSpec> {
-        self.tools.advertised()
+        let hidden = if self.text_only() { "view_image" } else { crate::tools::image::VISION };
+        let mut specs = self.tools.advertised();
+        specs.retain(|s| s.name != hidden);
+        specs
     }
 
     /// Store a tool result in the transcript (credentials scrubbed, large
@@ -1329,7 +1338,16 @@ impl Agent {
         Ok(true)
     }
 
-    pub(crate) fn push_counted(&mut self, item: Item) {
+    pub(crate) fn push_counted(&mut self, mut item: Item) {
+        // A text-only model gets attached images as files for `vision`.
+        if let Item::User { text, images } = &mut item {
+            if !images.is_empty() && self.text_only() {
+                let key = crate::tools::artifacts::session_key(self.session.as_ref().map(|s| s.id.as_str()));
+                let note = crate::tools::image::park_images(&crate::config::home(), &key, images);
+                text.push_str(&format!("\n\n{note}"));
+                images.clear();
+            }
+        }
         if !self.context_estimated {
             self.context_tokens = self.context_tokens.saturating_add(item_tokens(&item));
         }
@@ -3944,5 +3962,49 @@ mod tests {
         assert!(notes.contains("no question UI"), "{notes}");
         agent.tools.add(Box::new(AskUserTool));
         assert!(!agent.session_notes().contains("no question UI"));
+    }
+
+    #[test]
+    fn a_text_only_model_gets_vision_and_parked_images() {
+        struct TextOnly;
+        #[async_trait::async_trait]
+        impl Provider for TextOnly {
+            fn name(&self) -> &str {
+                "textonly-test"
+            }
+            fn model(&self) -> &str {
+                "t1"
+            }
+            fn set_model(&mut self, _: String) {}
+            fn fork(&self) -> Box<dyn Provider> {
+                Box::new(TextOnly)
+            }
+            async fn stream(&self, _: Request<'_>, _: EventSink<'_>) -> Result<Response> {
+                anyhow::bail!("unused")
+            }
+        }
+        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let doc = serde_json::json!({"textonly-test": {"models": {"t1": {"modalities": {"input": ["text"], "output": ["text"]}}}}});
+        std::fs::write(home.path().join("models.json"), doc.to_string()).unwrap();
+        let old = std::env::var_os("NYQ_HOME");
+        std::env::set_var("NYQ_HOME", home.path());
+        let mut subject = agent(Response::default(), None);
+        subject.tools = Registry::builtin();
+        let names: Vec<String> = subject.advertised().into_iter().map(|s| s.name).collect();
+        assert!(!names.contains(&"vision".to_string()) && names.contains(&"view_image".to_string()));
+
+        let mut agent = subject;
+        agent.provider = Box::new(TextOnly);
+        let names: Vec<String> = agent.advertised().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"vision".to_string()) && !names.contains(&"view_image".to_string()));
+        let png = crate::types::Image { media_type: "image/png".into(), data: "iVBORw0KGgo=".into() };
+        agent.push_counted(Item::User { text: "look".into(), images: vec![png] });
+        match old {
+            Some(v) => std::env::set_var("NYQ_HOME", v),
+            None => std::env::remove_var("NYQ_HOME"),
+        }
+        let Some(Item::User { text, images }) = agent.items.last() else { panic!() };
+        assert!(images.is_empty() && text.starts_with("look\n\n[Image(s) attached: "), "{text}");
     }
 }
