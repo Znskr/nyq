@@ -13,11 +13,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Runs on the self-hosted machine (label nyq-linux): no GitHub minutes.
+  # Runs on the dedicated AWS Lightsail runner.
   linux:
-    name: test (self-hosted linux)
-    runs-on: [self-hosted, nyq-linux]
+    name: test (AWS linux)
+    runs-on: [self-hosted, Linux, X64, nyq-aws]
+    timeout-minutes: 30
     env:
+      CARGO_BUILD_JOBS: 2
       CARGO_TARGET_DIR: ${{ github.workspace }}/../nyq-ci-target
     steps:
       - uses: actions/checkout@v4
