@@ -4,7 +4,9 @@
 pub mod clipboard;
 pub mod editor;
 pub mod mode_menu;
+mod highlight;
 mod render;
+pub mod theme;
 pub mod settings;
 pub mod statusline;
 pub mod transcript;
@@ -152,12 +154,12 @@ fn banner_text(version: &str) -> String {
         "{} {}",
         paint(
             true,
-            Style::new().bold().fg(Color::Rgb(238, 238, 238)),
+            theme::fg(theme::BRIGHT).bold(),
             "𝒏yq"
         ),
         paint(
             true,
-            Style::new().fg(Color::Rgb(138, 138, 138)),
+            theme::fg(theme::GRAY),
             &format!(
                 "v{} · Run /help for commands · ctrl+l models · ctrl+d quit",
                 sanitize_text(version)
