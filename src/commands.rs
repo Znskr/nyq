@@ -502,6 +502,42 @@ pub fn fresh(agent: &mut Agent, sessions_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resume with the model, effort and fast mode a session last used. When the
+/// model can't be built (signed out, provider gone), the current one stays.
+pub fn restore_prefs(home: &Path, agent: &mut Agent, prefs: Option<&session::Prefs>) {
+    let Some(p) = prefs.filter(|p| !p.provider.is_empty() && !p.model.is_empty()) else {
+        return;
+    };
+    if p.provider != agent.provider.name() || p.model != agent.provider.model() {
+        let choice = ModelChoice {
+            provider: p.provider.clone(),
+            model: p.model.clone(),
+            ..ModelChoice::default()
+        };
+        match crate::models::build(home, &choice, p.effort.clone()) {
+            Ok(provider) => {
+                agent.provider = provider;
+                agent.set_context_window(crate::config::context_window_for(
+                    agent.provider.name(),
+                    agent.provider.context_window(),
+                ));
+            }
+            Err(e) => {
+                ui::error(&format!(
+                    "could not restore {} · {} ({e:#}); using {} · {}",
+                    p.provider,
+                    p.model,
+                    agent.provider.name(),
+                    agent.provider.model()
+                ));
+                return;
+            }
+        }
+    }
+    agent.provider.set_effort(p.effort.clone());
+    agent.provider.set_fast(p.fast);
+}
+
 /// `/reset`: drop the transcript and background processes, keeping this
 /// session's settings. (`/new` and `/clear` keep background processes.)
 pub fn reset(agent: &mut Agent) -> Result<()> {

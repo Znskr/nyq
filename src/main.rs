@@ -759,6 +759,10 @@ async fn run() -> Result<()> {
         None
     };
     commands::apply_startup(&home, &mut agent);
+    // A resumed session keeps its model unless one is given on the command line.
+    if let Some(meta) = resumed.as_ref().filter(|_| cli.model.is_none() && cli.provider.is_none()) {
+        commands::restore_prefs(&home, &mut agent, meta.prefs.as_ref());
+    }
     if !interactive {
         anyhow::ensure!(
             !pick,
@@ -840,6 +844,7 @@ async fn run() -> Result<()> {
 
     loop {
         grants::persist(&mut agent);
+        agent.sync_prefs();
         sync_footer(&tui, &agent, current.as_ref());
         let line = match pending.pop_front() {
             Some(t) => t,
@@ -1407,7 +1412,10 @@ async fn shell(cmd: &str, cwd: &Path, tui: &Tui) {
 }
 
 fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
-    Ok(format_sessions(&session::list(dir)?))
+    let (all, skipped) = session::list_report(dir)?;
+    let mut lines = format_sessions(&all);
+    lines.extend(session::skipped_warning(skipped.len()));
+    Ok(lines)
 }
 
 fn format_sessions(all: &[session::Meta]) -> Vec<String> {
@@ -1419,7 +1427,7 @@ fn format_sessions(all: &[session::Meta]) -> Vec<String> {
             format!(
                 "{}  {}  {}  {}",
                 session_label(&m.id),
-                m.created
+                m.updated
                     .with_timezone(&chrono::Local)
                     .format("%Y-%m-%d %H:%M"),
                 m.cwd.display(),
@@ -1452,6 +1460,7 @@ async fn resume_session(
         }
     };
     agent.reset(Some(s));
+    commands::restore_prefs(&config::home(), agent, meta.prefs.as_ref());
     ui::replay(&items);
     agent.items = items;
     agent.adopt_transcript();
@@ -1472,7 +1481,10 @@ fn open_sessions(tui: &Tui, sessions_dir: &std::path::Path, agent: &Agent) -> Re
 /// `nyq sessions`: this directory's conversations (or every one when `cwd`
 /// is None), newest first.
 fn list_sessions(dir: &Path, cwd: Option<&Path>, limit: Option<u16>, json: bool) -> Result<()> {
-    let mut all = session::list(dir)?;
+    let (mut all, skipped) = session::list_report(dir)?;
+    if let Some(warning) = session::skipped_warning(skipped.len()) {
+        eprintln!("{warning}");
+    }
     if let Some(cwd) = cwd {
         all.retain(|m| session::same_cwd(&m.cwd, cwd));
     }
