@@ -16,8 +16,11 @@ mod limits;
 mod login;
 mod mcp;
 mod mcp_cli;
+mod mcp_client;
 mod mcp_features;
 mod mcp_slash;
+mod mcp_schema;
+mod mcp_sse;
 mod models;
 mod notify;
 mod permissions;
@@ -813,7 +816,17 @@ async fn run() -> Result<()> {
         ui::replay(&agent.items);
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     }
-    mcp_slash::connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
+    // Prompt commands follow servers that connect or change later.
+    let screen = tui.screen.clone();
+    mcp.on_change(move |mcp| {
+        let commands = mcp_features::prompt_commands(mcp);
+        screen.lock().unwrap_or_else(|e| e.into_inner()).editor.set_mcp_commands(commands);
+    });
+    if let Err(e) = mcp_slash::connect_profile_servers(&mut mcp, &mut agent, &servers, false).await {
+        drop(tui);
+        mcp.shutdown().await;
+        return Err(e);
+    }
     mcp_features::sync(&mut agent, &mcp);
     tui.screen()
         .editor
@@ -1304,7 +1317,10 @@ async fn print_mode(
     if let Some(meta) = resumed {
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
     }
-    mcp_slash::connect_profile_servers(mcp, agent, servers, true).await;
+    if let Err(e) = mcp_slash::connect_profile_servers(mcp, agent, servers, true).await {
+        mcp.shutdown().await;
+        return Err(e);
+    }
     mcp_features::sync(agent, mcp);
     hooks::session_start(agent, if resumed.is_some() { "resume" } else { "startup" }).await;
     let mut plain = ui::PlainUi::new(agent.permission_mode.is_yolo());

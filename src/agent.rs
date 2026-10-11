@@ -335,8 +335,15 @@ impl Agent {
             if !self.auto_compact(ui, &cancel).await? {
                 return Ok(TurnEnd::Cancelled);
             }
+            // MCP servers that connected or changed their tools since the last step.
+            self.tools.refresh();
             let specs = self.tools.advertised();
-            let note = continue_note.then(|| format!("{}{CONTINUE_NOTE}", self.system));
+            let mcp = crate::tools::mcp_search::notes_section(&self.tools.mcp_notes());
+            let system = match &mcp {
+                Some(section) => std::borrow::Cow::Owned(format!("{}\n\n{section}", self.system)),
+                None => std::borrow::Cow::Borrowed(self.system.as_str()),
+            };
+            let note = continue_note.then(|| format!("{system}{CONTINUE_NOTE}"));
             crate::trace::log("provider", || {
                 format!(
                     "request {}/{} · {} items · {} tools",
@@ -348,7 +355,7 @@ impl Agent {
             });
             let started = std::time::Instant::now();
             let result = {
-                let system = note.as_deref().unwrap_or(self.system.as_str());
+                let system = note.as_deref().unwrap_or(&system);
                 let req = Request {
                     system,
                     items: &self.items,
