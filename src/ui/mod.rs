@@ -197,6 +197,15 @@ pub fn list(lines: &[String]) {
     }
 }
 
+/// The session title shown in the status line and the window title.
+pub fn set_session_title(title: &str) {
+    if let Some(screen) = tui::active() {
+        let mut s = screen.lock().unwrap_or_else(|e| e.into_inner());
+        s.footer.title = one_line(title, 200);
+        s.redraw();
+    }
+}
+
 pub fn info(msg: &str) {
     let msg = sanitize_text(msg);
     match tui::active() {

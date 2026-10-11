@@ -560,6 +560,7 @@ async fn run() -> Result<()> {
         }
         if let Some(meta) = &resumed {
             ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+        ui::set_session_title(&meta.title);
         }
         connect_profile_servers(&mut mcp, &mut agent, &servers, true).await;
         mcp_features::sync(&mut agent, &mcp);
@@ -622,6 +623,7 @@ async fn run() -> Result<()> {
     if let Some(meta) = &resumed {
         ui::replay(&agent.items);
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+        ui::set_session_title(&meta.title);
     }
     connect_profile_servers(&mut mcp, &mut agent, &servers, false).await;
     mcp_features::sync(&mut agent, &mcp);
@@ -766,6 +768,9 @@ async fn run() -> Result<()> {
             }
         }
         tui.screen().print_user(&line);
+        if tui.screen().footer.title.is_empty() {
+            ui::set_session_title(&session::title_of(&line));
+        }
         // UserPromptSubmit sees the text the model gets (templates and MCP
         // prompts expanded); a blocked prompt keeps its pending attachments.
         if let Some(msg) =
@@ -822,6 +827,11 @@ async fn run() -> Result<()> {
         pending.extend(queue_leftovers(leftover));
     }
     drop(tui);
+    if relaunch.is_none() {
+        if let Some(id) = agent.session.as_ref().filter(|s| s.is_saved()).map(|s| s.id.clone()) {
+            eprintln!("Resume with: nyq -r {id}");
+        }
+    }
     if let Some(u) = &upgrader {
         u.stop();
     }
@@ -1140,6 +1150,7 @@ async fn resume_session(
     agent.items = items;
     agent.adopt_transcript();
     ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+    ui::set_session_title(&meta.title);
     hooks::session_start(agent, "resume").await;
     Ok(())
 }
@@ -1187,6 +1198,7 @@ async fn slash(
         }
         "/new" | "/clear" => {
             commands::fresh(agent, sessions_dir)?;
+            ui::set_session_title("");
             hooks::session_start(agent, "new").await;
         }
         "/reset" => commands::reset(agent)?,
