@@ -424,8 +424,8 @@ pub(crate) fn install_archive(bytes: &[u8], name: &str, version: &str, exe: &Pat
     replace_exe(&new_bin, exe, |staged| check_binary(staged, version))
 }
 
-/// `nyq upgrade [--channel stable|latest] [--check]`.
-pub async fn run(home: &Path, channel: Option<Channel>, check: bool) -> Result<()> {
+/// `nyq upgrade [--channel stable|latest] [--check] [--json]`.
+pub async fn run(home: &Path, channel: Option<Channel>, check: bool, json: bool) -> Result<()> {
     let mut state = load(home);
     if let Some(c) = channel.filter(|c| state.channel != Some(*c)) {
         state.channel = Some(c);
@@ -433,17 +433,34 @@ pub async fn run(home: &Path, channel: Option<Channel>, check: bool) -> Result<(
     }
     let channel = state.channel.unwrap_or_default();
     let name = platform_archive().context("no prebuilt nyq release exists for this platform; build from source instead")?;
+    let report = |status: &str, latest: &str, text: String| {
+        if json {
+            let value = serde_json::json!({
+                "status": status,
+                "current": CURRENT,
+                "latest": latest,
+                "channel": channel.label(),
+            });
+            println!("{value}");
+        } else {
+            println!("{text}");
+        }
+    };
 
     eprintln!("Checking for updates ({} channel)...", channel.label());
     let mut gh = Github::new(Duration::from_secs(300))?;
     let (release, latest) = newest(&mut gh, channel).await?;
     record_check(home, Some(&latest));
     if !is_newer(&latest, CURRENT) {
-        println!("nyq {CURRENT} is up to date ({} channel).", channel.label());
+        report("up_to_date", &latest, format!("nyq {CURRENT} is up to date ({} channel).", channel.label()));
         return Ok(());
     }
     if check {
-        println!("Update available: nyq {CURRENT} -> {latest} ({} channel). Run `nyq upgrade` to install it.", channel.label());
+        let text = format!(
+            "Update available: nyq {CURRENT} -> {latest} ({} channel). Run `nyq upgrade` to install it.",
+            channel.label()
+        );
+        report("available", &latest, text);
         return Ok(());
     }
 
@@ -451,7 +468,7 @@ pub async fn run(home: &Path, channel: Option<Channel>, check: bool) -> Result<(
     eprintln!("Downloading {name} ({})...", release.tag_name);
     let bytes = download_verified(&gh, &release, &name).await?;
     install_archive(&bytes, &name, &latest, &exe)?;
-    println!("Upgraded nyq {CURRENT} -> {latest} ({}).", exe.display());
+    report("upgraded", &latest, format!("Upgraded nyq {CURRENT} -> {latest} ({}).", exe.display()));
     Ok(())
 }
 

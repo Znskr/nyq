@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol as sdk;
+use anyhow::Context as _;
 use sdk::schema::v1 as acp;
 use sdk::schema::ProtocolVersion;
 use sdk::{Client, ConnectTo, ConnectionTo, Responder};
@@ -36,6 +37,23 @@ pub struct Options {
     pub allow_network: bool,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// `--add-dir`: extra writable directories for every session.
+    pub add_dirs: Vec<PathBuf>,
+    /// `--no-additional-dirs`: ignore the directories saved per workspace.
+    pub no_additional_dirs: bool,
+    /// `--log-file`: append request and error logs here.
+    pub log_file: Option<PathBuf>,
+}
+
+/// Report a problem on stderr and in the log file (`--log-file`).
+fn warn(msg: String) {
+    crate::trace::log("acp", || format!("error: {msg}"));
+    eprintln!("nyq: {msg}");
+}
+
+/// Log one request (`--log-file`, or `NYQ_TRACE`).
+fn log_request(method: &str, detail: impl FnOnce() -> String) {
+    crate::trace::log("acp", || format!("{method} {}", detail()));
 }
 
 const MODE_ASK: &str = "ask";
@@ -61,6 +79,11 @@ type ProviderFactory = Arc<dyn Fn() -> anyhow::Result<Box<dyn Provider>> + Send 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     let home = config::home();
+    if let Some(path) = &opts.log_file {
+        crate::trace::to_file(path, None)
+            .with_context(|| format!("opening log file {}", path.display()))?;
+        log_request("start", || format!("nyq {}", env!("CARGO_PKG_VERSION")));
+    }
     let policy = sandbox_policy(&opts)?;
     let factory: ProviderFactory = {
         let (home, provider, model) = (home.clone(), opts.provider.clone(), opts.model.clone());
@@ -88,7 +111,7 @@ fn sandbox_policy(opts: &Options) -> anyhow::Result<sandbox::Policy> {
                 "sandbox unavailable: {e} (use --sandbox off to run commands unconfined)"
             );
         }
-        eprintln!("nyq: sandbox unavailable ({e}); shell commands will run unconfined");
+        warn(format!("sandbox unavailable ({e}); shell commands will run unconfined"));
         policy.mode = sandbox::Mode::Off;
     }
     Ok(policy)
@@ -163,7 +186,7 @@ impl State {
                 }
                 let (choices, warnings) = models::list(&self.home).await;
                 for w in warnings {
-                    eprintln!("nyq: model list: {w}");
+                    warn(format!("model list: {w}"));
                 }
                 choices
             })
@@ -180,12 +203,15 @@ fn internal(e: impl std::fmt::Display) -> sdk::Error {
 }
 
 fn anyhow_error(e: anyhow::Error) -> sdk::Error {
-    internal(format!("{e:#}"))
+    let msg = format!("{e:#}");
+    crate::trace::log("acp", || format!("error: {msg}"));
+    internal(msg)
 }
 
 // ------------------------------------------------------------------ server
 
 async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyhow::Result<()> {
+    let s10 = state.clone();
     let (s1, s2, s3, s4, s5, s6, s7, s8, s9) = (
         state.clone(),
         state.clone(),
@@ -235,6 +261,19 @@ async fn serve(state: Arc<State>, transport: impl ConnectTo<sdk::Agent>) -> anyh
                 let st = s3.clone();
                 tokio::spawn(async move {
                     let r = load_session(&st, &cx, req).await;
+                    let _ = responder.respond_with_result(r);
+                });
+                Ok(())
+            },
+            sdk::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: acp::ResumeSessionRequest,
+                        responder: Responder<acp::ResumeSessionResponse>,
+                        cx: ConnectionTo<Client>| {
+                let st = s10.clone();
+                tokio::spawn(async move {
+                    let r = resume_session(&st, &cx, req).await;
                     let _ = responder.respond_with_result(r);
                 });
                 Ok(())
@@ -348,6 +387,7 @@ fn initialize(req: acp::InitializeRequest) -> acp::InitializeResponse {
                 .session_capabilities(
                     acp::SessionCapabilities::new()
                         .list(acp::SessionListCapabilities::new())
+                        .resume(acp::SessionResumeCapabilities::new())
                         .close(acp::SessionCloseCapabilities::new()),
                 ),
         )
@@ -371,6 +411,7 @@ async fn new_session(
     req: acp::NewSessionRequest,
 ) -> Result<acp::NewSessionResponse, sdk::Error> {
     check_cwd(&req.cwd)?;
+    log_request("session/new", || format!("cwd={}", req.cwd.display()));
     let provider = (state.make_provider)().map_err(anyhow_error)?;
     let session =
         Session::create(&state.sessions_dir(), &req.cwd, provider.model()).map_err(anyhow_error)?;
@@ -395,24 +436,63 @@ async fn load_session(
     req: acp::LoadSessionRequest,
 ) -> Result<acp::LoadSessionResponse, sdk::Error> {
     check_cwd(&req.cwd)?;
-    let id = req.session_id.0.to_string();
+    log_request("session/load", || format!("{} cwd={}", req.session_id, req.cwd.display()));
+    let live = reopen(state, &req.session_id, req.cwd, &req.mcp_servers).await?;
+    {
+        let inner = live.inner.lock().await;
+        replay(cx, &live.id, &inner.agent);
+    }
+    let (modes, options) = describe(state, &live, cx);
+    Ok(acp::LoadSessionResponse::new()
+        .modes(modes)
+        .config_options(options))
+}
+
+/// `session/resume`: reconnect to a live or saved session without replaying
+/// its history.
+async fn resume_session(
+    state: &Arc<State>,
+    cx: &ConnectionTo<Client>,
+    req: acp::ResumeSessionRequest,
+) -> Result<acp::ResumeSessionResponse, sdk::Error> {
+    check_cwd(&req.cwd)?;
+    log_request("session/resume", || format!("{} cwd={}", req.session_id, req.cwd.display()));
+    let held = lock(&state.sessions).get(&*req.session_id.0).cloned();
+    let live = match held {
+        Some(live) if live.cwd == req.cwd => live,
+        _ => reopen(state, &req.session_id, req.cwd, &req.mcp_servers).await?,
+    };
+    let (modes, options) = describe(state, &live, cx);
+    Ok(acp::ResumeSessionResponse::new()
+        .modes(modes)
+        .config_options(options))
+}
+
+/// Open a saved session afresh, replacing a live copy of it.
+async fn reopen(
+    state: &Arc<State>,
+    session_id: &acp::SessionId,
+    cwd: PathBuf,
+    mcp_servers: &[acp::McpServer],
+) -> Result<Arc<Live>, sdk::Error> {
+    let id = session_id.0.to_string();
     // The live copy holds the session file lock. Release it before reopening,
     // and put a handle back if that reopen fails.
     let held = lock(&state.sessions).get(&id).cloned();
     let loaded = if let Some(old) = &held {
         let mut inner = old.inner.lock().await;
         drop(inner.agent.session.take());
-        match session::load(&state.sessions_dir(), &id, &req.cwd) {
+        match session::load(&state.sessions_dir(), &id, &cwd) {
             Ok(loaded) => loaded,
             Err(e) => {
-                if let Ok((s, _, _)) = session::load(&state.sessions_dir(), &id, &req.cwd) {
+                if let Ok((s, _, _)) = session::load(&state.sessions_dir(), &id, &cwd) {
                     inner.agent.session = Some(s);
                 }
                 return Err(anyhow_error(e));
             }
         }
     } else {
-        session::load(&state.sessions_dir(), &id, &req.cwd).map_err(anyhow_error)?
+        session::load(&state.sessions_dir(), &id, &cwd).map_err(anyhow_error)?
     };
     let (session, meta, items) = loaded;
     if meta.id != id {
@@ -426,15 +506,7 @@ async fn load_session(
         old.inner.lock().await.mcp.shutdown().await;
     }
     let provider = (state.make_provider)().map_err(anyhow_error)?;
-    let live = open(state, req.cwd, provider, session, items, &req.mcp_servers).await;
-    {
-        let inner = live.inner.lock().await;
-        replay(cx, &live.id, &inner.agent);
-    }
-    let (modes, options) = describe(state, &live, cx);
-    Ok(acp::LoadSessionResponse::new()
-        .modes(modes)
-        .config_options(options))
+    Ok(open(state, cwd, provider, session, items, mcp_servers).await)
 }
 
 /// Build the agent for a session, connect MCP servers and register it.
@@ -446,14 +518,28 @@ async fn open(
     items: Vec<Item>,
     client_servers: &[acp::McpServer],
 ) -> Arc<Live> {
-    let sandbox = Arc::new(state.policy.clone());
+    let mut policy = state.policy.clone();
+    // `--add-dir` and the directories saved for this workspace, as in the shell.
+    match crate::workspace::Runtime::prepare(
+        &state.home,
+        &cwd,
+        &state.opts.add_dirs,
+        state.opts.no_additional_dirs,
+    ) {
+        Ok(prepared) => {
+            prepared.warnings.into_iter().for_each(warn);
+            policy.writable = prepared.active;
+        }
+        Err(e) => warn(format!("additional directories: {e:#}")),
+    }
+    let sandbox = Arc::new(policy);
     let (permissions, warnings) = crate::permissions::Permissions::load(&state.home, &cwd);
     for w in warnings {
-        eprintln!("nyq: {w}");
+        warn(w);
     }
     let (hooks, warnings) = crate::hooks::Hooks::load(&state.home, &cwd);
     for w in warnings {
-        eprintln!("nyq: {w}");
+        warn(w);
     }
     let source = if items.is_empty() {
         "startup"
@@ -499,7 +585,7 @@ async fn open(
     let mut mcp = McpManager::new(state.home.clone());
     let (servers, warnings) = mcp::load_configs(&state.home, &cwd);
     for w in warnings {
-        eprintln!("nyq: {w}");
+        warn(w);
     }
     let mut wanted: Vec<ServerConfig> = servers
         .into_iter()
@@ -512,7 +598,7 @@ async fn open(
                 wanted.retain(|s| s.name != cfg.name);
                 wanted.push(cfg);
             }
-            Err(e) => eprintln!("nyq: {e}"),
+            Err(e) => warn(e.to_string()),
         }
     }
     for cfg in &wanted {
@@ -593,7 +679,7 @@ async fn connect_server(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerCon
             for tool in tools {
                 let name = tool.spec().name.clone();
                 if let Err(e) = agent.tools.try_insert(tool) {
-                    eprintln!("nyq: MCP {}: {e}", cfg.name);
+                    warn(format!("MCP {}: {e}", cfg.name));
                     agent.tools.remove_names(&added);
                     agent.tools.remove_prefix(&mcp::tool_prefix(&cfg.name));
                     let _ = mcp.disconnect(&cfg.name).await;
@@ -602,7 +688,7 @@ async fn connect_server(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerCon
                 added.push(name);
             }
         }
-        Err(e) => eprintln!("nyq: MCP {}: {e:#}", cfg.name),
+        Err(e) => warn(format!("MCP {}: {e:#}", cfg.name)),
     }
 }
 
@@ -786,6 +872,7 @@ async fn prompt(
     req: acp::PromptRequest,
     request_cancel: sdk::RequestCancellation,
 ) -> Result<acp::PromptResponse, sdk::Error> {
+    log_request("session/prompt", || req.session_id.to_string());
     let live = state.get(&req.session_id)?;
     let item = user_item(&req.prompt, &live.cwd);
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1087,7 +1174,7 @@ impl Asker {
                 _ => Approval::No,
             },
             Err(e) => {
-                eprintln!("nyq: permission request failed: {e}");
+                warn(format!("permission request failed: {e}"));
                 Approval::No
             }
         };

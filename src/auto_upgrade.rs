@@ -303,7 +303,16 @@ pub struct Relaunch {
 }
 
 /// Options of the interactive command line that take a value (kept with it).
-pub(crate) const VALUE_LONG: &[&str] = &["--model", "--provider", "--permission-mode", "--sandbox", "--add-dir"];
+pub(crate) const VALUE_LONG: &[&str] = &[
+    "--model",
+    "--provider",
+    "--permission-mode",
+    "--sandbox",
+    "--add-dir",
+    "--context-limit",
+    "--system",
+    "--image",
+];
 pub(crate) const VALUE_SHORT: &[char] = &['m'];
 /// Flags that must not carry over: they pick or start a conversation, or (a
 /// tape) can't be reopened for the same session.
