@@ -461,6 +461,7 @@ fn ask_json(
         "session_id": session_id,
         "steps": steps,
         "tool_calls": record.map_or(&[][..], |r| r.tool_calls.as_slice()),
+        "notices": record.map_or(&[][..], |r| r.notices.as_slice()),
     });
     if let Some(e) = error {
         v["error"] = e.into();

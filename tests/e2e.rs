@@ -278,7 +278,15 @@ fn auto_compaction_and_resume_discard_earlier_tool_output() {
     let resumed = seen[3]["messages"].as_array().unwrap();
     assert_eq!(resumed.len(), 3);
     assert!(resumed[1]["content"].as_str().unwrap().ends_with(summary));
-    assert_eq!(resumed[2], json!({"role":"user","content":"next"}));
+    assert_eq!(resumed[2]["role"], "user");
+    assert_eq!(without_note(&resumed[2]["content"]), "next");
+}
+
+/// A message's text without the per-request session note nyq appends to the
+/// newest message.
+fn without_note(text: &Value) -> &str {
+    let text = text.as_str().unwrap();
+    text.split("\n\n[Session state]").next().unwrap_or(text)
 }
 
 // A complete 1x1 PNG, rather than just the image magic bytes.
@@ -322,7 +330,7 @@ fn prompt_attaches_workspace_image() {
     assert_eq!(seen.len(), 1);
     assert_image(&seen[0]["messages"][1]);
     assert_eq!(
-        seen[0]["messages"][1]["content"][0]["text"],
+        without_note(&seen[0]["messages"][1]["content"][0]["text"]),
         "describe @shot.png"
     );
 }
@@ -624,9 +632,10 @@ fn env_sets_permission_mode_and_step_limit() {
         .args(["--json", "read x"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
+    // Reaching the limit ends the run with a notice, not an error.
+    assert_eq!(out.status.code(), Some(0));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(v["error"].as_str().unwrap().contains("stopped after 1 steps"), "{v}");
+    assert!(v["notices"][0].as_str().unwrap().contains("Stopped after 1 model steps"), "{v}");
     assert_eq!(v["tool_calls"][0]["status"], "ok");
 }
 
