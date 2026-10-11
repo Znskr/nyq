@@ -27,19 +27,22 @@ impl Tool for Bash {
         ToolSpec {
             name: "bash".into(),
             description: "Run a shell command in the workspace and return its combined stdout and \
-                stderr (truncated to the last 30000 chars). Non-zero exits are reported as errors \
-                with \"exit code N\" appended. The command runs in its own process group with a \
+                stderr. Long output keeps its beginning and end; the full text is stored and can be read \
+                with read_tool_result. Non-zero exits are reported as errors with \"exit code N\" appended \
+                (except benign ones such as grep finding no match or diff finding differences). The command runs in its own process group with a \
                 timeout in seconds (default 120, max 600); on timeout or cancellation the whole \
                 group is terminated. Set run_in_background for servers, watchers and other long-running \
-                commands: it returns a process id at once; read new output with bash_output and stop it \
-                with kill_shell."
+                commands: it returns a process id at once; read new output with bash_output, wait for a line, \
+                port or exit with process_wait, and stop it with kill_shell. Add interactive to drive a REPL \
+                or prompt with process_write."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command line to run with bash -c."},
                     "timeout_secs": {"type": "integer", "description": "Kill the process group after this many seconds (default 120, max 600)."},
-                    "run_in_background": {"type": "boolean", "description": "Start the command in the background and return its id immediately (no timeout)."}
+                    "run_in_background": {"type": "boolean", "description": "Start the command in the background and return its id immediately (no timeout)."},
+                    "interactive": {"type": "boolean", "description": "With run_in_background: keep stdin open so process_write can send input (REPLs, prompts). Otherwise stdin is empty."}
                 },
                 "required": ["command"]
             }),
@@ -68,7 +71,8 @@ impl Tool for Bash {
             return ToolOutput::err("bash: missing required argument `command`.");
         };
         if args.get("run_in_background").and_then(Value::as_bool) == Some(true) {
-            return super::background::started_message(command, &ctx.cwd, &ctx.sandbox);
+            let interactive = args.get("interactive").and_then(Value::as_bool).unwrap_or(false);
+            return super::background::started_message(command, &ctx.cwd, &ctx.sandbox, interactive);
         }
         let timeout = Duration::from_secs(
             args.get("timeout_secs")
@@ -77,7 +81,8 @@ impl Tool for Bash {
                 .clamp(1, MAX_TIMEOUT),
         );
 
-        run_command(command, &ctx.cwd, &ctx.sandbox, &ctx.cancel, Some(timeout)).await
+        let store = Some((crate::config::home(), super::artifacts::session_key(ctx.session_id.as_deref())));
+        run_command(command, &ctx.cwd, &ctx.sandbox, &ctx.cancel, Some(timeout), store).await
     }
 }
 
@@ -90,7 +95,7 @@ pub(crate) async fn run_shell(
     cancel: &tokio_util::sync::CancellationToken,
     timeout: Option<Duration>,
 ) -> ToolOutput {
-    run_command(command, cwd, sandbox, cancel, timeout).await
+    run_command(command, cwd, sandbox, cancel, timeout, None).await
 }
 
 async fn run_command(
@@ -99,8 +104,9 @@ async fn run_command(
     sandbox: &crate::sandbox::Policy,
     cancel: &tokio_util::sync::CancellationToken,
     timeout: Option<Duration>,
+    store: Option<(std::path::PathBuf, String)>,
 ) -> ToolOutput {
-        let child = match spawn(command, cwd, sandbox) {
+        let child = match spawn(command, cwd, sandbox, false) {
             Ok((child, job)) => (child, job),
             Err(e) => return ToolOutput::err(format!("bash: {e}")),
         };
@@ -108,7 +114,7 @@ async fn run_command(
         let mut child = child.0;
         let pid = child.id().unwrap_or(0);
 
-        let tail = std::sync::Arc::new(std::sync::Mutex::new(Tail::default()));
+        let tail = std::sync::Arc::new(std::sync::Mutex::new(Capture { store, ..Capture::default() }));
         let _running = Running::new(&tail);
         let mut pumps = Vec::new();
         if let Some(out) = child.stdout.take() {
@@ -157,13 +163,15 @@ async fn run_command(
         };
 
         finish_pumps(pumps).await;
-        let (output, dropped) = {
-            let tail = tail.lock().unwrap_or_else(|e| e.into_inner());
-            (tail.buf.clone(), tail.dropped)
+        let bytes = tail.lock().unwrap_or_else(|e| e.into_inner()).render();
+        let (exit, failed) = match status.as_ref().and_then(exit_note) {
+            Some(note) => match status.as_ref().and_then(|s| s.code()).and_then(|code| benign_exit(command, code)) {
+                Some(meaning) => (Some(format!("{note} ({meaning})")), false),
+                None => (Some(note), true),
+            },
+            None => (None, false),
         };
-        let bytes = render_output(&output, dropped);
-        let exit = status.as_ref().and_then(exit_note);
-        let is_error = timed_out || exit.is_some();
+        let is_error = timed_out || failed;
         let mut content = bytes;
         if timed_out {
             let secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
@@ -182,26 +190,75 @@ async fn run_command(
         ToolOutput { content, is_error, display: None, images: Vec::new(), changed: false, ..ToolOutput::default() }
 }
 
-const TAIL_BYTES: usize = MAX_OUTPUT * 4;
+/// Output kept from the start and the end of a long run. Together they stay
+/// under the large-result limit, so the model sees both ends directly.
+const HEAD_BYTES: usize = 6 * 1024;
+const TAIL_BYTES: usize = 8 * 1024;
 
+/// A command's output: its first and last bytes in memory and, once it
+/// outgrows them, the whole stream in a stored tool result.
 #[derive(Default)]
-struct Tail {
-    buf: Vec<u8>,
+struct Capture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
     dropped: usize,
+    /// Home and session key for the stored result; None keeps only the ends.
+    store: Option<(std::path::PathBuf, String)>,
+    /// The stored result's id and open file once the output overflowed
+    /// (the file is None after a write error).
+    stored: Option<(String, Option<std::fs::File>)>,
 }
 
-impl Tail {
-    fn push(&mut self, chunk: &[u8]) {
-        self.buf.extend_from_slice(chunk);
-        if self.buf.len() > TAIL_BYTES {
-            let extra = self.buf.len() - TAIL_BYTES;
-            self.buf.drain(..extra);
+impl Capture {
+    fn push(&mut self, mut chunk: &[u8]) {
+        if let Some((_, file)) = &mut self.stored {
+            use std::io::Write;
+            if file.as_mut().is_some_and(|f| f.write_all(chunk).is_err()) {
+                *file = None;
+            }
+        }
+        if self.head.len() < HEAD_BYTES {
+            let n = chunk.len().min(HEAD_BYTES - self.head.len());
+            self.head.extend_from_slice(&chunk[..n]);
+            chunk = &chunk[n..];
+        }
+        self.tail.extend_from_slice(chunk);
+        if self.tail.len() > TAIL_BYTES {
+            if self.stored.is_none() {
+                // Everything so far is still in memory: store it, then append.
+                if let Some((home, key)) = &self.store {
+                    let mut all = self.head.clone();
+                    all.extend_from_slice(&self.tail);
+                    self.stored = Some(match super::artifacts::store_open(home, key, "bash", &all) {
+                        Ok((id, file)) => (id, Some(file)),
+                        Err(_) => (String::new(), None),
+                    });
+                }
+            }
+            let extra = self.tail.len() - TAIL_BYTES;
+            self.tail.drain(..extra);
             self.dropped += extra;
         }
     }
+
+    fn render(&self) -> String {
+        let head = String::from_utf8_lossy(&self.head);
+        let tail = String::from_utf8_lossy(&self.tail);
+        if self.dropped == 0 {
+            return format!("{head}{tail}");
+        }
+        let note = match &self.stored {
+            Some((id, Some(_))) => format!(
+                "the full output is stored as tool result \"{id}\"; read it with {} {{\"id\": \"{id}\"}} (offset/limit or query)",
+                super::artifacts::TOOL
+            ),
+            _ => "it was not kept".into(),
+        };
+        format!("{head}\n… [{} bytes of output omitted; {note}] …\n{tail}", self.dropped)
+    }
 }
 
-type SharedTail = std::sync::Arc<std::sync::Mutex<Tail>>;
+type SharedTail = std::sync::Arc<std::sync::Mutex<Capture>>;
 
 /// Output of the commands running now, newest last, for the UI to show.
 static RUNNING: std::sync::Mutex<Vec<SharedTail>> = std::sync::Mutex::new(Vec::new());
@@ -228,8 +285,10 @@ pub(crate) fn live_tail(n: usize) -> Vec<String> {
     let Some(tail) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).last().cloned() else {
         return Vec::new();
     };
-    let tail = tail.lock().unwrap_or_else(|e| e.into_inner());
-    tail_lines(&tail.buf[tail.buf.len().saturating_sub(8192)..], n)
+    let capture = tail.lock().unwrap_or_else(|e| e.into_inner());
+    let mut recent = if capture.dropped == 0 { capture.head.clone() } else { Vec::new() };
+    recent.extend_from_slice(&capture.tail);
+    tail_lines(&recent[recent.len().saturating_sub(8192)..], n)
 }
 
 fn tail_lines(bytes: &[u8], n: usize) -> Vec<String> {
@@ -242,9 +301,31 @@ fn tail_lines(bytes: &[u8], n: usize) -> Vec<String> {
     lines.split_off(lines.len().saturating_sub(n))
 }
 
-pub(super) fn spawn(command: &str, cwd: &std::path::Path, sandbox: &crate::sandbox::Policy) -> io::Result<(Child, Option<WinJob>)> {
+/// What a non-zero exit means when it is not a failure: `grep` finding no
+/// match, `diff` finding differences, `test` evaluating false.
+fn benign_exit(command: &str, code: i32) -> Option<&'static str> {
+    if code != 1 {
+        return None;
+    }
+    // The exit status is the last pipeline stage's (without pipefail).
+    let last = command.trim().rsplit(['|', ';', '\n']).next().unwrap_or("");
+    let last = last.rsplit("&&").next().unwrap_or(last);
+    let program = last
+        .split_whitespace()
+        .find(|w| !w.contains('=') && !matches!(*w, "command" | "sudo" | "!"))
+        .map(crate::agent::program_base)?;
+    match program {
+        "grep" | "egrep" | "fgrep" | "rg" | "ag" => Some("no matches found"),
+        "diff" | "cmp" => Some("the inputs differ"),
+        "test" | "[" | "[[" => Some("the condition is false"),
+        _ => None,
+    }
+}
+
+pub(super) fn spawn(command: &str, cwd: &std::path::Path, sandbox: &crate::sandbox::Policy, stdin: bool) -> io::Result<(Child, Option<WinJob>)> {
     let mut cmd = crate::sandbox::shell_command(sandbox, cwd, command).map_err(io::Error::other)?;
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let input = if stdin { Stdio::piped() } else { Stdio::null() };
+    cmd.stdin(input).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     #[cfg(unix)]
     {
         cmd.process_group(0); // its own group, so we can kill the whole tree
@@ -272,7 +353,7 @@ pub(super) fn spawn(command: &str, cwd: &std::path::Path, sandbox: &crate::sandb
     }
 }
 
-async fn pump<R: tokio::io::AsyncRead + Unpin>(mut r: R, tail: std::sync::Arc<std::sync::Mutex<Tail>>) {
+async fn pump<R: tokio::io::AsyncRead + Unpin>(mut r: R, tail: std::sync::Arc<std::sync::Mutex<Capture>>) {
     let mut buf = [0u8; 8192];
     loop {
         match r.read(&mut buf).await {
@@ -649,12 +730,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_truncated_to_last_30k() {
-        let out = run(json!({"command": "printf 'x%.0s' $(seq 1 20000); printf 'z%.0s' $(seq 1 20000)"})).await;
+    async fn long_output_keeps_both_ends_and_stores_the_rest() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_ctx(dir.path(), &CancellationToken::new());
+        let store = Some((home.path().to_path_buf(), "s1".to_string()));
+        let command = "echo FIRST-ERROR; seq 1 20000; echo LAST-LINE";
+        let out = run_command(command, dir.path(), &ctx.sandbox, &ctx.cancel, None, store).await;
         assert!(!out.is_error);
-        assert!(out.content.starts_with("[output truncated: first "), "{}", &out.content[..60]);
-        assert_eq!(out.content.matches('x').count(), 10_000);
-        assert_eq!(out.content.matches('z').count(), 20_000);
+        assert!(out.content.starts_with("FIRST-ERROR\n1\n"), "{}", &out.content[..60]);
+        assert!(out.content.trim_end().ends_with("LAST-LINE"));
+        assert!(out.content.len() < super::super::artifacts::SPILL_AT, "{}", out.content.len());
+        let id = out.content.split("tool result \"").nth(1).unwrap().split('"').next().unwrap();
+        let full = super::super::artifacts::read(home.path(), "s1", id, 0, 1 << 20, Some("10000")).unwrap();
+        assert!(full.contains("10000"), "{full}");
+    }
+
+    #[tokio::test]
+    async fn benign_exit_codes_are_not_errors() {
+        let out = run(json!({"command": "echo a | grep zzz"})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("exit code 1 (no matches found)"), "{}", out.content);
+        let out = run(json!({"command": "grep -q x /nonexistent-file-nyq"})).await;
+        assert!(out.is_error, "exit 2 is a real failure: {}", out.content);
+        assert_eq!(benign_exit("FOO=1 diff a b", 1), Some("the inputs differ"));
+        assert_eq!(benign_exit("cd x && [ -f y ]", 1), Some("the condition is false"));
+        assert_eq!(benign_exit("grep x | wc -l", 1), None);
+        assert_eq!(benign_exit("make", 1), None);
     }
 
     #[tokio::test]

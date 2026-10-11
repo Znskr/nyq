@@ -1,14 +1,18 @@
 //! Background shell processes: `bash` with `run_in_background` starts one and
 //! returns its id; `bash_output` returns what it printed since the last read
-//! plus its status; `kill_shell` stops it. Output is kept in memory (the last
-//! [`BUF_CAP`] bytes per process) and every process is killed when nyq exits.
+//! plus its status; `process_write` sends it input (when started with
+//! `interactive`); `process_wait` blocks until its output matches, a port
+//! opens, or it exits; `kill_shell` stops it. Output is kept in memory (the
+//! last [`BUF_CAP`] bytes per process), a dev-server URL it prints is noted,
+//! and every process is killed when nyq exits.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::bash::{exit_note, finish_pumps, kill_group, reap_leftovers, render_output, spawn, WinJob, GRACE};
 use super::{Registry, Tool, ToolCtx, ToolOutput};
@@ -18,6 +22,11 @@ use crate::types::ToolSpec;
 const BUF_CAP: usize = 1024 * 1024;
 /// A finished process whose output has all been read is dropped after this.
 const DONE_KEEP: Duration = Duration::from_secs(60);
+const WAIT_DEFAULT: u64 = 30;
+const WAIT_MAX: u64 = 600;
+const POLL: Duration = Duration::from_millis(100);
+/// How long `process_write` lets the process answer before reading its output.
+const WRITE_SETTLE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Debug, PartialEq)]
 enum State {
@@ -31,6 +40,11 @@ enum State {
 struct Proc {
     id: u32,
     command: String,
+    cwd: PathBuf,
+    /// The dev-server URL it printed, if any.
+    url: Option<String>,
+    /// Open stdin for `process_write` (interactive processes only).
+    stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
     started: Instant,
     ended: Option<Instant>,
     state: State,
@@ -46,6 +60,13 @@ struct Proc {
 
 impl Proc {
     fn push(&mut self, chunk: &[u8]) {
+        if self.url.is_none() {
+            // Look a little before the chunk too, in case a URL was split.
+            let from = self.buf.len().saturating_sub(256);
+            let mut window = self.buf[from..].to_vec();
+            window.extend_from_slice(chunk);
+            self.url = server_url(&String::from_utf8_lossy(&window));
+        }
         self.buf.extend_from_slice(chunk);
         if self.buf.len() > BUF_CAP {
             let extra = self.buf.len() - BUF_CAP;
@@ -61,6 +82,7 @@ impl Proc {
     fn status(&self) -> String {
         let t = duration(self.runtime());
         match &self.state {
+            State::Running if self.url.is_some() => format!("running for {t}, serving {}", self.url.as_deref().unwrap_or("")),
             State::Running => format!("running for {t}"),
             State::Exited(None) => format!("exited with code 0 after {t}"),
             State::Exited(Some(note)) => format!("exited ({note}) after {t}"),
@@ -121,10 +143,12 @@ fn duration(d: Duration) -> String {
 }
 
 /// Start `command` in the background (sandboxed like `bash`). Returns its id.
-pub(crate) fn start(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy) -> Result<u32, String> {
-    let (mut child, job) = spawn(command, cwd, sandbox).map_err(|e| e.to_string())?;
+/// An `interactive` process keeps its stdin open for `process_write`.
+pub(crate) fn start(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy, interactive: bool) -> Result<u32, String> {
+    let (mut child, job) = spawn(command, cwd, sandbox, interactive).map_err(|e| e.to_string())?;
     let pid = child.id().unwrap_or(0);
     let job = job.map(Arc::new);
+    let stdin = child.stdin.take().map(|s| Arc::new(tokio::sync::Mutex::new(s)));
     let id = {
         let mut t = table();
         compact_finished(&mut t);
@@ -133,6 +157,9 @@ pub(crate) fn start(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy)
         t.procs.push(Proc {
             id,
             command: command.to_string(),
+            cwd: cwd.to_path_buf(),
+            url: None,
+            stdin,
             started: Instant::now(),
             ended: None,
             state: State::Running,
@@ -158,6 +185,7 @@ pub(crate) fn start(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy)
         finish_pumps(pumps).await;
         with_proc(id, |p| {
             p.ended = Some(Instant::now());
+            p.stdin = None;
             p.state = match status {
                 _ if p.kill_requested => State::Killed,
                 Ok(s) => State::Exited(exit_note(&s)),
@@ -239,6 +267,97 @@ pub(crate) async fn kill(id: u32) -> Result<String, String> {
     Ok(with_proc(id, |p| format!("process {id}: {}", p.status())).unwrap_or_default())
 }
 
+/// Send `text` to the process's stdin, closing it afterwards when `close`.
+pub(crate) async fn write(id: u32, text: &str, close: bool) -> Result<(), String> {
+    let stdin = with_proc(id, |p| {
+        if p.state != State::Running {
+            return Err(format!("process {id} is not running ({})", p.status()));
+        }
+        p.stdin.clone().ok_or_else(|| {
+            format!("process {id} has no open stdin; start it with bash {{\"run_in_background\": true, \"interactive\": true}}")
+        })
+    })
+    .ok_or_else(|| format!("no background process with id {id}"))??;
+    let mut pipe = stdin.lock().await;
+    let result = async {
+        pipe.write_all(text.as_bytes()).await?;
+        pipe.flush().await
+    }
+    .await;
+    if let Err(e) = result {
+        with_proc(id, |p| p.stdin = None);
+        return Err(format!("could not write to process {id}: {e}"));
+    }
+    if close {
+        let _ = pipe.shutdown().await;
+        with_proc(id, |p| p.stdin = None);
+    }
+    Ok(())
+}
+
+/// What `process_wait` waits for; with neither, the process's exit.
+pub(crate) struct WaitFor {
+    pub pattern: Option<Regex>,
+    pub port: Option<u16>,
+}
+
+async fn port_open(port: u16) -> bool {
+    let connect = tokio::net::TcpStream::connect(("127.0.0.1", port));
+    matches!(tokio::time::timeout(Duration::from_millis(250), connect).await, Ok(Ok(_)))
+}
+
+/// Wait until `cond` holds, the process exits, `timeout` passes or `cancel`
+/// fires; then return why, followed by the new output.
+pub(crate) async fn wait(id: u32, cond: &WaitFor, timeout: Duration, cancel: &tokio_util::sync::CancellationToken) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    let reason = loop {
+        let (running, matched) = with_proc(id, |p| {
+            let from = p.read.saturating_sub(p.base) as usize;
+            let unread = String::from_utf8_lossy(&p.buf[from.min(p.buf.len())..]);
+            let matched = cond.pattern.as_ref().is_some_and(|re| re.is_match(&strip_ansi(&unread)));
+            (p.state == State::Running, matched)
+        })
+        .ok_or_else(|| format!("no background process with id {id}"))?;
+        if matched {
+            break "the output matched the pattern".to_string();
+        }
+        if let Some(port) = cond.port {
+            if port_open(port).await {
+                break format!("port {port} is accepting connections");
+            }
+        }
+        if !running {
+            break if cond.pattern.is_some() || cond.port.is_some() {
+                "the process ended before the condition was met".to_string()
+            } else {
+                "the process ended".to_string()
+            };
+        }
+        if Instant::now() >= deadline {
+            break format!("timed out after {}s; the condition was not met", timeout.as_secs());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(POLL) => {}
+            _ = cancel.cancelled() => return Err("Cancelled by user.".into()),
+        }
+    };
+    Ok(format!("[wait: {reason}]\n{}", read_new(id)?))
+}
+
+/// One line per tracked process, for the model's per-turn context.
+pub(crate) fn context_lines() -> Vec<String> {
+    let mut t = table();
+    compact_finished(&mut t);
+    t.procs
+        .iter()
+        .map(|p| {
+            let cmd: String = p.command.lines().next().unwrap_or("").chars().take(120).collect();
+            let stdin = if p.stdin.is_some() { ", stdin open" } else { "" };
+            format!("- #{} `{cmd}` in {} (pid {}): {}{stdin}", p.id, p.cwd.display(), p.pid, p.status())
+        })
+        .collect()
+}
+
 /// Kill every running background process (on exit).
 pub(crate) fn kill_all() {
     for p in table().procs.iter_mut().filter(|p| p.state == State::Running) {
@@ -286,8 +405,10 @@ fn strip_ansi(text: &str) -> String {
 }
 
 /// The last local server URL (`http://localhost:3000`, `http://127.0.0.1:8080/`,
-/// `http://0.0.0.0:5173`) the output mentions, ready to open.
+/// `http://0.0.0.0:5173`) the output mentions, ready to open (terminal colors
+/// are ignored).
 fn server_url(text: &str) -> Option<String> {
+    let text = &strip_ansi(text);
     let mut found = None;
     for (i, _) in text.match_indices("http") {
         let rest = &text[i..];
@@ -412,6 +533,125 @@ fn id_arg(args: &Value, tool: &str) -> Result<u32, ToolOutput> {
 
 const ID_SCHEMA: &str = "Background process id returned by bash with run_in_background.";
 
+struct ProcessWrite;
+
+#[async_trait::async_trait]
+impl Tool for ProcessWrite {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "process_write".into(),
+            description: "Send input to the stdin of a background process started with bash \
+                {\"run_in_background\": true, \"interactive\": true}, e.g. a REPL line or an answer to a \
+                prompt. Include \"\\n\" to press Enter. Returns the process's output shortly afterwards; \
+                use process_wait to block until a specific reply. close_stdin sends end-of-file."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": ID_SCHEMA},
+                    "text": {"type": "string", "description": "Text to write, exactly (add \\n for Enter)."},
+                    "close_stdin": {"type": "boolean", "description": "Close stdin after writing (end of input)."}
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    fn needs_approval(&self, _args: &Value) -> bool {
+        true
+    }
+
+    fn summary(&self, args: &Value) -> String {
+        let text: String = args.get("text").and_then(Value::as_str).unwrap_or("").escape_debug().take(80).collect();
+        format!("{} {text}", BashOutput.summary(args)).trim_end().to_string()
+    }
+
+    fn preview(&self, args: &Value, _ctx: &ToolCtx) -> Option<String> {
+        let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+        let close = if args.get("close_stdin").and_then(Value::as_bool) == Some(true) { "\n(then close stdin)" } else { "" };
+        Some(format!("{text}{close}"))
+    }
+
+    async fn run(&self, args: Value, _ctx: &ToolCtx) -> ToolOutput {
+        let id = match id_arg(&args, "process_write") {
+            Ok(id) => id,
+            Err(out) => return out,
+        };
+        let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+        let close = args.get("close_stdin").and_then(Value::as_bool).unwrap_or(false);
+        if text.is_empty() && !close {
+            return ToolOutput::err("process_write: give `text` to send, or close_stdin.");
+        }
+        if let Err(e) = write(id, text, close).await {
+            return ToolOutput::err(format!("process_write: {e}"));
+        }
+        tokio::time::sleep(WRITE_SETTLE).await;
+        read_new(id).map_or_else(ToolOutput::err, ToolOutput::ok)
+    }
+}
+
+struct ProcessWait;
+
+#[async_trait::async_trait]
+impl Tool for ProcessWait {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "process_wait".into(),
+            description: "Wait for a background process instead of polling bash_output: until its new output \
+                matches `pattern` (a regex), until TCP `port` on localhost accepts connections, or (with \
+                neither) until it exits. Also returns when the process ends or after timeout_secs \
+                (default 30, max 600). Returns why it stopped waiting plus the output since the last read."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": ID_SCHEMA},
+                    "pattern": {"type": "string", "description": "Regular expression to wait for in new output."},
+                    "port": {"type": "integer", "description": "Wait until this localhost TCP port accepts connections."},
+                    "timeout_secs": {"type": "integer", "description": "Give up after this many seconds (default 30, max 600)."}
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    fn summary(&self, args: &Value) -> String {
+        let what = args
+            .get("pattern")
+            .and_then(Value::as_str)
+            .map(|p| format!("/{p}/"))
+            .or_else(|| args.get("port").map(|p| format!("port {p}")))
+            .unwrap_or_else(|| "exit".into());
+        format!("{} {what}", BashOutput.summary(args))
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
+        let id = match id_arg(&args, "process_wait") {
+            Ok(id) => id,
+            Err(out) => return out,
+        };
+        let pattern = match args.get("pattern").and_then(Value::as_str).filter(|p| !p.is_empty()) {
+            Some(p) => match Regex::new(p) {
+                Ok(re) => Some(re),
+                Err(e) => return ToolOutput::err(format!("process_wait: invalid pattern {p:?}: {e}")),
+            },
+            None => None,
+        };
+        let port = match args.get("port").filter(|v| !v.is_null()) {
+            Some(v) => match v.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0) {
+                Some(n) => Some(n),
+                None => return ToolOutput::err("process_wait: `port` must be a TCP port number."),
+            },
+            None => None,
+        };
+        let secs = args.get("timeout_secs").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX);
+        match wait(id, &WaitFor { pattern, port }, Duration::from_secs(secs), &ctx.cancel).await {
+            Ok(text) => ToolOutput::ok(text),
+            Err(e) => ToolOutput::err(format!("process_wait: {e}")),
+        }
+    }
+}
+
 struct BashOutput;
 
 #[async_trait::async_trait]
@@ -471,18 +711,24 @@ impl Tool for KillShell {
 }
 
 /// The `bash` result for a command started with `run_in_background`.
-pub(crate) fn started_message(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy) -> ToolOutput {
-    match start(command, cwd, sandbox) {
-        Ok(id) => ToolOutput::ok(format!(
-            "Started background process {id}. Read its output with bash_output {{\"id\": {id}}}; \
-             stop it with kill_shell {{\"id\": {id}}}. It is killed when nyq exits."
-        )),
+pub(crate) fn started_message(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy, interactive: bool) -> ToolOutput {
+    match start(command, cwd, sandbox, interactive) {
+        Ok(id) => {
+            let input = if interactive { format!(" Send input with process_write {{\"id\": {id}, \"text\": \"…\\n\"}}.") } else { String::new() };
+            ToolOutput::ok(format!(
+                "Started background process {id}. Read its output with bash_output {{\"id\": {id}}}, or wait for a \
+                 line, a port or its exit with process_wait {{\"id\": {id}, \"pattern\": \"…\"}}.{input} Stop it with \
+                 kill_shell {{\"id\": {id}}}. It is killed when nyq exits."
+            ))
+        }
         Err(e) => ToolOutput::err(format!("bash: {e}")),
     }
 }
 
 pub fn register(r: &mut Registry) {
     r.add(Box::new(BashOutput));
+    r.add(Box::new(ProcessWrite));
+    r.add(Box::new(ProcessWait));
     r.add(Box::new(KillShell));
 }
 
@@ -505,7 +751,7 @@ mod tests {
     #[tokio::test]
     async fn output_is_read_incrementally_and_exit_status_reported() {
         let dir = tempfile::tempdir().unwrap();
-        let id = start("echo one; sleep 0.3; echo two; exit 3", dir.path(), &policy()).unwrap();
+        let id = start("echo one; sleep 0.3; echo two; exit 3", dir.path(), &policy(), false).unwrap();
         wait_until(id, |p| String::from_utf8_lossy(&p.buf).contains("one")).await;
         let first = read_new(id).unwrap();
         assert!(first.contains("running for"), "{first}");
@@ -533,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn logs_show_head_tail_and_url() {
         let dir = tempfile::tempdir().unwrap();
-        let id = start("for i in $(seq 1 60); do echo line$i; done; echo 'at http://localhost:4321'", dir.path(), &policy()).unwrap();
+        let id = start("for i in $(seq 1 60); do echo line$i; done; echo 'at http://localhost:4321'", dir.path(), &policy(), false).unwrap();
         wait_until(id, |p| p.state != State::Running).await;
         let lines = log_lines(id).unwrap();
         assert!(lines[0].starts_with(&format!("#{id} exited with code 0")), "{lines:?}");
@@ -548,7 +794,7 @@ mod tests {
     #[tokio::test]
     async fn kill_stops_the_process_group() {
         let dir = tempfile::tempdir().unwrap();
-        let id = start("echo started; sleep 885533 & sleep 885533", dir.path(), &policy()).unwrap();
+        let id = start("echo started; sleep 885533 & sleep 885533", dir.path(), &policy(), false).unwrap();
         wait_until(id, |p| !p.buf.is_empty()).await;
         let msg = kill(id).await.unwrap();
         assert!(msg.contains("killed"), "{msg}");
@@ -587,6 +833,52 @@ mod tests {
         let killed = r.get("kill_shell").unwrap().run(json!({"id": format!("#{id}")}), &ctx).await;
         assert!(!killed.is_error, "{}", killed.content);
     }
+
+    #[tokio::test]
+    async fn interactive_input_and_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let id = start("while read line; do echo \"got $line\"; done; echo bye", dir.path(), &policy(), true).unwrap();
+        write(id, "hello\n", false).await.unwrap();
+        let cond = WaitFor { pattern: Some(Regex::new("got hel+o").unwrap()), port: None };
+        let out = wait(id, &cond, Duration::from_secs(10), &cancel).await.unwrap();
+        assert!(out.starts_with("[wait: the output matched the pattern]") && out.contains("got hello"), "{out}");
+        write(id, "", true).await.unwrap();
+        let exit = WaitFor { pattern: None, port: None };
+        let out = wait(id, &exit, Duration::from_secs(10), &cancel).await.unwrap();
+        assert!(out.contains("[wait: the process ended]") && out.contains("bye"), "{out}");
+        assert!(write(id, "x", false).await.unwrap_err().contains("not running"));
+
+        let quiet = start("sleep 30", dir.path(), &policy(), false).unwrap();
+        assert!(write(quiet, "x", false).await.unwrap_err().contains("no open stdin"));
+        let cond = WaitFor { pattern: Some(Regex::new("never").unwrap()), port: None };
+        let out = wait(quiet, &cond, Duration::from_secs(1), &cancel).await.unwrap();
+        assert!(out.contains("timed out after 1s"), "{out}");
+        kill(quiet).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_port_and_notes_server_urls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = format!("printf '\\033[32m  Local:   http://localhost:{port}/\\033[0m\\n'; sleep 30");
+        let id = start(&cmd, dir.path(), &policy(), false).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let out = wait(id, &WaitFor { pattern: None, port: Some(port) }, Duration::from_secs(10), &cancel).await.unwrap();
+        assert!(out.contains(&format!("port {port} is accepting")), "{out}");
+        wait_until(id, |p| p.url.is_some()).await;
+        let line = context_lines().into_iter().find(|l| l.starts_with(&format!("- #{id} "))).unwrap();
+        assert!(line.contains(&format!("serving http://localhost:{port}/")), "{line}");
+        kill(id).await.unwrap();
+    }
+
+    #[test]
+    fn server_urls_are_found_in_colored_output() {
+        assert_eq!(server_url("  ➜  Local:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m").as_deref(), Some("http://localhost:5173/"));
+        assert_eq!(server_url("Listening on http://0.0.0.0:8000.").as_deref(), Some("http://localhost:8000"));
+        assert_eq!(server_url("see https://docs.rs/tokio for docs"), None);
+    }
 }
 
 #[cfg(test)]
@@ -597,6 +889,9 @@ mod retain {
         Proc {
             id: 1,
             command: command.into(),
+            cwd: PathBuf::new(),
+            url: None,
+            stdin: None,
             started: Instant::now(),
             ended,
             state: State::Exited(Some("exit code 0".into())),
