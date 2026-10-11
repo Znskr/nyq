@@ -50,6 +50,11 @@ pub trait Provider: Send + Sync {
     /// one for routing and prompt caching (Codex `session_id`,
     /// OpenCode Go `x-opencode-session`).
     fn set_conversation(&mut self, _id: &str) {}
+    /// A small model for the auto-mode permission classifier when the
+    /// `classifier_model` setting is unset (None: the session model).
+    fn reviewer_model(&self) -> Option<String> {
+        None
+    }
     /// A fresh provider with the same settings (for subagents).
     fn fork(&self) -> Box<dyn Provider>;
     /// Stream one response. Cancellation is done by dropping the future.

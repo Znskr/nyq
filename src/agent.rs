@@ -415,7 +415,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> crate::classifier::ReviewResult {
         let mut provider = self.provider.fork();
-        if let Some(model) = crate::settings::classifier_model() {
+        if let Some(model) = crate::settings::classifier_model().or_else(|| provider.reviewer_model()) {
             provider.set_model(model);
         }
         provider.set_effort(None);
