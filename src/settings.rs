@@ -159,7 +159,7 @@ pub struct Settings {
     /// Default reasoning effort for Codex models (`auto` or absent = model default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Codex fast mode (the `priority` service tier) where the model offers it.
+    /// Fast mode where the model offers it (Codex `priority` tier, AI Gateway fast speed).
     pub fast_mode: bool,
     /// `ask` (default), `auto` (classifier), or `yolo` (never ask). Deny rules still block.
     pub permission_mode: String,
