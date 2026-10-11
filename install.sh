@@ -14,7 +14,7 @@ have() {
 
 os=$(uname -s)
 case "$os" in
-    Linux) os_part=unknown-linux-gnu ;;
+    Linux) os_part=unknown-linux-musl ;;
     Darwin) os_part=apple-darwin ;;
     *) err "unsupported operating system '$os': this installer ships nyq binaries for Linux and macOS only" ;;
 esac
@@ -104,6 +104,12 @@ download_asset() {
 }
 
 archive_url=$(asset_url "$archive")
+if [ -z "$archive_url" ] && [ "$os_part" = unknown-linux-musl ]; then
+    # Releases up to 0.4.1 only ship glibc Linux builds.
+    target="$arch_part-unknown-linux-gnu"
+    archive="nyq-$target.tar.gz"
+    archive_url=$(asset_url "$archive")
+fi
 [ -n "$archive_url" ] || err "release '$tag' of $REPO has no asset named '$archive'"
 
 sums_url=$(asset_url SHA256SUMS)

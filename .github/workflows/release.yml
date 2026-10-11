@@ -15,7 +15,7 @@ env:
 
 jobs:
   # Cross-compiles every target on the AWS runner with cargo-zigbuild (no
-  # GitHub-hosted minutes): Linux against glibc 2.17, macOS against a pinned
+  # GitHub-hosted minutes): static musl Linux binaries, macOS against a pinned
   # SDK, Windows through MinGW-w64 as provided by zig.
   release:
     name: build and release
@@ -32,7 +32,7 @@ jobs:
       - name: Toolchain
         run: |
           set -euo pipefail
-          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
             x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-gnu
           mkdir -p "$TOOLS"
           zig="$TOOLS/zig-x86_64-linux-$ZIG_VERSION"
@@ -63,9 +63,12 @@ jobs:
               *) tar -czf "dist/$3" -C pkg "$2" README.md ;;
             esac
           }
-          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-            cargo zigbuild --release --locked --target "$t.2.17"
+          for arch in x86_64 aarch64; do
+            t=$arch-unknown-linux-musl
+            cargo zigbuild --release --locked --target "$t"
             package "$t" nyq "nyq-$t.tar.gz"
+            # Installs from 0.4.1 and earlier look for the glibc name.
+            cp "dist/nyq-$t.tar.gz" "dist/nyq-$arch-unknown-linux-gnu.tar.gz"
           done
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
             cargo zigbuild --release --locked --target "$t"
@@ -78,7 +81,8 @@ jobs:
           (cd dist && sha256sum nyq-*.tar.gz nyq-*.zip > SHA256SUMS && cat SHA256SUMS)
       - name: Smoke test
         run: |
-          tar -xzf dist/nyq-x86_64-unknown-linux-gnu.tar.gz -O nyq > "$RUNNER_TEMP/nyq" && chmod +x "$RUNNER_TEMP/nyq"
+          tar -xzf dist/nyq-x86_64-unknown-linux-musl.tar.gz -O nyq > "$RUNNER_TEMP/nyq" && chmod +x "$RUNNER_TEMP/nyq"
+          file "$RUNNER_TEMP/nyq" | grep -q 'statically linked'
           "$RUNNER_TEMP/nyq" --version
           if [ "$GITHUB_REF_TYPE" = tag ]; then "$RUNNER_TEMP/nyq" --version | grep -F " ${GITHUB_REF_NAME#v}"; fi
       - uses: softprops/action-gh-release@v3
