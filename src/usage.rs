@@ -159,6 +159,9 @@ impl Report {
         if r.ts < now - chrono::Duration::hours(period.hours()) || r.ts > now {
             return;
         }
+        self.push(r);
+    }
+    fn push(&mut self, r: Record) {
         self.providers
             .entry(r.provider.clone())
             .or_default()
@@ -172,11 +175,11 @@ impl Report {
         let mut lines = vec!["Usage by provider:".into()];
         lines.extend(self.providers.iter().map(|(p, t)| t.line(p)));
         lines.push("Usage by model:".into());
-        lines.extend(
-            self.models
-                .iter()
-                .map(|((p, m), t)| t.line(&format!("{p}/{m}"))),
-        );
+        let all: u64 = self.models.values().map(|t| t.input + t.output).sum();
+        lines.extend(self.models.iter().map(|((p, m), t)| {
+            let share = if all == 0 { 0.0 } else { (t.input + t.output) as f64 * 100.0 / all as f64 };
+            format!("{} · {share:.0}% of tokens", t.line(&format!("{p}/{m}")))
+        }));
         if self.models.is_empty() {
             lines.push("  No usage recorded in this period.".into());
         }
@@ -190,6 +193,18 @@ impl Report {
     }
 }
 pub fn read(home: &Path, period: Period) -> Result<Report> {
+    let now = Utc::now();
+    read_with(home, |report, r| report.add(r, period, now))
+}
+/// Every record of one session, whatever its age.
+pub fn read_session(home: &Path, session: &str) -> Result<Report> {
+    read_with(home, |report, r| {
+        if r.session == session {
+            report.push(r)
+        }
+    })
+}
+fn read_with(home: &Path, mut add: impl FnMut(&mut Report, Record)) -> Result<Report> {
     let path = home.join("usage.jsonl");
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
@@ -197,11 +212,10 @@ pub fn read(home: &Path, period: Period) -> Result<Report> {
         Err(e) => return Err(e).context("reading usage log"),
     };
     let mut report = Report::default();
-    let now = Utc::now();
     for line in BufReader::new(file).lines() {
         let line = line?;
         match serde_json::from_str(&line) {
-            Ok(r) => report.add(r, period, now),
+            Ok(r) => add(&mut report, r),
             Err(_) => report.malformed += 1,
         }
     }
@@ -210,6 +224,21 @@ pub fn read(home: &Path, period: Period) -> Result<Report> {
 pub fn show(home: &Path, period: Period) -> Result<()> {
     crate::ui::list(&read(home, period)?.lines());
     Ok(())
+}
+/// `/usage [session|24h|7d|30d]` (also `/cost`).
+pub fn slash(home: &Path, args: &[&str], session: Option<&str>) -> Result<()> {
+    match args {
+        ["session"] => {
+            let id = session.context("this conversation has no session yet")?;
+            let mut lines = vec![format!("This session ({}):", id.chars().take(8).collect::<String>())];
+            lines.extend(read_session(home, id)?.lines());
+            crate::ui::list(&lines);
+            Ok(())
+        }
+        [] => show(home, Period::Month),
+        [p] => show(home, Period::parse(p).map_err(|_| anyhow::anyhow!("usage: /usage [session|24h|7d|30d]"))?),
+        _ => anyhow::bail!("usage: /usage [session|24h|7d|30d]"),
+    }
 }
 
 pub struct Stats {
@@ -336,6 +365,8 @@ mod tests {
         });
         let report = read(dir.path(), Period::Day).unwrap();
         assert_eq!(report.malformed, 1);
+        assert_eq!(read_session(dir.path(), "s").unwrap().providers["openai"].requests, 20);
+        assert!(read_session(dir.path(), "other").unwrap().models.is_empty());
         assert_eq!(report.providers["openai"].requests, 20);
         assert!((report.providers["openai"].cost - 0.00082).abs() < 1e-10);
         #[cfg(unix)]
@@ -426,6 +457,8 @@ mod tests {
                 );
             }
             assert_eq!(report.models.len(), 3);
+            let lines = report.lines();
+            assert!(lines.iter().any(|l| l.contains("openai/b") && l.ends_with("· 33% of tokens")), "{lines:?}");
             let t = &report.providers["openai"];
             assert_eq!(
                 (t.requests, t.input, t.cached, t.output, t.unknown),

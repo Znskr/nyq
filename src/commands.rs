@@ -484,10 +484,15 @@ pub fn fresh(agent: &mut Agent, sessions_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `/reset`: drop the transcript and keep this session's settings.
+/// `/reset`: drop the transcript and background processes, keeping this
+/// session's settings. (`/new` and `/clear` keep background processes.)
 pub fn reset(agent: &mut Agent) -> Result<()> {
     agent.clear_context()?;
+    let stopped = crate::tools::background::forget_all();
     ui::info("Cleared the conversation. Session settings are unchanged.");
+    if stopped > 0 {
+        ui::info(&format!("Stopped {stopped} background process(es)."));
+    }
     Ok(())
 }
 

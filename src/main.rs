@@ -246,7 +246,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "/clear",
         "start a fresh session (background processes are kept)",
     ),
-    ("/reset", "clear this conversation, keeping the session"),
+    ("/reset", "clear this conversation and stop background processes, keeping the session"),
     ("/continue", "continue an interrupted or cut-off response"),
     (
         "/rename",
@@ -279,7 +279,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/memory", "saved memories; /memory remove N forgets one"),
     (
         "/background",
-        "background processes; /background kill ID|last",
+        "background processes; /background logs|open|kill ID|last",
     ),
     (
         "/permissions",
@@ -1243,7 +1243,7 @@ async fn slash(
         "/hooks" => hooks::command(agent, arg.first().copied()),
         "/login" | "/logout" | "/setup" | "/credits" | "/balance" => account::slash(cmd, &arg, agent, tui).await?,
         "/yolo" => commands::toggle_yolo(&config::home(), agent),
-        "/usage" | "/cost" => usage::show(&config::home(), usage::Period::parse(arg.first().copied().unwrap_or("30d"))?)?,
+        "/usage" | "/cost" => usage::slash(&config::home(), &arg, agent.session.as_ref().map(|s| s.id.as_str()))?,
         "/stats" => agent.stats.show(agent.usage),
         "/status" => doctor::show_agent_status(agent, mcp, servers, skills.len())?,
         "/version" => doctor::version(),
