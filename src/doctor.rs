@@ -299,6 +299,7 @@ pub async fn doctor(
         },
         "install git and add it to PATH",
     ));
+    checks.push(sessions_check(&home.join("sessions")));
     let terminal = std::io::stdin().is_terminal()
         && std::io::stderr().is_terminal()
         && std::env::var("TERM").map_or(true, |v| v != "dumb");
@@ -315,6 +316,50 @@ pub async fn doctor(
     ui::list(&checks.iter().map(Check::line).collect::<Vec<_>>());
     anyhow::ensure!(checks.iter().all(|c| c.ok || !c.required), "doctor found failing checks");
     Ok(())
+}
+/// Saved sessions: how many, and which cannot be read or are very large.
+fn sessions_check(dir: &Path) -> Check {
+    let short = |p: &Path| -> String {
+        p.file_stem()
+            .map(|s| s.to_string_lossy().chars().take(8).collect())
+            .unwrap_or_default()
+    };
+    let (all, unreadable) = match crate::session::list_report(dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return Check {
+                required: false,
+                ..check("sessions", false, format!("cannot list: {e:#}"), "check the sessions directory permissions")
+            }
+        }
+    };
+    let large: Vec<String> = all
+        .iter()
+        .filter(|m| std::fs::metadata(&m.path).is_ok_and(|s| s.len() > crate::session::OVERSIZED_BYTES))
+        .map(|m| short(&m.path))
+        .collect();
+    let mut detail = format!("{} saved", all.len());
+    if !unreadable.is_empty() {
+        let ids: Vec<String> = unreadable.iter().map(|p| short(p)).collect();
+        detail += &format!(", {} unreadable ({})", unreadable.len(), ids.join(", "));
+    }
+    if !large.is_empty() {
+        detail += &format!(
+            ", {} over {} MB ({})",
+            large.len(),
+            crate::session::OVERSIZED_BYTES / (1024 * 1024),
+            large.join(", ")
+        );
+    }
+    Check {
+        required: false,
+        ..check(
+            "sessions",
+            unreadable.is_empty() && large.is_empty(),
+            detail,
+            "copy what is readable with `nyq session recover ID` (or upgrade an old one with `nyq session migrate ID`); large sessions load slowly, so /compact them or delete unneeded ones",
+        )
+    }
 }
 pub async fn models(home: &Path) {
     let (choices, warnings) = crate::models::list(home).await;
@@ -372,6 +417,20 @@ mod tests {
             "✗ auth: expired — run nyq login"
         );
         assert_eq!(check("test", false, "failed", "").line(), "✗ test: failed");
+    }
+    #[test]
+    fn session_check_reports_unreadable_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let c = sessions_check(&dir);
+        assert!(c.ok && c.detail == "0 saved", "{c:?}");
+        let mut s = crate::session::Session::create(&dir, tmp.path(), "m").unwrap();
+        s.append(&crate::types::Item::user("hi")).unwrap();
+        std::fs::write(dir.join("deadbeef-broken.jsonl"), "not json\n").unwrap();
+        let c = sessions_check(&dir);
+        assert!(!c.ok && !c.required, "{c:?}");
+        assert_eq!(c.detail, "1 saved, 1 unreadable (deadbeef)");
+        assert!(c.line().contains("nyq session recover"));
     }
     #[tokio::test]
     async fn endpoint_probe_accepts_http_errors_as_reachable() {

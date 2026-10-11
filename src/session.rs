@@ -1,10 +1,13 @@
 //! Saved conversations: one JSONL file per session under `<home>/sessions`.
 //!
-//! Line 1 is a header (`{"type":"session",...}`). A later
-//! `{"type":"title","title":...}` line is metadata from `/rename` (the latest
-//! one wins in listings). Every other line is one [`Item`]. Files are
-//! append-only, so a crash can at worst truncate the last line, which loading
-//! tolerates.
+//! Line 1 is a header (`{"type":"session",...}`). Later metadata lines are
+//! `{"type":"title","title":...}` from `/rename` and `{"type":"prefs",...}`
+//! with the model settings in effect (the latest of each wins). Every other
+//! line is one [`Item`]. Files are append-only, so a crash can at worst
+//! truncate the last line, which loading tolerates.
+//!
+//! Listings read each file once and cache the result in `<id>.summary`,
+//! reused while the transcript's size and modification time are unchanged.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -19,18 +22,48 @@ use crate::types::Item;
 
 const INTERRUPTED: &str = "Interrupted before this tool ran.";
 const TITLE_MAX: usize = 60;
+const PREVIEW_MAX: usize = 240;
 /// Longest `/rename` title, in bytes. Listings may still shorten it.
 pub const MAX_TITLE_BYTES: usize = 240;
+/// Shown when no prompt can name the session.
+pub const UNTITLED: &str = "Untitled session";
+/// The title of a session whose first prompt is only images.
+pub const IMAGE_TITLE: &str = "Image session";
+/// Sessions larger than this are reported by `nyq doctor`.
+pub const OVERSIZED_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Meta {
     pub id: String,
     pub created: DateTime<Utc>,
+    /// Last activity: when the transcript was last written.
+    pub updated: DateTime<Utc>,
     pub cwd: PathBuf,
     pub model: String,
-    /// `/rename` title, or the first user message when the session was never renamed.
+    /// `/rename` title, or the first prompt when the session was never renamed.
     pub title: String,
+    /// The first prompt, on one line (searched by the picker).
+    #[serde(default)]
+    pub preview: String,
+    /// User turns in the whole transcript.
+    #[serde(default)]
+    pub turns: usize,
+    /// Model settings last used in the session.
+    #[serde(default)]
+    pub prefs: Option<Prefs>,
+    #[serde(skip)]
     pub path: PathBuf,
+}
+
+/// Model settings saved with a session and restored when it is resumed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Prefs {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub fast: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -111,9 +144,13 @@ pub fn recover(dir: &Path, which: &str, cwd: &Path) -> Result<(String, usize, us
         if let Ok(item) = serde_json::from_slice::<Item>(line) {
             payload.push_str(&serde_json::to_string(&item)?);
             kept += 1;
-        } else if is_title_line(line) {
+        } else if is_meta_line(line) {
             let value: serde_json::Value = serde_json::from_slice(line)?;
-            if value["title"].as_str().is_none() {
+            let valid = match value["type"].as_str() {
+                Some("title") => value["title"].is_string(),
+                _ => serde_json::from_value::<Prefs>(value.clone()).is_ok(),
+            };
+            if !valid {
                 skipped += 1;
                 continue;
             }
@@ -148,7 +185,7 @@ pub fn migrate(dir: &Path, which: &str, cwd: &Path) -> Result<bool> {
         &data[..]
     };
     for (i, line) in body.split(|b| *b == b'\n').enumerate() {
-        if line.iter().all(u8::is_ascii_whitespace) || is_title_line(line) {
+        if line.iter().all(u8::is_ascii_whitespace) || is_meta_line(line) {
             continue;
         }
         serde_json::from_slice::<Item>(line)
@@ -199,6 +236,10 @@ pub struct Session {
     pending_header: Option<String>,
     /// Items accepted by `append` whose write has not landed yet.
     queued: Vec<String>,
+    /// A prefs line not yet written; a new session writes it with its header.
+    pending_prefs: Option<String>,
+    /// The latest prefs given to `set_prefs` (or read when loading).
+    prefs: Option<Prefs>,
     file: Option<File>,
     /// Held while the session is open (see `lock_session`).
     lock: Option<File>,
@@ -221,9 +262,24 @@ impl Session {
             id,
             pending_header: Some(serde_json::to_string(&header)?),
             queued: Vec::new(),
+            pending_prefs: None,
+            prefs: None,
             file: None,
             lock: None,
         })
+    }
+
+    /// Record the model settings in use. Only changes are written; a session
+    /// that is not saved yet writes them with its first item.
+    pub fn set_prefs(&mut self, prefs: &Prefs) -> Result<()> {
+        if self.prefs.as_ref() == Some(prefs) {
+            return Ok(());
+        }
+        let mut value = serde_json::to_value(prefs)?;
+        value["type"] = "prefs".into();
+        self.pending_prefs = Some(serde_json::to_string(&value)?);
+        self.prefs = Some(prefs.clone());
+        self.flush_queue()
     }
 
     pub fn append(&mut self, item: &Item) -> Result<()> {
@@ -246,7 +302,8 @@ impl Session {
     /// Write the header (once) and every queued item. A failed write is rolled
     /// back and the items stay queued for the next attempt.
     fn flush_queue(&mut self) -> Result<()> {
-        if self.queued.is_empty() {
+        let prefs_only = self.pending_prefs.is_some() && self.pending_header.is_none();
+        if self.queued.is_empty() && !prefs_only {
             return Ok(());
         }
         self.ensure_file()?;
@@ -255,11 +312,12 @@ impl Session {
             .seek(SeekFrom::End(0))
             .with_context(|| format!("saving session {}", self.id))?;
         let mut payload = String::new();
-        if let Some(header) = &self.pending_header {
-            payload.push_str(header);
-            payload.push('\n');
-        }
-        for line in &self.queued {
+        for line in self
+            .pending_header
+            .iter()
+            .chain(&self.pending_prefs)
+            .chain(&self.queued)
+        {
             payload.push_str(line);
             payload.push('\n');
         }
@@ -271,6 +329,7 @@ impl Session {
             return Err(e).with_context(|| format!("saving session {}", self.id));
         }
         self.pending_header = None;
+        self.pending_prefs = None;
         self.queued.clear();
         Ok(())
     }
@@ -339,7 +398,11 @@ impl Session {
         write_private(&self.path, &bytes).with_context(|| format!("clearing session {}", self.id))?;
         self.ensure_file()?;
         self.pending_header = None;
-        Ok(())
+        // The settings stay; write them again.
+        match self.prefs.take() {
+            Some(prefs) => self.set_prefs(&prefs),
+            None => Ok(()),
+        }
     }
 
     fn header_line(&self) -> Result<String> {
@@ -461,29 +524,84 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// All sessions, newest first.
+/// All sessions, most recently active first.
 pub fn list(dir: &Path) -> Result<Vec<Meta>> {
+    Ok(list_report(dir)?.0)
+}
+
+/// All readable sessions (most recently active first) and the paths of
+/// session files that could not be read.
+pub fn list_report(dir: &Path) -> Result<(Vec<Meta>, Vec<PathBuf>)> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
-    let mut all: Vec<Meta> = entries
+    let (mut all, mut skipped) = (Vec::new(), Vec::new());
+    for path in entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|p| read_meta(&p))
-        .collect();
-    all.sort_by_key(|m| std::cmp::Reverse(m.created));
-    Ok(all)
+    {
+        match cached_meta(&path) {
+            Some(meta) => all.push(meta),
+            None => skipped.push(path),
+        }
+    }
+    all.sort_by_key(|m: &Meta| std::cmp::Reverse(m.updated));
+    Ok((all, skipped))
 }
 
-/// Header plus title (first user message); `None` if the file is unreadable.
+/// The `nyq sessions` warning for unreadable files, if any.
+pub fn skipped_warning(skipped: usize) -> Option<String> {
+    (skipped > 0).then(|| {
+        format!("skipped {skipped} unreadable saved session{} (see nyq doctor)", if skipped == 1 { "" } else { "s" })
+    })
+}
+
+/// `<id>.jsonl` → `<id>.summary`.
+fn summary_path(path: &Path) -> PathBuf {
+    path.with_extension("summary")
+}
+
+#[derive(Serialize, Deserialize)]
+struct Summary {
+    len: u64,
+    modified: DateTime<Utc>,
+    meta: Meta,
+}
+
+/// [`read_meta`], reusing the cached summary while the file is unchanged.
+fn cached_meta(path: &Path) -> Option<Meta> {
+    let stat = fs::metadata(path).ok()?;
+    let modified: DateTime<Utc> = stat.modified().ok()?.into();
+    let cache = summary_path(path);
+    if let Some(summary) = fs::read(&cache)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Summary>(&b).ok())
+        .filter(|s| s.len == stat.len() && s.modified == modified)
+    {
+        return Some(Meta { path: path.into(), ..summary.meta });
+    }
+    let mut meta = read_meta(path)?;
+    meta.updated = modified;
+    let summary = Summary { len: stat.len(), modified, meta };
+    if let Ok(bytes) = serde_json::to_vec(&summary) {
+        let _ = write_private(&cache, &bytes);
+    }
+    Some(summary.meta)
+}
+
+/// Header, title, first prompt, turn count and latest prefs; `None` if the
+/// file is unreadable. `updated` is the creation time until the caller sets it.
 fn read_meta(path: &Path) -> Option<Meta> {
     let mut lines = BufReader::new(File::open(path).ok()?).lines();
     let header: Header = serde_json::from_str(&lines.next()?.ok()?).ok()?;
     let mut custom = None;
-    let mut derived = None;
+    let mut first: Option<(String, String)> = None;
+    let mut image_only = false;
+    let mut turns = 0;
+    let mut prefs = None;
     for line in lines.map_while(Result::ok) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
@@ -493,28 +611,49 @@ fn read_meta(path: &Path) -> Option<Meta> {
                 if let Some(title) = value
                     .get("title")
                     .and_then(|t| t.as_str())
-                    .filter(|t| !t.is_empty())
+                    .filter(|t| !t.trim().is_empty())
                 {
                     custom = Some(title.to_string());
                 }
             }
-            Some("user") if derived.is_none() => {
-                if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
-                    derived = Some(title_of(text));
+            Some("prefs") => prefs = serde_json::from_value(value).ok().or(prefs),
+            Some("user") => {
+                turns += 1;
+                if first.is_some() {
+                    continue;
+                }
+                let text = value.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                let trimmed = text.trim();
+                if !trimmed.is_empty() && !is_slash_only(trimmed) {
+                    first = Some((title_of(text), preview_of(text)));
+                } else if value["images"].as_array().is_some_and(|i| !i.is_empty()) {
+                    image_only = true;
                 }
             }
             _ => {}
         }
     }
-    let title = custom.or(derived).unwrap_or_else(|| "(untitled)".into());
+    let (derived, preview) = first.unzip();
+    // An image-only first prompt names the session even if text follows.
+    let derived = if image_only { Some(IMAGE_TITLE.to_string()) } else { derived };
+    let preview = preview.unwrap_or_default();
     Some(Meta {
         id: header.id,
         created: header.created,
+        updated: header.created,
         cwd: header.cwd,
         model: header.model,
-        title,
+        title: custom.or(derived).unwrap_or_else(|| UNTITLED.into()),
+        preview,
+        turns,
+        prefs,
         path: path.into(),
     })
+}
+
+/// A lone slash command (`/compact`), which says nothing about the session.
+fn is_slash_only(trimmed: &str) -> bool {
+    trimmed.starts_with('/') && !trimmed.contains('\n')
 }
 
 /// A user-supplied `/rename` title: trimmed, printable, at most [`MAX_TITLE_BYTES`].
@@ -554,30 +693,39 @@ pub fn generated_title(raw: &str) -> Result<String> {
     validate_title(&title).map_err(|_| anyhow::anyhow!("the model did not return a usable title"))
 }
 
-fn is_title_line(line: &[u8]) -> bool {
+/// A `title` or `prefs` metadata line (not a transcript item).
+fn is_meta_line(line: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(line)
         .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(|kind| kind.as_str())
-                .map(|kind| kind == "title")
-        })
-        .unwrap_or(false)
+        .is_some_and(|value| matches!(value["type"].as_str(), Some("title" | "prefs")))
 }
 
-fn title_of(text: &str) -> String {
+/// The first non-empty line, at most `max` characters.
+fn first_line(text: &str, max: usize) -> String {
     let line = text
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    if line.chars().count() > TITLE_MAX {
-        let cut: String = line.chars().take(TITLE_MAX - 1).collect();
+    clip(line, max)
+}
+
+fn clip(line: &str, max: usize) -> String {
+    if line.chars().count() > max {
+        let cut: String = line.chars().take(max - 1).collect();
         format!("{}…", cut.trim_end())
     } else {
         line.to_string()
     }
+}
+
+fn title_of(text: &str) -> String {
+    first_line(text, TITLE_MAX)
+}
+
+/// The whole prompt on one line, for searching and previews.
+fn preview_of(text: &str) -> String {
+    clip(&text.split_whitespace().collect::<Vec<_>>().join(" "), PREVIEW_MAX)
 }
 
 /// Resolve `last`, an id, or a unique id prefix to one session in `dir`.
@@ -625,6 +773,7 @@ pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
     let meta = find(dir, which, cwd)?;
     fs::remove_file(&meta.path).with_context(|| format!("deleting {}", meta.path.display()))?;
     let _ = fs::remove_file(lock_path(&meta.path));
+    let _ = fs::remove_file(summary_path(&meta.path));
     // Its named subagents go with it.
     let _ = fs::remove_dir_all(crate::subagents::store_dir(&meta.path));
     if let Some(home) = dir.parent() {
@@ -637,7 +786,7 @@ pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
 
 /// Whether two working directories are the same place. Canonical paths match
 /// through symlinks; Windows and macOS also ignore ASCII case.
-fn same_cwd(saved: &Path, current: &Path) -> bool {
+pub(crate) fn same_cwd(saved: &Path, current: &Path) -> bool {
     if saved == current {
         return true;
     }
@@ -663,69 +812,66 @@ pub fn format_summary(meta: &Meta, items: &[Item]) -> String {
     let mut users = 0usize;
     let mut assistants = 0usize;
     let mut tools = 0usize;
-    let mut recent = Vec::new();
+    let mut body = String::new();
     for item in items {
-        match item {
-            Item::User { text, .. } => {
+        let line = match item {
+            Item::User { text, images } => {
                 users += 1;
-                recent.push(format!("user: {}", preview_line(text)));
+                body.push_str(&format!("\n[turn {users}]\n"));
+                let images = match images.len() {
+                    0 => String::new(),
+                    1 => " [1 image]".into(),
+                    n => format!(" [{n} images]"),
+                };
+                format!("user: {}{images}", preview_line(text))
             }
             Item::Assistant { text } if !text.trim().is_empty() => {
                 assistants += 1;
-                recent.push(format!("assistant: {}", preview_line(text)));
+                format!("assistant: {}", preview_line(text))
             }
             Item::ToolCall { name, .. } => {
                 tools += 1;
-                recent.push(format!("tool: {name}"));
+                format!("tool: {name}")
             }
-            Item::Compaction { summary } => {
-                recent.push(format!("summary: {}", preview_line(summary)))
-            }
-            _ => {}
-        }
+            Item::Compaction { summary } => format!("summary: {}", preview_line(summary)),
+            _ => continue,
+        };
+        body.push_str(&line);
+        body.push('\n');
     }
-    let shown = if recent.len() > 8 {
-        &recent[recent.len() - 8..]
-    } else {
-        recent.as_slice()
+    let model = match &meta.prefs {
+        Some(p) => format!(
+            "{} · {}{}{}",
+            p.provider,
+            p.model,
+            p.effort.as_deref().map(|e| format!(" · effort {e}")).unwrap_or_default(),
+            if p.fast { " · fast" } else { "" }
+        ),
+        None => meta.model.clone(),
     };
     let mut out = format!(
-        "{}\ntitle: {}\ncreated: {}\ndirectory: {}\nmodel: {}\n{} messages · {} user · {} assistant · {} tool calls\n",
+        "{}\ntitle: {}\ncreated: {}\nupdated: {}\ndirectory: {}\nmodel: {}\nhistory: {} items · {} turns · {} assistant · {} tool calls\n",
         meta.id,
         meta.title,
         meta.created.to_rfc3339(),
+        meta.updated.to_rfc3339(),
         meta.cwd.display(),
-        meta.model,
+        model,
         items.len(),
         users,
         assistants,
         tools,
     );
-    if shown.is_empty() {
+    if body.is_empty() {
         out.push_str("\n(no messages yet)\n");
     } else {
-        out.push('\n');
-        for line in shown {
-            out.push_str(line);
-            out.push('\n');
-        }
+        out.push_str(&body);
     }
     out
 }
 
 fn preview_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("");
-    const MAX: usize = 120;
-    if line.chars().count() > MAX {
-        let cut: String = line.chars().take(MAX - 1).collect();
-        format!("{}…", cut.trim_end())
-    } else {
-        line.to_string()
-    }
+    first_line(text, 120)
 }
 
 fn read_stored_items(path: &Path) -> Result<Vec<Item>> {
@@ -764,6 +910,8 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         path: meta.path.clone(),
         pending_header: None,
         queued: Vec::new(),
+        pending_prefs: None,
+        prefs: meta.prefs.clone(),
         file: Some(file),
         lock: Some(lock),
     };
@@ -799,7 +947,7 @@ fn read_items(data: &[u8], path: &Path) -> Result<(Vec<Item>, usize)> {
         let mut line = raw.strip_suffix(b"\n").unwrap_or(raw);
         line = line.strip_suffix(b"\r").unwrap_or(line);
         let blank = line.iter().all(u8::is_ascii_whitespace);
-        if n > 0 && !blank && !is_title_line(line) {
+        if n > 0 && !blank && !is_meta_line(line) {
             match serde_json::from_slice::<Item>(line) {
                 Ok(item) => items.push(item),
                 Err(_) if end == data.len() => break,
@@ -906,7 +1054,7 @@ mod tests {
             let mut s = Session::create(dir, Path::new(cwd), "m").unwrap();
             s.append(&user(text)).unwrap();
             ids.push(s.id.clone());
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         // Newest first.
         let titles: Vec<_> = list(dir).unwrap().into_iter().map(|m| m.title).collect();
@@ -1129,7 +1277,7 @@ mod tests {
         assert!(raw.starts_with(b"{"), "a crash window must not leave an empty file");
         let metas = list(dir).unwrap();
         assert_eq!(metas[0].id, id);
-        assert_eq!(metas[0].title, "(untitled)");
+        assert_eq!(metas[0].title, UNTITLED);
         drop(s);
         assert!(load(dir, &id, Path::new("/w")).unwrap().2.is_empty());
         delete(dir, &id[..8], Path::new("/w")).unwrap();
@@ -1281,5 +1429,160 @@ mod tests {
         let upper = tmp.path().join("NoSuch");
         let lower = tmp.path().join("nosuch");
         assert!(same_cwd(&upper, &lower));
+    }
+
+    fn prefs(model: &str, effort: Option<&str>, fast: bool) -> Prefs {
+        Prefs {
+            provider: "codex".into(),
+            model: model.into(),
+            effort: effort.map(Into::into),
+            fast,
+        }
+    }
+
+    fn prefs_lines(path: &Path) -> usize {
+        fs::read_to_string(path).unwrap().matches("\"type\":\"prefs\"").count()
+    }
+
+    #[test]
+    fn prefs_are_saved_on_change_and_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        // Before the first item nothing is written; the latest prefs go with it.
+        s.set_prefs(&prefs("a", None, false)).unwrap();
+        s.set_prefs(&prefs("b", Some("high"), false)).unwrap();
+        assert!(!s.path.exists());
+        s.append(&user("hi")).unwrap();
+        assert_eq!(prefs_lines(&s.path), 1);
+        s.set_prefs(&prefs("b", Some("high"), false)).unwrap();
+        assert_eq!(prefs_lines(&s.path), 1, "unchanged prefs are not written again");
+        s.set_prefs(&prefs("b", Some("low"), true)).unwrap();
+        assert_eq!(prefs_lines(&s.path), 2);
+        assert_eq!(list(dir).unwrap()[0].prefs, Some(prefs("b", Some("low"), true)));
+        let id = s.id.clone();
+        drop(s);
+
+        let (mut s, meta, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert_eq!(meta.prefs, Some(prefs("b", Some("low"), true)));
+        assert_eq!(items, vec![user("hi")], "prefs lines are not transcript items");
+        s.set_prefs(&prefs("b", Some("low"), true)).unwrap();
+        assert_eq!(prefs_lines(&s.path), 2);
+        // /reset keeps the settings.
+        s.clear_transcript().unwrap();
+        assert_eq!(prefs_lines(&s.path), 1);
+        drop(s);
+        assert_eq!(find(dir, &id, Path::new("/w")).unwrap().prefs, Some(prefs("b", Some("low"), true)));
+        assert!(!migrate(dir, &id, Path::new("/w")).unwrap());
+    }
+
+    #[test]
+    fn recovery_keeps_prefs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Session::create(tmp.path(), Path::new("/w"), "m").unwrap();
+        s.set_prefs(&prefs("a", None, true)).unwrap();
+        s.append(&user("hi")).unwrap();
+        let (id, kept, skipped) = recover(tmp.path(), &s.id, Path::new("/w")).unwrap();
+        assert_eq!((kept, skipped), (1, 0));
+        assert_eq!(find(tmp.path(), &id, Path::new("/w")).unwrap().prefs, Some(prefs("a", None, true)));
+    }
+
+    #[test]
+    fn titles_skip_slash_commands_and_name_image_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let title = |items: Vec<Item>| {
+            let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+            for item in &items {
+                s.append(item).unwrap();
+            }
+            let meta = read_meta(&s.path).unwrap();
+            fs::remove_file(&s.path).unwrap();
+            (meta.title, meta.preview, meta.turns)
+        };
+        let image = Item::User {
+            text: "  ".into(),
+            images: vec![crate::types::Image {
+                media_type: "image/png".into(),
+                data: String::new(),
+            }],
+        };
+        assert_eq!(
+            title(vec![user("/compact"), user("\n  fix   the\nparser  ")]),
+            ("fix   the".into(), "fix the parser".into(), 2)
+        );
+        assert_eq!(title(vec![image, user("what is this")]).0, IMAGE_TITLE);
+        assert_eq!(title(vec![user("   ")]).0, UNTITLED);
+        assert_eq!(title(vec![Item::Assistant { text: "hi".into() }]).0, UNTITLED);
+        // A blank /rename title does not hide the derived one.
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("real")).unwrap();
+        s.set_title(" ").unwrap();
+        assert_eq!(read_meta(&s.path).unwrap().title, "real");
+    }
+
+    #[test]
+    fn listing_follows_last_activity_and_reports_unreadable_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut old = Session::create(dir, Path::new("/w"), "m").unwrap();
+        old.append(&user("old")).unwrap();
+        let mut new = Session::create(dir, Path::new("/w"), "m").unwrap();
+        new.append(&user("new")).unwrap();
+        // The older session was active more recently.
+        let now = std::time::SystemTime::now();
+        let at = |s: &Session, secs: u64| {
+            let f = OpenOptions::new().append(true).open(&s.path).unwrap();
+            f.set_modified(now - std::time::Duration::from_secs(secs)).unwrap();
+        };
+        at(&new, 600);
+        at(&old, 60);
+        let titles = |dir: &Path| list(dir).unwrap().into_iter().map(|m| m.title).collect::<Vec<_>>();
+        assert_eq!(titles(dir), ["old", "new"]);
+        assert_eq!(find(dir, "last", Path::new("/w")).unwrap().title, "old");
+        let summary = summary_path(&old.path);
+        assert!(summary.exists());
+        // A cached summary is reused while the file is unchanged...
+        let cached = fs::read_to_string(&summary).unwrap();
+        fs::write(&summary, cached.replace("\"title\":\"old\"", "\"title\":\"cached\"")).unwrap();
+        assert_eq!(titles(dir), ["cached", "new"]);
+        // ...and refreshed once it changes.
+        old.append(&user("more")).unwrap();
+        at(&old, 30);
+        let metas = list(dir).unwrap();
+        assert_eq!((metas[0].title.as_str(), metas[0].turns), ("old", 2));
+
+        fs::write(dir.join("broken.jsonl"), "not json\n").unwrap();
+        let (all, skipped) = list_report(dir).unwrap();
+        assert_eq!((all.len(), skipped, ), (2, vec![dir.join("broken.jsonl")]));
+        assert_eq!(skipped_warning(0), None);
+        assert_eq!(
+            skipped_warning(2).unwrap(),
+            "skipped 2 unreadable saved sessions (see nyq doctor)"
+        );
+        let id = old.id.clone();
+        drop(old);
+        delete(dir, &id, Path::new("/w")).unwrap();
+        assert!(!summary.exists());
+    }
+
+    #[test]
+    fn show_prints_every_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Session::create(tmp.path(), Path::new("/w"), "m").unwrap();
+        s.set_prefs(&prefs("gpt", Some("high"), true)).unwrap();
+        for i in 1..=12 {
+            s.append(&user(&format!("question {i}"))).unwrap();
+            s.append(&Item::Assistant { text: format!("answer {i}") }).unwrap();
+        }
+        s.append(&call("c1")).unwrap();
+        let meta = find(tmp.path(), &s.id, Path::new("/w")).unwrap();
+        let items = read_stored_items(&meta.path).unwrap();
+        let out = format_summary(&meta, &items);
+        assert!(out.contains("[turn 1]\nuser: question 1\nassistant: answer 1\n"), "{out}");
+        assert!(out.contains("[turn 12]\nuser: question 12\nassistant: answer 12\ntool: bash\n"));
+        assert!(out.contains("updated: "));
+        assert!(out.contains("model: codex · gpt · effort high · fast"));
+        assert!(out.contains("history: 25 items · 12 turns · 12 assistant · 1 tool calls"));
     }
 }

@@ -228,8 +228,24 @@ impl Agent {
         Some(u)
     }
 
+    /// Save the model settings in use with the session, so resuming restores
+    /// them. Only changes are written.
+    pub fn sync_prefs(&mut self) {
+        let Some(s) = &mut self.session else { return };
+        let prefs = crate::session::Prefs {
+            provider: self.provider.name().into(),
+            model: self.provider.model().into(),
+            effort: self.provider.effort().map(Into::into),
+            fast: self.provider.fast(),
+        };
+        if let Err(e) = s.set_prefs(&prefs) {
+            crate::ui::error(&format!("could not save session settings: {e:#}"));
+        }
+    }
+
     pub fn push(&mut self, item: Item) {
         self.stats.item(&item);
+        self.sync_prefs();
         if let Some(s) = &mut self.session {
             if let Err(e) = s.append(&item) {
                 crate::ui::error(&format!("could not save session: {e:#}"));
@@ -1614,6 +1630,35 @@ mod tests {
             }
             Ok(self.response.clone())
         }
+    }
+
+    #[test]
+    fn sessions_save_and_restore_model_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = agent(Response::default(), None);
+        a.session = Some(Session::create(dir.path(), dir.path(), "fake").unwrap());
+        a.push(Item::user("hi"));
+        let id = a.session.as_ref().unwrap().id.clone();
+        let meta = crate::session::find(dir.path(), &id, dir.path()).unwrap();
+        let saved = meta.prefs.clone().unwrap();
+        assert_eq!((saved.provider.as_str(), saved.model.as_str(), saved.fast), ("fake", "fake", false));
+
+        let prefs = crate::session::Prefs {
+            provider: "ollama".into(),
+            model: "llama3".into(),
+            ..Default::default()
+        };
+        crate::commands::restore_prefs(dir.path(), &mut a, Some(&prefs));
+        assert_eq!((a.provider.name(), a.provider.model()), ("ollama", "llama3"));
+        a.sync_prefs();
+        drop(a);
+        let meta = crate::session::find(dir.path(), &id, dir.path()).unwrap();
+        assert_eq!(meta.prefs, Some(prefs));
+        // An unusable provider keeps the current model.
+        let mut b = agent(Response::default(), None);
+        let bad = crate::session::Prefs { provider: "nope".into(), model: "x".into(), ..Default::default() };
+        crate::commands::restore_prefs(dir.path(), &mut b, Some(&bad));
+        assert_eq!(b.provider.name(), "fake");
     }
 
     fn agent(response: Response, cancel: Option<CancellationToken>) -> Agent {

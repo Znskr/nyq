@@ -183,19 +183,43 @@ impl ModelMenu {
 
 /// The session picker (`/resume`, `nyq -r`).
 struct SessionMenu {
+    /// Most recently active first, without the current session.
     sessions: Vec<Meta>,
+    /// Ids of the sessions started in this workspace.
+    local: std::collections::HashSet<String>,
+    /// Show every workspace's sessions (Tab toggles).
+    all: bool,
     filter: String,
     selected: usize,
 }
 
 impl SessionMenu {
+    fn new(mut sessions: Vec<Meta>, cwd: &std::path::Path, current: Option<&str>) -> Self {
+        sessions.retain(|m| Some(m.id.as_str()) != current);
+        sessions.sort_by_key(|m| std::cmp::Reverse(m.updated));
+        let local: std::collections::HashSet<String> = sessions
+            .iter()
+            .filter(|m| crate::session::same_cwd(&m.cwd, cwd))
+            .map(|m| m.id.clone())
+            .collect();
+        Self {
+            all: local.is_empty(),
+            sessions,
+            local,
+            filter: String::new(),
+            selected: 0,
+        }
+    }
+
     fn visible(&self) -> Vec<&Meta> {
         let f = self.filter.to_lowercase();
         self.sessions
             .iter()
+            .filter(|m| self.all || self.local.contains(&m.id))
             .filter(|m| {
                 f.is_empty()
                     || m.title.to_lowercase().contains(&f)
+                    || m.preview.to_lowercase().contains(&f)
                     || m.cwd.to_string_lossy().to_lowercase().contains(&f)
                     || m.id.starts_with(&f)
             })
@@ -217,14 +241,6 @@ fn ago(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) 
             .format("%Y-%m-%d")
             .to_string(),
     }
-}
-
-/// Sessions for the picker: this folder's first, each group newest first,
-/// without the current one.
-fn order_sessions(mut all: Vec<Meta>, cwd: &std::path::Path, current: Option<&str>) -> Vec<Meta> {
-    all.retain(|m| Some(m.id.as_str()) != current);
-    all.sort_by_key(|m| (m.cwd != cwd, std::cmp::Reverse(m.created)));
-    all
 }
 
 pub struct Screen {
@@ -1116,10 +1132,19 @@ impl Screen {
                 )
             } else if let Some(m) = &self.sessions {
                 let visible = m.visible();
+                let scope = |label: &str, on: bool| {
+                    if on {
+                        paint(fg(BRIGHT), &format!("[{label}]"))
+                    } else {
+                        paint(fg(GRAY), label)
+                    }
+                };
                 let prefix = format!(
-                    "{} {}  ",
+                    "{} {}  {} {}  ",
                     paint(fg(BRIGHT).bold(), "Sessions"),
-                    paint(fg(GRAY), &visible.len().to_string())
+                    paint(fg(GRAY), &visible.len().to_string()),
+                    scope("This workspace", !m.all),
+                    scope("All workspaces", m.all)
                 );
                 let filter_text = if m.filter.is_empty() {
                     "Type to filter"
@@ -1132,14 +1157,12 @@ impl Screen {
                     .iter()
                     .map(|m| MenuItem {
                         label: one_line(&m.title, 200),
-                        detail: String::new(),
-                        tag: one_line(
-                            &format!(
-                                "{} · {}",
-                                ago(m.created, now),
-                                tilde(&m.cwd.display().to_string())
-                            ),
-                            200,
+                        detail: one_line(&tilde(&m.cwd.display().to_string()), 200),
+                        tag: format!(
+                            "{} turn{} · {}",
+                            m.turns,
+                            if m.turns == 1 { "" } else { "s" },
+                            ago(m.updated, now)
                         ),
                     })
                     .collect();
@@ -1147,7 +1170,12 @@ impl Screen {
                     header,
                     items,
                     m.selected,
-                    vec![("↑↓", "Navigate"), ("Enter", "Resume"), ("Esc", "Close")],
+                    vec![
+                        ("↑↓", "Navigate"),
+                        ("Tab", "Scope"),
+                        ("Enter", "Resume"),
+                        ("Esc", "Close"),
+                    ],
                 )
             } else {
                 let s = self.editor.suggestions();
@@ -1696,11 +1724,7 @@ impl Screen {
         self.menu = None;
         self.settings = None;
         self.modes = None;
-        self.sessions = Some(SessionMenu {
-            sessions: order_sessions(all, cwd, current),
-            filter: String::new(),
-            selected: 0,
-        });
+        self.sessions = Some(SessionMenu::new(all, cwd, current));
         self.redraw();
     }
 
@@ -1724,6 +1748,10 @@ impl Screen {
                 } else {
                     (m.selected + 1) % count
                 }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                m.all = !m.all;
+                m.selected = 0;
             }
             KeyCode::Backspace => {
                 m.filter.pop();
@@ -3090,35 +3118,53 @@ mod tests {
     }
 
     fn meta(id: &str, cwd: &str, mins: i64) -> Meta {
+        let when = chrono::Utc::now() - chrono::Duration::minutes(mins);
         Meta {
             id: id.into(),
-            created: chrono::Utc::now() - chrono::Duration::minutes(mins),
+            // Created long ago: ordering follows the last activity.
+            created: when - chrono::Duration::days(mins),
+            updated: when,
             cwd: cwd.into(),
             model: String::new(),
             title: format!("title {id}"),
+            preview: format!("first prompt of {id}"),
+            turns: 1,
+            prefs: None,
             path: PathBuf::new(),
         }
     }
 
     #[test]
-    fn session_picker_orders_and_filters() {
+    fn session_picker_scopes_orders_and_filters() {
         let all = vec![
             meta("a", "/other", 1),
             meta("b", "/here", 5),
             meta("cur", "/here", 0),
             meta("c", "/here", 2),
         ];
-        let ordered = order_sessions(all, std::path::Path::new("/here"), Some("cur"));
-        let ids: Vec<&str> = ordered.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["c", "b", "a"]);
-        let mut m = SessionMenu {
-            sessions: ordered,
-            filter: "other".into(),
-            selected: 0,
+        let mut m = SessionMenu::new(all.clone(), std::path::Path::new("/here"), Some("cur"));
+        let ids = |m: &SessionMenu| m.visible().iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        assert!(!m.all);
+        assert_eq!(ids(&m), ["c", "b"]);
+        let key = |m: &mut Screen, code| {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            m.on_sessions_key(KeyEvent::new(code, KeyModifiers::NONE), &tx);
         };
-        assert_eq!(m.visible().len(), 1);
+        let mut s = Screen::new(Footer::default(), Editor::default(), Vec::new(), PathBuf::new());
+        s.sessions = Some(SessionMenu::new(all.clone(), std::path::Path::new("/here"), None));
+        key(&mut s, KeyCode::Tab);
+        let menu = s.sessions.as_ref().unwrap();
+        assert!(menu.all);
+        assert_eq!(ids(menu), ["cur", "a", "c", "b"]);
+        m.all = true;
+        m.filter = "other".into();
+        assert_eq!(ids(&m), ["a"]);
         m.filter = "TITLE B".into();
-        assert_eq!(m.visible()[0].id, "b");
+        assert_eq!(ids(&m), ["b"]);
+        m.filter = "prompt of c".into();
+        assert_eq!(ids(&m), ["c"]);
+        // Nothing here: start on every workspace.
+        assert!(SessionMenu::new(all, std::path::Path::new("/nowhere"), None).all);
     }
 
     #[test]

@@ -549,6 +549,10 @@ async fn run() -> Result<()> {
         Some(record_tape::Capture::start(&home, &agent.session.as_ref().expect("session").id)?)
     } else { None };
     commands::apply_startup(&home, &mut agent);
+    // A resumed session keeps its model unless one is given on the command line.
+    if let Some(meta) = resumed.as_ref().filter(|_| cli.model.is_none() && cli.provider.is_none()) {
+        commands::restore_prefs(&home, &mut agent, meta.prefs.as_ref());
+    }
     if !interactive {
         anyhow::ensure!(
             !pick,
@@ -654,6 +658,7 @@ async fn run() -> Result<()> {
     let mut relaunch = None;
 
     loop {
+        agent.sync_prefs();
         sync_footer(&tui, &agent, current.as_ref());
         let line = match pending.pop_front() {
             Some(t) => t,
@@ -1093,24 +1098,26 @@ async fn shell(cmd: &str, cwd: &Path, tui: &Tui) {
 }
 
 fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
-    let all = session::list(dir)?;
-    if all.is_empty() {
-        return Ok(vec!["No saved conversations.".into()]);
-    }
-    Ok(all
+    let (all, skipped) = session::list_report(dir)?;
+    let mut lines: Vec<String> = all
         .iter()
         .map(|m| {
             format!(
                 "{}  {}  {}  {}",
                 session_label(&m.id),
-                m.created
+                m.updated
                     .with_timezone(&chrono::Local)
                     .format("%Y-%m-%d %H:%M"),
                 m.cwd.display(),
                 m.title
             )
         })
-        .collect())
+        .collect();
+    if lines.is_empty() {
+        lines.push("No saved conversations.".into());
+    }
+    lines.extend(session::skipped_warning(skipped.len()));
+    Ok(lines)
 }
 
 /// Switch to a saved session (`id`, id prefix or `last`), replaying it.
@@ -1136,6 +1143,7 @@ async fn resume_session(
         }
     };
     agent.reset(Some(s));
+    commands::restore_prefs(&config::home(), agent, meta.prefs.as_ref());
     ui::replay(&items);
     agent.items = items;
     agent.adopt_transcript();
