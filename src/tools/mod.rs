@@ -26,18 +26,25 @@ use crate::types::ToolSpec;
 
 /// Directories and files the read tools must not open: nyq's own tokens,
 /// the codex CLI login, SSH keys, cloud credentials, and `~/.netrc`.
+/// Installed skills (`~/.nyq/skills`) stay readable so their scripts and
+/// references can be opened.
 #[derive(Clone)]
 pub(crate) struct SecretRoots {
     roots: Vec<PathBuf>,
+    /// Readable subdirectories of a secret root.
+    open: Vec<PathBuf>,
 }
 
 impl SecretRoots {
     pub(crate) fn load() -> Self {
         let mut roots = Vec::new();
+        let mut open = Vec::new();
         let home = crate::config::home();
         add_secret(&mut roots, home.clone());
+        add_secret(&mut open, home.join("skills"));
         if let Some(user) = dirs::home_dir() {
             add_secret(&mut roots, user.join(".nyq"));
+            add_secret(&mut open, user.join(".nyq").join("skills"));
             add_secret(&mut roots, user.join(".codex"));
             add_secret(&mut roots, user.join(".ssh"));
             add_secret(&mut roots, user.join(".aws"));
@@ -49,7 +56,7 @@ impl SecretRoots {
         // added above. A custom `NYQ_CODEX_AUTH` such as `/repo/auth.json`
         // must not make the rest of that directory unreadable.
         add_secret(&mut roots, auth);
-        Self { roots }
+        Self { roots, open }
     }
 
     /// `Some` when `user_path` or `resolved` lands in a credential location.
@@ -68,9 +75,8 @@ impl SecretRoots {
     }
 
     fn covers(&self, path: &Path) -> bool {
-        self.roots
-            .iter()
-            .any(|root| path == root || path.starts_with(root))
+        let under = |dirs: &[PathBuf]| dirs.iter().any(|d| path == d || path.starts_with(d));
+        under(&self.roots) && !under(&self.open)
     }
 }
 
@@ -186,10 +192,20 @@ pub(crate) fn outside_workspace(cwd: &Path, user_path: &str) -> bool {
     !crate::agent::inside(cwd, user_path)
 }
 
-/// A `path` argument that points outside the workspace needs approval.
+/// A `path` argument that points outside the workspace needs approval;
+/// installed skills (`~/.nyq/skills`) can be read without asking.
 pub(crate) fn outside_path_arg(cwd: &Path, args: &Value) -> bool {
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    outside_workspace(cwd, path)
+    outside_workspace(cwd, path) && !in_installed_skills(path)
+}
+
+fn in_installed_skills(path: &str) -> bool {
+    let Some(full) = expand_tilde(path).or_else(|| Path::new(path).is_absolute().then(|| PathBuf::from(path))) else {
+        return false;
+    };
+    // Fully resolved, so a link inside a skill that points elsewhere still asks.
+    let skills = crate::config::home().join("skills");
+    std::fs::canonicalize(&skills).is_ok_and(|skills| resolved_path(&full).starts_with(skills))
 }
 
 /// A path as shown to the model and user: always with `/` separators.
@@ -449,7 +465,7 @@ impl SecretRoots {
         for path in paths {
             add_secret(&mut roots, path);
         }
-        Self { roots }
+        Self { roots, open: Vec::new() }
     }
 }
 
@@ -473,6 +489,26 @@ mod secret_tests {
             let link = dir.path().join("link");
             std::os::unix::fs::symlink(secret.join("token"), &link).unwrap();
             assert!(roots.blocks_path(&link));
+        }
+    }
+
+    #[test]
+    fn installed_skills_stay_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let skill = home.join("skills/review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("check.sh"), "echo ok").unwrap();
+        std::fs::write(home.join("auth.json"), "{}").unwrap();
+        let mut roots = SecretRoots::from_paths([home.clone()]);
+        add_secret(&mut roots.open, home.join("skills"));
+        assert!(!roots.blocks_path(&skill.join("check.sh")));
+        assert!(roots.blocks_path(&home.join("auth.json")));
+        assert!(roots.blocks_path(&home.join("skills/../auth.json")));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(home.join("auth.json"), skill.join("leak")).unwrap();
+            assert!(roots.blocks_path(&skill.join("leak")));
         }
     }
 
