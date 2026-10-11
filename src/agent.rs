@@ -362,6 +362,10 @@ impl Agent {
                     return Ok(TurnEnd::Cancelled);
                 }
                 let mut out = self.call_tool(id, name, arguments, ui, &cancel).await;
+                // Credentials never reach the model or the session file.
+                if let std::borrow::Cow::Owned(clean) = crate::tools::redact::scrub(&out.content) {
+                    out.content = clean;
+                }
                 // Oversized output is stored; the model gets head, tail and an id.
                 let key = crate::tools::artifacts::session_key(
                     self.session.as_ref().map(|s| s.id.as_str()),
