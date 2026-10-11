@@ -4,6 +4,7 @@ mod agent;
 mod auto_upgrade;
 mod catalog;
 mod classifier;
+mod command_effect;
 mod commands;
 mod config;
 mod diagnostics;

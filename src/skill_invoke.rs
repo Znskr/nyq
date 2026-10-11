@@ -1,12 +1,13 @@
 //! Skills the user asks for by name in a prompt: a leading `/name`, a
 //! `$name` word (from the `$` picker), or "use the NAME skill". Their
 //! instructions go with that turn, so the model does not have to load them.
+//! Skills are matched by id (`name`, or `name@location` for a duplicate).
 
 use crate::skills::{self, Skill};
 
 /// `(name, description)` rows for the `/` and `$` pickers.
 pub fn entries(skills: &[Skill]) -> Vec<(String, String)> {
-    skills.iter().map(|s| (s.name.clone(), s.description.clone())).collect()
+    skills.iter().map(|s| (s.id.clone(), s.description.clone())).collect()
 }
 
 /// The skill a leading `/name` names, unless `is_command` claims the word.
@@ -16,7 +17,7 @@ pub fn leading<'a>(skills: &'a [Skill], text: &str, is_command: impl Fn(&str) ->
     if is_command(word) {
         return None;
     }
-    skills.iter().find(|s| s.name.eq_ignore_ascii_case(name))
+    skills.iter().find(|s| s.id.eq_ignore_ascii_case(name))
 }
 
 /// Every skill `text` names, in the order of `skills`.
@@ -30,7 +31,7 @@ pub fn named<'a>(skills: &'a [Skill], text: &str) -> Vec<&'a Skill> {
     skills
         .iter()
         .filter(|s| {
-            let name = s.name.to_lowercase();
+            let name = s.id.to_lowercase();
             first.eq_ignore_ascii_case(&format!("/{name}"))
                 || words.iter().any(|w| w.eq_ignore_ascii_case(&format!("${name}")))
                 || [
@@ -55,9 +56,9 @@ pub fn turn_text(chosen: &[&Skill], text: &str) -> (String, Vec<String>) {
         match skills::load_text(skill) {
             Ok(body) => out.push_str(&format!(
                 "<skill name=\"{}\">\nThe user explicitly invoked this skill for this request; follow its instructions.\n\n{}</skill>\n\n",
-                skill.name, body
+                skill.id, body
             )),
-            Err(e) => errors.push(format!("skill {}: {e}", skill.name)),
+            Err(e) => errors.push(format!("skill {}: {e}", skill.id)),
         }
     }
     out.push_str(text);

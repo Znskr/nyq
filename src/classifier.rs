@@ -26,6 +26,9 @@ const MAX_PRIOR_ENTRIES: usize = 16;
 const MAX_PRIOR_CONTENT: usize = 1024;
 const MAX_PRIOR_EVIDENCE: usize = 8 * 1024;
 const COPY_NEEDLE_MIN: usize = 8;
+/// File-change diffs and MCP input schemas are cut to this many bytes.
+const MAX_DIFF_BYTES: usize = 4 * 1024;
+const MAX_SCHEMA_BYTES: usize = 4 * 1024;
 
 pub const UNTRUSTED_COPY: &str =
     "Exact action copied from untrusted tool output; choose a materially different action.";
@@ -167,6 +170,11 @@ pub struct Action {
     pub origin: String,
     pub branch: Option<String>,
     pub older_omitted: bool,
+    /// For file writes and edits: a summary of the change (see
+    /// [`file_change`]), sent instead of the raw arguments.
+    pub file_change: Option<String>,
+    /// For MCP tools: the tool's input schema (JSON).
+    pub input_schema: Option<String>,
 }
 
 impl Action {
@@ -182,6 +190,8 @@ impl Action {
             origin: "root".into(),
             branch: None,
             older_omitted: false,
+            file_change: None,
+            input_schema: None,
         }
     }
 }
@@ -428,6 +438,8 @@ fn cache_key(action: &Action) -> String {
     key.push_str(&action.origin);
     key.push('\0');
     key.push_str(action.branch.as_deref().unwrap_or(""));
+    key.push('\0');
+    key.push_str(action.file_change.as_deref().unwrap_or(""));
     for prior in &action.prior {
         key.push('\0');
         key.push_str(&prior.name);
@@ -508,13 +520,57 @@ fn render_evidence(action: &Action, complete: &mut bool) -> String {
             action.background,
             std::env::consts::OS
         ));
+    } else if let Some(change) = &action.file_change {
+        out.push_str("action: file_change\n");
+        push_field(&mut out, "tool", &action.tool, complete);
+        out.push_str(change);
     } else {
         out.push_str("action: tool\n");
         push_field(&mut out, "tool", &action.tool, complete);
         push_field(&mut out, "arguments_json", &action.arguments_json, complete);
+        if let Some(schema) = &action.input_schema {
+            out.push_str(&format!(
+                "tool_input_schema: {}\n",
+                head_tail(schema, MAX_SCHEMA_BYTES).0
+            ));
+        }
     }
     out.push_str(&format!("action_evidence_incomplete: {}\n", !*complete));
     out
+}
+
+/// A file write or edit as the classifier sees it: the path, whether the file
+/// existed, how many lines are added and removed, and the start of the diff
+/// (`preview` is the tool's approval preview; `content` a write's new content).
+pub fn file_change(path: &str, existed: bool, preview: &str, content: Option<&str>) -> String {
+    let (added, removed, diff) = match content.filter(|_| !existed) {
+        Some(text) => (
+            text.lines().count(),
+            0,
+            text.lines().map(|l| format!("+{l}\n")).collect::<String>(),
+        ),
+        None => {
+            let (mut added, mut removed) = (0, 0);
+            for line in preview
+                .lines()
+                .filter(|l| !l.starts_with("+++ ") && !l.starts_with("--- "))
+            {
+                if line.starts_with('+') {
+                    added += 1;
+                } else if line.starts_with('-') {
+                    removed += 1;
+                }
+            }
+            (added, removed, preview.to_string())
+        }
+    };
+    let (diff, whole) = head_tail(&diff, MAX_DIFF_BYTES);
+    format!(
+        "path: {}\nexisted_before: {existed}\nlines_added: {added}\nlines_removed: {removed}\ndiff_truncated: {}\ndiff:\n{}\n",
+        head_tail(path, 1024).0,
+        !whole,
+        diff.trim_end()
+    )
 }
 
 fn render_prior(index: usize, entry: &PriorTool, complete: &mut bool) -> String {
@@ -839,6 +895,45 @@ mod tests {
             }
         );
         assert_eq!(cache.values().next().unwrap(), &result.verdict);
+    }
+
+    #[test]
+    fn file_changes_and_mcp_schemas_are_summarized() {
+        let mut action = Action::new(
+            "write_file",
+            r#"{"path":"src/a.rs","content":"SECRET_RAW_ARGS"}"#,
+            "Fix the bug.",
+        );
+        let diff = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n+more\n ctx\n";
+        action.file_change = Some(file_change("src/a.rs", true, diff, Some("ignored")));
+        let text = prepare(&action).instruction;
+        assert!(text.contains("action: file_change"), "{text}");
+        assert!(
+            text.contains("path: src/a.rs") && text.contains("existed_before: true"),
+            "{text}"
+        );
+        assert!(
+            text.contains("lines_added: 2") && text.contains("lines_removed: 1"),
+            "{text}"
+        );
+        assert!(!text.contains("SECRET_RAW_ARGS"), "{text}");
+
+        let created = file_change("new.txt", false, "new file: new.txt", Some("a\nb\nc"));
+        assert!(
+            created.contains("lines_added: 3") && created.contains("+b"),
+            "{created}"
+        );
+        let big = file_change("x", false, "", Some(&"line\n".repeat(5000)));
+        assert!(big.contains("diff_truncated: true") && big.len() < MAX_DIFF_BYTES + 512);
+
+        let mut mcp = Action::new("mcp__wiki__ask", r#"{"q":"x"}"#, "Ask the wiki.");
+        mcp.input_schema = Some(r#"{"type":"object","properties":{"q":{"type":"string"}}}"#.into());
+        let text = prepare(&mcp).instruction;
+        assert!(
+            text.contains("tool_input_schema: {\"type\":\"object\""),
+            "{text}"
+        );
+        assert!(text.contains("arguments_json"), "{text}");
     }
 
     #[test]

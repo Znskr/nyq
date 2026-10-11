@@ -25,21 +25,29 @@ pub struct Skill {
     root: PathBuf,
     /// "project" or "user".
     pub scope: &'static str,
+    /// The skill root it was found in, e.g. `.claude/skills` or `~/.config/opencode/skills`.
+    pub location: String,
+    /// How the skill is named to the model and in `/skills`: its name, or
+    /// `name@location` when a skill of the same name was found earlier.
+    pub id: String,
 }
 
-/// Skill roots in precedence order (the first skill with a given name wins).
-/// `(scan directory, containment root, scope)`.
-fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<(PathBuf, PathBuf, &'static str)> {
-    let mut roots: Vec<(PathBuf, PathBuf, &'static str)> = [".agents", ".codex", ".claude", ".nyq"]
+/// One skill root: `(scan directory, containment root, scope, location label)`.
+type Root = (PathBuf, PathBuf, &'static str, String);
+
+/// Skill roots in precedence order (for same-named skills, the first keeps
+/// the plain name).
+fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<Root> {
+    let mut roots: Vec<Root> = [".agents/skills", ".codex/skills", ".claude/skills", ".nyq/skills", ".opencode/skills", "skills"]
         .iter()
-        .map(|d| (cwd.join(d).join("skills"), cwd.to_path_buf(), "project"))
+        .map(|d| (cwd.join(d), cwd.to_path_buf(), "project", d.to_string()))
         .collect();
     let user_skills = home.join("skills");
-    roots.push((user_skills.clone(), user_skills, "user"));
+    roots.push((user_skills.clone(), user_skills.clone(), "user", slash_path(&user_skills)));
     if let Some(user_home) = user_home {
-        for d in [".agents", ".codex", ".claude"] {
-            let dir = user_home.join(d).join("skills");
-            roots.push((dir.clone(), dir, "user"));
+        for d in [".agents/skills", ".codex/skills", ".claude/skills", ".config/opencode/skills"] {
+            let dir = user_home.join(d);
+            roots.push((dir.clone(), dir, "user", format!("~/{d}")));
         }
     }
     roots
@@ -47,35 +55,71 @@ fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<(PathBuf, Pat
 
 /// Discover skills for a session. `home` is the nyq profile dir (~/.nyq).
 pub fn discover(home: &Path, cwd: &Path) -> Vec<Skill> {
-    discover_with(home, dirs::home_dir().as_deref(), cwd)
+    discover_report(home, cwd).0
+}
+
+/// [`discover`], plus problems with SKILL.md files (for `/skills`).
+pub fn discover_report(home: &Path, cwd: &Path) -> (Vec<Skill>, Vec<String>) {
+    discover_in(&roots(home, dirs::home_dir().as_deref(), cwd))
 }
 
 /// [`discover`] with an explicit user home (None skips the user's other tools' skills).
+#[cfg(test)]
 pub(crate) fn discover_with(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<Skill> {
-    discover_in(&roots(home, user_home, cwd))
+    discover_in(&roots(home, user_home, cwd)).0
 }
 
-fn discover_in(roots: &[(PathBuf, PathBuf, &'static str)]) -> Vec<Skill> {
+fn discover_in(roots: &[Root]) -> (Vec<Skill>, Vec<String>) {
     let mut skills: Vec<Skill> = Vec::new();
-    for (scan, root, scope) in roots {
+    let mut problems = Vec::new();
+    for (scan, root, scope, location) in roots {
         let Ok(entries) = std::fs::read_dir(scan) else { continue };
         let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
         dirs.sort();
         for dir in dirs {
             let path = dir.join("SKILL.md");
-            let Ok(text) = crate::tools::read_rooted_text(root, &path) else { continue };
+            if std::fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            let text = match crate::tools::read_rooted_text(root, &path) {
+                Ok(text) => text,
+                Err(e) => {
+                    problems.push(format!("{}: skipped: {e}", slash_path(&path)));
+                    continue;
+                }
+            };
+            if let Err(e) = front_matter(&text) {
+                problems.push(format!("{}: {e}", slash_path(&path)));
+            }
             let (meta, _) = split_frontmatter(&text);
+            if meta.description.as_deref().is_none_or(|d| d.trim().is_empty()) {
+                problems.push(format!("{}: no `description` in the frontmatter", slash_path(&path)));
+            }
             let dir_name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let name = meta.name.filter(|n| !n.is_empty()).unwrap_or(dir_name);
-            if skills.iter().any(|s| s.name == name) {
+            // Same-named skills from different roots are all kept; later ones
+            // are told apart by where they live.
+            let id = if skills.iter().any(|s| s.name == name) { format!("{name}@{location}") } else { name.clone() };
+            // The same SKILL.md reached twice (a symlinked directory) is one skill.
+            let real = std::fs::canonicalize(&path).ok();
+            if skills.iter().any(|s| s.id == id || (real.is_some() && std::fs::canonicalize(&s.path).ok() == real)) {
                 continue;
             }
             let description = meta.description.unwrap_or_default();
-            skills.push(Skill { name, description, path, dir, root: root.clone(), scope });
+            skills.push(Skill {
+                name,
+                description,
+                path,
+                dir,
+                root: root.clone(),
+                scope,
+                location: location.clone(),
+                id,
+            });
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
-    skills
+    (skills, problems)
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -224,8 +268,8 @@ pub fn prompt_section(skills: &[Skill]) -> String {
     let max_description = crate::limits::get("skill_description_bytes").unwrap_or(usize::MAX);
     for skill in skills.iter().take(MAX_PROMPT_SKILLS) {
         match short(&skill.description, max_description) {
-            d if d.is_empty() => out.push_str(&format!("- {}\n", skill.name)),
-            d => out.push_str(&format!("- {}: {d}\n", skill.name)),
+            d if d.is_empty() => out.push_str(&format!("- {}\n", skill.id)),
+            d => out.push_str(&format!("- {}: {d}\n", skill.id)),
         }
     }
     if skills.len() > MAX_PROMPT_SKILLS {
@@ -237,12 +281,12 @@ pub fn prompt_section(skills: &[Skill]) -> String {
 /// Lines for a `/skills` listing.
 pub fn list_lines(skills: &[Skill]) -> Vec<String> {
     if skills.is_empty() {
-        return vec!["No skills found (add <dir>/SKILL.md under .agents/skills, .claude/skills, ...).".into()];
+        return vec!["No skills found (add <dir>/SKILL.md under skills/, .agents/skills, .claude/skills, .opencode/skills, ...).".into()];
     }
-    let width = skills.iter().map(|s| s.name.chars().count()).max().unwrap_or(0);
+    let width = skills.iter().map(|s| s.id.chars().count()).max().unwrap_or(0);
     skills
         .iter()
-        .map(|s| format!("{:width$}  {:7}  {}", s.name, s.scope, short(&s.description, 100)))
+        .map(|s| format!("{:width$}  {:7}  {}", s.id, s.scope, short(&s.description, 100)))
         .map(|l| l.trim_end().to_string())
         .collect()
 }
@@ -266,7 +310,11 @@ struct SkillTool {
 }
 
 fn find_in<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
-    skills.iter().find(|s| s.name == name).or_else(|| skills.iter().find(|s| s.name.eq_ignore_ascii_case(name)))
+    skills
+        .iter()
+        .find(|s| s.id == name)
+        .or_else(|| skills.iter().find(|s| s.name == name))
+        .or_else(|| skills.iter().find(|s| s.name.eq_ignore_ascii_case(name)))
 }
 
 impl SkillTool {
@@ -290,10 +338,10 @@ impl SkillTool {
                 let n = s.name.to_lowercase();
                 n.contains(&lower) || lower.contains(&n) || edit_distance(&n, &lower) <= 3
             })
-            .map(|s| s.name.as_str())
+            .map(|s| s.id.as_str())
             .collect();
         if close.is_empty() {
-            let all: Vec<&str> = self.skills.iter().take(30).map(|s| s.name.as_str()).collect();
+            let all: Vec<&str> = self.skills.iter().take(30).map(|s| s.id.as_str()).collect();
             format!("Unknown skill \"{name}\". Available skills: {}", all.join(", "))
         } else {
             format!("Unknown skill \"{name}\". Did you mean: {}?", close.join(", "))
@@ -456,16 +504,46 @@ mod tests {
         write_skill(&cwd.join(".nyq/skills"), "pack/inner", &md("inner", "nested"));
         fs::write(cwd.join(".nyq/skills/stray.md"), "not a dir").unwrap();
 
-        let skills = discover_in(&roots(&home, Some(&user), &cwd));
-        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["deploy", "nodesc", "review"]);
-        assert_eq!(skills[0].description, "ship it");
-        assert_eq!(skills[0].scope, "user");
-        assert_eq!(skills[1].description, "");
-        assert_eq!(skills[2].description, "agents review wins");
-        assert_eq!(skills[2].scope, "project");
-        assert_eq!(skills[2].dir, cwd.join(".agents/skills/rev"));
-        assert_eq!(skills[2].path, cwd.join(".agents/skills/rev/SKILL.md"));
+        // Workspace `skills/`, `.opencode/skills` and opencode's user root count too.
+        write_skill(&cwd.join("skills"), "lint", &md("lint", "workspace lint"));
+        write_skill(&cwd.join(".opencode/skills"), "fmt", &md("fmt", "opencode fmt"));
+        write_skill(&user.join(".config/opencode/skills"), "doc", &md("doc", "user doc"));
+        // Malformed SKILL.md files are reported.
+        write_skill(&cwd.join(".claude/skills"), "broken", "---\nname: broken\n");
+
+        let (skills, problems) = discover_in(&roots(&home, Some(&user), &cwd));
+        let ids: Vec<&str> = skills.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "broken",
+                "deploy",
+                "deploy@~/.claude/skills",
+                "doc",
+                "fmt",
+                "lint",
+                "nodesc",
+                "review",
+                "review@.claude/skills",
+                &format!("review@{}", slash_path(&home.join("skills"))),
+            ]
+        );
+        let get = |id: &str| skills.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(get("deploy").description, "ship it");
+        assert_eq!(get("deploy").scope, "user");
+        assert_eq!(get("deploy@~/.claude/skills").description, "shadowed");
+        assert_eq!(get("nodesc").description, "");
+        assert_eq!(get("review").description, "agents review wins");
+        assert_eq!(get("review").scope, "project");
+        assert_eq!(get("review").location, ".agents/skills");
+        assert_eq!(get("review").dir, cwd.join(".agents/skills/rev"));
+        assert_eq!(get("review").path, cwd.join(".agents/skills/rev/SKILL.md"));
+        assert_eq!(get("review@.claude/skills").description, "project review");
+        assert_eq!(find_in(&skills, "review@.claude/skills").unwrap().description, "project review");
+        assert_eq!(find_in(&skills, "Review").unwrap().description, "agents review wins");
+        assert!(problems.iter().any(|p| p.contains("broken/SKILL.md") && p.contains("closing")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("nodesc/SKILL.md") && p.contains("description")), "{problems:?}");
+        assert!(!problems.iter().any(|p| p.contains("deploy")), "{problems:?}");
     }
 
     #[cfg(unix)]
@@ -477,25 +555,25 @@ mod tests {
         let root = proj.join(".claude/skills");
         fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(t.path().join("store/linked"), root.join("linked")).unwrap();
-        let skills = discover_in(&roots(&t.path().join("home"), None, &proj));
+        let skills = discover_in(&roots(&t.path().join("home"), None, &proj)).0;
         assert!(skills.is_empty(), "a skill directory symlink must not leave the project");
 
         write_skill(&root, "real", &md("real", "inside"));
         std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
-        let skills = discover_in(&roots(&t.path().join("home"), None, &proj));
+        let skills = discover_in(&roots(&t.path().join("home"), None, &proj)).0;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "inside");
 
         let evil = root.join("evil");
         fs::create_dir(&evil).unwrap();
         std::os::unix::fs::symlink(t.path().join("store/linked/SKILL.md"), evil.join("SKILL.md")).unwrap();
-        let skills = discover_in(&roots(&t.path().join("home"), None, &proj));
+        let skills = discover_in(&roots(&t.path().join("home"), None, &proj)).0;
         assert!(skills.iter().all(|s| s.name != "linked"));
         if Path::new("/dev/zero").exists() {
             let huge = root.join("huge");
             fs::create_dir(&huge).unwrap();
             std::os::unix::fs::symlink("/dev/zero", huge.join("SKILL.md")).unwrap();
-            let _ = discover_in(&roots(&t.path().join("home"), None, &proj));
+            let _ = discover_in(&roots(&t.path().join("home"), None, &proj)).0;
         }
     }
 
@@ -507,6 +585,8 @@ mod tests {
             dir: name.into(),
             root: name.into(),
             scope: "user",
+            location: "skills".into(),
+            id: name.into(),
         }
     }
 
@@ -536,7 +616,7 @@ mod tests {
         fs::write(root.join("pdf/scripts/fill.py"), "").unwrap();
         fs::write(root.join("pdf/REFERENCE.md"), "").unwrap();
         fs::write(root.join("pdf/.hidden"), "").unwrap();
-        let skills = discover_in(&roots(&t.path().join("home"), None, &t.path().join("proj")));
+        let skills = discover_in(&roots(&t.path().join("home"), None, &t.path().join("proj"))).0;
         let tool = tool(skills);
         assert!(!tool.needs_approval(&json!({"name": "pdf"})));
         let out = tool.run(json!({"name": "pdf"}), &ToolCtx::default()).await;
