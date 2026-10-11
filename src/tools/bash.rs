@@ -32,15 +32,17 @@ impl Tool for Bash {
                 (except benign ones such as grep finding no match or diff finding differences). The command runs in its own process group with a \
                 timeout in seconds (default 120, max 600); on timeout or cancellation the whole \
                 group is terminated. Set run_in_background for servers, watchers and other long-running \
-                commands: it returns a process id at once; read new output with bash_output and stop it \
-                with kill_shell."
+                commands: it returns a process id at once; read new output with bash_output, wait for a line, \
+                port or exit with process_wait, and stop it with kill_shell. Add interactive to drive a REPL \
+                or prompt with process_write."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command line to run with bash -c."},
                     "timeout_secs": {"type": "integer", "description": "Kill the process group after this many seconds (default 120, max 600)."},
-                    "run_in_background": {"type": "boolean", "description": "Start the command in the background and return its id immediately (no timeout)."}
+                    "run_in_background": {"type": "boolean", "description": "Start the command in the background and return its id immediately (no timeout)."},
+                    "interactive": {"type": "boolean", "description": "With run_in_background: keep stdin open so process_write can send input (REPLs, prompts). Otherwise stdin is empty."}
                 },
                 "required": ["command"]
             }),
@@ -69,7 +71,8 @@ impl Tool for Bash {
             return ToolOutput::err("bash: missing required argument `command`.");
         };
         if args.get("run_in_background").and_then(Value::as_bool) == Some(true) {
-            return super::background::started_message(command, &ctx.cwd, &ctx.sandbox);
+            let interactive = args.get("interactive").and_then(Value::as_bool).unwrap_or(false);
+            return super::background::started_message(command, &ctx.cwd, &ctx.sandbox, interactive);
         }
         let timeout = Duration::from_secs(
             args.get("timeout_secs")
@@ -678,20 +681,12 @@ mod tests {
 
     #[tokio::test]
     async fn long_output_keeps_both_ends_and_stores_the_rest() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
-        let old = std::env::var_os("NYQ_HOME");
-        std::env::set_var("NYQ_HOME", home.path());
         let dir = tempfile::tempdir().unwrap();
-        let mut ctx = make_ctx(dir.path(), &CancellationToken::new());
-        ctx.session_id = Some("s1".into());
-        let out = Bash
-            .run(json!({"command": "echo FIRST-ERROR; seq 1 20000; echo LAST-LINE"}), &ctx)
-            .await;
-        match old {
-            Some(v) => std::env::set_var("NYQ_HOME", v),
-            None => std::env::remove_var("NYQ_HOME"),
-        }
+        let ctx = make_ctx(dir.path(), &CancellationToken::new());
+        let store = Some((home.path().to_path_buf(), "s1".to_string()));
+        let command = "echo FIRST-ERROR; seq 1 20000; echo LAST-LINE";
+        let out = run_command(command, dir.path(), &ctx.sandbox, &ctx.cancel, None, store).await;
         assert!(!out.is_error);
         assert!(out.content.starts_with("FIRST-ERROR\n1\n"), "{}", &out.content[..60]);
         assert!(out.content.trim_end().ends_with("LAST-LINE"));
