@@ -1,4 +1,4 @@
-//! The terminal bell and desktop notifications for a long turn that ended
+//! Sounds (system chimes or the terminal bell) and desktop notifications for a long turn that ended
 //! and for prompts that wait on you (approvals, questions), per settings.
 
 use std::io::Write;
@@ -12,10 +12,19 @@ pub enum Event<'a> {
     Attention(&'a str),
 }
 
+/// Which sound to play, where the system has sounds to play.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cue {
+    Done,
+    Failed,
+    Attention,
+}
+
 /// What to do for one event.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    pub bell: bool,
+    /// A sound: a system chime when one can play, else the terminal bell.
+    pub sound: Option<Cue>,
     /// (title, body) of a desktop notification.
     pub desktop: Option<(String, String)>,
 }
@@ -25,16 +34,60 @@ pub fn plan(s: &Settings, event: &Event) -> Plan {
         Event::TurnEnd { secs, failed } => {
             let long = *secs >= s.notify_after_secs;
             let what = if *failed { "Stopped" } else { "Finished" };
+            let cue = if *failed { Cue::Failed } else { Cue::Done };
             Plan {
-                bell: s.sound == "max" || (s.sound == "on" && long),
+                sound: (s.sound == "max" || (s.sound == "on" && long)).then_some(cue),
                 desktop: (s.notifications && long).then(|| ("nyq".into(), format!("{what} after {}", duration(*secs)))),
             }
         }
         Event::Attention(what) => Plan {
-            bell: s.sound != "off",
+            sound: (s.sound != "off").then_some(Cue::Attention),
             desktop: s.notifications.then(|| ("nyq".into(), what.to_string())),
         },
     }
+}
+
+/// Play a system sound for `cue` in a local graphical session. Returns
+/// false when there is none, so the caller rings the bell instead.
+#[cfg(target_os = "macos")]
+fn chime(cue: Cue) -> bool {
+    let name = match cue {
+        Cue::Done => "Glass",
+        Cue::Failed => "Basso",
+        Cue::Attention => "Ping",
+    };
+    let file = format!("/System/Library/Sounds/{name}.aiff");
+    if std::env::var_os("SSH_CONNECTION").is_some() || !std::path::Path::new(&file).exists() {
+        return false;
+    }
+    let mut cmd = std::process::Command::new("afplay");
+    cmd.arg(file);
+    spawn_detached(cmd)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn chime(cue: Cue) -> bool {
+    let graphical = std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if !graphical || std::env::var_os("SSH_CONNECTION").is_some() {
+        return false;
+    }
+    let name = match cue {
+        Cue::Done => "complete",
+        Cue::Failed => "dialog-warning",
+        Cue::Attention => "message",
+    };
+    let file = format!("/usr/share/sounds/freedesktop/stereo/{name}.oga");
+    if !std::path::Path::new(&file).exists() {
+        return false;
+    }
+    let mut cmd = std::process::Command::new("paplay");
+    cmd.arg(file);
+    spawn_detached(cmd)
+}
+
+#[cfg(windows)]
+fn chime(_cue: Cue) -> bool {
+    false
 }
 
 fn duration(secs: u64) -> String {
@@ -93,8 +146,15 @@ fn env(name: &str) -> String {
 /// the system notifier when running in a local graphical session, and the
 /// terminal's escape sequence otherwise (e.g. over SSH).
 pub fn emit(out: &mut impl Write, plan: &Plan) {
-    if plan.bell {
-        let _ = out.write_all(b"\x07");
+    emit_with(out, plan, chime);
+}
+
+fn emit_with(out: &mut impl Write, plan: &Plan, chime: impl Fn(Cue) -> bool) {
+    // Prompts always ring too, so multiplexers can flag the pane.
+    if let Some(cue) = plan.sound {
+        if !chime(cue) || cue == Cue::Attention {
+            let _ = out.write_all(b"\x07");
+        }
     }
     if let Some((title, body)) = &plan.desktop {
         if !native(title, body) {
@@ -182,16 +242,22 @@ mod tests {
         let short = plan(&s, &Event::TurnEnd { secs: 3, failed: false });
         assert_eq!(short, Plan::default());
         let long = plan(&s, &Event::TurnEnd { secs: 75, failed: true });
-        assert!(long.bell);
+        assert_eq!(long.sound, Some(Cue::Failed));
         assert_eq!(long.desktop, Some(("nyq".into(), "Stopped after 1m 15s".into())));
-        assert!(plan(&s, &Event::Attention("Approve bash")).bell);
+        assert_eq!(plan(&s, &Event::Attention("Approve bash")).sound, Some(Cue::Attention));
         s.sound = "max".into();
         s.notifications = false;
-        assert_eq!(plan(&s, &Event::TurnEnd { secs: 1, failed: false }), Plan { bell: true, desktop: None });
+        assert_eq!(plan(&s, &Event::TurnEnd { secs: 1, failed: false }), Plan { sound: Some(Cue::Done), desktop: None });
         s.sound = "off".into();
         assert_eq!(plan(&s, &Event::Attention("Question")), Plan::default());
-        let mut out = Vec::new();
-        emit(&mut out, &Plan { bell: true, desktop: None });
-        assert_eq!(out, b"\x07");
+        // A chime replaces the bell, except for prompts; no chime falls back to it.
+        let ring = |cue, played: bool| {
+            let mut out = Vec::new();
+            emit_with(&mut out, &Plan { sound: Some(cue), desktop: None }, |_| played);
+            out
+        };
+        assert_eq!(ring(Cue::Done, true), b"");
+        assert_eq!(ring(Cue::Done, false), b"\x07");
+        assert_eq!(ring(Cue::Attention, true), b"\x07");
     }
 }
