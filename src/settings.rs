@@ -19,11 +19,13 @@ pub enum Segment {
     Sandbox,
     Folder,
     Branch,
+    Session,
 }
 
 impl Segment {
-    pub const ALL: [Segment; 7] = [
+    pub const ALL: [Segment; 8] = [
         Segment::Model,
+        Segment::Session,
         Segment::Provider,
         Segment::Context,
         Segment::Tokens,
@@ -41,6 +43,7 @@ impl Segment {
             Segment::Sandbox => "sandbox",
             Segment::Folder => "folder",
             Segment::Branch => "branch",
+            Segment::Session => "session",
         }
     }
 
@@ -53,6 +56,7 @@ impl Segment {
             Segment::Sandbox => "Sandbox",
             Segment::Folder => "Folder",
             Segment::Branch => "Git branch",
+            Segment::Session => "Session title",
         }
     }
 
@@ -65,6 +69,7 @@ impl Segment {
             Segment::Sandbox => "Show the sandbox and permission mode",
             Segment::Folder => "Show the workspace folder",
             Segment::Branch => "Show the current Git branch",
+            Segment::Session => "Show the session title",
         }
     }
 
@@ -78,6 +83,7 @@ impl Segment {
                 "git" => Some(Segment::Branch),
                 "workspace" | "cwd" => Some(Segment::Folder),
                 "usage" => Some(Segment::Tokens),
+                "title" => Some(Segment::Session),
                 _ => None,
             })
     }
@@ -103,6 +109,8 @@ pub struct StatusLine {
     pub folder: bool,
     #[serde(default = "yes")]
     pub branch: bool,
+    #[serde(default = "yes")]
+    pub session: bool,
 }
 
 impl Default for StatusLine {
@@ -115,6 +123,7 @@ impl Default for StatusLine {
             sandbox: true,
             folder: true,
             branch: true,
+            session: true,
         }
     }
 }
@@ -137,6 +146,7 @@ impl StatusLine {
             Segment::Sandbox => &self.sandbox,
             Segment::Folder => &self.folder,
             Segment::Branch => &self.branch,
+            Segment::Session => &self.session,
         }
     }
 
@@ -149,6 +159,7 @@ impl StatusLine {
             Segment::Sandbox => &mut self.sandbox,
             Segment::Folder => &mut self.folder,
             Segment::Branch => &mut self.branch,
+            Segment::Session => &mut self.session,
         }
     }
 }
@@ -182,6 +193,13 @@ pub struct Settings {
     pub prompt_history: bool,
     /// Download and install new releases in the background (interactive sessions).
     pub auto_upgrade: bool,
+    /// `auto` (follow the terminal background), `dark` or `light`. `NYQ_THEME` overrides it.
+    pub theme: String,
+    /// Show finished tool groups as their header line only.
+    pub collapse_tool_calls: bool,
+    /// Push the shell output on screen into the scrollback at start, so the
+    /// session begins at the top of the screen.
+    pub startup_scrollback: bool,
     /// Keys nyq doesn't manage here (`provider`, `models`, …), kept on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -208,6 +226,9 @@ impl Default for Settings {
             statusline: StatusLine::default(),
             prompt_history: true,
             auto_upgrade: true,
+            theme: "auto".into(),
+            collapse_tool_calls: false,
+            startup_scrollback: false,
             extra: Map::new(),
         }
     }
@@ -305,15 +326,17 @@ pub enum Category {
     StatusLine,
     Agent,
     Notifications,
+    Display,
     Advanced,
 }
 
 impl Category {
-    pub const ALL: [Category; 5] = [
+    pub const ALL: [Category; 6] = [
         Category::All,
         Category::StatusLine,
         Category::Agent,
         Category::Notifications,
+        Category::Display,
         Category::Advanced,
     ];
 
@@ -323,6 +346,7 @@ impl Category {
             Category::StatusLine => "Status line",
             Category::Agent => "Agent",
             Category::Notifications => "Notifications",
+            Category::Display => "Display",
             Category::Advanced => "Advanced",
         }
     }
@@ -342,6 +366,9 @@ pub enum Id {
     Segment(Segment),
     PromptHistory,
     AutoUpgrade,
+    Theme,
+    CollapseToolCalls,
+    StartupScrollback,
 }
 
 /// Session state the menu shows next to the saved settings.
@@ -430,6 +457,24 @@ pub fn specs() -> Vec<Spec> {
         description: seg.description(),
     }));
     v.push(Spec {
+        id: Id::Theme,
+        category: Category::Display,
+        label: "Theme",
+        description: "Colors for dark or light terminals; auto follows the background",
+    });
+    v.push(Spec {
+        id: Id::CollapseToolCalls,
+        category: Category::Display,
+        label: "Collapse tool calls",
+        description: "Show finished tool groups as one summary line (ctrl+o shows them all)",
+    });
+    v.push(Spec {
+        id: Id::StartupScrollback,
+        category: Category::Display,
+        label: "Start at top of screen",
+        description: "Move earlier shell output into the scrollback at start",
+    });
+    v.push(Spec {
         id: Id::PromptHistory,
         category: Category::Advanced,
         label: "Prompt history",
@@ -471,6 +516,9 @@ pub fn value(id: Id, s: &Settings, live: &Live) -> String {
         Id::Segment(seg) => on_off(s.statusline.get(seg)),
         Id::PromptHistory => on_off(s.prompt_history),
         Id::AutoUpgrade => on_off(s.auto_upgrade),
+        Id::Theme => s.theme.clone(),
+        Id::CollapseToolCalls => on_off(s.collapse_tool_calls),
+        Id::StartupScrollback => on_off(s.startup_scrollback),
     }
 }
 
@@ -489,7 +537,14 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
         Id::AutoCompact => list(&["off", "50%", "60%", "70%", "80%", "90%"]),
         Id::Sound => list(&["off", "on", "max"]),
         Id::NotifyAfter => list(&["0s", "5s", "10s", "30s", "60s", "120s"]),
-        Id::Fast | Id::Notifications | Id::Segment(_) | Id::PromptHistory | Id::AutoUpgrade => {
+        Id::Theme => list(&["auto", "dark", "light"]),
+        Id::Fast
+        | Id::Notifications
+        | Id::Segment(_)
+        | Id::PromptHistory
+        | Id::AutoUpgrade
+        | Id::CollapseToolCalls
+        | Id::StartupScrollback => {
             list(&["off", "on"])
         }
     }
@@ -523,6 +578,9 @@ pub fn apply(id: Id, value: &str, s: &mut Settings) -> bool {
         Id::Segment(seg) => s.statusline.set(seg, on),
         Id::PromptHistory => s.prompt_history = on,
         Id::AutoUpgrade => s.auto_upgrade = on,
+        Id::Theme => s.theme = value.into(),
+        Id::CollapseToolCalls => s.collapse_tool_calls = on,
+        Id::StartupScrollback => s.startup_scrollback = on,
         Id::Model | Id::Effort | Id::Fast | Id::Permission => return false,
     }
     true
@@ -668,6 +726,13 @@ mod tests {
         );
         assert!(filtered(Category::Agent, "nothing like this", &s, &live).is_empty());
         assert_eq!(Segment::parse("git"), Some(Segment::Branch));
+        assert_eq!(Segment::parse("title"), Some(Segment::Session));
+        assert_eq!(value(Id::Theme, &s, &live), "auto");
+        assert_eq!(cycle(Id::Theme, &s, &live, 1).as_deref(), Some("dark"));
+        assert!(apply(Id::Theme, "light", &mut t) && t.theme == "light");
+        assert!(apply(Id::CollapseToolCalls, "on", &mut t) && t.collapse_tool_calls);
+        assert!(apply(Id::StartupScrollback, "on", &mut t) && t.startup_scrollback);
+        assert_eq!(filtered(Category::Display, "", &s, &live).len(), 3);
         assert_eq!(
             sandbox_mode(&Settings {
                 sandbox: "read-only".into(),

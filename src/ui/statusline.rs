@@ -41,6 +41,9 @@ pub fn left(f: &Footer) -> Option<String> {
 pub fn right(f: &Footer, width: usize) -> Vec<String> {
     let on = |seg| f.segments.get(seg);
     let mut out = Vec::new();
+    if on(Segment::Session) && !f.title.trim().is_empty() {
+        out.push(one_line(&f.title, 32));
+    }
     if on(Segment::Provider) && !f.provider.is_empty() {
         out.push(f.provider.clone());
     }
@@ -159,6 +162,10 @@ mod tests {
             f.segments.set(seg, false);
         }
         assert_eq!(right(&f, 80), ["10% of 272k", "/work/nyq"]);
+        f.title = "Fix the flaky login test in the auth module".into();
+        assert_eq!(right(&f, 80)[0], "Fix the flaky login test in the …");
+        f.segments.set(Segment::Session, false);
+        assert_eq!(right(&f, 80).len(), 2);
         f.segments.set(Segment::Model, false);
         assert!(left(&f).is_none());
         f.fast = false;

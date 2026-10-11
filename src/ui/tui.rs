@@ -15,31 +15,28 @@ use crossterm::event::{
 };
 use crossterm::{cursor, execute, queue, terminal};
 use futures::StreamExt;
-use nu_ansi_term::{Color, Style};
+use nu_ansi_term::Style;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::{Action, Editor};
 use super::render::{
-    diff, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells, truncate,
-    visible_width, Markdown,
+    diff, escape_len, is_table_sep, looks_like_diff, one_line, sanitize_text, table, table_cells,
+    truncate, visible_width, wrap_row, file_url, link, Fence, Markdown, RULE,
 };
 use super::statusline::{tilde, tokens};
+use super::theme::{fg, BRIGHT, FAINT, GRAY, MID, RED, YELLOW};
 use crate::agent::{Approval, ApprovalRequest, Approver, Ui};
 use crate::models::ModelChoice;
 use crate::session::Meta;
 use crate::tools::ToolOutput;
 use crate::types::{Item, StreamEvent, Usage};
 
-const BRIGHT: Color = Color::Rgb(238, 238, 238);
-const MID: Color = Color::Rgb(208, 208, 208);
-const GRAY: Color = Color::Rgb(138, 138, 138);
-const FAINT: Color = Color::Rgb(88, 88, 88);
-const RED: Color = Color::Rgb(215, 95, 95);
-const YELLOW: Color = Color::Rgb(215, 175, 95);
 const MAX_PREVIEW: usize = 14;
 const MENU_ROWS: usize = 8;
+/// Rows kept for repainting after a resize.
+const RECENT_ROWS: usize = 1000;
 
 /// What the app loop receives from the input task.
 pub enum Command {
@@ -90,6 +87,8 @@ pub struct Footer {
     /// Efforts the current model supports, for the settings menu.
     pub efforts: Vec<String>,
     pub fast_supported: bool,
+    /// The session title (renamed, or the first prompt); also the window title.
+    pub title: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -238,7 +237,10 @@ pub struct Screen {
     live_block: Block,
     last_block: Block,
     md: Markdown,
-    fence: Option<String>,
+    fence: Option<Fence>,
+    /// The latest rows printed to the scrollback, unwrapped, for repainting
+    /// the screen at a new width after a resize.
+    recent: std::collections::VecDeque<String>,
     /// Markdown table lines held back until the table ends (column widths
     /// depend on every row); a lone line with `|` is a candidate header.
     table: Vec<String>,
@@ -286,10 +288,6 @@ fn lock(s: &Arc<Mutex<Screen>>) -> MutexGuard<'_, Screen> {
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn fg(c: Color) -> Style {
-    Style::new().fg(c)
-}
-
 fn paint(style: Style, s: &str) -> String {
     if s.is_empty() {
         String::new()
@@ -311,16 +309,12 @@ fn clip_width(s: &str, width: usize) -> String {
     let limit = width - 1;
     let mut out = String::new();
     let mut w = 0;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
         if c == '\x1b' {
-            out.push(c);
-            for c in chars.by_ref() {
-                out.push(c);
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+            let n = escape_len(rest);
+            out.push_str(&rest[..n]);
+            rest = &rest[n..];
             continue;
         }
         let cw = c.width().unwrap_or(0);
@@ -329,10 +323,14 @@ fn clip_width(s: &str, width: usize) -> String {
         }
         w += cw;
         out.push(c);
+        rest = &rest[c.len_utf8()..];
     }
     out.push('…');
-    // A cut can land inside a styled span and drop its reset, so later rows
-    // keep the last color. Put the reset back when the source used escapes.
+    // A cut can land inside a styled span or link and drop its end, so later
+    // rows keep the last color. Put the resets back when the source used escapes.
+    if s.contains("\x1b]8;") {
+        out.push_str("\x1b]8;;\x1b\\");
+    }
     if s.contains('\x1b') {
         out.push_str("\x1b[0m");
     }
@@ -529,6 +527,7 @@ impl Screen {
             last_block: Block::None,
             md: Markdown::default(),
             fence: None,
+            recent: Default::default(),
             table: Vec::new(),
             busy: None,
             thinking_since: None,
@@ -597,11 +596,13 @@ impl Screen {
             } else {
                 paint(verb_style, &t.verb)
             };
-            format!(
-                "{lead}{verb} {}{}",
-                paint(fg(GRAY), &target),
-                paint(fg(GRAY), &note)
-            )
+            let mut target = paint(fg(GRAY), &target);
+            if matches!(t.tool.as_str(), "read_file" | "write_file" | "edit_file") {
+                if let Some(url) = file_url(&self.footer.cwd, &t.target) {
+                    target = link(&url, &target);
+                }
+            }
+            format!("{lead}{verb} {target}{}", paint(fg(GRAY), &note))
         };
         let detail = |t: &ToolRow, rows: &mut Vec<String>, bar: &str| {
             let style = if t.status == Status::Failed {
@@ -1287,7 +1288,8 @@ impl Screen {
         self.draw_pane();
     }
 
-    /// Print finished rows into the scrollback above the pane.
+    /// Print finished rows into the scrollback above the pane, wrapped to
+    /// the width with a hanging indent.
     fn emit(&mut self, rows: &[String]) {
         if self.viewer.is_some() {
             self.deferred.extend_from_slice(rows);
@@ -1295,9 +1297,48 @@ impl Screen {
         }
         self.clear_pane();
         for r in rows {
+            for line in wrap_row(r, self.width) {
+                let _ = self.out.write_all(line.as_bytes());
+                let _ = self.out.write_all(b"\r\n");
+            }
+        }
+        self.recent.extend(rows.iter().cloned());
+        let excess = self.recent.len().saturating_sub(RECENT_ROWS);
+        self.recent.drain(..excess);
+        self.draw_pane();
+    }
+
+    /// The screen after a resize: the latest rows wrapped to the new width
+    /// and the pane below them, painted from the top. Rows the terminal
+    /// reflowed (or tore) on screen are overwritten instead of left behind.
+    fn reflow(&mut self) {
+        if self.viewer.is_some() {
+            return self.draw_viewer(false);
+        }
+        let room = self.height.saturating_sub(self.pane().0.len());
+        let mut rows = std::collections::VecDeque::new();
+        for r in self.recent.iter().rev() {
+            if rows.len() >= room {
+                break;
+            }
+            for line in wrap_row(r, self.width).into_iter().rev() {
+                rows.push_front(line);
+            }
+        }
+        let excess = rows.len().saturating_sub(room);
+        rows.drain(..excess);
+        let _ = queue!(
+            self.out,
+            terminal::BeginSynchronizedUpdate,
+            cursor::MoveTo(0, 0),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        );
+        for r in rows {
             let _ = self.out.write_all(r.as_bytes());
             let _ = self.out.write_all(b"\r\n");
         }
+        self.pane_rows = 0;
+        self.cursor_row = 0;
         self.draw_pane();
     }
 
@@ -1359,16 +1400,13 @@ impl Screen {
         let text = sanitize_text(text);
         self.log.user(&text);
         self.flush_all();
-        let w = self.width;
         let mut rows = self.begin(Block::User);
         for line in text.trim().lines() {
-            for r in wrap(line, w.saturating_sub(2)) {
-                rows.push(format!(
-                    "{} {}",
-                    paint(fg(BRIGHT), "┃"),
-                    paint(Style::new().bold(), &r)
-                ));
-            }
+            rows.push(format!(
+                "{} {}",
+                paint(fg(BRIGHT), "┃"),
+                paint(Style::new().bold(), line)
+            ));
         }
         self.emit(&rows);
     }
@@ -1443,29 +1481,24 @@ impl Screen {
             .collect()
     }
 
-    /// Markdown line, indented, with framed code blocks.
+    /// Markdown line, indented, with framed and highlighted code blocks.
     fn render_line(&mut self, line: &str) -> String {
-        let t = line.trim_start();
-        if let Some(lang) = t.strip_prefix("```").or_else(|| t.strip_prefix("~~~")) {
-            return if self.fence.take().is_some() {
-                format!("  {}", paint(fg(FAINT), &"─".repeat(34)))
-            } else {
-                let lang = if lang.trim().is_empty() {
-                    "code"
-                } else {
-                    lang.trim()
-                };
-                self.fence = Some(lang.to_string());
-                format!(
-                    "  {} {} {}",
-                    paint(fg(FAINT), "─"),
-                    paint(fg(GRAY), lang),
-                    paint(fg(FAINT), &"─".repeat(32usize.saturating_sub(lang.len())))
-                )
-            };
+        if let Some(f) = &mut self.fence {
+            if f.closes(line) {
+                self.fence = None;
+                return format!("  {}", paint(fg(FAINT), &"─".repeat(RULE)));
+            }
+            return format!("  {}", f.code_line(line, true));
         }
-        if self.fence.is_some() {
-            return format!("  {}", paint(fg(MID), line));
+        if let Some(f) = Fence::open(line) {
+            let lang = if f.lang.is_empty() { "code".to_string() } else { f.lang.clone() };
+            self.fence = Some(f);
+            return format!(
+                "  {} {} {}",
+                paint(fg(FAINT), "─"),
+                paint(fg(GRAY), &lang),
+                paint(fg(FAINT), &"─".repeat((RULE - 2).saturating_sub(lang.chars().count())))
+            );
         }
         format!("  {}", self.md.line(line, true))
     }
@@ -1828,6 +1861,9 @@ impl Screen {
                         }
                         Err(e) => self.hint = Some(format!("Could not save settings: {e:#}")),
                     }
+                    if id == Id::Theme {
+                        super::theme::apply_setting(&value);
+                    }
                     if id == Id::Sandbox {
                         self.hint = Some("The default sandbox applies from the next start.".into());
                     }
@@ -1882,7 +1918,8 @@ impl Screen {
         let _ = self.out.flush();
         // Set before entering so a panic in the viewer still leaves the alt screen.
         TRANSCRIPT_ALT_SCREEN.store(true, Ordering::SeqCst);
-        let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide);
+        // Mouse reporting only while the viewer is open, for the wheel.
+        let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide, crossterm::event::EnableMouseCapture);
         self.viewer = Some(super::transcript::Viewer::new(
             &self.log,
             self.width,
@@ -1897,7 +1934,7 @@ impl Screen {
             return;
         }
         if TRANSCRIPT_ALT_SCREEN.swap(false, Ordering::SeqCst) {
-            let _ = execute!(self.out, terminal::LeaveAlternateScreen, cursor::Show);
+            let _ = execute!(self.out, crossterm::event::DisableMouseCapture, terminal::LeaveAlternateScreen, cursor::Show);
         } else {
             let _ = execute!(self.out, cursor::Show);
         }
@@ -2355,6 +2392,8 @@ impl Tui {
         )));
         terminal::enable_raw_mode()?;
         let mut setup = TerminalSetup::arm();
+        // Before anything else reads input: the background query's reply arrives there.
+        super::theme::init(&crate::settings::current().theme, true);
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
         let mut out = crate::record_tape::stdout();
         execute!(out, crossterm::event::EnableBracketedPaste)?;
@@ -2433,10 +2472,22 @@ impl Tui {
                             }
                             s.redraw();
                         }
+                        Event::Mouse(m) => {
+                            use crossterm::event::MouseEventKind;
+                            let up = match m.kind {
+                                MouseEventKind::ScrollUp => true,
+                                MouseEventKind::ScrollDown => false,
+                                _ => continue,
+                            };
+                            if let Some(v) = &mut s.viewer {
+                                v.wheel(up);
+                                s.draw_viewer(true);
+                            }
+                        }
                         Event::Resize(w, h) => {
                             s.width = (w as usize).max(1);
                             s.height = (h as usize).max(1);
-                            s.redraw();
+                            s.reflow();
                         }
                         _ => {}
                     }
@@ -2631,7 +2682,7 @@ fn restore_terminal() {
     let (alt, enhanced) = take_terminal_fixes();
     let mut out = crate::record_tape::stdout();
     if alt {
-        let _ = execute!(out, terminal::LeaveAlternateScreen);
+        let _ = execute!(out, crossterm::event::DisableMouseCapture, terminal::LeaveAlternateScreen);
     }
     if enhanced {
         let _ = execute!(out, PopKeyboardEnhancementFlags);

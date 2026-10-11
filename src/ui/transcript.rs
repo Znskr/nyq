@@ -6,16 +6,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nu_ansi_term::{Color, Style};
 use unicode_width::UnicodeWidthChar;
 
-use super::render::{diff, looks_like_diff, sanitize_text, strip_ansi, truncate, visible_width, Markdown};
+use super::theme::{color, fg, BRIGHT, FAINT, GRAY, MID, RED, YELLOW};
+use super::render::{looks_like_diff, numbered_diff, sanitize_text, strip_ansi, truncate, visible_width, wrap_row, Markdown};
 
-const BRIGHT: Color = Color::Rgb(238, 238, 238);
-const MID: Color = Color::Rgb(208, 208, 208);
-const GRAY: Color = Color::Rgb(138, 138, 138);
-const FAINT: Color = Color::Rgb(88, 88, 88);
-const RED: Color = Color::Rgb(215, 95, 95);
-const YELLOW: Color = Color::Rgb(215, 175, 95);
 /// Tool output kept per call.
 const MAX_OUTPUT: usize = 256 * 1024;
+/// Output rows per tool call in the compact view.
+const COMPACT_ROWS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
@@ -140,8 +137,18 @@ fn block(rows: &mut Vec<String>, text: &str, width: usize, lead: &str, cont: &st
     }
 }
 
-/// Render the whole log at `width` columns.
-pub fn render(entries: &[Entry], width: usize) -> Vec<String> {
+/// At most `max` of `rows`, with a note saying how many were left out.
+fn cap(rows: &mut Vec<String>, from: usize, max: usize, bar: &str) {
+    let n = rows.len() - from;
+    if n > max {
+        rows.truncate(from + max);
+        rows.push(format!("{bar}{}", paint(fg(FAINT), &format!("… {} more lines", n - max))));
+    }
+}
+
+/// Render the whole log at `width` columns. `compact` folds reasoning to one
+/// line and tool output to a few rows.
+pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
     let mut rows = Vec::new();
     for e in entries {
         if !rows.is_empty() {
@@ -149,40 +156,49 @@ pub fn render(entries: &[Entry], width: usize) -> Vec<String> {
         }
         match e {
             Entry::User(t) => {
-                let bar = paint(Style::new().fg(BRIGHT), "┃ ");
+                let bar = paint(fg(BRIGHT), "┃ ");
                 block(&mut rows, t.trim(), width, &bar, &bar, Style::new().bold());
             }
             Entry::Assistant(t) => {
                 let mut md = Markdown::default();
                 for line in sanitize_text(t.trim()).lines() {
-                    let styled = md.line(line, true);
-                    if visible_width(&styled) + 2 <= width {
-                        rows.push(format!("  {styled}"));
-                    } else {
-                        block(&mut rows, &strip_ansi(&styled), width, "  ", "  ", Style::new().fg(MID));
-                    }
+                    rows.extend(wrap_row(&format!("  {}", md.line(line, true)), width));
                 }
+            }
+            Entry::Reasoning(t) if compact => {
+                let first = t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").trim_matches('*');
+                let line = sanitize_text(&format!("• Thought · {first}"));
+                rows.push(paint(fg(GRAY).italic(), &truncate(&line, width)));
             }
             Entry::Reasoning(t) => {
-                rows.push(paint(Style::new().fg(GRAY).italic(), "• Thinking"));
-                block(&mut rows, t.trim(), width, "  ", "  ", Style::new().fg(GRAY).italic());
+                rows.push(paint(fg(GRAY).italic(), "• Thinking"));
+                block(&mut rows, t.trim(), width, "  ", "  ", fg(GRAY).italic());
             }
             Entry::Tool { name, summary, output, display, is_error } => {
-                let head = format!("{} {}", paint(Style::new().fg(if *is_error { RED } else { BRIGHT }), "●"), paint(Style::new().fg(BRIGHT), name));
+                let head = format!("{} {}", paint(fg(if *is_error { RED } else { BRIGHT }), "●"), paint(fg(BRIGHT), name));
                 let summary = sanitize_text(summary).replace('\n', " ");
                 let room = width.saturating_sub(visible_width(&head) + 1);
-                rows.push(format!("{head} {}", paint(Style::new().fg(GRAY), &truncate(&summary, room))));
-                let bar = paint(Style::new().fg(FAINT), "  │ ");
+                rows.push(format!("{head} {}", paint(fg(GRAY), &truncate(&summary, room))));
+                let bar = paint(fg(FAINT), "  │ ");
+                let from = rows.len();
                 match (display.as_deref().filter(|d| looks_like_diff(d)), output) {
-                    (Some(d), _) => rows.extend(diff(&sanitize_text(d), true, usize::MAX, width, "  │ ").lines().map(str::to_string)),
-                    (None, Some(o)) if !o.trim().is_empty() => {
-                        block(&mut rows, o.trim_end(), width, &bar, &bar, Style::new().fg(if *is_error { RED } else { GRAY }))
+                    (Some(d), _) => {
+                        rows.extend(numbered_diff(&sanitize_text(d), true, width, &bar));
+                        if compact {
+                            cap(&mut rows, from, COMPACT_ROWS * 4, &bar);
+                        }
                     }
-                    (None, Some(_)) => rows.push(format!("{bar}{}", paint(Style::new().fg(FAINT), "(no output)"))),
-                    (None, None) => rows.push(format!("{bar}{}", paint(Style::new().fg(FAINT), "(running…)"))),
+                    (None, Some(o)) if !o.trim().is_empty() => {
+                        block(&mut rows, o.trim_end(), width, &bar, &bar, fg(if *is_error { RED } else { GRAY }));
+                        if compact {
+                            cap(&mut rows, from, COMPACT_ROWS, &bar);
+                        }
+                    }
+                    (None, Some(_)) => rows.push(format!("{bar}{}", paint(fg(FAINT), "(no output)"))),
+                    (None, None) => rows.push(format!("{bar}{}", paint(fg(FAINT), "(running…)"))),
                 }
             }
-            Entry::Info(t) => block(&mut rows, t, width, "", "", Style::new().fg(GRAY)),
+            Entry::Info(t) => block(&mut rows, t, width, "", "", fg(GRAY)),
         }
     }
     rows
@@ -201,7 +217,7 @@ pub fn find_matches(plain: &[String], query: &str) -> Vec<usize> {
 fn highlight(row: &str, query: &str, current: bool) -> String {
     let lower = row.to_lowercase();
     let q = query.to_lowercase();
-    let hit = if current { Style::new().fg(Color::Black).on(YELLOW) } else { Style::new().reverse() };
+    let hit = if current { fg(Color::Black).on(color(YELLOW)) } else { Style::new().reverse() };
     if q.is_empty() || lower.len() != row.len() {
         return paint(hit, row);
     }
@@ -209,11 +225,11 @@ fn highlight(row: &str, query: &str, current: bool) -> String {
     let mut at = 0;
     while let Some(i) = lower[at..].find(&q) {
         let start = at + i;
-        out.push_str(&paint(Style::new().fg(MID), &row[at..start]));
+        out.push_str(&paint(fg(MID), &row[at..start]));
         out.push_str(&paint(hit, &row[start..start + q.len()]));
         at = start + q.len();
     }
-    out.push_str(&paint(Style::new().fg(MID), &row[at..]));
+    out.push_str(&paint(fg(MID), &row[at..]));
     out
 }
 
@@ -231,6 +247,9 @@ pub struct Viewer {
     width: usize,
     height: usize,
     version: u64,
+    /// Reasoning and tool output folded (←), or everything (→).
+    compact: bool,
+    compact_shown: bool,
     /// The search being typed after `/`.
     typing: Option<String>,
     query: String,
@@ -248,6 +267,8 @@ impl Viewer {
             width: 0,
             height,
             version: u64::MAX,
+            compact: false,
+            compact_shown: false,
             typing: None,
             query: String::new(),
             matches: Vec::new(),
@@ -269,11 +290,12 @@ impl Viewer {
 
     /// Re-render when the log or the size changed; follows the end if it was there.
     pub fn refresh(&mut self, log: &Log, width: usize, height: usize) -> bool {
-        if log.version == self.version && width == self.width && height == self.height {
+        if log.version == self.version && width == self.width && height == self.height && self.compact == self.compact_shown {
             return false;
         }
         let at_end = self.top >= self.max_top();
-        self.rows = render(&log.entries, width.max(1));
+        self.rows = render(&log.entries, width.max(1), self.compact);
+        self.compact_shown = self.compact;
         self.plain = self.rows.iter().map(|r| strip_ansi(r).to_lowercase()).collect();
         self.width = width;
         self.height = height;
@@ -282,6 +304,11 @@ impl Viewer {
         self.current = self.current.min(self.matches.len().saturating_sub(1));
         self.top = if at_end { self.max_top() } else { self.top.min(self.max_top()) };
         true
+    }
+
+    /// Mouse wheel: three rows per notch.
+    pub fn wheel(&mut self, up: bool) {
+        self.scroll(if up { -3 } else { 3 });
     }
 
     fn scroll(&mut self, delta: isize) {
@@ -339,6 +366,9 @@ impl Viewer {
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll(page),
             KeyCode::Char('u') if ctrl => self.scroll(-page / 2),
             KeyCode::Char('d') if ctrl => self.scroll(page / 2),
+            KeyCode::Left => self.compact = true,
+            KeyCode::Right => self.compact = false,
+            KeyCode::Tab => self.compact = !self.compact,
             KeyCode::Home | KeyCode::Char('g') => self.top = 0,
             KeyCode::End | KeyCode::Char('G') => self.top = self.max_top(),
             _ => {}
@@ -352,10 +382,11 @@ impl Viewer {
         let body = self.body();
         let end = (self.top + body).min(self.rows.len());
         let range = if self.rows.is_empty() { "empty".to_string() } else { format!("{}–{} of {}", self.top + 1, end, self.rows.len()) };
-        let mut head = format!("{} {}", paint(Style::new().fg(BRIGHT).bold(), "Transcript"), paint(Style::new().fg(GRAY), &range));
+        let view = if self.compact { "compact" } else { "full" };
+        let mut head = format!("{} {}", paint(fg(BRIGHT).bold(), "Transcript"), paint(fg(GRAY), &format!("{view} · {range}")));
         if !self.query.is_empty() {
             let pos = if self.matches.is_empty() { "no matches".into() } else { format!("{}/{}", self.current + 1, self.matches.len()) };
-            head.push_str(&paint(Style::new().fg(GRAY), &format!("  /{} {pos}", truncate(&self.query, 30))));
+            head.push_str(&paint(fg(GRAY), &format!("  /{} {pos}", truncate(&self.query, 30))));
         }
         let mut out = vec![head];
         let current_row = self.matches.get(self.current).copied();
@@ -369,13 +400,13 @@ impl Viewer {
             };
             out.push(if visible_width(&row) > w { format!("{}\x1b[0m", truncate(&strip_ansi(&row), w)) } else { row });
         }
-        let hints: &[(&str, &str)] = &[("↑↓", "Scroll"), ("PgUp/PgDn", "Page"), ("Home/End", "Jump"), ("/", "Search"), ("n/N", "Next"), ("q", "Close")];
+        let hints: &[(&str, &str)] = &[("↑↓", "Scroll"), ("PgUp/PgDn", "Page"), ("Home/End", "Jump"), ("←→", "Compact/Full"), ("/", "Search"), ("n/N", "Next"), ("q", "Close")];
         let footer = match (&self.typing, &self.message) {
-            (Some(t), _) => format!("{}{}{}", paint(Style::new().fg(BRIGHT), "/"), paint(Style::new().fg(MID), t), paint(Style::new().fg(FAINT), "  Enter Find · Esc Cancel")),
-            (None, Some(m)) => paint(Style::new().fg(YELLOW), m),
+            (Some(t), _) => format!("{}{}{}", paint(fg(BRIGHT), "/"), paint(fg(MID), t), paint(fg(FAINT), "  Enter Find · Esc Cancel")),
+            (None, Some(m)) => paint(fg(YELLOW), m),
             (None, None) => hints
                 .iter()
-                .map(|(k, a)| format!("{} {}", paint(Style::new().fg(BRIGHT), k), paint(Style::new().fg(GRAY), a)))
+                .map(|(k, a)| format!("{} {}", paint(fg(BRIGHT), k), paint(fg(GRAY), a)))
                 .collect::<Vec<_>>()
                 .join("   "),
         };
@@ -426,11 +457,18 @@ mod tests {
 
     #[test]
     fn rendering_expands_tool_output() {
-        let rows: Vec<String> = render(&log().entries, 40).iter().map(|r| strip_ansi(r)).collect();
+        let rows: Vec<String> = render(&log().entries, 40, false).iter().map(|r| strip_ansi(r)).collect();
         assert!(rows.iter().any(|r| r == "┃ find the bug"), "{rows:?}");
         assert!(rows.iter().any(|r| r == "  │ NEEDLE here"), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("Looking at main.")), "{rows:?}");
-        assert!(render(&log().entries, 20).iter().all(|r| visible_width(r) <= 20));
+        assert!(rows.iter().any(|r| r == "  Thinking about it"), "{rows:?}");
+        assert!(render(&log().entries, 20, false).iter().all(|r| visible_width(r) <= 20));
+        // Long assistant lines wrap with their styling.
+        let mut l = Log::default();
+        l.text("**bold words that go on and on** and on", false);
+        let rows = render(&l.entries, 20, false);
+        assert!(rows.len() > 1 && rows.iter().all(|r| visible_width(r) <= 20), "{rows:?}");
+        assert!(rows[1].contains("\x1b[1m"), "{rows:?}");
     }
 
     #[test]
@@ -485,6 +523,33 @@ mod tests {
         assert_eq!(v.top, v.max_top(), "follows new output at the end");
         assert!(!v.refresh(&l, 60, 10));
         assert_eq!(v.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)), Action::Close);
+    }
+
+    #[test]
+    fn compact_view_folds_output_and_wheel_scrolls() {
+        let mut l = log();
+        l.tool_start("bash", "seq 10");
+        l.tool_end(&(1..=10).map(|i| i.to_string()).collect::<Vec<_>>().join("\n"), None, false);
+        l.tool_start("edit_file", "a.rs");
+        l.tool_end("Edited a.rs.", Some("--- a/a.rs\n+++ b/a.rs\n@@ -3,2 +3,2 @@\n ctx\n-old\n+new\n"), false);
+        let full: Vec<String> = render(&l.entries, 60, false).iter().map(|r| strip_ansi(r)).collect();
+        assert!(full.iter().any(|r| r == "  │ 10"), "{full:?}");
+        assert!(full.iter().any(|r| r == "  │ 4 - old"), "{full:?}");
+        assert!(full.iter().any(|r| r == "  │ 4 + new"), "{full:?}");
+        let compact: Vec<String> = render(&l.entries, 60, true).iter().map(|r| strip_ansi(r)).collect();
+        assert!(compact.iter().any(|r| r == "  │ … 7 more lines"), "{compact:?}");
+        assert!(compact.iter().any(|r| r == "• Thought · Thinking about it"), "{compact:?}");
+        let mut v = Viewer::new(&l, 60, 10);
+        v.on_key(key(KeyCode::Left));
+        assert!(v.refresh(&l, 60, 10));
+        assert!(strip_ansi(&v.frame()[0]).contains("compact"));
+        let end = v.top;
+        v.wheel(true);
+        assert_eq!(v.top, end - 3);
+        v.wheel(false);
+        assert_eq!(v.top, end);
+        v.on_key(key(KeyCode::Right));
+        assert!(v.refresh(&l, 60, 10));
     }
 
     #[test]
