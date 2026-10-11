@@ -146,8 +146,9 @@ pub fn pick_release(releases: Vec<Release>, channel: Channel) -> Option<Release>
 /// The release target triple for an OS/arch pair (as in `std::env::consts`).
 pub fn target_for(os: &str, arch: &str) -> Option<&'static str> {
     Some(match (os, arch) {
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        // Static musl builds run on any Linux distribution.
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
         ("macos", "x86_64") => "x86_64-apple-darwin",
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("windows", "x86_64") => "x86_64-pc-windows-msvc",
@@ -387,6 +388,18 @@ pub(crate) fn platform_archive() -> Option<String> {
     target_for(std::env::consts::OS, std::env::consts::ARCH).map(archive_name)
 }
 
+/// `name`, or for releases made before the static Linux builds (0.4.1 and
+/// earlier), the glibc archive that stood in for it.
+fn release_asset_name(release: &Release, name: &str) -> String {
+    if release.asset(name).is_none() && name.contains("-linux-musl") {
+        let glibc = name.replace("-linux-musl", "-linux-gnu");
+        if release.asset(&glibc).is_some() {
+            return glibc;
+        }
+    }
+    name.to_string()
+}
+
 /// The newest release on `channel` and its version (without the `v`).
 pub(crate) async fn newest(gh: &mut Github, channel: Channel) -> Result<(Release, String)> {
     let release = pick_release(gh.releases().await?, channel)
@@ -398,6 +411,7 @@ pub(crate) async fn newest(gh: &mut Github, channel: Channel) -> Result<(Release
 /// Download the archive `name` of `release` and verify it against the
 /// release's SHA256SUMS.
 pub(crate) async fn download_verified(gh: &Github, release: &Release, name: &str) -> Result<Vec<u8>> {
+    let name = &release_asset_name(release, name);
     let asset = release.asset(name).with_context(|| format!("release {} has no asset named {name}", release.tag_name))?;
     let sums = release
         .asset("SHA256SUMS")
@@ -515,7 +529,7 @@ mod tests {
 
     #[test]
     fn assets_are_selected_per_target() {
-        assert_eq!(target_for("linux", "x86_64"), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(target_for("linux", "x86_64"), Some("x86_64-unknown-linux-musl"));
         assert_eq!(target_for("macos", "aarch64"), Some("aarch64-apple-darwin"));
         assert_eq!(target_for("windows", "x86_64"), Some("x86_64-pc-windows-msvc"));
         assert_eq!(target_for("freebsd", "x86_64"), None);
@@ -525,6 +539,12 @@ mod tests {
         let a = r.asset(&archive_name(target_for("macos", "aarch64").unwrap())).unwrap();
         assert_eq!(a.browser_download_url, "dl/nyq-aarch64-apple-darwin.tar.gz");
         assert!(r.asset("nyq-x86_64-pc-windows-msvc.zip").is_none());
+        // Older releases only have glibc Linux archives; newer ones prefer musl.
+        let musl = archive_name(target_for("linux", "aarch64").unwrap());
+        let old = release("v0.4.1", false, &["nyq-aarch64-unknown-linux-gnu.tar.gz"]);
+        assert_eq!(release_asset_name(&old, &musl), "nyq-aarch64-unknown-linux-gnu.tar.gz");
+        let new = release("v0.5.0", false, &["nyq-aarch64-unknown-linux-gnu.tar.gz", "nyq-aarch64-unknown-linux-musl.tar.gz"]);
+        assert_eq!(release_asset_name(&new, &musl), musl);
         // The running platform maps to a target wherever nyq ships binaries.
         if cfg!(all(any(target_os = "linux", target_os = "macos"), any(target_arch = "x86_64", target_arch = "aarch64"))) {
             assert!(target_for(std::env::consts::OS, std::env::consts::ARCH).is_some());
