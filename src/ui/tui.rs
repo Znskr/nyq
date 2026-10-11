@@ -131,7 +131,11 @@ struct PendingApproval {
     save_rule: Option<String>,
     /// Who asks when it isn't the main agent, e.g. "subagent · Count files".
     origin: Option<String>,
-    reply: oneshot::Sender<Approval>,
+    /// A note for the model, typed after Tab; sent with the answer.
+    note: String,
+    /// Keys go to `note` (Tab or Enter returns to the choices).
+    noting: bool,
+    reply: oneshot::Sender<(Approval, Option<String>)>,
 }
 
 struct PendingQuestion {
@@ -764,7 +768,7 @@ impl Screen {
         }
 
         // Input, or the approval prompt in its place.
-        let (cursor_row, cursor_col);
+        let (mut cursor_row, mut cursor_col);
         if let Some(a) = &self.approval {
             if let Some(origin) = &a.origin {
                 rows.push(format!(
@@ -811,12 +815,30 @@ impl Screen {
                     paint(fg(MID), &truncate(text, w.saturating_sub(3)))
                 ));
             }
-            rows.push(rule(w));
-            let mut keys = vec![("y", "Once"), ("a", "Always")];
-            if save.is_some() {
-                keys.push(("s", "Save"));
+            if a.noting || !a.note.is_empty() {
+                // Show the end of a long note, where the cursor is.
+                let room = w.saturating_sub(8).max(1);
+                let shown: String = {
+                    let chars: Vec<char> = a.note.chars().collect();
+                    chars[chars.len().saturating_sub(room)..].iter().collect()
+                };
+                if a.noting {
+                    cursor_row = rows.len();
+                    cursor_col = 6 + visible_width(&shown);
+                }
+                rows.push(format!("{} {}", paint(fg(YELLOW), "note"), paint(fg(MID), &shown)));
             }
-            keys.extend([("n", "Deny"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]);
+            rows.push(rule(w));
+            let keys = if a.noting {
+                vec![("Enter", "Done"), ("Esc", "Clear note")]
+            } else {
+                let mut keys = vec![("y", "Once"), ("a", "Always")];
+                if save.is_some() {
+                    keys.push(("s", "Save"));
+                }
+                keys.extend([("n", "Deny"), ("Tab", "Note"), ("↑↓", "Scroll"), ("Esc", "Interrupt")]);
+                keys
+            };
             rows.push(hints(&keys));
         } else if let Some(sec) = &self.secret {
             for l in wrap(&sanitize_text(&sec.prompt), w.saturating_sub(2).max(1)) {
@@ -2032,10 +2054,33 @@ impl Screen {
         if let Some(mut a) = self.approval.take() {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT);
+            if a.noting && !ctrl {
+                match key.code {
+                    KeyCode::Tab | KeyCode::Enter => a.noting = false,
+                    KeyCode::Esc => {
+                        a.noting = false;
+                        a.note.clear();
+                    }
+                    KeyCode::Backspace => {
+                        a.note.pop();
+                    }
+                    KeyCode::Char(ch) if text_key(key, ch) => a.note.push(ch),
+                    _ => {}
+                }
+                self.approval = Some(a);
+                self.redraw();
+                return;
+            }
+            if key.code == KeyCode::Tab {
+                a.noting = true;
+                self.approval = Some(a);
+                self.redraw();
+                return;
+            }
             if key.code == KeyCode::Esc
                 || (ctrl && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('c')))
             {
-                let _ = a.reply.send(Approval::No);
+                let _ = a.reply.send((Approval::No, None));
                 if let Some(c) = &self.cancel {
                     c.cancel();
                 }
@@ -2066,7 +2111,8 @@ impl Screen {
             };
             match answer {
                 Some(ans) => {
-                    let _ = a.reply.send(ans);
+                    let note = Some(a.note.trim().to_string()).filter(|n| !n.is_empty());
+                    let _ = a.reply.send((ans, note));
                 }
                 None => self.approval = Some(a),
             }
@@ -2535,6 +2581,7 @@ impl Tui {
         TuiUi {
             screen: self.screen.clone(),
             cwd,
+            note: None,
         }
     }
 }
@@ -2654,13 +2701,14 @@ impl Drop for ClearQuestion {
     }
 }
 
-/// Show the approval pane on `screen` and wait for the answer. `origin`
-/// names who asks when it isn't the main agent (shown above the title).
+/// Show the approval pane on `screen` and wait for the answer and any note
+/// the user typed. `origin` names who asks when it isn't the main agent
+/// (shown above the title).
 async fn approve_on(
     screen: &Arc<Mutex<Screen>>,
     origin: Option<&str>,
     req: &ApprovalRequest<'_>,
-) -> Approval {
+) -> (Approval, Option<String>) {
     let (tool, summary, preview) = (req.tool, req.summary, req.preview);
     let (tx, rx) = oneshot::channel();
     {
@@ -2725,12 +2773,14 @@ async fn approve_on(
             rule: req.rule.as_deref().map(|r| one_line(r, 300)),
             save_rule: req.save_rule.as_deref().map(|r| one_line(r, 300)),
             origin,
+            note: String::new(),
+            noting: false,
             reply: tx,
         });
         s.redraw();
     }
     let guard = ClearApproval(Arc::clone(screen));
-    let answer = rx.await.unwrap_or(Approval::No);
+    let answer = rx.await.unwrap_or((Approval::No, None));
     drop(guard);
     answer
 }
@@ -2744,6 +2794,9 @@ struct TuiApprover {
 #[async_trait::async_trait]
 impl Approver for TuiApprover {
     async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval {
+        approve_on(&self.screen, Some(origin), req).await.0
+    }
+    async fn approve_noted(&self, origin: &str, req: &ApprovalRequest<'_>) -> (Approval, Option<String>) {
         approve_on(&self.screen, Some(origin), req).await
     }
 }
@@ -2763,6 +2816,8 @@ impl Drop for ClearApproval {
 pub struct TuiUi {
     screen: Arc<Mutex<Screen>>,
     cwd: PathBuf,
+    /// The note attached to the last approval answer.
+    note: Option<String>,
 }
 
 impl TuiUi {
@@ -2819,12 +2874,17 @@ impl Ui for TuiUi {
     }
 
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
-        let answer = approve_on(&self.screen, None, req).await;
+        let (answer, note) = approve_on(&self.screen, None, req).await;
+        self.note = note;
         if answer == Approval::No {
             // The loop reports the denial through tool_end.
             self.s().tool_start(req.tool, req.summary);
         }
         answer
+    }
+
+    fn approval_note(&mut self) -> Option<String> {
+        self.note.take()
     }
 
     fn approver(&self) -> Option<Arc<dyn Approver>> {
@@ -3220,6 +3280,8 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
+            note: String::new(),
+            noting: false,
             reply: tx,
         });
         let (rows, _, _) = s.pane();
@@ -3275,11 +3337,13 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
+            note: String::new(),
+            noting: false,
             reply: tx,
         });
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &cmd_tx);
-        assert_eq!(rx.try_recv().unwrap(), Approval::No);
+        assert_eq!(rx.try_recv().unwrap(), (Approval::No, None));
         assert!(cancel.is_cancelled());
         assert!(s.approval.is_none());
 
@@ -3292,13 +3356,15 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
+            note: String::new(),
+            noting: false,
             reply: tx,
         });
         s.on_key(
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
             &cmd_tx,
         );
-        assert_eq!(rx.try_recv().unwrap(), Approval::No);
+        assert_eq!(rx.try_recv().unwrap(), (Approval::No, None));
         assert!(matches!(cmd_rx.try_recv().unwrap(), Command::Exit));
     }
 
@@ -3316,6 +3382,8 @@ mod tests {
             rule: Some("`mcp__wiki__ask`".into()),
             save_rule: save.map(str::to_string),
             origin: Some("subagent · Count files".into()),
+            note: String::new(),
+            noting: false,
             reply: tx,
         };
         let (tx, mut rx) = oneshot::channel();
@@ -3343,8 +3411,64 @@ mod tests {
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
             &cmd_tx,
         );
-        assert_eq!(rx.try_recv().unwrap(), Approval::AlwaysSave);
+        assert_eq!(rx.try_recv().unwrap(), (Approval::AlwaysSave, None));
         assert!(s.approval.is_none());
+    }
+
+    #[test]
+    fn tab_attaches_a_note_to_the_answer() {
+        let mut s = screen();
+        s.width = 80;
+        s.height = 40;
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(PendingApproval {
+            title: "Run cargo test".into(),
+            lines: Vec::new(),
+            prewrapped: false,
+            scroll: 0,
+            rule: None,
+            save_rule: None,
+            origin: None,
+            note: String::new(),
+            noting: false,
+            reply: tx,
+        });
+        s.on_key(key(KeyCode::Tab), &cmd_tx);
+        // While typing a note, y/n are text, not answers.
+        for ch in "use nextest".chars() {
+            s.on_key(key(KeyCode::Char(ch)), &cmd_tx);
+        }
+        assert!(rx.try_recv().is_err());
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("note use nextest"), "{text}");
+        s.on_key(key(KeyCode::Enter), &cmd_tx);
+        s.on_key(key(KeyCode::Char('n')), &cmd_tx);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (Approval::No, Some("use nextest".to_string()))
+        );
+
+        // Esc while typing clears the note instead of interrupting.
+        let (tx, mut rx) = oneshot::channel();
+        s.approval = Some(PendingApproval {
+            title: "t".into(),
+            lines: Vec::new(),
+            prewrapped: false,
+            scroll: 0,
+            rule: None,
+            save_rule: None,
+            origin: None,
+            note: String::new(),
+            noting: false,
+            reply: tx,
+        });
+        s.on_key(key(KeyCode::Tab), &cmd_tx);
+        s.on_key(key(KeyCode::Char('x')), &cmd_tx);
+        s.on_key(key(KeyCode::Esc), &cmd_tx);
+        s.on_key(key(KeyCode::Char('y')), &cmd_tx);
+        assert_eq!(rx.try_recv().unwrap(), (Approval::Yes, None));
     }
 
     #[test]
@@ -3353,6 +3477,7 @@ mod tests {
         let mut ui = TuiUi {
             screen: Arc::clone(&screen),
             cwd: PathBuf::new(),
+            note: None,
         };
         let options = vec!["a".to_string()];
         let mut fut = Box::pin(Ui::ask(&mut ui, "pick", &options));
@@ -3431,6 +3556,8 @@ mod tests {
                 rule: None,
                 save_rule: None,
                 origin: None,
+                note: String::new(),
+                noting: false,
                 reply: tx,
             });
         }
