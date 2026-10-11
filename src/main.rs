@@ -25,7 +25,9 @@ mod session;
 mod record_tape;
 mod settings;
 mod skill_install;
+mod skill_invoke;
 mod skills;
+mod slash;
 mod subagents;
 mod templates;
 mod tools;
@@ -294,7 +296,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "/yolo",
         "toggle yolo mode (never ask; deny rules still block)",
     ),
-    ("/usage", "profile usage totals: /usage [24h|7d|30d]"),
+    ("/usage", "usage totals (also /cost): /usage [session|24h|7d|30d]"),
     (
         "/stats",
         "session turns, requests, tokens, tools and duration",
@@ -600,7 +602,7 @@ async fn run() -> Result<()> {
         .chain(["quit", "q", "clear", "img"])
         .collect();
     let templates = templates::discover(&home, &cwd, &reserved);
-    let commands = COMMANDS
+    let commands: Vec<(String, String)> = COMMANDS
         .iter()
         .chain(commands::COMMANDS)
         .map(|(c, d)| (c.to_string(), d.to_string()))
@@ -611,7 +613,14 @@ async fn run() -> Result<()> {
             )
         }))
         .collect();
+    // Words that are commands; any other `/word …` line is a prompt.
+    let known: HashSet<String> = commands
+        .iter()
+        .map(|(c, _)| c.clone())
+        .chain(slash::ALIASES.iter().map(|(a, _)| a.to_string()))
+        .collect();
     let mut tui = Tui::start(footer, home.clone(), commands)?;
+    tui.screen().editor.set_skills(skill_invoke::entries(&skills));
     sync_footer(&tui, &agent, None);
     ui::banner(env!("CARGO_PKG_VERSION"));
     ui::info(&sandbox::describe(&agent.sandbox));
@@ -709,6 +718,10 @@ async fn run() -> Result<()> {
             Some(text) if !text.trim().is_empty() => text,
             _ => line,
         };
+        // `/path/to/file what is this?` and `/skill-name …` are prompts.
+        let is_command = line.starts_with('/')
+            && skill_invoke::leading(&skills, &line, |c| known.contains(c)).is_none()
+            && !slash::is_prompt(&line, |c| known.contains(c));
         // An MCP prompt's messages become the turn's text.
         let mut turn_text = line.clone();
         if line.starts_with("/mcp:") {
@@ -719,7 +732,7 @@ async fn run() -> Result<()> {
                     continue;
                 }
             }
-        } else if line.starts_with('/') {
+        } else if is_command {
             if line.trim() == "/model" {
                 tui.open_models();
                 continue;
@@ -756,6 +769,9 @@ async fn run() -> Result<()> {
                     .editor
                     .set_mcp_commands(mcp_features::prompt_commands(&mcp));
             }
+            if line.starts_with("/skills") {
+                tui.screen().editor.set_skills(skill_invoke::entries(&skills));
+            }
             match result {
                 Ok(true) => continue,
                 Ok(false) => break,
@@ -766,6 +782,15 @@ async fn run() -> Result<()> {
             }
         }
         tui.screen().print_user(&line);
+        // Skills named in the prompt send their instructions with it.
+        let chosen = skill_invoke::named(&skills, &line);
+        if !chosen.is_empty() {
+            let (text, errors) = skill_invoke::turn_text(&chosen, &turn_text);
+            errors.iter().for_each(|e| ui::error(e));
+            let names: Vec<&str> = chosen.iter().map(|s| s.name.as_str()).collect();
+            ui::info(&format!("Using skill {}", names.join(", ")));
+            turn_text = text;
+        }
         // UserPromptSubmit sees the text the model gets (templates and MCP
         // prompts expanded); a blocked prompt keeps its pending attachments.
         if let Some(msg) =
@@ -1177,13 +1202,8 @@ async fn slash(
     match cmd {
         "/exit" | "/quit" | "/q" => return Ok(false),
         "/help" | "/?" => {
-            for (c, d) in COMMANDS.iter().chain(commands::COMMANDS) {
-                ui::info(&format!("  {c:<14} {d}"));
-            }
-            for (c, d) in mcp_features::prompt_commands(mcp) {
-                ui::info(&format!("  {c} — {d}"));
-            }
-            ui::info("  !CMD       run a shell command yourself (not sandboxed)\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts\n  Ctrl+O transcript · Ctrl+V paste an image · Ctrl+G reload into a ready upgrade · prompt templates: see /alias");
+            tui.screen().open_help();
+            ui::info("  !CMD run a shell command yourself (not sandboxed) · $skill or /skill sends a skill with your message\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts\n  Ctrl+O transcript · Ctrl+V paste an image · Ctrl+G reload into a ready upgrade · prompt templates: see /alias");
         }
         "/new" | "/clear" => {
             commands::fresh(agent, sessions_dir)?;
@@ -1365,7 +1385,7 @@ async fn slash(
         "/hooks" => hooks::command(agent, arg.first().copied()),
         "/login" | "/logout" | "/setup" | "/credits" | "/balance" => account::slash(cmd, &arg, agent, tui).await?,
         "/yolo" => commands::toggle_yolo(&config::home(), agent),
-        "/usage" => usage::show(&config::home(), usage::Period::parse(arg.first().copied().unwrap_or("30d"))?)?,
+        "/usage" | "/cost" => usage::show(&config::home(), usage::Period::parse(arg.first().copied().unwrap_or("30d"))?)?,
         "/stats" => agent.stats.show(agent.usage),
         "/status" => doctor::show_agent_status(agent, mcp, servers, skills.len())?,
         "/version" => doctor::version(),
