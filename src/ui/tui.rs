@@ -136,8 +136,9 @@ struct PendingApproval {
     save_rule: Option<String>,
     /// Who asks when it isn't the main agent, e.g. "subagent · Count files".
     origin: Option<String>,
-    /// The highlighted choice (arrows move it, Enter picks it).
-    selected: usize,
+    /// The choice picked with the arrows; Enter confirms it. None at first,
+    /// so a stray Enter never approves.
+    selected: Option<usize>,
     /// The whole preview for the full-screen review, when it doesn't fit.
     review: Option<String>,
     reply: oneshot::Sender<Approval>,
@@ -882,7 +883,7 @@ impl Screen {
                 rows.push(String::new());
             }
             for (i, (key, _, text)) in approval_choices(a).iter().enumerate() {
-                let sel = i == a.selected;
+                let sel = Some(i) == a.selected;
                 let label = truncate(&format!("{}. {text}", i + 1), w.saturating_sub(6));
                 rows.push(format!(
                     "{}{}  {}",
@@ -2243,8 +2244,8 @@ impl Screen {
             let page = MAX_PREVIEW - 1;
             let mut moved = true;
             match key.code {
-                KeyCode::Up => a.selected = (a.selected + n - 1) % n,
-                KeyCode::Down => a.selected = (a.selected + 1) % n,
+                KeyCode::Up => a.selected = Some(a.selected.map_or(n - 1, |i| (i + n - 1) % n)),
+                KeyCode::Down => a.selected = Some(a.selected.map_or(0, |i| (i + 1) % n)),
                 KeyCode::PageUp => a.scroll = a.scroll.saturating_sub(page),
                 KeyCode::PageDown => a.scroll = a.scroll.saturating_add(page),
                 _ => moved = false,
@@ -2259,7 +2260,7 @@ impl Screen {
                 return self.open_review(&title, &text);
             }
             let answer = match key.code {
-                KeyCode::Enter => choices.get(a.selected).map(|c| c.1),
+                KeyCode::Enter => a.selected.and_then(|i| choices.get(i)).map(|c| c.1),
                 KeyCode::Char(d @ '1'..='9') => choices.get(d as usize - '1' as usize).map(|c| c.1),
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Approval::Yes),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(Approval::Always),
@@ -2960,7 +2961,7 @@ async fn approve_on(
             rule: req.rule.as_deref().map(|r| one_line(r, 300)),
             save_rule: req.save_rule.as_deref().map(|r| one_line(r, 300)),
             origin,
-            selected: 0,
+            selected: None,
             review,
             reply: tx,
         });
@@ -3459,7 +3460,7 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
-            selected: 0,
+            selected: None,
             review: None,
             reply: tx,
         });
@@ -3517,7 +3518,7 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
-            selected: 0,
+            selected: None,
             review: None,
             reply: tx,
         });
@@ -3536,7 +3537,7 @@ mod tests {
             rule: None,
             save_rule: None,
             origin: None,
-            selected: 0,
+            selected: None,
             review: None,
             reply: tx,
         });
@@ -3562,7 +3563,7 @@ mod tests {
             rule: Some("`mcp__wiki__ask`".into()),
             save_rule: save.map(str::to_string),
             origin: Some("subagent · Count files".into()),
-            selected: 0,
+            selected: None,
             review: None,
             reply: tx,
         };
@@ -3604,7 +3605,7 @@ mod tests {
             rule: Some("edits".into()),
             save_rule: None,
             origin: None,
-            selected: 0,
+            selected: None,
             review,
             reply: tx,
         }
@@ -3619,8 +3620,11 @@ mod tests {
         let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
         let (tx, mut rx) = oneshot::channel();
         s.approval = Some(pending_approval(tx, Some("@@ -1 +1 @@\n-a\n+b".into())));
+        s.on_key(key(KeyCode::Enter), &cmd_tx);
+        assert!(rx.try_recv().is_err(), "Enter alone never approves");
         s.on_key(key(KeyCode::Down), &cmd_tx);
-        assert_eq!(s.approval.as_ref().unwrap().selected, 1);
+        s.on_key(key(KeyCode::Down), &cmd_tx);
+        assert_eq!(s.approval.as_ref().unwrap().selected, Some(1));
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
         assert!(text.contains("› a  2. Always allow edits") && text.contains("v Review"), "{text}");
         s.on_key(key(KeyCode::PageDown), &cmd_tx);
@@ -3788,7 +3792,7 @@ mod tests {
                 rule: None,
                 save_rule: None,
                 origin: None,
-                selected: 0,
+                selected: None,
                 review: None,
                 reply: tx,
             });
