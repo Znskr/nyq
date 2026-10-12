@@ -16,31 +16,29 @@ const RECENT_ITEMS: usize = 50;
 const EXCERPT: usize = 240;
 
 /// Replace things that look like credentials with `[redacted]`: API keys,
-/// bearer tokens, JWTs, `key=value` secrets and long opaque strings.
+/// bearer tokens, JWTs, `key=value` secrets, URL credentials and long opaque
+/// strings.
 pub fn redact(text: &str) -> String {
     use std::sync::OnceLock;
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    static PATTERNS: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         [
-            r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}",
-            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*",
-            r"\b(sk|pk|rk)-[A-Za-z0-9_-]{12,}",
-            r"\b(ghp|gho|ghu|ghs|ghr|github_pat|glpat|xox[abprs])[-_][A-Za-z0-9_-]{10,}",
-            r"\bAKIA[0-9A-Z]{16}\b",
-            r#"(?i)\b([a-z0-9_]*(api[_-]?key|token|secret|password|passwd|auth)[a-z0-9_]*)\s*[:=]\s*["']?[^\s"',;]{4,}"#,
-            r"\b[A-Za-z0-9+/_-]{40,}={0,2}",
+            (r#"(?i)\b(https?://)[^\s/?#"'`<>@:]+:[^\s/?#"'`<>@]+@"#, "${1}[redacted]@"),
+            (r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}", "[redacted]"),
+            (r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*", "[redacted]"),
+            (r"\b(sk|pk|rk)-[A-Za-z0-9_-]{12,}", "[redacted]"),
+            (r"\b(ghp|gho|ghu|ghs|ghr|github_pat|glpat|xox[abprs])[-_][A-Za-z0-9_-]{10,}", "[redacted]"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "[redacted]"),
+            (r#"(?i)\b([a-z0-9_]*(api[_-]?key|token|secret|password|passwd|auth)[a-z0-9_]*)\s*[:=]\s*["']?[^\s"',;]{4,}"#, "$1=[redacted]"),
+            (r"\b[A-Za-z0-9+/_-]{40,}={0,2}", "[redacted]"),
         ]
         .iter()
-        .map(|p| regex::Regex::new(p).expect("valid redaction pattern"))
+        .map(|(p, with)| (regex::Regex::new(p).expect("valid redaction pattern"), *with))
         .collect()
     });
     let mut out = text.to_string();
-    for (i, re) in patterns.iter().enumerate() {
-        out = if i == 5 {
-            re.replace_all(&out, "$1=[redacted]").into_owned()
-        } else {
-            re.replace_all(&out, "[redacted]").into_owned()
-        };
+    for (re, with) in patterns {
+        out = re.replace_all(&out, *with).into_owned();
     }
     out
 }
@@ -178,6 +176,13 @@ mod tests {
             redact("cargo test --release in src/main.rs"),
             "cargo test --release in src/main.rs"
         );
+        // URL credentials go, the host stays; ports and hosts without
+        // credentials are untouched.
+        assert_eq!(
+            redact("clone https://x-access-token:hunter2@github.com/o/r.git"),
+            "clone https://[redacted]@github.com/o/r.git"
+        );
+        assert_eq!(redact("https://example.com:8443/v1"), "https://example.com:8443/v1");
     }
 
     #[test]
