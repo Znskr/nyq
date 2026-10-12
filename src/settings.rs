@@ -498,7 +498,7 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
     let user = read(&home.join("settings.json"));
     let project_path = cwd.join(".nyq").join("settings.json");
     let mut project = read(&project_path);
-    let workspace = workspace_overrides(&user, cwd);
+    let mut workspace = workspace_overrides(&user, cwd);
     let ignored: Vec<String> = project
         .keys()
         .filter(|k| !PROJECT_KEYS.contains(&k.as_str()))
@@ -518,7 +518,10 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
     let settings = serde_json::from_value(Value::Object(merged))
         .or_else(|e| {
             warnings.push(format!("project or workspace settings: {e} (using your settings.json)"));
+            // The layers are unusable: none of them may be reported as the
+            // source of a value or shadow a later change.
             project.clear();
+            workspace.clear();
             serde_json::from_value(Value::Object(user))
         })
         .unwrap_or_else(|e| {
@@ -961,6 +964,37 @@ mod tests {
         let (s, warnings) = load_layered(home.path(), cwd.path());
         assert_eq!((s.sound.as_str(), s.auto_compact), ("off", 50));
         assert_eq!(warnings.len(), 1);
+
+        // A workspace layer with an unusable value is dropped entirely: the
+        // user file applies, no layer is reported as a value's source, and a
+        // later change is not reverted as shadowed.
+        std::fs::write(cwd.path().join(".nyq/settings.json"), r#"{"sound": "max"}"#).unwrap();
+        std::fs::write(
+            home.path().join("settings.json"),
+            serde_json::json!({
+                "sound": "on",
+                "auto_compact": 70,
+                "statusline": {"tokens": false},
+                "workspaces": {ws.to_string_lossy(): {"sound": 5}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (s, warnings) = load_layered(home.path(), cwd.path());
+        assert_eq!(s.sound, "on");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("project or workspace settings"), "{warnings:?}");
+        assert_eq!(source(Id::Sound), None, "a dropped layer must not be a source");
+        assert_eq!(source(Id::AutoCompact), None);
+        install(s);
+        let (effective, notice) = update(home.path(), |s| s.sound = "off".into()).unwrap();
+        assert_eq!(effective.sound, "off");
+        assert!(notice.is_none(), "{notice:?}");
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(home.path().join("settings.json")).unwrap()).unwrap();
+        assert_eq!(raw["sound"], "off");
+        *CURRENT.lock().unwrap() = None;
+        *OVERRIDES.lock().unwrap() = None;
     }
 
     #[test]
