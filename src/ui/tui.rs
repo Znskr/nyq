@@ -2511,12 +2511,14 @@ impl Screen {
                 self.approval = Some(a);
                 return self.redraw();
             }
-            if a.review.is_some() && (key.code == KeyCode::Char('v') || (ctrl && key.code == KeyCode::Char('o'))) {
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            if a.review.is_some() && ((plain && matches!(key.code, KeyCode::Char('v' | 'V'))) || (ctrl && key.code == KeyCode::Char('o'))) {
                 let (title, text) = (super::render::strip_ansi(&a.title), a.review.clone().unwrap_or_default());
                 self.approval = Some(a);
                 return self.open_review(&title, &text);
             }
             let answer = match key.code {
+                KeyCode::Char(_) if !plain => None,
                 KeyCode::Enter => a.selected.and_then(|i| choices.get(i)).map(|c| c.1),
                 KeyCode::Char(d @ '1'..='9') => choices.get(d as usize - '1' as usize).map(|c| c.1),
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Approval::Yes),
@@ -3945,6 +3947,56 @@ mod tests {
         );
         assert_eq!(rx.try_recv().unwrap(), (Approval::No, None));
         assert!(matches!(cmd_rx.try_recv().unwrap(), Command::Exit));
+    }
+
+    #[test]
+    fn approval_shortcuts_require_plain_or_shift_keys() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        for ch in "yYaAsSlLnNvV1".chars() {
+            for modifiers in [
+                KeyModifiers::NONE, KeyModifiers::SHIFT, KeyModifiers::CONTROL,
+                KeyModifiers::ALT, KeyModifiers::SUPER, KeyModifiers::HYPER,
+                KeyModifiers::META, KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+            ] {
+                let mut s = screen();
+                let (tx, mut rx) = oneshot::channel();
+                s.approval = Some(PendingApproval {
+                    title: "Approve".into(),
+                    lines: Vec::new(),
+                    prewrapped: false,
+                    scroll: 0,
+                    rule: Some("bash:git status".into()),
+                    save_rule: Some("bash:git status".into()),
+                    origin: None,
+                    note: String::new(),
+                    noting: false,
+                    selected: None,
+                    review: Some("preview".into()),
+                    reply: tx,
+                });
+                s.on_key(KeyEvent::new(KeyCode::Char(ch), modifiers), &cmd_tx);
+                let plain = modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT;
+                if plain && matches!(ch, 'v' | 'V') {
+                    assert!(s.viewer.is_some());
+                    assert!(s.approval.is_some());
+                } else if plain {
+                    let expected = match ch.to_ascii_lowercase() {
+                        'y' | '1' => Approval::Yes,
+                        'a' => Approval::Always,
+                        's' => Approval::AlwaysSave,
+                        'l' => Approval::AlwaysSaveLocal,
+                        'n' => Approval::No,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(rx.try_recv().unwrap(), (expected, None));
+                } else {
+                    assert!(rx.try_recv().is_err(), "{ch} {modifiers:?}");
+                    assert!(s.approval.is_some());
+                    assert!(s.viewer.is_none());
+                }
+            }
+        }
     }
 
     #[test]
