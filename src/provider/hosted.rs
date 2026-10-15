@@ -50,7 +50,7 @@ impl Service {
         match name.to_ascii_lowercase().as_str() {
             "opencode-go" | "go" => Some(Service::OpencodeGo),
             "opencode" | "zen" | "opencode-zen" => Some(Service::Opencode),
-            "xai" | "grok" => Some(Service::Xai),
+            "xai" => Some(Service::Xai),
             _ => None,
         }
     }
@@ -409,8 +409,9 @@ mod tests {
         assert_eq!(bare("grok-4"), Protocol::Responses);
         assert_eq!(bare("glm-5"), Protocol::Chat);
         assert_eq!(p(Service::Xai, "anything"), Protocol::Responses);
-        assert_eq!(Service::parse("Grok"), Some(Service::Xai));
         assert!(Service::parse("vercel").is_none());
+        assert!(Service::parse("grok").is_none());
+        assert!(Service::parse("Grok").is_none());
         assert!(Service::parse("codex").is_none());
         for s in Service::ALL {
             assert_eq!(Service::parse(s.id()), Some(s));
