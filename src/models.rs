@@ -9,7 +9,7 @@ use crate::provider::Provider;
 /// One selectable model.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelChoice {
-    /// Provider group shown as a tab: "codex", "ollama", "openai", or a
+    /// Provider group shown as a tab: "codex", "grok", "ollama", "openai", or a
     /// hosted service ("opencode-go", "opencode", "xai").
     pub provider: String,
     pub model: String,
@@ -146,14 +146,15 @@ fn short(error: &str) -> String {
     }
 }
 
-/// All models from every reachable provider (Codex login, local Ollama, the
-/// configured OpenAI-compatible endpoint, hosted services with an API key).
+/// All models from every reachable provider (Codex login, Grok subscription,
+/// local Ollama, the configured OpenAI-compatible endpoint, hosted services
+/// with an API key).
 /// Unreachable providers are skipped and reported as warnings. Never takes
 /// longer than a few seconds.
 pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
     use crate::{
         config,
-        provider::{codex::CodexProvider, openai::OpenAiProvider},
+        provider::{codex::CodexProvider, grok::GrokProvider, openai::OpenAiProvider},
     };
     let auth = config::codex_auth_path(home);
     let ollama_url = config::ollama_url();
@@ -182,7 +183,17 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
             Err(e) => Ok((model.into_iter().collect(), Some(format!("openai: {e}")))),
         }
     };
-    let (codex, ollama, openai, hosted): (_, _, Result<_>, _) = tokio::join!(codex, ollama, openai, hosted(home));
+    let grok = async {
+        if !crate::provider::grok::has_session(home) {
+            return Ok(Vec::new());
+        }
+        let provider = GrokProvider::new(home.to_path_buf(), crate::provider::grok::DEFAULT_MODEL.into(), None);
+        tokio::time::timeout(std::time::Duration::from_secs(6), provider.list_models())
+            .await
+            .map_err(anyhow::Error::from)?
+    };
+    let (codex, grok, ollama, openai, hosted): (_, Result<_>, _, Result<_>, _) =
+        tokio::join!(codex, grok, ollama, openai, hosted(home));
     crate::provider::remember_listing("ollama", ollama.clone(), Vec::new());
     if let Ok((models, None)) = &openai {
         crate::provider::remember_listing("openai", models.clone(), Vec::new());
@@ -195,6 +206,10 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
             Vec::new()
         }
     };
+    match grok {
+        Ok(models) => choices.extend(models),
+        Err(e) => warnings.push(format!("grok: {e}")),
+    }
     let context = std::env::var("NYQ_CONTEXT_WINDOW")
         .ok()
         .and_then(|v| v.parse().ok());
@@ -239,7 +254,7 @@ pub fn build(
 ) -> Result<Box<dyn Provider>> {
     use crate::{
         config,
-        provider::{codex::CodexProvider, openai::OpenAiProvider},
+        provider::{codex::CodexProvider, grok::GrokProvider, openai::OpenAiProvider},
     };
     anyhow::ensure!(!choice.model.trim().is_empty(), "model must not be empty");
     match choice.provider.as_str() {
@@ -251,6 +266,16 @@ pub fn build(
                 choice.model.clone(),
                 effort.filter(|e| e != "auto"),
             )))
+        }
+        "grok" => {
+            anyhow::ensure!(
+                crate::provider::grok::has_session(home),
+                "grok provider needs a Grok subscription sign-in"
+            );
+            Ok(Box::new(
+                GrokProvider::new(home.to_path_buf(), choice.model.clone(), effort.filter(|e| e != "auto"))
+                    .with_catalog(choice.efforts.clone(), choice.context_window),
+            ))
         }
         "ollama" => Ok(Box::new(OpenAiProvider::with_label(
             "ollama".into(),

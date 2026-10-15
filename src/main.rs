@@ -84,7 +84,7 @@ struct Cli {
     /// Model id (overrides config).
     #[arg(short, long, global = true)]
     model: Option<String>,
-    /// Provider: codex, openai, ollama, opencode-go, opencode or xai.
+    /// Provider: codex, grok, openai, ollama, opencode-go, opencode or xai.
     #[arg(long, global = true)]
     provider: Option<String>,
     /// Run tools without asking for approval.
@@ -220,15 +220,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Sign in: ChatGPT subscription (default, Codex models), or store an API
-    /// key for opencode-go, opencode or xai.
+    /// Sign in: ChatGPT subscription (default, Codex models), a Grok
+    /// subscription, or store an API key for opencode-go, opencode or xai.
     Login {
-        /// codex (default), opencode-go, opencode or xai.
+        /// codex (default), grok, opencode-go, opencode or xai.
         provider: Option<String>,
     },
     /// Remove nyq's stored login for a provider, or every stored login.
     Logout {
-        /// codex, opencode-go, opencode or xai [default: all of them].
+        /// codex, grok, opencode-go, opencode or xai [default: all of them].
         provider: Option<String>,
     },
     /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
@@ -366,7 +366,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tools", "list available tools"),
     ("/skills", "skills: /skills [list|install SOURCE [--project]|remove NAME|info NAME|create NAME|path]"),
     ("/agents", "named subagents: /agents [list|show NAME|stop NAME|delete NAME]"),
-    ("/login", "sign in: ChatGPT in the browser, or an API key (hidden input)"),
+    ("/login", "sign in: ChatGPT or Grok in the browser, or an API key (hidden input)"),
     ("/logout", "remove nyq's stored sign-in: /logout [provider]"),
     ("/setup", "connections, default provider, credential source"),
     ("/mcp", "MCP servers and tools: /mcp [list|add|remove|reload|path|connect|disconnect|login|logout|trust|resource|prompt]"),
@@ -585,10 +585,13 @@ async fn run() -> Result<()> {
     }
     match cli.command {
         Some(Command::Login { provider }) => {
-            let msg = match provider.as_deref().filter(|p| *p != "codex") {
+            let msg = match provider.as_deref().filter(|p| !p.eq_ignore_ascii_case("codex")) {
+                Some(name) if name.eq_ignore_ascii_case("grok") => {
+                    login::login_grok(&home, provider::grok::stdin_code()).await?
+                }
                 Some(name) => {
                     let service = provider::hosted::Service::parse(name).with_context(|| {
-                        format!("unknown provider `{name}` (expected codex, opencode-go, opencode or xai)")
+                        format!("unknown provider `{name}` (expected codex, grok, opencode-go, opencode or xai)")
                     })?;
                     login::login_key(&home, service).await?
                 }
@@ -605,8 +608,8 @@ async fn run() -> Result<()> {
         }
         Some(Command::Logout { provider }) => {
             let msg = match provider {
-                Some(p) => login::logout(&home, &p)?,
-                None => login::logout_all(&home)?,
+                Some(p) => login::logout(&home, &p).await?,
+                None => login::logout_all(&home).await?,
             };
             println!("{msg}");
             return Ok(());

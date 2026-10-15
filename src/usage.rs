@@ -232,7 +232,7 @@ impl Total {
         self.cached += r.cached;
         self.reasoning += r.reasoning;
         self.cache_write += r.cache_write;
-        if r.provider == "codex" {
+        if r.provider == "codex" || r.provider == "grok" {
             self.subscription += 1;
         } else if let Some(c) = r.cost_usd {
             self.cost += c;

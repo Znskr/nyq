@@ -3,14 +3,15 @@
 //! Profile directory: `$NYQ_HOME`, else `~/.nyq`.
 //!
 //! Provider resolution, first match wins:
-//! 1. `--provider` flag or `NYQ_PROVIDER` (`codex` | `openai` | `ollama` |
-//!    `opencode-go` | `opencode` | `xai`)
+//! 1. `--provider` flag or `NYQ_PROVIDER` (`codex` | `grok` | `openai` |
+//!    `ollama` | `opencode-go` | `opencode` | `xai`)
 //! 2. `NYQ_BASE_URL` set → `openai`
 //! 3. last-model.json (unless explicit model/provider flags or env are set)
 //! 4. `settings.json` `"provider"`
 //! 5. a ChatGPT login present (codex CLI or `chatgpt-auth.json`) → `codex`
-//! 6. `model.json` present → `openai`
-//! 7. an API key for a hosted service (OpenCode Go, OpenCode Zen, xAI) →
+//! 6. a Grok subscription sign-in (`grok-auth.json`) → `grok`
+//! 7. `model.json` present → `openai`
+//! 8. an API key for a hosted service (OpenCode Go, OpenCode Zen, xAI) →
 //!    that service
 
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{
     codex::CodexProvider,
+    grok::GrokProvider,
     hosted::{HostedProvider, Service},
     openai::OpenAiProvider,
     Provider,
@@ -171,7 +173,7 @@ pub(crate) fn codex_auth_path(home: &Path) -> PathBuf {
 /// flag, the environment, or a saved setting (settings.json, last-model.json).
 pub fn unknown_provider(name: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "unknown provider `{name}` (expected codex, ollama, openai, opencode-go, opencode or xai). \
+        "unknown provider `{name}` (expected codex, grok, ollama, openai, opencode-go, opencode or xai). \
          If it is saved in settings.json or last-model.json, choose another with `nyq provider NAME` or /model."
     )
 }
@@ -211,6 +213,7 @@ pub fn provider(
         .or_else(|| env("NYQ_BASE_URL").map(|_| "openai".into()))
         .or_else(|| settings.provider.clone())
         .or_else(|| auth_path.exists().then(|| "codex".into()))
+        .or_else(|| crate::provider::grok::has_session(home).then(|| "grok".into()))
         .or_else(|| model_file.base_url.as_ref().map(|_| "openai".into()))
         .or_else(|| {
             Service::ALL
@@ -231,6 +234,18 @@ pub fn provider(
                 .unwrap_or_else(|| DEFAULT_CODEX_MODEL.into());
             let effort = settings.effort.filter(|e| e != "auto");
             Ok(Box::new(CodexProvider::new(auth_path, model, effort)))
+        }
+        Some("grok") => {
+            if !crate::provider::grok::has_session(home) {
+                bail!("grok provider needs a Grok subscription sign-in: run `nyq login grok`");
+            }
+            let model = model_flag
+                .map(str::to_string)
+                .or_else(|| env("NYQ_MODEL"))
+                .or_else(|| settings.models.get("grok").cloned())
+                .unwrap_or_else(|| crate::provider::grok::DEFAULT_MODEL.into());
+            let effort = settings.effort.filter(|e| e != "auto");
+            Ok(Box::new(GrokProvider::new(home.to_path_buf(), model, effort)))
         }
         Some("openai") => {
             let base_url = env("NYQ_BASE_URL")
@@ -262,7 +277,7 @@ pub fn provider(
             Ok(Box::new(HostedProvider::configured(home, service, model, effort)?))
         }
         None => bail!(
-            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • OpenCode Go/Zen or xAI: run `nyq login opencode-go|opencode|xai` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
+            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • Grok subscription: run `nyq login grok`\n  • OpenCode Go/Zen or xAI: run `nyq login opencode-go|opencode|xai` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
         ),
     }
 }

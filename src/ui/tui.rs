@@ -3093,6 +3093,14 @@ impl Tui {
         answer.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
     }
 
+    /// Clear a masked prompt left up after sign-in finishes another way.
+    pub fn dismiss_secret(&self) {
+        let mut s = self.screen();
+        if s.secret.take().is_some() {
+            s.redraw();
+        }
+    }
+
     /// The `agent::Ui` for one run.
     pub fn ui(&self, cwd: PathBuf) -> TuiUi {
         TuiUi {

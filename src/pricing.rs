@@ -38,7 +38,7 @@ fn from_catalog(home: &Path, provider: &str, model: &str) -> Option<Price> {
 }
 
 pub fn lookup(home: &Path, provider: &str, model: &str) -> Option<Price> {
-    if provider == "codex" {
+    if provider == "codex" || provider == "grok" {
         return None;
     }
     if let Some(price) = from_catalog(home, provider, model) {
