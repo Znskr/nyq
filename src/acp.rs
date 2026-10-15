@@ -548,6 +548,11 @@ async fn open(
     for w in warnings {
         warn(w);
     }
+    let (ext, warnings) = crate::extensions::Extensions::load(&state.home, &cwd, crate::extensions::Mode::Acp);
+    for w in warnings {
+        warn(w);
+    }
+    let hooks = hooks.with_extensions(ext.clone());
     let source = if items.is_empty() {
         "startup"
     } else {
@@ -589,6 +594,11 @@ async fn open(
         agent.adopt_transcript();
     }
 
+    ext.attach(&mut agent.tools);
+    if let Some(s) = &agent.session {
+        ext.set_session(&s.id);
+    }
+    ext.start();
     let mcp = McpManager::new(state.home.clone());
     mcp.attach(&mut agent.tools);
     let session_id = acp::SessionId::new(agent.session.as_ref().map(|s| s.id.clone()).unwrap_or_default());
@@ -619,6 +629,7 @@ async fn open(
         install_server(&mcp, &mut agent, cfg, result).await;
     }
     crate::mcp_features::sync(&mut agent, &mcp);
+    ext.wait_ready(crate::extensions::STARTUP_TIMEOUT).await;
     crate::hooks::session_start(&agent, source).await;
 
     let live = Arc::new(Live {

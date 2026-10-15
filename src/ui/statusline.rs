@@ -77,6 +77,7 @@ pub fn right(f: &Footer, width: usize) -> Vec<String> {
             out.push(format!("⎇ {}", one_line(b, 60)));
         }
     }
+    out.extend(f.extensions.iter().map(|s| one_line(s, 60)));
     out
 }
 

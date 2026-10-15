@@ -64,7 +64,7 @@ fn parse_source(raw: &str, filter: Option<&str>) -> Result<Source> {
     Ok(Source { location, filter })
 }
 
-fn expand_tilde(p: &str) -> PathBuf {
+pub(crate) fn expand_tilde(p: &str) -> PathBuf {
     match p.strip_prefix("~/").zip(dirs::home_dir()) {
         Some((rest, home)) => home.join(rest),
         None if p == "~" => dirs::home_dir().unwrap_or_default(),
@@ -73,7 +73,7 @@ fn expand_tilde(p: &str) -> PathBuf {
 }
 
 /// The URL to clone for a non-local source (`owner/repo` means GitHub).
-fn clone_url(location: &str) -> Option<String> {
+pub(crate) fn clone_url(location: &str) -> Option<String> {
     if location.contains("://") || location.starts_with("git@") {
         return Some(location.to_string());
     }
@@ -164,7 +164,7 @@ fn find_skills(root: &Path, fallback: &str, filter: Option<&str>) -> (Vec<Found>
 }
 
 /// Copy a directory tree, skipping `.git` and symlinks.
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("creating {}", slash_path(to)))?;
     for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", slash_path(from)))? {
         let entry = entry?;
@@ -184,7 +184,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Removes a staging directory when dropped.
-struct Staging(PathBuf);
+pub(crate) struct Staging(pub(crate) PathBuf);
 
 impl Drop for Staging {
     fn drop(&mut self) {
@@ -220,12 +220,12 @@ fn install_from_dir(dir: &Path, fallback: &str, filter: Option<&str>, dest: &Pat
     Ok(names)
 }
 
-fn remove_path(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_path(path: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }
 }
 
-async fn git_clone(url: &str, into: &Path) -> Result<()> {
+pub(crate) async fn git_clone(url: &str, into: &Path) -> Result<()> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(["clone", "--depth", "1", "--quiet", "--", url])
         .arg(into)
