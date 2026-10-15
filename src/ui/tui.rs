@@ -103,6 +103,8 @@ pub struct Footer {
     pub models: Vec<String>,
     /// The session title (renamed, or the first prompt); also the window title.
     pub title: String,
+    /// Status texts set by extensions (`status/set`).
+    pub extensions: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

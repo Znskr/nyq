@@ -9,6 +9,7 @@ mod commands;
 mod config;
 mod diagnostics;
 mod doctor;
+mod extensions;
 mod github;
 mod grants;
 mod hooks;
@@ -280,6 +281,12 @@ enum Command {
         #[command(subcommand)]
         action: mcp_cli::McpCommand,
     },
+    /// List, install or remove extensions (alias: ext).
+    #[command(alias = "ext")]
+    Extensions {
+        #[command(subcommand)]
+        action: extensions::cli::ExtCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -386,6 +393,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/hooks",
         "list hooks and trust state; /hooks trust trusts the project's hooks",
+    ),
+    (
+        "/extensions",
+        "extensions and their state: /extensions [list|reload|trust]",
     ),
     (
         "/yolo",
@@ -612,6 +623,7 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Mcp { action }) => return mcp_cli::run(&home, &cwd, action).await,
+        Some(Command::Extensions { action }) => return extensions::cli::run(&home, &cwd, action).await,
         Some(Command::Acp { log_file }) => {
             let opts = acp::Options {
                 yolo: permission_mode.is_yolo(),
@@ -684,6 +696,15 @@ async fn run() -> Result<()> {
     for w in &hook_warnings {
         ui::error(w);
     }
+    let terminal = !print
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let ext_mode = if terminal { extensions::Mode::Tui } else { extensions::Mode::Print };
+    let (ext, ext_warnings) = extensions::Extensions::load(&home, &cwd, ext_mode);
+    for w in &ext_warnings {
+        ui::error(w);
+    }
+    let hooks = hooks.with_extensions(ext.clone());
     let session = if ask.no_save && print {
         None
     } else {
@@ -735,10 +756,12 @@ async fn run() -> Result<()> {
         ui::error(w);
     }
 
+    ext.attach(&mut agent.tools);
+    if let Some(s) = &agent.session {
+        ext.set_session(&s.id);
+    }
     let mut text = prompt.join(" ");
-    let interactive = !print
-        && std::io::IsTerminal::is_terminal(&std::io::stdin())
-        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let interactive = terminal;
     // A yolo saved from the settings menu never carries over to print mode or
     // piped input: scripts get mutations only when they ask on the command line.
     let explicit_mode = cli.permission_mode.is_some() || cli.yolo || env_mode.is_some();
@@ -765,7 +788,7 @@ async fn run() -> Result<()> {
             !pick,
             "-r without an id needs a terminal to pick a session; pass -r ID or -c"
         );
-        return print_mode(&mut agent, &mut mcp, &servers, &ask, &mut text, resumed.as_ref()).await;
+        return print_mode(&mut agent, &mut mcp, &servers, &ext, &ask, &mut text, resumed.as_ref()).await;
     }
     let footer = Footer {
         cwd: cwd.display().to_string(),
@@ -776,8 +799,9 @@ async fn run() -> Result<()> {
         .iter()
         .chain(commands::COMMANDS)
         .map(|(c, _)| &c[1..])
-        .chain(["quit", "q", "clear", "img"])
+        .chain(["quit", "q", "clear", "img", "transcript", "paste"])
         .collect();
+    ext.reserve(reserved.iter().map(|c| c.to_string()));
     let templates = templates::discover(&home, &cwd, &reserved);
     let commands: Vec<(String, String)> = COMMANDS
         .iter()
@@ -816,9 +840,21 @@ async fn run() -> Result<()> {
         let commands = mcp_features::prompt_commands(mcp);
         screen.lock().unwrap_or_else(|e| e.into_inner()).editor.set_mcp_commands(commands);
     });
+    // Extensions start in the background; their commands and status
+    // segments appear as they come up.
+    let screen = tui.screen.clone();
+    let watched = ext.clone();
+    ext.on_change(move || {
+        let mut s = screen.lock().unwrap_or_else(|e| e.into_inner());
+        s.editor.set_extension_commands(watched.commands());
+        s.footer.extensions = watched.statuses();
+        s.redraw();
+    });
+    ext.start();
     if let Err(e) = mcp_slash::connect_profile_servers(&mut mcp, &mut agent, &servers, false).await {
         drop(tui);
         mcp.shutdown().await;
+        ext.shutdown().await;
         return Err(e);
     }
     mcp_features::sync(&mut agent, &mcp);
@@ -854,46 +890,57 @@ async fn run() -> Result<()> {
         grants::persist(&mut agent);
         agent.sync_prefs();
         sync_footer(&tui, &agent, current.as_ref());
-        let line = match pending.pop_front() {
-            Some(t) => t,
-            None => match tui.commands.recv().await {
-                Some(UiCommand::Submit(t)) => t,
-                Some(UiCommand::SetModel(choice)) => {
-                    switch_model(&home, &mut agent, &choice);
-                    current = Some(choice);
-                    continue;
-                }
-                Some(UiCommand::Resume(id)) => {
-                    if let Err(e) = resume_session(&mut agent, &sessions_dir, &id).await {
-                        ui::error(&format!("{e:#}"));
-                    }
-                    continue;
-                }
-                Some(UiCommand::CycleEffort) => {
-                    cycle_effort(&home, &mut agent, current.as_ref());
-                    continue;
-                }
-                Some(UiCommand::Setting(id, value)) => {
-                    commands::apply_setting(&home, &mut agent, current.as_ref(), id, &value);
-                    continue;
-                }
-                Some(UiCommand::SetPermissionMode(mode)) => {
-                    commands::set_permission_mode(&home, &mut agent, &mode);
-                    continue;
-                }
-                Some(UiCommand::ApplyUpgrade) => match prepare_relaunch(&tui, &mut agent, &raw_args, &cwd) {
-                    Ok(r) => {
-                        relaunch = Some(r);
-                        break;
-                    }
-                    Err(notice) => {
-                        tui.screen().set_hint(None);
-                        ui::error(&notice);
+        let next = match pending.pop_front() {
+            Some(t) => Some(UiCommand::Submit(t)),
+            None => tokio::select! {
+                c = tui.commands.recv() => c,
+                // An extension sent a message while nyq was idle.
+                _ = ext.queued() => {
+                    let queued = ext.take_all_queued();
+                    if queued.is_empty() {
                         continue;
                     }
-                },
-                Some(UiCommand::Exit) | None => break,
+                    Some(UiCommand::Submit(queued.join("\n\n")))
+                }
             },
+        };
+        let line = match next {
+            Some(UiCommand::Submit(t)) => t,
+            Some(UiCommand::SetModel(choice)) => {
+                switch_model(&home, &mut agent, &choice);
+                current = Some(choice);
+                continue;
+            }
+            Some(UiCommand::Resume(id)) => {
+                if let Err(e) = resume_session(&mut agent, &sessions_dir, &id).await {
+                    ui::error(&format!("{e:#}"));
+                }
+                continue;
+            }
+            Some(UiCommand::CycleEffort) => {
+                cycle_effort(&home, &mut agent, current.as_ref());
+                continue;
+            }
+            Some(UiCommand::Setting(id, value)) => {
+                commands::apply_setting(&home, &mut agent, current.as_ref(), id, &value);
+                continue;
+            }
+            Some(UiCommand::SetPermissionMode(mode)) => {
+                commands::set_permission_mode(&home, &mut agent, &mode);
+                continue;
+            }
+            Some(UiCommand::ApplyUpgrade) => match prepare_relaunch(&tui, &mut agent, &raw_args, &cwd) {
+                Ok(r) => {
+                    relaunch = Some(r);
+                    break;
+                }
+                Err(notice) => {
+                    tui.screen().set_hint(None);
+                    ui::error(&notice);
+                    continue;
+                }
+            },
+            Some(UiCommand::Exit) | None => break,
         };
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -909,12 +956,36 @@ async fn run() -> Result<()> {
             _ => line,
         };
         // `/path/to/file what is this?` and `/skill-name …` are prompts.
+        let is_known = |c: &str| known.contains(c) || ext.has_command(c);
         let is_command = line.starts_with('/')
-            && skill_invoke::leading(&skills, &line, |c| known.contains(c)).is_none()
-            && !slash::is_prompt(&line, |c| known.contains(c));
+            && skill_invoke::leading(&skills, &line, is_known).is_none()
+            && !slash::is_prompt(&line, is_known);
+        let first = line.split_whitespace().next().unwrap_or("");
         // An MCP prompt's messages become the turn's text.
         let mut turn_text = line.clone();
-        if line.starts_with("/mcp:") {
+        if is_command && !known.contains(first) && ext.has_command(first) {
+            // An extension command prints a message and/or sends a prompt.
+            let cancel = CancellationToken::new();
+            tui.screen().set_busy(Some("Running"), Some(cancel.clone()));
+            let args = line[first.len()..].trim().to_string();
+            let result = ext.run_command(first, &args, &cancel).await;
+            tui.screen().idle();
+            match result {
+                Ok(r) => {
+                    if let Some(m) = &r.message {
+                        ui::info(m);
+                    }
+                    match r.prompt {
+                        Some(p) => turn_text = p,
+                        None => continue,
+                    }
+                }
+                Err(e) => {
+                    ui::error(&format!("{e:#}"));
+                    continue;
+                }
+            }
+        } else if line.starts_with("/mcp:") {
             match mcp_features::prompt_turn(&mcp, &line).await {
                 Ok(t) => turn_text = t,
                 Err(e) => {
@@ -1057,6 +1128,7 @@ async fn run() -> Result<()> {
     }
     tools::background::kill_all();
     mcp.shutdown().await;
+    ext.shutdown().await;
     if let Some(r) = relaunch {
         // Close the session (and its lock) and the tape before handing over.
         let resume = agent.session.take().filter(|s| s.is_saved()).map(|s| s.id.clone());
@@ -1299,10 +1371,12 @@ fn sandbox_policy(cli: &Cli) -> Result<sandbox::Policy> {
 
 /// Answer one prompt without the TUI (`nyq -p`, `nyq ask`). Exits 130 after
 /// Ctrl-C and 143 after SIGTERM, cleaning up either way.
+#[allow(clippy::too_many_arguments)]
 async fn print_mode(
     agent: &mut Agent,
     mcp: &mut McpManager,
     servers: &[ServerConfig],
+    ext: &extensions::Extensions,
     ask: &AskOpts,
     text: &mut String,
     resumed: Option<&session::Meta>,
@@ -1320,11 +1394,15 @@ async fn print_mode(
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
         ui::set_session_title(&meta.title);
     }
+    ext.start();
     if let Err(e) = mcp_slash::connect_profile_servers(mcp, agent, servers, true).await {
         mcp.shutdown().await;
+        ext.shutdown().await;
         return Err(e);
     }
     mcp_features::sync(agent, mcp);
+    // A single answer: wait for the extensions' tools and handlers first.
+    ext.wait_ready(extensions::STARTUP_TIMEOUT).await;
     hooks::session_start(agent, if resumed.is_some() { "resume" } else { "startup" }).await;
     let mut plain = ui::PlainUi::new(agent.permission_mode.is_yolo());
     plain.quiet = ask.quiet || ask.json;
@@ -1356,6 +1434,7 @@ async fn print_mode(
     cancel.cancel();
     tools::background::kill_all();
     mcp.shutdown().await;
+    ext.shutdown().await;
     if let Some(s) = agent.session.as_mut() {
         let _ = s.flush();
     }
@@ -1639,6 +1718,11 @@ async fn slash(
         "/permissions" => commands::permissions(agent, tui, &config::home(), &arg).await,
         "/allowlist" => commands::allowlist(agent, &arg),
         "/hooks" => hooks::command(agent, arg.first().copied()),
+        "/extensions" => {
+            if let Some(ext) = agent.hooks.extensions().cloned() {
+                extensions::slash(&ext, &arg).await;
+            }
+        }
         "/login" | "/logout" | "/setup" => account::slash(cmd, &arg, agent, tui).await?,
         "/yolo" => commands::toggle_yolo(&config::home(), agent),
         "/usage" | "/cost" => usage::slash(&config::home(), &arg, agent.session.as_ref().map(|s| s.id.as_str()))?,

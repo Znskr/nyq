@@ -361,6 +361,8 @@ pub struct Registry {
     /// MCP tools picked with `mcp_select_tool` while MCP tools are deferred.
     selected: HashSet<String>,
     live: Option<LiveTools>,
+    /// Tool changes from extensions (`crate::extensions`).
+    extensions: Option<LiveTools>,
 }
 
 impl Registry {
@@ -386,12 +388,18 @@ impl Registry {
         self.live = Some(live);
     }
 
+    /// Receive tool changes from running extensions.
+    pub fn attach_extensions(&mut self, live: LiveTools) {
+        self.extensions = Some(live);
+    }
+
     /// Apply queued tool changes.
     pub fn refresh(&mut self) {
-        let Some(live) = self.live.clone() else { return };
-        let patches = std::mem::take(&mut *live.patches.lock().unwrap_or_else(|e| e.into_inner()));
-        for patch in patches {
-            patch(self);
+        for live in [self.live.clone(), self.extensions.clone()].into_iter().flatten() {
+            let patches = std::mem::take(&mut *live.patches.lock().unwrap_or_else(|e| e.into_inner()));
+            for patch in patches {
+                patch(self);
+            }
         }
     }
 
@@ -420,13 +428,15 @@ impl Registry {
     }
 
     /// The session's own tools a subagent inherits: MCP tools (and MCP
-    /// resources) and skills.
+    /// resources), extension tools and skills.
     pub fn shared(&self) -> Vec<std::sync::Arc<dyn Tool>> {
         self.tools
             .iter()
             .filter(|t| {
                 let name = t.spec().name;
-                mcp_search::is_mcp(&name) || SHARED.contains(&name.as_str())
+                mcp_search::is_mcp(&name)
+                    || name.starts_with(crate::extensions::TOOL_PREFIX)
+                    || SHARED.contains(&name.as_str())
             })
             .cloned()
             .collect()
