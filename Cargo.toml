@@ -1,6 +1,6 @@
 [package]
 name = "nyq"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "A small, friendly coding-agent CLI"
 license = "Apache-2.0"
