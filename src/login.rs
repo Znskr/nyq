@@ -1,6 +1,6 @@
 //! Signing in: the ChatGPT browser flow for the Codex provider, the Grok
 //! subscription browser flow, and API keys for hosted services
-//! (`nyq login opencode-go|opencode|xai`).
+//! (`nyq login anthropic|opencode-go|opencode|xai`).
 use std::{io::Write, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
@@ -334,9 +334,19 @@ fn open_browser_windows(url: &str) {
 /// `nyq login <service>`: read an API key from the terminal (hidden) or
 /// stdin and store it in `<home>/auth.json`.
 pub async fn login_key(home: &Path, service: Service) -> Result<String> {
-    eprintln!("Paste your {} API key from {} and press Enter:", service.title(), key_site(service));
+    eprintln!("{} and press Enter:", key_prompt(service));
     let key = read_secret()?;
     store_key(home, service, &key).await
+}
+
+/// "Paste your xAI API key from https://console.x.ai"; for an
+/// Anthropic-compatible endpoint, the endpoint instead.
+pub fn key_prompt(service: Service) -> String {
+    let base = service.base_url();
+    if service == Service::Anthropic && base != hosted::ANTHROPIC_URL {
+        return format!("Paste the API key for the Anthropic-compatible endpoint {base}");
+    }
+    format!("Paste your {} API key from {}", service.title(), key_site(service))
 }
 
 /// Where to get an API key for `service`.
@@ -344,6 +354,7 @@ pub fn key_site(service: Service) -> &'static str {
     match service {
         Service::OpencodeGo | Service::Opencode => "https://opencode.ai/auth",
         Service::Xai => "https://console.x.ai",
+        Service::Anthropic => "https://console.anthropic.com/settings/keys",
     }
 }
 
@@ -356,7 +367,7 @@ pub async fn store_key(home: &Path, service: Service, key: &str) -> Result<Strin
 
 async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) -> Result<String> {
     anyhow::ensure!(!key.trim().is_empty(), "the API key is empty");
-    let warning = match hosted::check_key(base_url, key).await {
+    let warning = match hosted::check_key(service, base_url, key).await {
         hosted::KeyCheck::Accepted => None,
         hosted::KeyCheck::Refused(e) => anyhow::bail!("{} rejected this API key, so it was not saved: {e}", service.title()),
         hosted::KeyCheck::Unknown(e) => Some(format!("\nWarning: could not check the key with {} ({e}); saved it anyway.", service.title())),
@@ -365,7 +376,11 @@ async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) 
     let mut msg = format!("Saved your {} key in {}.", service.title(), home.join("auth.json").display());
     msg.extend(warning);
     if hosted::api_key(home, service).as_deref() != Some(key.trim()) {
-        let other = if service.key_env() == "OPENCODE_API_KEY" { "OPENCODE_API_KEY or the OpenCode CLI's login" } else { service.key_env() };
+        let other = match service {
+            Service::OpencodeGo | Service::Opencode => "OPENCODE_API_KEY or the OpenCode CLI's login",
+            Service::Anthropic => "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN",
+            Service::Xai => service.key_env(),
+        };
         msg.push_str(&format!("\nNote: {other} is set and takes precedence."));
     }
     Ok(msg)
@@ -405,7 +420,7 @@ pub async fn logout(home: &Path, provider: &str) -> Result<String> {
         });
     }
     let service = Service::parse(provider)
-        .with_context(|| format!("unknown provider `{provider}` (expected codex, grok, opencode-go, opencode or xai)"))?;
+        .with_context(|| format!("unknown provider `{provider}` (expected codex, grok, anthropic, opencode-go, opencode or xai)"))?;
     Ok(if hosted::remove_key(home, service)? {
         format!("Removed the stored {} key.", service.title())
     } else {
@@ -580,6 +595,33 @@ mod tests {
         assert!(msg.contains("Warning"), "{msg}");
         assert_eq!(stored(), Some(json!("offline")));
         assert!(store_key_at(home, Service::Xai, " ", &url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn anthropic_keys_are_checked_with_anthropic_headers() {
+        use crate::provider::sse::tests::server;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let (url, mut requests, task) = server(vec![
+            (401, r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#.into()),
+            (200, r#"{"data":[]}"#.into()),
+        ])
+        .await;
+        let base = format!("{url}/v1");
+        let err = store_key_at(home, Service::Anthropic, "sk-ant-bad", &base).await.unwrap_err().to_string();
+        assert!(err.contains("Anthropic API rejected this API key") && err.contains("invalid x-api-key"), "{err}");
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("get /v1/models "), "{request}");
+        for header in ["x-api-key: sk-ant-bad", "anthropic-version: 2023-06-01"] {
+            assert!(request.contains(header), "{header}");
+        }
+        assert!(!request.contains("authorization"));
+        let msg = store_key_at(home, Service::Anthropic, "sk-ant-good", &base).await.unwrap();
+        assert!(msg.starts_with("Saved your Anthropic API key"), "{msg}");
+        assert_eq!(hosted::read_own(home).unwrap()["anthropic"]["key"], json!("sk-ant-good"));
+        task.await.unwrap();
+        assert!(logout(home, "claude").await.unwrap().contains("Anthropic API"));
+        assert!(hosted::read_own(home).unwrap().get("anthropic").is_none());
     }
 
     #[test]

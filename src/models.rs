@@ -123,7 +123,7 @@ async fn hosted(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
     }
     crate::catalog::refresh(home).await;
     let lists = futures::future::join_all(configured.iter().map(|&service| async move {
-        let provider = HostedProvider::configured(home, service, service.default_model().into(), None)?;
+        let provider = HostedProvider::configured(home, service, service.default_model(), None)?;
         provider.list_models().await
     }))
     .await;

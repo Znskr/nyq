@@ -15,14 +15,15 @@ use crate::provider::hosted::{self, Service};
 use crate::ui::{self, tui::Tui};
 
 /// Every provider nyq can use, in menu order.
-pub const PROVIDERS: [&str; 7] = ["codex", "grok", "opencode-go", "opencode", "xai", "openai", "ollama"];
+pub const PROVIDERS: [&str; 8] = ["codex", "grok", "anthropic", "opencode-go", "opencode", "xai", "openai", "ollama"];
 /// Providers `/login` can sign in to (the rest are configured by endpoint).
-const LOGIN: [&str; 5] = ["codex", "grok", "opencode-go", "opencode", "xai"];
+const LOGIN: [&str; 6] = ["codex", "grok", "anthropic", "opencode-go", "opencode", "xai"];
 
 const OPENAI_HELP: &str = "OpenAI-compatible APIs need no sign-in: set NYQ_BASE_URL, NYQ_MODEL and NYQ_API_KEY, or base_url/model/api_key in ~/.nyq/model.json.";
 const OLLAMA_HELP: &str = "Ollama runs locally and needs no sign-in: start it (OLLAMA_HOST picks the address) and choose a model with /model.";
 
-/// The provider id for a name or alias (`chatgpt` → `codex`, …).
+/// The provider id for a name or alias (`chatgpt` → `codex`, `claude` →
+/// `anthropic`, …).
 pub fn canonical(name: &str) -> Option<&'static str> {
     match name.trim().to_ascii_lowercase().as_str() {
         "codex" | "chatgpt" => Some("codex"),
@@ -119,7 +120,7 @@ fn default_model(home: &Path, id: &str) -> Option<String> {
         "grok" => Some(crate::provider::grok::DEFAULT_MODEL.into()),
         "openai" => config::openai_config(home).ok().and_then(|c| c.2),
         "ollama" => None,
-        other => Service::parse(other).map(|s| s.default_model().into()),
+        other => Service::parse(other).map(|s| s.default_model()),
     }
 }
 
@@ -197,6 +198,10 @@ fn source_lines(home: &Path) -> Vec<String> {
     lines.push("API keys: the provider's environment variable, then the OpenCode CLI's login (OpenCode only), then nyq's auth.json.".into());
     lines.push("ChatGPT: NYQ_CODEX_AUTH, then a valid codex CLI login, then nyq's own sign-in.".into());
     lines.push("Grok subscription: nyq's sign-in in grok-auth.json.".into());
+    lines.push(format!(
+        "Anthropic: ANTHROPIC_API_KEY, then ANTHROPIC_AUTH_TOKEN (sent as a bearer token), then nyq's auth.json · endpoint {} (ANTHROPIC_BASE_URL)",
+        hosted::Service::Anthropic.base_url()
+    ));
     lines
 }
 
@@ -274,7 +279,7 @@ pub async fn cli_setup(home: &Path) -> Result<()> {
     use std::io::IsTerminal;
     summary_lines(home).iter().for_each(|l| println!("{l}"));
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        println!("\nSign in with `nyq login [codex|grok|opencode-go|opencode|xai]`, choose the default with `nyq provider NAME`, or run /setup inside nyq.");
+        println!("\nSign in with `nyq login [codex|grok|anthropic|opencode-go|opencode|xai]`, choose the default with `nyq provider NAME`, or run /setup inside nyq.");
         return Ok(());
     }
     let labels = |home: &Path| -> Vec<String> { PROVIDERS.iter().map(|id| format!("{:<24} {}", title(id), connection(home, id).status)).collect() };
@@ -377,7 +382,7 @@ async fn tui_login(home: &Path, tui: &Tui, name: Option<&str>) -> Result<()> {
         }
         other => {
             let service = Service::parse(other).ok_or_else(|| unknown(other))?;
-            let prompt = format!("Paste your {} API key from {} (hidden)", service.title(), crate::login::key_site(service));
+            let prompt = format!("{} (hidden)", crate::login::key_prompt(service));
             match tui.secret(&prompt).await {
                 Some(key) => {
                     tui.screen().set_busy(Some("Checking the key"), None);
@@ -496,6 +501,8 @@ mod tests {
         assert_eq!(canonical("vercel"), None);
         assert_eq!(canonical("gateway"), None);
         assert_eq!(canonical("grok"), Some("grok"));
+        assert_eq!(canonical("Claude"), Some("anthropic"));
+        assert_eq!(title("anthropic"), "Anthropic API");
         assert_eq!(title("grok"), "Grok subscription");
         assert_eq!(canonical("ollama"), Some("ollama"));
         assert_eq!(canonical("nope"), None);
@@ -516,7 +523,7 @@ mod tests {
         assert_eq!((last["provider"].as_str(), last["model"].as_str()), (Some("xai"), Some("grok-custom")));
         assert!(last["effort"].is_null());
         // Built-in default model, then a provider without one drops last-model.json.
-        assert_eq!(persist_default(home, "opencode").unwrap().as_deref(), Some(Service::Opencode.default_model()));
+        assert_eq!(persist_default(home, "opencode").unwrap().as_deref(), Some(Service::Opencode.default_model().as_str()));
         assert_eq!(persist_default(home, "ollama").unwrap(), None);
         assert!(!home.join("last-model.json").exists());
         let settings: Value = serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();

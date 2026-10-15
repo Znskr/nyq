@@ -3,8 +3,11 @@
 //! Thinking blocks become [`Item::Reasoning`] with `id` [`THINKING`] (text in
 //! `summary`, signature in `encrypted`) or [`REDACTED`] (opaque data in
 //! `encrypted`), and are replayed unchanged on the next request.
+//!
+//! Also the Models API (`GET {base}/models`), whose capabilities say how a
+//! model thinks and which efforts it takes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use eventsource_stream::Eventsource;
@@ -16,15 +19,72 @@ use crate::types::{Item, Request, Response, StreamEvent, Usage};
 
 pub const THINKING: &str = "thinking";
 pub const REDACTED: &str = "redacted_thinking";
-const VERSION: &str = "2023-06-01";
+pub const VERSION: &str = "2023-06-01";
+
+/// How a model is asked to think.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Thinking {
+    /// Not known: guessed from the model id ([`infer_thinking`]).
+    #[default]
+    Unknown,
+    /// `{"type":"adaptive"}`, depth set by `output_config.effort`.
+    Adaptive,
+    /// `{"type":"enabled","budget_tokens":N}`.
+    Budget,
+    /// The model does not think.
+    Off,
+}
+
+/// Adaptive thinking for current Claude models (4.6 and later), a token
+/// budget for older Claude models and for other models behind
+/// Anthropic-compatible endpoints.
+pub fn infer_thinking(model: &str) -> Thinking {
+    let id = model.to_ascii_lowercase();
+    if !id.contains("claude") {
+        return Thinking::Budget;
+    }
+    match claude_version(&id) {
+        Some(version) if version < (4, 6) => Thinking::Budget,
+        _ => Thinking::Adaptive,
+    }
+}
+
+/// `(major, minor)` from ids like `claude-opus-4-6`, `claude-3-7-sonnet-…`
+/// or `claude-sonnet-4-20250514` (a date is not a minor version).
+fn claude_version(id: &str) -> Option<(u32, u32)> {
+    let mut numbers = id.split(['-', '.', '@', '/']).skip_while(|p| p.parse::<u32>().is_err());
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next().filter(|p| p.len() <= 2).and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Efforts a model takes when the Models API has not said: the adaptive
+/// ladder for current Claude models, three budgets otherwise.
+pub fn default_efforts(model: &str) -> Vec<String> {
+    let id = model.to_ascii_lowercase();
+    let mut efforts = vec!["low", "medium", "high"];
+    if infer_thinking(&id) == Thinking::Adaptive {
+        if claude_version(&id).is_none_or(|v| v >= (4, 7)) {
+            efforts.push("xhigh");
+        }
+        efforts.push("max");
+    }
+    efforts.into_iter().map(String::from).collect()
+}
 
 #[derive(Clone)]
 pub struct AnthropicProvider {
     pub label: String,
     pub base_url: String,
     pub api_key: Option<String>,
+    /// Send the key as `Authorization: Bearer` (`ANTHROPIC_AUTH_TOKEN`)
+    /// instead of `x-api-key`.
+    pub bearer: bool,
     pub model: String,
     pub effort: Option<String>,
+    pub thinking: Thinking,
+    /// Ask adaptive models to think even when no effort is chosen.
+    pub think_by_default: bool,
     /// Output token cap per response.
     pub max_tokens: u64,
     pub headers: Vec<(String, String)>,
@@ -32,7 +92,18 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(label: String, base_url: String, api_key: Option<String>, model: String) -> Self {
-        Self { label, base_url, api_key, model, effort: None, max_tokens: 32_000, headers: Vec::new() }
+        Self {
+            label,
+            base_url,
+            api_key,
+            bearer: false,
+            model,
+            effort: None,
+            thinking: Thinking::Unknown,
+            think_by_default: false,
+            max_tokens: 32_000,
+            headers: Vec::new(),
+        }
     }
 
     fn body(&self, req: Request<'_>) -> Value {
@@ -73,9 +144,14 @@ impl AnthropicProvider {
                 }
             }
         }
-        // Cache the conversation prefix up to the newest message.
-        if let Some(block) = messages.last_mut().and_then(|m| m["content"].as_array_mut()).and_then(|c| c.last_mut()) {
-            if !matches!(block["type"].as_str(), Some(THINKING | REDACTED)) {
+        // Cache the conversation prefix up to the newest message, and up to
+        // the previous user message (where the last request's breakpoint
+        // was), so long tool rounds still find it. With the system prompt
+        // that is three of the four breakpoints a request may carry.
+        let previous_user = messages.len().checked_sub(1).and_then(|last| messages[..last].iter().rposition(|m| m["role"] == "user"));
+        for index in messages.len().checked_sub(1).into_iter().chain(previous_user) {
+            let blocks = messages[index]["content"].as_array_mut().unwrap();
+            if let Some(block) = blocks.iter_mut().rev().find(|b| !matches!(b["type"].as_str(), Some(THINKING | REDACTED))) {
                 block["cache_control"] = json!({"type":"ephemeral"});
             }
         }
@@ -91,12 +167,20 @@ impl AnthropicProvider {
         if !req.tools.is_empty() {
             body["tools"] = req.tools.iter().map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.parameters})).collect();
         }
-        if let Some(effort) = &self.effort {
-            if self.model.contains("claude") {
-                // Current Claude models think adaptively; effort sets the depth.
+        let thinking = match self.thinking {
+            Thinking::Unknown => infer_thinking(&self.model),
+            known => known,
+        };
+        match (thinking, &self.effort) {
+            // Current Claude models think adaptively; effort sets the depth.
+            (Thinking::Adaptive, Some(effort)) => {
                 body["thinking"] = json!({"type":"adaptive","display":"summarized"});
                 body["output_config"] = json!({"effort": effort});
-            } else {
+            }
+            (Thinking::Adaptive, None) if self.think_by_default => {
+                body["thinking"] = json!({"type":"adaptive","display":"summarized"});
+            }
+            (Thinking::Budget, Some(effort)) => {
                 let budget = match effort.as_str() {
                     "minimal" | "low" => 2_048,
                     "medium" => 8_192,
@@ -106,6 +190,7 @@ impl AnthropicProvider {
                 .min(self.max_tokens.saturating_sub(1).max(1_024));
                 body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
             }
+            _ => {}
         }
         body
     }
@@ -206,7 +291,17 @@ pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSi
                 completed = true;
                 break;
             }
-            "error" => anyhow::bail!("{}", sse::failure(&data)),
+            "error" => {
+                // Overload and server errors mid-stream are as transient as
+                // their HTTP forms, so retries treat them alike.
+                let status = match data["error"]["type"].as_str() {
+                    Some("overloaded_error") => 529,
+                    Some("rate_limit_error") => 429,
+                    Some("api_error") => 500,
+                    _ => anyhow::bail!("{}", sse::failure(&data)),
+                };
+                return Err(sse::HttpError { status, retry_after: None, message: format!("{label}: {}", sse::failure(&data)) }.into());
+            }
             _ => {}
         }
     }
@@ -245,19 +340,142 @@ impl Provider for AnthropicProvider {
         Box::new(self.clone())
     }
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
-        let mut request = reqwest::Client::new()
+        let request = reqwest::Client::new()
             .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
             .header("anthropic-version", VERSION)
             .header("accept", "text/event-stream")
             .json(&self.body(req));
-        if let Some(key) = &self.api_key {
-            request = request.header("x-api-key", key);
-        }
+        let mut request = authorize(request, self.api_key.as_deref(), self.bearer);
         for (k, v) in &self.headers {
             request = request.header(k, v);
         }
         read_stream(request.send().await.context("sending request")?, &self.label, on_event).await
     }
+}
+
+/// `x-api-key`, or `Authorization: Bearer` for `ANTHROPIC_AUTH_TOKEN`.
+pub fn authorize(request: reqwest::RequestBuilder, key: Option<&str>, bearer: bool) -> reqwest::RequestBuilder {
+    match key {
+        Some(key) if bearer => request.bearer_auth(key),
+        Some(key) => request.header("x-api-key", key),
+        None => request,
+    }
+}
+
+/// A model as the Models API describes it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Context window (`max_input_tokens`).
+    pub context: Option<u64>,
+    /// Output cap (`max_tokens`).
+    pub max_output: Option<u64>,
+    pub thinking: Thinking,
+    /// Efforts it takes, lowest first (empty: none, or not reported).
+    pub efforts: Vec<String>,
+    pub image_input: Option<bool>,
+}
+
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// One entry of `GET /v1/models`. Endpoints that only list ids (most
+/// Anthropic-compatible ones) leave the rest unknown.
+pub fn parse_model(value: &Value) -> Option<ModelInfo> {
+    let id = value["id"].as_str().map(str::trim).filter(|id| !id.is_empty())?.to_owned();
+    let caps = &value["capabilities"];
+    let supported = |v: &Value| v["supported"].as_bool();
+    let thinking = match (supported(&caps["thinking"]), supported(&caps["thinking"]["types"]["adaptive"]), supported(&caps["thinking"]["types"]["enabled"])) {
+        (Some(false), ..) => Thinking::Off,
+        (_, Some(true), _) => Thinking::Adaptive,
+        (_, _, Some(true)) => Thinking::Budget,
+        _ => Thinking::Unknown,
+    };
+    let efforts = match supported(&caps["effort"]) {
+        Some(true) => EFFORTS.iter().filter(|e| supported(&caps["effort"][**e]) == Some(true)).map(|e| e.to_string()).collect(),
+        _ if thinking == Thinking::Budget => vec!["low".into(), "medium".into(), "high".into()],
+        _ => Vec::new(),
+    };
+    Some(ModelInfo {
+        id,
+        context: value["max_input_tokens"].as_u64().filter(|n| *n > 0),
+        max_output: value["max_tokens"].as_u64().filter(|n| *n > 0),
+        thinking,
+        efforts,
+        image_input: supported(&caps["image_input"]),
+    })
+}
+
+fn models_request(client: &reqwest::Client, url: String, key: Option<&str>, bearer: bool) -> reqwest::RequestBuilder {
+    let request = client
+        .get(url)
+        .header("anthropic-version", VERSION)
+        .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10));
+    authorize(request, key, bearer)
+}
+
+/// Every model `GET {base}/models` lists, following `has_more`/`last_id`.
+pub async fn list_models(base_url: &str, key: Option<&str>, bearer: bool) -> Result<Vec<ModelInfo>> {
+    let client = reqwest::Client::new();
+    let base = base_url.trim_end_matches('/');
+    let mut models = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..10 {
+        let mut url = format!("{base}/models?limit=1000");
+        if let Some(id) = &after {
+            url.push_str("&after_id=");
+            url.push_str(&id.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>());
+        }
+        let response = sse::checked(models_request(&client, url, key, bearer).send().await.context("listing models")?).await?;
+        let page: Value = response.json().await.context("parsing the model list")?;
+        let data = page["data"].as_array().context("the model list has no data")?;
+        models.extend(data.iter().filter_map(parse_model));
+        after = page["last_id"].as_str().map(str::to_owned).or_else(|| models.last().map(|m: &ModelInfo| m.id.clone()));
+        if page["has_more"].as_bool() != Some(true) || data.is_empty() {
+            break;
+        }
+    }
+    remember(base_url, &models);
+    Ok(models)
+}
+
+/// `GET {base}/models/{id}`; None when the endpoint does not describe it.
+pub async fn retrieve_model(base_url: &str, key: Option<&str>, bearer: bool, model: &str) -> Option<ModelInfo> {
+    let url = format!("{}/models/{}", base_url.trim_end_matches('/'), model);
+    let response = models_request(&reqwest::Client::new(), url, key, bearer).timeout(std::time::Duration::from_secs(4)).send().await.ok()?;
+    let value: Value = sse::checked(response).await.ok()?.json().await.ok()?;
+    parse_model(&value).filter(|m| m.id == model)
+}
+
+/// What the Models API said per (base URL, model id); None = asked, no answer.
+type Known = HashMap<(String, String), Option<ModelInfo>>;
+static KNOWN: std::sync::Mutex<Option<Known>> = std::sync::Mutex::new(None);
+
+fn key(base_url: &str, model: &str) -> (String, String) {
+    (base_url.trim_end_matches('/').to_owned(), model.to_owned())
+}
+
+pub fn remember(base_url: &str, models: &[ModelInfo]) {
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let known = known.get_or_insert_with(HashMap::new);
+    for m in models {
+        known.insert(key(base_url, &m.id), Some(m.clone()));
+    }
+}
+
+/// Some(answer) once the model was listed or looked up.
+pub fn known(base_url: &str, model: &str) -> Option<Option<ModelInfo>> {
+    KNOWN.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&key(base_url, model)).cloned()
+}
+
+/// Look the model up once per process (a failed lookup is remembered too).
+pub async fn describe(base_url: &str, key_: Option<&str>, bearer: bool, model: &str) -> Option<ModelInfo> {
+    if let Some(answer) = known(base_url, model) {
+        return answer;
+    }
+    let info = retrieve_model(base_url, key_, bearer, model).await;
+    KNOWN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key(base_url, model), info.clone());
+    info
 }
 
 #[cfg(test)]
@@ -403,6 +621,102 @@ mod tests {
             let err = p.stream(Request { system: "", items: &[], tools: &[] }, &mut |_| {}).await.unwrap_err();
             assert!(format!("{err:#}").contains(expected), "{err:#}");
         }
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn thinking_follows_the_model() {
+        assert_eq!(infer_thinking("claude-opus-5-5"), Thinking::Adaptive);
+        assert_eq!(infer_thinking("claude-opus-4-6"), Thinking::Adaptive);
+        assert_eq!(infer_thinking("anthropic/claude-sonnet-5"), Thinking::Adaptive);
+        assert_eq!(infer_thinking("claude-haiku-4-5"), Thinking::Budget);
+        assert_eq!(infer_thinking("claude-sonnet-4-20250514"), Thinking::Budget);
+        assert_eq!(infer_thinking("claude-3-7-sonnet-20250219"), Thinking::Budget);
+        assert_eq!(infer_thinking("deepseek-v4"), Thinking::Budget);
+        assert_eq!(default_efforts("claude-opus-4-6"), ["low", "medium", "high", "max"]);
+        assert_eq!(default_efforts("claude-opus-5-5"), ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(default_efforts("kimi-k3"), ["low", "medium", "high"]);
+
+        let full = json!({"id":"claude-x","display_name":"X","max_input_tokens":1000000,"max_tokens":128000,"capabilities":{
+            "image_input":{"supported":true},
+            "thinking":{"supported":true,"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}},
+            "effort":{"supported":true,"low":{"supported":true},"medium":{"supported":true},"high":{"supported":true},"xhigh":{"supported":false},"max":{"supported":true}}}});
+        let info = parse_model(&full).unwrap();
+        assert_eq!(info.thinking, Thinking::Adaptive);
+        assert_eq!(info.efforts, ["low", "medium", "high", "max"]);
+        assert_eq!((info.context, info.max_output, info.image_input), (Some(1_000_000), Some(128_000), Some(true)));
+        let budget = json!({"id":"claude-old","capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":true},"adaptive":{"supported":false}}},"effort":{"supported":false}}});
+        let info = parse_model(&budget).unwrap();
+        assert_eq!((info.thinking, info.efforts.len()), (Thinking::Budget, 3));
+        let off = parse_model(&json!({"id":"tiny","capabilities":{"thinking":{"supported":false}}})).unwrap();
+        assert_eq!((off.thinking, off.efforts.len()), (Thinking::Off, 0));
+        // Compatible endpoints often list bare ids.
+        assert_eq!(parse_model(&json!({"id":"glm-5"})).unwrap(), ModelInfo { id: "glm-5".into(), ..Default::default() });
+        assert!(parse_model(&json!({"id":" "})).is_none());
+    }
+
+    #[test]
+    fn thinking_request_per_mode() {
+        let mut p = provider("unused".into());
+        let body = |p: &AnthropicProvider| p.body(Request { system: "", items: &[], tools: &[] });
+        p.think_by_default = true;
+        assert_eq!(body(&p)["thinking"], json!({"type":"adaptive","display":"summarized"}));
+        assert!(body(&p).get("output_config").is_none());
+        p.thinking = Thinking::Off;
+        p.effort = Some("high".into());
+        assert!(body(&p).get("thinking").is_none());
+        p.thinking = Thinking::Budget;
+        p.max_tokens = 4_096;
+        assert_eq!(body(&p)["thinking"], json!({"type":"enabled","budget_tokens":4095}));
+        p.effort = None;
+        assert!(body(&p).get("thinking").is_none());
+    }
+
+    #[test]
+    fn cache_breakpoints_cover_system_and_recent_turns() {
+        let p = provider("unused".into());
+        let items = vec![
+            Item::user("one"),
+            Item::Assistant { text: "a".into() },
+            Item::user("two"),
+            Item::Reasoning { id: Some(THINKING.into()), summary: "s".into(), encrypted: Some("sig".into()) },
+            Item::ToolCall { id: "t".into(), name: "bash".into(), arguments: "{}".into() },
+            Item::ToolResult { id: "t".into(), output: "ok".into(), is_error: false },
+        ];
+        let body = p.body(Request { system: "sys", items: &items, tools: &[] });
+        let marked: Vec<(usize, usize)> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| m["content"].as_array().unwrap().iter().enumerate().filter(|(_, b)| b.get("cache_control").is_some()).map(move |(j, _)| (i, j)))
+            .collect();
+        // The newest message (the tool result) and the previous user turn.
+        assert_eq!(marked, [(2, 0), (4, 0)]);
+        assert_eq!(body["messages"][3]["content"][0]["type"], "thinking");
+        assert!(body["system"][0].get("cache_control").is_some());
+    }
+
+    #[tokio::test]
+    async fn overload_is_retried_and_bearer_tokens_are_sent() {
+        let ok = events(&[
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"done"}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let (url, mut requests, task) = server(vec![
+            (529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#.into()),
+            (200, events(&[json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})])),
+            (200, ok),
+        ])
+        .await;
+        let mut p = provider(url);
+        p.bearer = true;
+        let mut seen = Vec::new();
+        let response = crate::provider::stream_with_retry(&p, Request { system: "", items: &[], tools: &[] }, &mut |e| seen.push(e)).await.unwrap();
+        assert_eq!(response.items, vec![Item::Assistant { text: "done".into() }]);
+        assert_eq!(seen.iter().filter(|e| matches!(e, StreamEvent::Retrying(_))).count(), 2, "{seen:?}");
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.contains("authorization: bearer key") && !request.contains("x-api-key"), "{request}");
         task.await.unwrap();
     }
 }
