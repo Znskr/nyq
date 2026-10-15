@@ -1,5 +1,6 @@
-//! Signing in: the ChatGPT browser flow for the Codex provider, and API keys
-//! for hosted services (`nyq login opencode-go|opencode|xai`).
+//! Signing in: the ChatGPT browser flow for the Codex provider, the Grok
+//! subscription browser flow, and API keys for hosted services
+//! (`nyq login opencode-go|opencode|xai`).
 use std::{io::Write, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
@@ -370,8 +371,31 @@ async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) 
     Ok(msg)
 }
 
+/// Browser sign-in for a Grok subscription. `manual` is a pasted code, or
+/// `None` when stdin closes without one. The URL is always printed;
+/// `NYQ_NO_OPEN_BROWSER` skips opening it.
+pub async fn login_grok(
+    home: &Path,
+    manual: impl std::future::Future<Output = Result<Option<String>>>,
+) -> Result<String> {
+    crate::provider::grok::login(
+        home,
+        |url| {
+            crate::ui::info(&format!(
+                "Sign in to Grok in your browser (waiting up to 5 minutes):\n  {url}"
+            ));
+        },
+        open_browser,
+        manual,
+    )
+    .await
+}
+
 /// `nyq logout <provider>`: forget nyq's stored credentials.
-pub fn logout(home: &Path, provider: &str) -> Result<String> {
+pub async fn logout(home: &Path, provider: &str) -> Result<String> {
+    if provider.eq_ignore_ascii_case("grok") {
+        return crate::provider::grok::logout(home).await;
+    }
     if provider == "codex" {
         let path = home.join("chatgpt-auth.json");
         return Ok(match std::fs::remove_file(&path) {
@@ -381,7 +405,7 @@ pub fn logout(home: &Path, provider: &str) -> Result<String> {
         });
     }
     let service = Service::parse(provider)
-        .with_context(|| format!("unknown provider `{provider}` (expected codex, opencode-go, opencode or xai)"))?;
+        .with_context(|| format!("unknown provider `{provider}` (expected codex, grok, opencode-go, opencode or xai)"))?;
     Ok(if hosted::remove_key(home, service)? {
         format!("Removed the stored {} key.", service.title())
     } else {
@@ -390,10 +414,13 @@ pub fn logout(home: &Path, provider: &str) -> Result<String> {
 }
 
 /// `nyq logout` without a provider: forget every sign-in nyq stored.
-pub fn logout_all(home: &Path) -> Result<String> {
+pub async fn logout_all(home: &Path) -> Result<String> {
     let mut done = Vec::new();
     if home.join("chatgpt-auth.json").is_file() {
-        done.push(logout(home, "codex")?);
+        done.push(logout(home, "codex").await?);
+    }
+    if crate::provider::grok::auth_path(home).is_file() {
+        done.push(crate::provider::grok::logout(home).await?);
     }
     for service in Service::ALL {
         if hosted::remove_key(home, service)? {
@@ -444,18 +471,18 @@ fn read_secret() -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn logout_all_forgets_every_stored_sign_in() {
+    #[tokio::test]
+    async fn logout_all_forgets_every_stored_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        assert_eq!(logout_all(home).unwrap(), "No sign-ins stored by nyq.");
+        assert_eq!(logout_all(home).await.unwrap(), "No sign-ins stored by nyq.");
         std::fs::write(home.join("chatgpt-auth.json"), "{}").unwrap();
         hosted::save_key(home, Service::Xai, "xai-key").unwrap();
-        let msg = logout_all(home).unwrap();
+        let msg = logout_all(home).await.unwrap();
         assert!(msg.contains("Signed out of ChatGPT."), "{msg}");
         assert!(msg.contains(Service::Xai.title()), "{msg}");
         assert!(!home.join("chatgpt-auth.json").exists());
-        assert_eq!(logout_all(home).unwrap(), "No sign-ins stored by nyq.");
+        assert_eq!(logout_all(home).await.unwrap(), "No sign-ins stored by nyq.");
     }
 
     #[test]
