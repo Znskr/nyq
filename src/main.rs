@@ -471,6 +471,16 @@ fn env_permission_mode() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Saved Yolo is only for interactive terminal sessions.
+fn noninteractive_mode(mode: permissions::Mode, explicit: bool) -> permissions::Mode {
+    if mode.is_yolo() && !explicit {
+        eprintln!("note: the saved yolo permission mode does not apply here; pass --yolo to allow changes");
+        permissions::Mode::Ask
+    } else {
+        mode
+    }
+}
+
 async fn run() -> Result<()> {
     // Kept for relaunching after an auto-upgrade (Ctrl+G).
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -502,6 +512,7 @@ async fn run() -> Result<()> {
         ui::error(w);
     }
 
+    let explicit_mode = cli.permission_mode.is_some() || cli.yolo || env_mode.is_some();
     match &cli.command {
         Some(Command::Replay { tape, speed }) => return record_tape::replay(tape, *speed).await,
         Some(Command::Session { action: Some(SessionCommand::Recover { which, json }) }) => {
@@ -613,6 +624,7 @@ async fn run() -> Result<()> {
         }
         Some(Command::Mcp { action }) => return mcp_cli::run(&home, &cwd, action).await,
         Some(Command::Acp { log_file }) => {
+            let permission_mode = noninteractive_mode(permission_mode, explicit_mode);
             let opts = acp::Options {
                 yolo: permission_mode.is_yolo(),
                 permission_mode,
@@ -739,12 +751,8 @@ async fn run() -> Result<()> {
     let interactive = !print
         && std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
-    // A yolo saved from the settings menu never carries over to print mode or
-    // piped input: scripts get mutations only when they ask on the command line.
-    let explicit_mode = cli.permission_mode.is_some() || cli.yolo || env_mode.is_some();
-    if !interactive && agent.permission_mode.is_yolo() && !explicit_mode {
-        agent.permission_mode = permissions::Mode::Ask;
-        eprintln!("note: the saved yolo permission mode does not apply here; pass --yolo to allow changes");
+    if !interactive {
+        agent.permission_mode = noninteractive_mode(agent.permission_mode, explicit_mode);
     }
     anyhow::ensure!(!cli.record || interactive, "--record requires an interactive terminal");
     // NYQ_RECORD names the tape file, with or without --record.
