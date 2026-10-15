@@ -57,6 +57,8 @@ pub struct Editor {
     browsing: Option<usize>,
     draft: String,
     commands: Vec<(String, String)>,
+    /// The entries in `commands` that extensions registered.
+    ext_commands: Vec<String>,
     /// User-invocable skills: (name, description), offered as `$name`.
     skills: Vec<(String, String)>,
     empty_ctrl_c: bool,
@@ -127,6 +129,7 @@ impl Editor {
             browsing: None,
             draft: String::new(),
             commands,
+            ext_commands: Vec::new(),
             skills: Vec::new(),
             empty_ctrl_c: false,
             search: None,
@@ -898,6 +901,14 @@ impl Editor {
     pub fn set_mcp_commands(&mut self, extra: Vec<(String, String)>) {
         self.commands.retain(|(name, _)| !name.starts_with("/mcp:"));
         self.commands.extend(extra);
+    }
+    /// Replace the slash commands extensions registered (`ext` lists the
+    /// current ones); nyq's own commands are kept.
+    pub fn set_extension_commands(&mut self, ext: Vec<(String, String)>) {
+        let old = std::mem::take(&mut self.ext_commands);
+        self.commands.retain(|(name, _)| !old.contains(name));
+        self.ext_commands = ext.iter().map(|(n, _)| n.clone()).collect();
+        self.commands.extend(ext);
     }
     /// Commands that start with the text (Tab completion in the editor).
     fn matches(&self) -> impl Iterator<Item = &(String, String)> {

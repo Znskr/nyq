@@ -118,6 +118,10 @@ pub struct Hooks {
     /// Content hash of the project file as loaded (what `/hooks` showed).
     project_hash: Option<String>,
     project_trusted: bool,
+    /// The session's extensions, which see the same events.
+    ext: Option<crate::extensions::Extensions>,
+    /// A subagent's hooks: extensions see its tool calls only.
+    subagent: bool,
 }
 
 pub fn user_path(home: &Path) -> PathBuf {
@@ -190,6 +194,25 @@ impl Hooks {
         !self.matching(Event::PostToolUse, Some(tool)).is_empty()
     }
 
+    /// Let `ext` see this session's events too.
+    pub fn with_extensions(mut self, ext: crate::extensions::Extensions) -> Self {
+        self.ext = Some(ext);
+        self
+    }
+
+    /// The session's extensions (None for a subagent, which only passes
+    /// its tool calls to them).
+    pub fn extensions(&self) -> Option<&crate::extensions::Extensions> {
+        self.ext.as_ref().filter(|_| !self.subagent)
+    }
+
+    /// `tool_result` extension handlers may rewrite what the model sees.
+    pub async fn tool_result(&self, tool: &str, args: &Value, out: &mut ToolOutput) {
+        if let Some(ext) = &self.ext {
+            ext.tool_result(tool, args, out).await;
+        }
+    }
+
     /// The hooks a subagent runs: the tool hooks (so a user's PreToolUse
     /// guard also covers delegated calls) and AttentionRequired (its
     /// approvals wait on the user too), while turn and session events stay
@@ -205,6 +228,8 @@ impl Hooks {
             project: tools(&self.project),
             project_hash: self.project_hash.clone(),
             project_trusted: self.project_trusted,
+            ext: self.ext.clone(),
+            subagent: true,
         }
     }
 
@@ -580,6 +605,11 @@ impl Hooks {
         if cancel.is_cancelled() {
             return Err("Cancelled by user.".to_string());
         }
+        if let Some(ext) = &self.ext {
+            if let Some(input) = ext.tool_call(tool, updated.as_ref().unwrap_or(args)).await? {
+                updated = Some(input);
+            }
+        }
         Ok(updated)
     }
 
@@ -734,10 +764,11 @@ impl Hooks {
 
 /// SessionStart hooks for an agent's current session.
 pub async fn session_start(agent: &crate::agent::Agent, source: &str) {
-    agent
-        .hooks
-        .session_start(source, &agent.cwd, agent.session.as_ref().map(|s| s.id.as_str()))
-        .await;
+    let session = agent.session.as_ref().map(|s| s.id.as_str());
+    if let Some(ext) = agent.hooks.extensions() {
+        ext.session_start(source, session);
+    }
+    agent.hooks.session_start(source, &agent.cwd, session).await;
 }
 
 /// Stop hooks after an agent's turn, with its final answer. Returns the
@@ -774,18 +805,23 @@ pub async fn prompt_submit(agent: &mut crate::agent::Agent, prompt: &str, cancel
 /// state; `/hooks trust` trusts the project's file as last listed.
 pub fn command(agent: &mut crate::agent::Agent, arg: Option<&str>) {
     let home = crate::config::home();
+    let ext = agent.hooks.ext.clone();
+    let keep = |mut h: Hooks| {
+        h.ext = ext.clone();
+        std::sync::Arc::new(h)
+    };
     match arg {
         None => {
             let (reloaded, warnings) = Hooks::load(&home, &agent.cwd);
             warnings.iter().for_each(|w| crate::ui::error(w));
-            agent.hooks = std::sync::Arc::new(reloaded);
+            agent.hooks = keep(reloaded);
             crate::ui::list(&agent.hooks.lines());
         }
         Some("trust") => match agent.hooks.trust_project(&home, &agent.cwd) {
             Ok(path) => {
                 let (reloaded, warnings) = Hooks::load(&home, &agent.cwd);
                 warnings.iter().for_each(|w| crate::ui::error(w));
-                agent.hooks = std::sync::Arc::new(reloaded);
+                agent.hooks = keep(reloaded);
                 crate::ui::info(&format!("Trusted the project hooks in {}.", path.display()));
                 crate::ui::list(&agent.hooks.lines());
             }
@@ -938,6 +974,7 @@ mod tests {
             project_hash: None,
             project_trusted: trusted,
             user_path: PathBuf::from("/h/hooks.json"),
+            ..Default::default()
         }
     }
 

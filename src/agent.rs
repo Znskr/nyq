@@ -481,8 +481,43 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<TurnEnd> {
         self.bind_conversation();
+        let Some(input) = self.extension_prompt(input, ui).await else {
+            return Ok(TurnEnd::Done);
+        };
         self.push_counted(input);
         self.drive(ui, cancel, false).await
+    }
+
+    /// Run extensions' `user_prompt` handlers: they may block the prompt
+    /// (None), rewrite its text, or add context before it.
+    async fn extension_prompt(&mut self, mut input: Item, ui: &mut dyn Ui) -> Option<Item> {
+        let Some(ext) = self.hooks.extensions().cloned() else { return Some(input) };
+        let Item::User { text, .. } = &mut input else { return Some(input) };
+        let edit = ext.user_prompt(text).await;
+        if let Some(msg) = edit.blocked {
+            ui.notice(&msg);
+            return None;
+        }
+        if let Some(prompt) = edit.prompt {
+            *text = prompt;
+        }
+        for context in edit.context {
+            ui.notice(context.lines().next().unwrap_or(""));
+            self.push_counted(Item::user(context));
+        }
+        Some(input)
+    }
+
+    /// Steering messages from the user and from extensions (`session/send`).
+    fn take_steering(&self, ui: &mut dyn Ui) -> Vec<Item> {
+        let mut items = ui.take_steering();
+        if let Some(ext) = self.hooks.extensions() {
+            for text in ext.take_queued(true) {
+                ui.notice(&format!("An extension steers: {}", text.lines().next().unwrap_or("")));
+                items.push(Item::user(text));
+            }
+        }
+        items
     }
 
     /// Continue an interrupted or cut-off response. No user message is added.
@@ -611,9 +646,17 @@ impl Agent {
                 self.submitted = self.items.len();
                 // Queued input keeps the run going: steering first, then one
                 // follow-up at a time.
-                let mut queued = ui.take_steering();
+                let mut queued = self.take_steering(ui);
                 if queued.is_empty() {
                     queued.extend(ui.take_follow_up());
+                }
+                if queued.is_empty() {
+                    if let Some(ext) = self.hooks.extensions() {
+                        for text in ext.take_queued(false) {
+                            ui.notice(&format!("An extension follows up: {}", text.lines().next().unwrap_or("")));
+                            queued.push(Item::user(text));
+                        }
+                    }
                 }
                 if queued.is_empty() {
                     self.sync_estimate();
@@ -626,7 +669,16 @@ impl Agent {
                                 "[A Stop hook asked you to keep going before finishing]\n{reason}"
                             )));
                         }
-                        None => return Ok(TurnEnd::Done),
+                        None => {
+                            if let Some(ext) = self.hooks.extensions() {
+                                let last = self.items.iter().rev().find_map(|i| match i {
+                                    Item::Assistant { text } => Some(text.as_str()),
+                                    _ => None,
+                                });
+                                ext.turn_end(last.unwrap_or(""));
+                            }
+                            return Ok(TurnEnd::Done);
+                        }
                     }
                 }
                 for item in queued {
@@ -691,7 +743,7 @@ impl Agent {
                 );
                 self.push_counted(Item::User { text, images });
             }
-            for item in ui.take_steering() {
+            for item in self.take_steering(ui) {
                 self.push_counted(item);
             }
         }
@@ -1025,6 +1077,7 @@ impl Agent {
                 .unwrap_or_else(|e| e.into_inner())
                 .drain(..),
         );
+        self.hooks.tool_result(&ready.name, &ready.args, out).await;
         if let Some(args) = &ready.hook_args {
             self.hooks
                 .post_tool_use(&ready.name, args, out, &self.cwd, ready.ctx.session_id.as_deref(), cancel)
@@ -1354,7 +1407,13 @@ impl Agent {
             "cannot compact with unanswered tool calls"
         );
         let mut items = self.items.clone();
-        items.push(Item::user(COMPACT_PROMPT));
+        let mut prompt = COMPACT_PROMPT.to_string();
+        if let Some(ext) = self.hooks.extensions() {
+            for extra in ext.before_compact().await {
+                prompt.push_str(&format!("\n\nAdditional instructions for this summary:\n{extra}"));
+            }
+        }
+        items.push(Item::user(prompt));
         let req = Request {
             system: &self.system,
             items: &items,
