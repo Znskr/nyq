@@ -507,6 +507,16 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_extra_arguments_are_not_read_only() {
+        for arg in ["$'--short'", "$'\\x2d\\x2dshort'", "$\"--short\"", "$", "$FLAGS", "${FLAGS}", "`echo --short`", "$(echo --short)"] {
+            let cmd = format!("git status {arg}");
+            assert!(ro(&cmd).is_none(), "{cmd}");
+            assert!(!known_reversible(&cmd, &std::env::temp_dir(), &[]), "{cmd}");
+        }
+        assert!(ro("echo '$HOME'").is_some());
+    }
+
+    #[test]
     fn lexing() {
         let words = |cmd: &str| -> Vec<String> {
             lex(cmd)

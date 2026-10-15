@@ -1644,7 +1644,7 @@ const NETWORK_CLIENTS: &[&str] = &[
 
 /// Whether a command chains, pipes, substitutes or redirects (or spans lines).
 fn has_control(cmd: &str) -> bool {
-    cmd.contains("$(")
+    cmd.contains('$')
         || cmd
             .chars()
             .any(|c| matches!(c, ';' | '&' | '|' | '`' | '>' | '<' | '\n' | '\r'))
@@ -2606,6 +2606,18 @@ mod tests {
         ] {
             assert_eq!(p(c), None, "{c:?}");
         }
+    }
+
+    #[test]
+    fn bash_grants_reject_dynamic_extra_arguments() {
+        let allowed = ["bash:git status".to_string()].into();
+        for arg in ["$'--short'", "$'\\x2d\\x2dshort'", "$\"--short\"", "$", "$FLAGS", "${FLAGS}", "`echo --short`", "$(echo --short)"] {
+            let cmd = format!("git status {arg}");
+            assert!(!bash_matches("git status", &cmd), "{cmd}");
+            assert!(!is_allowed(&allowed, "bash", &serde_json::json!({"command": cmd}), Path::new("/tmp")), "{cmd}");
+            assert!(bash_prefix(&cmd).is_none(), "{cmd}");
+        }
+        assert!(bash_matches("git status", "git status --short"));
     }
 
     #[test]

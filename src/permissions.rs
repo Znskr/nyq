@@ -969,6 +969,16 @@ mod tests {
     }
 
     #[test]
+    fn bash_allow_rules_reject_dynamic_arguments() {
+        for arg in ["$'--short'", "$\"--short\"", "$", "$FLAGS", "${FLAGS}", "`echo --short`", "$(echo --short)"] {
+            let cmd = format!("git status {arg}");
+            let args = serde_json::json!({"command": cmd});
+            assert!(!matches("bash:git status", "bash", &args, true), "{cmd}");
+            assert!(matches("bash:git status", "bash", &args, false), "{cmd}");
+        }
+    }
+
+    #[test]
     fn wildcards() {
         assert!(glob("mcp__deepwiki__*", "mcp__deepwiki__ask_question"));
         assert!(glob("mcp__*", "mcp__x__y"));
