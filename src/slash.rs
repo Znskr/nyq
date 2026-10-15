@@ -232,6 +232,11 @@ const BACKGROUND: &[ArgOption] = &[
 ];
 const BACKGROUND_ID: &[ArgOption] = &[("last", "the most recent process", false)];
 const HOOKS: &[ArgOption] = &[("trust", "trust the project's hooks", false)];
+const EXTENSIONS: &[ArgOption] = &[
+    ("list", "extensions and their state", false),
+    ("reload", "restart them and pick up new ones", false),
+    ("trust", "trust the project's extensions", false),
+];
 const MEMORY: &[ArgOption] = &[("list", "saved memories", false), ("remove", "forget one: remove N", true)];
 const USAGE: &[ArgOption] = &[
     ("session", "this session", false),
@@ -273,6 +278,7 @@ pub fn arg_options(cmd: &str, prior: &[&str]) -> &'static [ArgOption] {
         ("/background", []) => BACKGROUND,
         ("/background", ["logs" | "open" | "kill" | "stop"]) => BACKGROUND_ID,
         ("/hooks", []) => HOOKS,
+        ("/extensions", []) => EXTENSIONS,
         ("/memory", []) => MEMORY,
         ("/usage", []) => USAGE,
         ("/resume", []) => RESUME,
@@ -306,6 +312,7 @@ mod tests {
         assert_eq!(category("/usage"), Category::Account);
         assert_eq!(category("/permissions"), Category::Security);
         assert_eq!(category("/my-template"), Category::Extensions);
+        assert_eq!(category("/extensions"), Category::Extensions);
         assert_eq!(Category::Media.label(), "Media");
         assert_eq!(canonical("/cost"), "/usage");
         assert_eq!(canonical("/usage"), "/usage");
