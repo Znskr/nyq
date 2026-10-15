@@ -347,6 +347,117 @@ fn search_flag(rg: bool, f: &str) -> Option<(bool, bool)> {
     BOOL
 }
 
+/// Only reviewed options enter the read-only Git path. Unknown options ask.
+fn git_option(sub: &str, flag: &str) -> Option<(bool, bool)> {
+    let (name, value) = flag.split_once('=').map_or((flag, None), |(n, v)| (n, Some(v)));
+    let options = |booleans: &[&str], valued: &[&str]| {
+        if valued.contains(&name) {
+            if value.is_some() { BOOL } else { VALUE }
+        } else if value.is_none() && booleans.contains(&name) {
+            BOOL
+        } else {
+            None
+        }
+    };
+    if matches!(sub, "ls-files" | "branch" | "diff" | "log" | "show") && name == "--abbrev" && value.is_some_and(digits) {
+        return BOOL;
+    }
+    if matches!(sub, "branch" | "diff" | "log" | "show") && name == "--color" && matches!(value, None | Some("always" | "auto" | "never")) {
+        return BOOL;
+    }
+    match sub {
+        "status" => {
+            if (name == "--porcelain" && matches!(value, Some("v1" | "v2" | "1" | "2")))
+                || (name == "--untracked-files" && matches!(value, Some("no" | "normal" | "all")))
+                || (name == "--ignored" && matches!(value, Some("traditional" | "matching" | "no")))
+                || (value.is_none() && flag.starts_with('-') && !flag.starts_with("--")
+                    && flag[1..].chars().all(|c| "sbz".contains(c)))
+            {
+                return BOOL;
+            }
+            options(&["--short", "--branch", "--show-stash", "--porcelain", "--null", "--ignored",
+                "--no-renames", "--renames", "--ahead-behind", "--no-ahead-behind", "-uno", "-unormal", "-uall", "-v", "--verbose"], &[])
+        }
+        "ls-files" => options(&["-c", "--cached", "-d", "--deleted", "-m", "--modified", "-o", "--others",
+            "-i", "--ignored", "--exclude-standard", "-s", "--stage", "-u", "--unmerged", "-k", "--killed",
+            "-t", "-v", "-f", "-z", "--full-name", "--error-unmatch", "--deduplicate", "--eol"], &["-x", "--exclude"]),
+        "rev-parse" => {
+            if (name == "--short" && value.is_some_and(digits))
+                || (name == "--abbrev-ref" && matches!(value, Some("strict" | "loose")))
+                || (name == "--path-format" && matches!(value, Some("absolute" | "relative")))
+            {
+                return BOOL;
+            }
+            options(&["--show-toplevel", "--show-prefix", "--show-cdup", "--git-dir", "--absolute-git-dir",
+                "--git-common-dir", "--is-inside-work-tree", "--is-inside-git-dir", "--is-bare-repository",
+                "--verify", "--quiet", "-q", "--short", "--abbrev-ref", "--symbolic", "--symbolic-full-name",
+                "--all", "--branches", "--tags", "--remotes", "--not", "--no-revs", "--revs-only", "--no-flags",
+                "--flags", "--sq", "--local-env-vars", "--show-object-format", "--end-of-options"], &[])
+        }
+        "branch" => options(&["-a", "-r", "-v", "-vv", "--list", "--all", "--remotes", "--verbose",
+            "--show-current", "-i", "--ignore-case", "--no-color", "--no-column", "--no-abbrev"],
+            &["--merged", "--no-merged", "--contains", "--no-contains", "--points-at", "--sort", "--format"]),
+        "diff" | "log" | "show" => {
+            if value.is_none() && (flag.strip_prefix("-U").is_some_and(digits)
+                || sub != "diff" && (flag.strip_prefix('-').is_some_and(digits) || flag.strip_prefix("-n").is_some_and(digits)))
+            {
+                return BOOL;
+            }
+            if matches!(name, "--format" | "--pretty") && sub != "diff" {
+                // Signature format placeholders can start a verifier.
+                return value.filter(|v| matches!(*v, "oneline" | "short" | "medium" | "full" | "fuller" | "raw" | "email" | "mboxrd")).and(BOOL);
+            }
+            let common = options(&["-p", "--patch", "-s", "--no-patch", "-u", "--raw", "--patch-with-raw",
+                "--patch-with-stat", "--numstat", "--shortstat", "--stat", "--compact-summary", "--summary",
+                "--name-only", "--name-status", "--check", "--binary", "--full-index", "--no-abbrev", "--no-color",
+                "-z", "--exit-code", "--quiet", "--no-ext-diff", "--no-textconv", "--no-renames", "--minimal",
+                "-w", "--ignore-all-space", "-b", "--ignore-space-change", "--ignore-space-at-eol",
+                "--ignore-cr-at-eol", "--ignore-blank-lines", "--patience", "--histogram", "--no-prefix", "--relative"],
+                &["-U", "--unified", "--inter-hunk-context", "--stat-width", "--stat-name-width", "--stat-count",
+                    "-S", "-G", "--diff-filter", "--word-diff-regex"]);
+            common.or_else(|| {
+                if sub == "diff" {
+                    options(&["--cached", "--staged"], &[])
+                } else {
+                    options(&["--oneline", "--decorate", "--no-decorate", "--all", "--branches", "--tags", "--remotes",
+                        "--graph", "--first-parent", "--no-merges", "--merges", "--reverse", "--topo-order", "--date-order",
+                        "--author-date-order", "--follow", "--no-walk", "--walk-reflogs", "--parents", "--children",
+                        "--boundary", "--left-right", "--cherry-pick", "--cherry-mark"],
+                        &["-n", "--max-count", "--skip", "--author", "--committer", "--grep", "--since", "--until", "--after", "--before", "--date"])
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Git has optional option values. Never let a value hide another option.
+fn git_operands<'a>(sub: &str, args: &[&'a str]) -> Option<Vec<&'a str>> {
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--" {
+            ops.extend(&args[i + 1..]);
+            break;
+        }
+        if is_flag(arg) {
+            let (takes, _) = git_option(sub, arg)?;
+            if takes {
+                let value = args.get(i + 1)?;
+                if value.starts_with('-') {
+                    return None;
+                }
+                i += 1;
+            }
+        } else {
+            ops.push(arg);
+        }
+        i += 1;
+    }
+    Some(ops)
+}
+
 /// Read-only git: the argv to run (with config that could start programs
 /// switched off), or None.
 fn git_stage(args: &[&str], paths: &dyn Fn(&[&str]) -> bool) -> Option<Vec<String>> {
@@ -355,31 +466,20 @@ fn git_stage(args: &[&str], paths: &dyn Fn(&[&str]) -> bool) -> Option<Vec<Strin
         _ => args,
     };
     let (&sub, rest) = args.split_first()?;
-    let (_, ops) = split_options(rest, |_| BOOL)?;
     let has = |names: &[&str]| rest.iter().any(|a| names.iter().any(|n| a == n || a.strip_prefix(n).is_some_and(|r| r.starts_with('='))));
     let mut extra: &[&str] = &[];
     let ok = match sub {
-        "status" | "ls-files" | "rev-parse" => paths(&ops),
-        "diff" | "log" | "show" => {
-            extra = &["--no-ext-diff", "--no-textconv"];
-            !has(&["--output", "--no-index", "--ext-diff", "--textconv", "--show-signature"])
-                && !rest.iter().any(|a| a.starts_with("-O"))
-                && paths(&ops)
-        }
-        "branch" => {
-            let flags_ok = rest.iter().filter(|a| is_flag(a)).all(|a| {
-                let name = a.split('=').next().unwrap_or(a);
-                matches!(
-                    name,
-                    "-a" | "-r" | "-v" | "-vv" | "-l" | "-i" | "--list" | "--all" | "--remotes" | "--verbose"
-                        | "--show-current" | "--merged" | "--no-merged" | "--contains" | "--no-contains"
-                        | "--points-at" | "--sort" | "--format" | "--color" | "--no-color" | "--column"
-                        | "--no-column" | "--ignore-case" | "--abbrev" | "--no-abbrev"
-                )
-            });
-            // Names are patterns only in list mode (or a filter's commit).
-            let listing = has(&["-l", "--list", "--merged", "--no-merged", "--contains", "--no-contains", "--points-at"]);
-            flags_ok && (ops.is_empty() || listing)
+        "status" | "ls-files" | "rev-parse" | "diff" | "log" | "show" | "branch" => {
+            let ops = git_operands(sub, rest)?;
+            if matches!(sub, "diff" | "log" | "show") {
+                extra = &["--no-ext-diff", "--no-textconv"];
+            }
+            if sub == "branch" {
+                // Bare operands create branches unless listing was requested.
+                ops.is_empty() || has(&["--list", "--merged", "--no-merged", "--contains", "--no-contains", "--points-at"])
+            } else {
+                paths(&ops)
+            }
         }
         "remote" => matches!(rest, [] | ["-v"] | ["--verbose"]) || matches!(rest, ["get-url", name] if !is_flag(name)),
         "worktree" => {
@@ -438,7 +538,6 @@ fn reversible_stage(w: &[&str]) -> bool {
         return VERSIONED.contains(&program);
     }
     match (program, args) {
-        ("git", ["status", rest @ ..]) => rest.iter().all(|a| is_flag(a)),
         ("git", ["remote", "-v"]) => true,
         ("git", ["worktree", "list", rest @ ..]) => rest.iter().all(|a| matches!(*a, "--porcelain" | "-v" | "--verbose")),
         ("git", ["fetch", rest @ ..]) => rest.iter().all(|a| {
@@ -567,6 +666,39 @@ mod tests {
             "git status --short | wc -l",
         ] {
             assert!(ro(cmd).is_some(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn git_options_must_be_known_safe_for_the_subcommand() {
+        for cmd in [
+            "git status --short", "git status -sb", "git status --porcelain=v2",
+            "git log --oneline -n 5", "git log -n5", "git log -5 --all --graph",
+            "git log --author someone --since=yesterday --pretty=short",
+            "git diff --stat HEAD~1", "git diff --cached --name-only", "git diff -U5 -- src",
+            "git show HEAD:path", "git show --stat HEAD", "git ls-files --stage",
+            "git rev-parse --abbrev-ref HEAD", "git rev-parse --short=8 HEAD",
+            "git branch --list 'topic*'", "git branch -a", "git branch --contains HEAD",
+            "git remote -v", "git worktree list --porcelain",
+        ] {
+            assert!(ro(cmd).is_some(), "{cmd}");
+            assert!(known_reversible(cmd, &std::env::temp_dir(), &[]), "{cmd}");
+        }
+        for cmd in [
+            "git status --future-option", "git log --future-option", "git diff --future-option",
+            "git show --future-option", "git ls-files --future-option", "git rev-parse --future-option",
+            "git branch --list --future-option", "git remote -v --future-option", "git worktree list --future-option",
+            "git log --output=out", "git log --output out", "git diff --output=out", "git show --output=out",
+            "git log --ext-diff", "git show --textconv", "git diff --no-index a b", "git log -Oorder",
+            "git log --show-signature", "git show --format=%G?", "git log --pretty=format:%GG",
+            "git ls-files --exclude-from=/etc/passwd", "git rev-parse --resolve-git-dir /etc",
+            "git diff -U --output=out", "git diff --unified --output=out",
+            "git log --author -- --output=out", "git branch --contains --edit-description",
+            "git branch --edit-description", "git branch new", "git remote update", "git worktree repair",
+            "git status --oneline", "git diff --max-count=5", "git branch --list --output=out",
+        ] {
+            assert!(ro(cmd).is_none(), "{cmd}");
+            assert!(!known_reversible(cmd, &std::env::temp_dir(), &[]), "{cmd}");
         }
     }
 
