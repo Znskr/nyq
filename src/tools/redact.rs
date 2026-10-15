@@ -35,7 +35,7 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]{16,}=*", "${1}[redacted]"),
         // `NAME_TOKEN=value` lines as printed by `env` or found in `.env`.
         (
-            r"(?m)^(\s*(?:export\s+)?[A-Z0-9_]*(?:API_KEY|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*=\s*)[^\s#]{6,}",
+            r"(?m)^(\s*(?:\d+\t|[^\r\n]+?[:-]\d+[:-] )?\s*(?:export\s+)?[A-Z0-9_]*(?:API_KEY|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*=\s*)[^\s#]{6,}",
             "${1}[redacted]",
         ),
     ]
@@ -58,6 +58,15 @@ pub(crate) fn scrub(text: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masks_assignments_in_numbered_reads_and_search_results() {
+        for prefix in ["", "     1\t", "config.env:1: ", "config.env-2- ", "dir:with:colons/config.env:12: "] {
+            let input = format!("{prefix}DATABASE_PASSWORD=super_secret_123\n");
+            assert_eq!(scrub(&input), format!("{prefix}DATABASE_PASSWORD=[redacted]\n"));
+        }
+    }
+
 
     #[test]
     fn masks_known_token_shapes() {

@@ -804,3 +804,35 @@ fn continue_recovery_resumes_the_cut_off_answer() {
     let users = seen[1]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "user").count();
     assert_eq!(users, 1);
 }
+
+#[test]
+fn file_and_search_results_redact_password_assignments() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let secret = "audit_password_12345";
+    std::fs::write(work.path().join("config.env"), format!("DATABASE_PASSWORD={secret}\n")).unwrap();
+    let calls = [("read_file", json!({"path":"config.env"})), ("grep", json!({"pattern":"PASSWORD"}))];
+    let mut replies: Vec<Vec<Value>> = calls.iter().enumerate().map(|(i, (name, args))| {
+        vec![delta(json!({"tool_calls":[{"index":0,"id":format!("call_{i}"),"type":"function",
+            "function":{"name":name,"arguments":args.to_string()}}]}))]
+    }).collect();
+    replies.push(vec![delta(json!({"content":"Done."}))]);
+    let (url, seen) = fake_server(replies);
+    let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
+        .args(["-p", "--provider", "openai", "--sandbox", "off", "inspect config"])
+        .current_dir(work.path())
+        .env("NYQ_HOME", home.path()).env("HOME", home.path())
+        .env("NYQ_BASE_URL", url).env("NYQ_MODEL", "fake-model")
+        .output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    let sent = serde_json::to_string(&*seen).unwrap();
+    assert!(!sent.contains(secret));
+    assert!(sent.contains("DATABASE_PASSWORD=[redacted]"));
+    for entry in std::fs::read_dir(home.path().join("sessions")).unwrap().flatten() {
+        if entry.path().extension().is_some_and(|e| e == "jsonl") {
+            assert!(!std::fs::read_to_string(entry.path()).unwrap().contains(secret));
+        }
+    }
+}

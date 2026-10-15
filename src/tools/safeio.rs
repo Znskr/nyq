@@ -94,6 +94,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         }
     }
     let target = follow_final(path)?;
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let Some(name) = target.file_name() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
@@ -102,8 +105,21 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn follow_final(path: &Path) -> io::Result<PathBuf> {
+    follow_final_depth(path, 0)
+}
+
+fn follow_final_depth(path: &Path, depth: usize) -> io::Result<PathBuf> {
+    if depth > 40 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many symlinks"));
+    }
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let link = fs::read_link(path)?;
+            let target = if link.is_absolute() { link } else {
+                path.parent().unwrap_or(Path::new(".")).join(link)
+            };
+            follow_final_depth(&target, depth + 1)
+        },
         Ok(_) => Ok(path.to_path_buf()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let Some(name) = path.file_name() else {
@@ -917,6 +933,21 @@ fn map_loop(result: io::Result<File>) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_dangling_symlink_chains() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        symlink("second", dir.path().join("first")).unwrap();
+        symlink("new/target", dir.path().join("second")).unwrap();
+        write_atomic(&dir.path().join("first"), b"created").unwrap();
+        assert_eq!(fs::read(dir.path().join("new/target")).unwrap(), b"created");
+        assert!(fs::symlink_metadata(dir.path().join("first")).unwrap().file_type().is_symlink());
+        symlink("cycle", dir.path().join("cycle")).unwrap();
+        assert!(write_atomic(&dir.path().join("cycle"), b"no").is_err());
+    }
+
 
     #[test]
     fn relative_under_rejects_escape() {

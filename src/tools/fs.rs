@@ -63,7 +63,15 @@ fn open_regular(path: &Path) -> Result<fs::File, ToolOutput> {
     if fs::metadata(path).is_ok_and(|m| m.is_dir()) {
         return Err(ToolOutput::err(format!("read_file: {} is a directory (use list_dir).", display_path(path))));
     }
-    let file = match fs::File::open(path) {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // A FIFO must not block before we can inspect the opened descriptor.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(ToolOutput::err(format!("read_file: file not found: {}", display_path(path))));
@@ -630,6 +638,29 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipe");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let read_path = path.clone();
+        let worker = std::thread::spawn(move || { tx.send(open_regular(&read_path).is_err()).unwrap(); });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        if result.is_err() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _writer = fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(path);
+            worker.join().unwrap();
+            panic!("read_file blocked opening a FIFO");
+        }
+        assert!(result.unwrap());
+        worker.join().unwrap();
+    }
+
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &Path) -> ToolCtx {
