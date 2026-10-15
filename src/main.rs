@@ -84,7 +84,7 @@ struct Cli {
     /// Model id (overrides config).
     #[arg(short, long, global = true)]
     model: Option<String>,
-    /// Provider: codex, grok, openai, ollama, opencode-go, opencode or xai.
+    /// Provider: codex, grok, anthropic, openai, ollama, opencode-go, opencode or xai.
     #[arg(long, global = true)]
     provider: Option<String>,
     /// Run tools without asking for approval.
@@ -221,14 +221,14 @@ enum Command {
         json: bool,
     },
     /// Sign in: ChatGPT subscription (default, Codex models), a Grok
-    /// subscription, or store an API key for opencode-go, opencode or xai.
+    /// subscription, or store an API key for anthropic, opencode-go, opencode or xai.
     Login {
-        /// codex (default), grok, opencode-go, opencode or xai.
+        /// codex (default), grok, anthropic, opencode-go, opencode or xai.
         provider: Option<String>,
     },
     /// Remove nyq's stored login for a provider, or every stored login.
     Logout {
-        /// codex, grok, opencode-go, opencode or xai [default: all of them].
+        /// codex, grok, anthropic, opencode-go, opencode or xai [default: all of them].
         provider: Option<String>,
     },
     /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
@@ -271,7 +271,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Choose the default provider (codex, opencode-go, opencode, xai, openai, ollama).
+    /// Choose the default provider (codex, grok, anthropic, opencode-go, opencode, xai, openai, ollama).
     Provider { name: Option<String> },
     /// Show sign-in status per provider and the default; on a terminal, set them up.
     Setup,
@@ -591,7 +591,7 @@ async fn run() -> Result<()> {
                 }
                 Some(name) => {
                     let service = provider::hosted::Service::parse(name).with_context(|| {
-                        format!("unknown provider `{name}` (expected codex, grok, opencode-go, opencode or xai)")
+                        format!("unknown provider `{name}` (expected codex, grok, anthropic, opencode-go, opencode or xai)")
                     })?;
                     login::login_key(&home, service).await?
                 }

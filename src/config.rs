@@ -3,16 +3,16 @@
 //! Profile directory: `$NYQ_HOME`, else `~/.nyq`.
 //!
 //! Provider resolution, first match wins:
-//! 1. `--provider` flag or `NYQ_PROVIDER` (`codex` | `grok` | `openai` |
-//!    `ollama` | `opencode-go` | `opencode` | `xai`)
+//! 1. `--provider` flag or `NYQ_PROVIDER` (`codex` | `grok` | `anthropic` |
+//!    `openai` | `ollama` | `opencode-go` | `opencode` | `xai`)
 //! 2. `NYQ_BASE_URL` set → `openai`
 //! 3. last-model.json (unless explicit model/provider flags or env are set)
 //! 4. `settings.json` `"provider"`
 //! 5. a ChatGPT login present (codex CLI or `chatgpt-auth.json`) → `codex`
 //! 6. a Grok subscription sign-in (`grok-auth.json`) → `grok`
 //! 7. `model.json` present → `openai`
-//! 8. an API key for a hosted service (OpenCode Go, OpenCode Zen, xAI) →
-//!    that service
+//! 8. an API key for a hosted service (OpenCode Go, OpenCode Zen, xAI,
+//!    Anthropic: `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) → that service
 
 use std::path::{Path, PathBuf};
 
@@ -173,7 +173,7 @@ pub(crate) fn codex_auth_path(home: &Path) -> PathBuf {
 /// flag, the environment, or a saved setting (settings.json, last-model.json).
 pub fn unknown_provider(name: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "unknown provider `{name}` (expected codex, grok, ollama, openai, opencode-go, opencode or xai). \
+        "unknown provider `{name}` (expected codex, grok, anthropic, ollama, openai, opencode-go, opencode or xai). \
          If it is saved in settings.json or last-model.json, choose another with `nyq provider NAME` or /model."
     )
 }
@@ -272,12 +272,12 @@ pub fn provider(
                 .map(str::to_string)
                 .or_else(|| env("NYQ_MODEL"))
                 .or_else(|| settings.models.get(service.id()).cloned())
-                .unwrap_or_else(|| service.default_model().into());
+                .unwrap_or_else(|| service.default_model());
             let effort = settings.effort.filter(|e| e != "auto");
             Ok(Box::new(HostedProvider::configured(home, service, model, effort)?))
         }
         None => bail!(
-            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • Grok subscription: run `nyq login grok`\n  • OpenCode Go/Zen or xAI: run `nyq login opencode-go|opencode|xai` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
+            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • Grok subscription: run `nyq login grok`\n  • Anthropic API (or a compatible endpoint): run `nyq login anthropic` or set ANTHROPIC_API_KEY [ANTHROPIC_BASE_URL=…]\n  • OpenCode Go/Zen or xAI: run `nyq login opencode-go|opencode|xai` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
         ),
     }
 }
