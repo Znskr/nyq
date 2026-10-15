@@ -16,6 +16,10 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             r"-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----[\s\S]*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
             "-----BEGIN ${1}PRIVATE KEY-----\n[redacted]\n-----END ${1}PRIVATE KEY-----",
         ),
+        // Credentials inside a URL (https://user:password@host/…).
+        // Credentials inside a URL (https://user:password@host/…).
+        // Credentials inside a URL (https://user:password@host/…).
+        (r#"(?i)\b(https?://)[^\s/?#"'`<>@:]+:[^\s/?#"'`<>@]+@"#, "${1}[redacted]@"),
         // OpenAI/Anthropic-style and Stripe keys.
         (r"\b(sk|rk)-[A-Za-z0-9_-]{20,}", MASK),
         (r"\b(sk|pk|rk)_(live|test)_[A-Za-z0-9]{10,}", MASK),
@@ -78,6 +82,32 @@ mod tests {
         let pem = "a\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nabc\n-----END RSA PRIVATE KEY-----\nb";
         let out = scrub(pem);
         assert!(!out.contains("MIIEow") && out.starts_with("a\n") && out.ends_with("\nb"), "{out}");
+    }
+
+    #[test]
+    fn masks_url_credentials_but_not_ports_or_hosts() {
+        for case in [
+            "git clone https://x-access-token:ghp_abcdefghijklmnop@github.com/o/r.git",
+            "curl https://admin:hunter2@example.com/v1",
+            "fetch http://user:pa%24ss@data.example.com/x",
+        ] {
+            let out = scrub(case);
+            assert!(!out.contains("hunter2") && !out.contains("secretpw") && !out.contains("ghp_"), "{case} -> {out}");
+            assert!(out.contains("://[redacted]@"), "{case} -> {out}");
+        }
+        assert_eq!(
+            scrub("https://admin:hunter2@example.com/v1"),
+            "https://[redacted]@example.com/v1"
+        );
+        // Ports, plain hosts, IPv6 literals and user-only URLs are untouched.
+        for plain in [
+            "https://example.com:8443/v1/models",
+            "http://[2001:db8::1]:8080/x",
+            "https://user@example.com/x",
+            "see https://docs.rs/tokio and http://93.184.216.34/",
+        ] {
+            assert!(matches!(scrub(plain), Cow::Borrowed(_)), "{plain} -> {}", scrub(plain));
+        }
     }
 
     #[test]
