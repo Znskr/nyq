@@ -1,0 +1,6 @@
+{
+  "name": "git-status",
+  "version": "0.1.0",
+  "description": "Git branch in the status line, and the repository state as context for each prompt",
+  "command": ["node", "index.mjs"]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "word-tools",
+  "version": "0.1.0",
+  "description": "word_count tool, /hello command, and a guard that blocks rm -rf",
+  "command": ["python3", "ext.py"]
+}

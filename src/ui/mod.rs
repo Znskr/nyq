@@ -23,7 +23,8 @@ use serde_json::Value;
 use crate::agent::{Approval, ApprovalRequest, Approver, Ui};
 use crate::tools::ToolOutput;
 use crate::types::{Item, StreamEvent};
-use render::{dim, one_line, paint, sanitize_text};
+pub(crate) use render::one_line;
+use render::{dim, paint, sanitize_text};
 
 fn color_err() -> bool {
     std::env::var_os("NO_COLOR").is_none() && io::stderr().is_terminal()
