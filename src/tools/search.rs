@@ -17,8 +17,7 @@ const MAX_PAGE: usize = 2000;
 const MAX_CONTEXT: usize = 10;
 /// Files larger than this get no context lines around their matches.
 const GREP_CONTEXT_FILE: u64 = 8 * 1024 * 1024;
-const GREP_WINDOW: usize = 1024 * 1024;
-const GREP_OVERLAP: usize = 64 * 1024;
+const MAX_GREP_LINE: usize = 16 * 1024 * 1024;
 
 /// Resolve a possibly relative path against `cwd`.
 fn resolve(cwd: &Path, p: &str) -> PathBuf {
@@ -219,7 +218,7 @@ impl Tool for Grep {
                 Returns matching lines as \"path:line: text\" (300 per page, long lines truncated; \
                 `context` adds surrounding lines as \"path-line- text\"), with output=\"files\" just the \
                 paths of files containing matches, or with output=\"count\" the number of matching lines \
-                per file. Page with offset/limit. Use glob to restrict which files are searched."
+                per file. Lines over 16 MiB return an error. Page with offset/limit. Use glob to restrict which files are searched."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -354,8 +353,8 @@ fn with_context(root: &Path, hits: &[Hit], context: usize) -> String {
                 out.push("--".into());
             }
             for n in from..=to {
-                if n == hit.line {
-                    out.push(format!("{rel}:{n}: {}", hit.text));
+                if let Some(matched) = hits[i..j].iter().find(|h| h.line == n) {
+                    out.push(format!("{rel}:{n}: {}", matched.text));
                 } else if let Some(line) = lines.get(n - 1) {
                     out.push(format!("{rel}-{n}- {}", snippet(line.as_bytes())));
                 }
@@ -379,6 +378,7 @@ fn collect_grep(
 ) -> Result<Vec<Hit>, String> {
     let mut matches: Vec<Hit> = Vec::new();
     let owned = secrets.clone();
+    let mut scan_error = None;
 
     // Search one file; returns true when the match cap was reached.
     let mut check = |rel: &Path, abs: &Path| -> bool {
@@ -400,7 +400,11 @@ fn collect_grep(
             matches.truncate(before);
             matches.push(Hit { rel: super::slash_path(rel), line: n, text: String::new() });
         }
-        matches!(result, GrepFile::Cap)
+        match result {
+            GrepFile::Error(message) => { scan_error = Some(message); true }
+            GrepFile::Cap => true,
+            _ => false,
+        }
     };
 
     if root.is_file() {
@@ -426,18 +430,20 @@ fn collect_grep(
     if cancel.is_cancelled() {
         return Err("Cancelled by user.".into());
     }
+    if let Some(message) = scan_error { return Err(message); }
     Ok(matches)
 }
 
 enum GrepFile {
+    Error(String),
     Skip,
     Continue,
     Cap,
 }
 
 /// Scan a whole regular file. A NUL drops every match from that file.
-/// Lines longer than [`GREP_WINDOW`] are searched in overlapping windows so a
-/// match past the first mebibyte is still found.
+/// Match complete lines so anchors and boundaries retain their meaning.
+/// Reject oversized lines explicitly rather than returning misleading results.
 fn grep_file(
     path: &Path,
     rel: &Path,
@@ -463,7 +469,6 @@ fn grep_file(
     let mut chunk = [0u8; 64 * 1024];
     let mut binary = false;
     let mut cap_hit = false;
-    let mut hit = false;
     let mut file_done = false;
     let record = |line: &[u8], line_no: usize, matches: &mut Vec<Hit>| record_line(line, line_no, rel, re, output, cap, matches);
     loop {
@@ -473,7 +478,7 @@ fn grep_file(
         }
         let n = match reader.read(&mut chunk) {
             Ok(0) => {
-                if !pending.is_empty() && !hit && !file_done && !binary {
+                if !pending.is_empty() && !file_done && !binary {
                     cap_hit = record(&pending, line_no, matches);
                 }
                 break;
@@ -490,9 +495,12 @@ fn grep_file(
                 binary = true;
                 break;
             }
+            if pending.len().saturating_add(i + 1) > MAX_GREP_LINE {
+                return GrepFile::Error(format!("grep: {}:{line_no}: line exceeds 16 MiB", path.display()));
+            }
             pending.extend_from_slice(&rest[..=i]);
             rest = &rest[i + 1..];
-            if !hit && !file_done {
+            if !file_done {
                 let before = matches.len();
                 cap_hit = record(&pending, line_no, matches) || cap_hit;
                 if files_only && matches.len() > before {
@@ -500,7 +508,6 @@ fn grep_file(
                 }
             }
             pending.clear();
-            hit = false;
             line_no += 1;
             if cap_hit || binary {
                 break;
@@ -520,20 +527,8 @@ fn grep_file(
             binary = true;
             break;
         }
-        if pending.len() > GREP_WINDOW {
-            if !hit && !file_done && line_matches(re, &pending) {
-                cap_hit = record(&pending, line_no, matches);
-                hit = true;
-                if files_only {
-                    file_done = true;
-                }
-            }
-            let keep = GREP_OVERLAP.min(pending.len());
-            pending.drain(..pending.len() - keep);
-            if cap_hit && read_has_nul(&mut reader) {
-                binary = true;
-                break;
-            }
+        if pending.len() > MAX_GREP_LINE {
+            return GrepFile::Error(format!("grep: {}:{line_no}: line exceeds 16 MiB", path.display()));
         }
     }
     if binary {
@@ -584,21 +579,7 @@ fn record_line(
 }
 
 fn line_matches(re: &regex::Regex, line: &[u8]) -> bool {
-    if line.len() <= GREP_WINDOW {
-        return re.is_match(&String::from_utf8_lossy(line));
-    }
-    let mut start = 0;
-    while start < line.len() {
-        let end = (start + GREP_WINDOW).min(line.len());
-        if re.is_match(&String::from_utf8_lossy(&line[start..end])) {
-            return true;
-        }
-        if end == line.len() {
-            break;
-        }
-        start = end - GREP_OVERLAP;
-    }
-    false
+    re.is_match(&String::from_utf8_lossy(line))
 }
 
 // ------------------------------------------------------------------------------- misc
@@ -611,6 +592,33 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn context_preserves_adjacent_match_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "match1\nmatch2\nafter\n").unwrap();
+        let out = run(&Grep, json!({"pattern":"match", "context":1}), dir.path()).await;
+        assert_eq!(out.content, "a.txt:1: match1\na.txt:2: match2\na.txt-3- after");
+    }
+
+    #[tokio::test]
+    async fn long_lines_preserve_regex_anchors_and_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("{}TARGET{}END\n", "a".repeat(1024 * 1024 - 65536), "z".repeat(200000));
+        std::fs::write(dir.path().join("long.txt"), text).unwrap();
+        for pattern in ["^TARGET", "a$", r"\bTARGET"] {
+            let out = run(&Grep, json!({"pattern":pattern}), dir.path()).await;
+            assert_eq!(out.content, "No matches found.", "{pattern}");
+        }
+        for pattern in ["^a+TARGETz+END$", "TARGET", "END$"] {
+            let out = run(&Grep, json!({"pattern":pattern}), dir.path()).await;
+            assert!(!out.is_error && out.content.contains("long.txt:1:"), "{pattern}: {}", out.content);
+        }
+        std::fs::write(dir.path().join("long.txt"), vec![b'a'; MAX_GREP_LINE + 1]).unwrap();
+        let out = run(&Grep, json!({"pattern":"a"}), dir.path()).await;
+        assert!(out.is_error && out.content.contains("line exceeds 16 MiB"));
+    }
+
 
     #[cfg(unix)]
     #[tokio::test]
