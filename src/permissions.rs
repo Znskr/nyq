@@ -276,7 +276,7 @@ impl Permissions {
             return Some(format!("{} {r}", action.as_str()));
         }
         if action == Action::Allow {
-            if let Some(r) = self.local.iter().find(|p| matches(p, tool, args, strict)) {
+            if let Some(r) = self.local.iter().find(hit) {
                 return Some(format!("allow {r} (this workspace)"));
             }
         }
@@ -327,10 +327,12 @@ impl Permissions {
             };
         }
         // A path-scoped allow names its paths, so it may cover reads and
-        // edits outside the workspace (never edits under `.git`).
+        // edits outside the workspace (never edits under `.git`). Workspace
+        // local rules are allows too.
         let path_allow = || {
             self.allow
                 .iter()
+                .chain(self.local.iter())
                 .any(|p| path_rule_matches(p, tool, args, cwd, true))
                 && !(is_file_tool(tool) && crate::agent::path_under_git(args, cwd))
         };
@@ -1322,6 +1324,37 @@ mod tests {
                 Decision::Ask { forced: None }
             );
         }
+    }
+
+    #[test]
+    fn workspace_local_path_rules_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = outside.path().to_str().unwrap();
+        let mut p = perms(&[], &[], &[]);
+        p.local = vec!["edit_file:src/**".into(), format!("read:{root}/**")];
+        let none = HashSet::new();
+        let d = |tool: &str, path: &str| {
+            p.decide(&none, tool, &json!({ "path": path }), cwd, true, Mode::Ask)
+        };
+        assert_eq!(d("edit_file", "src/a.rs"), Decision::Run);
+        assert_eq!(d("write_file", "src/new/b.rs"), Decision::Run);
+        assert_eq!(d("write_file", "docs/a.md"), Decision::Ask { forced: None });
+        assert_eq!(
+            d("write_file", "src/.git/config"),
+            Decision::Ask { forced: None }
+        );
+        assert_eq!(d("list_dir", root), Decision::Run);
+        assert_eq!(d("read_file", "src/a.rs"), Decision::Ask { forced: None });
+        // A deny still wins over a workspace path allow.
+        let mut denied = perms(&[], &[], &["edit_file:src/**"]);
+        denied.local = vec!["edit_file:src/**".into()];
+        assert!(matches!(
+            denied.decide(&none, "edit_file", &json!({"path": "src/a.rs"}), cwd, true, Mode::Ask),
+            Decision::Deny(_)
+        ));
     }
 
     #[test]
