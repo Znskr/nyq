@@ -1316,43 +1316,45 @@ async fn print_mode(
     resumed: Option<&session::Meta>,
 ) -> Result<()> {
     let (cancel, signal) = cancel_on_signal();
-    if text.trim().is_empty() && !ask.continue_recovery {
-        use std::io::Read;
-        std::io::stdin().read_to_string(text)?;
-    }
-    let mut images = Vec::new();
-    for path in &ask.image {
-        images.push(tools::image::load(&agent.cwd.join(path))?);
-    }
-    if let Some(meta) = resumed {
-        ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
-        ui::set_session_title(&meta.title);
-    }
-    if let Err(e) = mcp_slash::connect_profile_servers(mcp, agent, servers, true).await {
-        mcp.shutdown().await;
-        return Err(e);
-    }
-    mcp_features::sync(agent, mcp);
-    hooks::session_start(agent, if resumed.is_some() { "resume" } else { "startup" }).await;
     let mut plain = ui::PlainUi::new(agent.permission_mode.is_yolo());
     plain.quiet = ask.quiet || ask.json;
     plain.prompt = ask.prompt_permissions;
     plain.record = ask.json.then(ui::RunRecord::default);
     let requests_before = agent.stats.requests;
-    let result = if ask.continue_recovery {
-        agent.continue_turn(&mut plain, cancel.clone()).await
-    } else if let Some(msg) = hooks::prompt_submit(agent, text, &cancel).await {
-        Err(anyhow::anyhow!("{msg}"))
-    } else {
-        let (mut item, _, warning) = tools::image::user_turn(text, &agent.cwd);
-        if let Some(warning) = warning {
-            ui::error(&warning);
+    let result = async {
+        if text.trim().is_empty() && !ask.continue_recovery {
+            match read_print_input(std::io::stdin(), &cancel).await? {
+                Some(input) => text.push_str(&input),
+                None => return Ok(TurnEnd::Cancelled),
+            }
         }
-        if let types::Item::User { images: attached, .. } = &mut item {
-            attached.extend(images);
+        let mut images = Vec::new();
+        for path in &ask.image {
+            images.push(tools::image::load(&agent.cwd.join(path))?);
         }
-        agent.turn(item, &mut plain, cancel.clone()).await
-    };
+        if let Some(meta) = resumed {
+            ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+            ui::set_session_title(&meta.title);
+        }
+        mcp_slash::connect_profile_servers(mcp, agent, servers, true).await?;
+        mcp_features::sync(agent, mcp);
+        hooks::session_start(agent, if resumed.is_some() { "resume" } else { "startup" }).await;
+        if ask.continue_recovery {
+            agent.continue_turn(&mut plain, cancel.clone()).await
+        } else if let Some(msg) = hooks::prompt_submit(agent, text, &cancel).await {
+            Err(anyhow::anyhow!("{msg}"))
+        } else {
+            let (mut item, _, warning) = tools::image::user_turn(text, &agent.cwd);
+            if let Some(warning) = warning {
+                ui::error(&warning);
+            }
+            if let types::Item::User { images: attached, .. } = &mut item {
+                attached.extend(images);
+            }
+            agent.turn(item, &mut plain, cancel.clone()).await
+        }
+    }
+    .await;
     let code = match &result {
         Ok(TurnEnd::Done) => 0,
         Ok(TurnEnd::Cancelled) => match signal.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1386,6 +1388,21 @@ async fn print_mode(
             Err(Exit(code).into())
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Stdin can wait indefinitely for EOF; keep it off the async workers.
+async fn read_print_input(
+    mut input: impl std::io::Read + Send + 'static,
+    cancel: &CancellationToken,
+) -> Result<Option<String>> {
+    let read = tokio::task::spawn_blocking(move || {
+        let mut text = String::new();
+        input.read_to_string(&mut text).map(|_| text)
+    });
+    tokio::select! {
+        result = read => Ok(Some(result??)),
+        _ = cancel.cancelled() => Ok(None),
     }
 }
 
@@ -1693,6 +1710,35 @@ fn queue_leftovers(leftover: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn piped_input_keeps_the_async_worker_responsive() {
+        struct WaitingInput {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl std::io::Read for WaitingInput {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                }
+                let _ = self.release.recv_timeout(std::time::Duration::from_secs(2));
+                Ok(0)
+            }
+        }
+        let cancel = CancellationToken::new();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            ready.await.unwrap();
+            token.cancel();
+        });
+        let result = read_print_input(WaitingInput { started: Some(started), release: wait }, &cancel).await;
+        release.send(()).unwrap();
+        assert!(result.unwrap().is_none());
+        assert_eq!(read_print_input(std::io::Cursor::new("hello\nworld"), &CancellationToken::new()).await.unwrap().as_deref(), Some("hello\nworld"));
+    }
 
     #[test]
     fn resume_flag_value_is_optional() {

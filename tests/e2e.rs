@@ -728,6 +728,60 @@ fn signals_interrupt_print_mode_with_conventional_exit_codes() {
 }
 
 #[test]
+#[cfg(unix)]
+fn signals_interrupt_print_mode_while_stdin_is_open() {
+    for (signal, code) in [("-INT", 130), ("-TERM", 143)] {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut child = ask_command(work.path(), home.path(), "http://127.0.0.1:1/v1")
+            .arg("--json")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        // Hold the pipe open after partial input: EOF must not be needed to exit.
+        let mut input = child.stdin.take().unwrap();
+        // More than a pipe buffer makes this wait until nyq starts reading.
+        input.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert!(Command::new("kill").args([signal, &child.id().to_string()]).status().unwrap().success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let exited = child.try_wait().unwrap().is_some();
+        if !exited {
+            let _ = child.kill();
+        }
+        let out = child.wait_with_output().unwrap();
+        drop(input);
+        assert!(exited, "did not exit while stdin was open");
+        assert_eq!(out.status.code(), Some(code), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["exit_code"], code);
+        assert_eq!(value["steps"], 0);
+    }
+}
+
+#[test]
+fn print_mode_reads_the_complete_piped_prompt() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (url, seen) = fake_server(vec![vec![delta(json!({"content": "Read it."}))]]);
+    let mut child = ask_command(work.path(), home.path(), &url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"hello\nfrom stdin").unwrap();
+    assert_success(&child.wait_with_output().unwrap());
+    let seen = seen.lock().unwrap();
+    let messages = seen[0]["messages"].as_array().unwrap();
+    let user = messages.iter().find(|m| m["role"] == "user").unwrap();
+    assert!(user["content"].to_string().contains("hello\\nfrom stdin"), "{user}");
+}
+
+#[test]
 fn continue_recovery_resumes_the_cut_off_answer() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
