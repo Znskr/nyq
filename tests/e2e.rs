@@ -525,6 +525,52 @@ fn print_mode_ignores_a_saved_yolo_mode() {
     assert!(!work.path().join("x.txt").exists(), "a saved yolo must not let print mode write files");
 }
 
+#[test]
+fn acp_ignores_saved_yolo_unless_explicit() {
+    for (flags, env_mode, expected) in [
+        (vec![], None, "ask"),
+        (vec!["--yolo"], None, "yolo"),
+        (vec!["--permission-mode", "yolo"], None, "yolo"),
+        (vec![], Some("yolo"), "yolo"),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("settings.json"), r#"{"permission_mode":"yolo"}"#).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nyq"));
+        cmd.args(["acp", "--sandbox", "off", "--provider", "openai"]).args(flags)
+            .current_dir(work.path()).env("NYQ_HOME", home.path()).env("HOME", home.path())
+            .env("NYQ_BASE_URL", "http://127.0.0.1:1/v1").env("NYQ_MODEL", "fake-model")
+            .env_remove("NYQ_PERMISSION_MODE");
+        if let Some(mode) = env_mode {
+            cmd.env("NYQ_PERMISSION_MODE", mode);
+        }
+        let mut child = cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if value["id"].is_number() {
+                    let _ = tx.send(value);
+                }
+            }
+        });
+        writeln!(input, "{}", json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":1,"clientCapabilities":{}}})).unwrap();
+        let init = rx.recv_timeout(std::time::Duration::from_secs(20));
+        writeln!(input, "{}", json!({"jsonrpc":"2.0", "id":2, "method":"session/new", "params":{"cwd":work.path(),"mcpServers":[]}})).unwrap();
+        let session = rx.recv_timeout(std::time::Duration::from_secs(20));
+        let _ = child.kill();
+        child.wait().unwrap();
+        reader.join().unwrap();
+        assert!(init.unwrap().get("result").is_some());
+        let session = session.unwrap();
+        assert_eq!(session["result"]["modes"]["currentModeId"], expected, "{session}");
+    }
+}
+
 /// `nyq ask` against `url` from `work`, without the --yolo of `print_command`.
 fn ask_command(work: &std::path::Path, home: &std::path::Path, url: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nyq"));
@@ -679,6 +725,60 @@ fn signals_interrupt_print_mode_with_conventional_exit_codes() {
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(v["exit_code"], code);
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn signals_interrupt_print_mode_while_stdin_is_open() {
+    for (signal, code) in [("-INT", 130), ("-TERM", 143)] {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut child = ask_command(work.path(), home.path(), "http://127.0.0.1:1/v1")
+            .arg("--json")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        // Hold the pipe open after partial input: EOF must not be needed to exit.
+        let mut input = child.stdin.take().unwrap();
+        // More than a pipe buffer makes this wait until nyq starts reading.
+        input.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert!(Command::new("kill").args([signal, &child.id().to_string()]).status().unwrap().success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let exited = child.try_wait().unwrap().is_some();
+        if !exited {
+            let _ = child.kill();
+        }
+        let out = child.wait_with_output().unwrap();
+        drop(input);
+        assert!(exited, "did not exit while stdin was open");
+        assert_eq!(out.status.code(), Some(code), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["exit_code"], code);
+        assert_eq!(value["steps"], 0);
+    }
+}
+
+#[test]
+fn print_mode_reads_the_complete_piped_prompt() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (url, seen) = fake_server(vec![vec![delta(json!({"content": "Read it."}))]]);
+    let mut child = ask_command(work.path(), home.path(), &url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"hello\nfrom stdin").unwrap();
+    assert_success(&child.wait_with_output().unwrap());
+    let seen = seen.lock().unwrap();
+    let messages = seen[0]["messages"].as_array().unwrap();
+    let user = messages.iter().find(|m| m["role"] == "user").unwrap();
+    assert!(user["content"].to_string().contains("hello\\nfrom stdin"), "{user}");
 }
 
 #[test]
