@@ -114,12 +114,13 @@ const BACKOFF: Duration = Duration::from_millis(if cfg!(test) { 10 } else { 1_00
 
 /// How long to wait before retrying after `error` (attempt 0 = first
 /// retry), or None when retrying cannot help: rate limits, server errors
-/// (500/502/503/504), and connection failures or timeouts are transient.
+/// (500/502/503/504, Anthropic's 529 overload), and connection failures
+/// or timeouts are transient.
 fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
     let backoff = (BACKOFF * 2u32.pow(attempt)).min(MAX_DELAY);
     error.chain().find_map(|cause| {
         if let Some(e) = cause.downcast_ref::<sse::HttpError>() {
-            if !matches!(e.status, 429 | 500 | 502 | 503 | 504) {
+            if !matches!(e.status, 429 | 500 | 502 | 503 | 504 | 529) {
                 return Some(None);
             }
             return Some(match e.retry_after {

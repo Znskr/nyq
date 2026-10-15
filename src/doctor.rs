@@ -22,6 +22,11 @@ fn auth_sources(home: &Path) -> Vec<String> {
     {
         sources.push("model.json api_key".into());
     }
+    for service in crate::provider::hosted::Service::ALL {
+        if let Some(source) = crate::provider::hosted::key_source(home, service) {
+            sources.push(format!("{} key ({source})", service.title()));
+        }
+    }
     for (label, path) in [
         ("selected Codex auth", config::codex_auth_path(home)),
         ("profile ChatGPT auth", home.join("chatgpt-auth.json")),
@@ -258,6 +263,10 @@ pub async fn doctor(
         Some("codex") => codex_auth_valid(home),
         Some("grok") => crate::provider::grok::has_session(home),
         Some("ollama") => true,
+        Some(name) if crate::provider::hosted::Service::parse(name).is_some() => {
+            crate::provider::hosted::Service::parse(name)
+                .is_some_and(|s| crate::provider::hosted::api_key(home, s).is_some())
+        }
         Some(_) => config::openai_config(home)
             .ok()
             .is_some_and(|(url, key, _)| {
