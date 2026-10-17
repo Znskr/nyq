@@ -6,6 +6,7 @@ pub(crate) mod background;
 mod bash;
 pub(crate) use bash::{live_tail, run_shell};
 mod fs;
+mod html;
 pub mod image;
 pub(crate) mod mcp_search;
 pub(crate) mod memory;

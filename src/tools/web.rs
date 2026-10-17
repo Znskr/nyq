@@ -319,19 +319,7 @@ fn html_title(html: &str) -> Option<String> {
 }
 
 fn html_to_markdown(html: &str) -> String {
-    let converter = htmd::HtmlToMarkdown::builder()
-        .options(htmd::options::Options {
-            bullet_list_marker: htmd::options::BulletListMarker::Dash,
-            ul_bullet_spacing: 1,
-            ol_number_spacing: 1,
-            ..Default::default()
-        })
-        .skip_tags(vec!["head", "script", "style", "noscript", "template", "nav", "footer", "iframe", "svg", "canvas", "form", "button"])
-        .build();
-    let md = converter.convert(html).unwrap_or_default();
-    // Collapse runs of blank lines left behind by skipped elements.
-    static BLANKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n[ \t]*(\n[ \t]*){2,}").unwrap());
-    BLANKS.replace_all(md.trim(), "\n\n").into_owned()
+    super::html::to_markdown(html)
 }
 
 /// Truncate to `max` characters, with a note saying so.
@@ -459,26 +447,8 @@ struct SearchResult {
     snippet: String,
 }
 
-/// Decode the handful of HTML entities that appear in result text.
 fn decode_entities(s: &str) -> String {
-    static ENTITY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);").unwrap());
-    ENTITY
-        .replace_all(s, |c: &regex::Captures| {
-            let e = &c[1];
-            let ch = match e {
-                "amp" => Some('&'),
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" => Some('\''),
-                "nbsp" => Some(' '),
-                _ if e.starts_with("#x") => u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32),
-                _ if e.starts_with('#') => e[1..].parse().ok().and_then(char::from_u32),
-                _ => None,
-            };
-            ch.map_or_else(|| c[0].to_string(), String::from)
-        })
-        .into_owned()
+    super::html::decode(s).into_owned()
 }
 
 /// Strip tags, decode entities, and collapse whitespace.
@@ -929,3 +899,4 @@ mod tests {
         assert_eq!(WebFetch.preview(&args, &ToolCtx::default()).as_deref(), Some(long.as_str()));
     }
 }
+
