@@ -326,6 +326,11 @@ impl Viewer {
         self.message = None;
     }
 
+    /// Whether the search query is being typed.
+    pub fn searching(&self) -> bool {
+        self.typing.is_some()
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if let Some(t) = &mut self.typing {

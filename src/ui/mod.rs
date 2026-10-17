@@ -5,6 +5,7 @@ pub mod clipboard;
 pub mod editor;
 mod files;
 pub mod help_menu;
+pub mod keys;
 pub mod history;
 pub mod mode_menu;
 mod highlight;
@@ -285,8 +286,10 @@ fn banner_text(version: &str) -> String {
             true,
             theme::fg(theme::GRAY),
             &format!(
-                "v{} · Run /help for commands · ctrl+l models · ctrl+d quit",
-                sanitize_text(version)
+                "v{} · Run /help for commands · {} models · {} quit",
+                sanitize_text(version),
+                keys::current().hint(keys::KeyAction::ModelMenu).unwrap_or_else(|| "/model".into()),
+                keys::current().hint(keys::KeyAction::Exit).unwrap_or_else(|| "/exit".into())
             )
         )
     )
