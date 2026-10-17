@@ -506,8 +506,9 @@ async fn run() -> Result<()> {
     let sessions_dir = home.join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
     let (user_settings, settings_warnings) = settings::load_layered(&home, &cwd);
+    let color_warnings = ui::theme::set_colors(&user_settings.theme_colors);
     settings::install(user_settings);
-    for w in settings_warnings {
+    for w in settings_warnings.into_iter().chain(color_warnings) {
         ui::error(&w);
     }
     limits::configure(&settings::current(), &cli.context_limit)?;

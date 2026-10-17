@@ -4,11 +4,14 @@
 //!
 //! The theme comes from `NYQ_THEME=light|dark`, else the `theme` setting,
 //! else the terminal background (an OSC 11 query, then `COLORFGBG`).
+//! The `theme_colors` setting replaces single roles, for both themes or one.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use nu_ansi_term::{Color, Style};
+use serde_json::{Map, Value};
 
 pub const BRIGHT: Color = Color::Rgb(238, 238, 238);
 pub const MID: Color = Color::Rgb(208, 208, 208);
@@ -20,6 +23,27 @@ pub const GREEN: Color = Color::Rgb(135, 175, 95);
 pub const BLUE: Color = Color::Rgb(95, 175, 215);
 pub const MAGENTA: Color = Color::Rgb(175, 135, 215);
 pub const ORANGE: Color = Color::Rgb(215, 135, 95);
+
+/// The roles by their `theme_colors` name.
+pub const ROLES: [(&str, Color); 10] = [
+    ("bright", BRIGHT),
+    ("mid", MID),
+    ("gray", GRAY),
+    ("faint", FAINT),
+    ("red", RED),
+    ("yellow", YELLOW),
+    ("green", GREEN),
+    ("blue", BLUE),
+    ("magenta", MAGENTA),
+    ("orange", ORANGE),
+];
+
+/// Overridden role colors, indexed by theme and then by `ROLES` position.
+type Palette = [[Option<Color>; ROLES.len()]; 2];
+
+static PALETTE: RwLock<Palette> = RwLock::new([[None; ROLES.len()]; 2]);
+/// Some role is overridden, so `PALETTE` is worth reading.
+static OVERRIDDEN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Theme {
@@ -63,6 +87,70 @@ pub fn apply_setting(setting: &str) {
     let theme = std::env::var("NYQ_THEME").ok().and_then(|v| parse(&v)).or_else(|| parse(setting)).unwrap_or(detected);
     let bits = if theme == Theme::Light { bits | LIGHT } else { bits & !LIGHT };
     MODE.store(bits, Ordering::Relaxed);
+}
+
+/// Install the `theme_colors` overrides (replacing earlier ones) and return
+/// warnings for the entries that were skipped.
+pub fn set_colors(settings: &Map<String, Value>) -> Vec<String> {
+    let (palette, warnings) = parse_colors(settings);
+    let any = palette.iter().flatten().any(Option::is_some);
+    *PALETTE.write().unwrap_or_else(|e| e.into_inner()) = palette;
+    OVERRIDDEN.store(any, Ordering::Relaxed);
+    warnings
+}
+
+/// The problems `set_colors` would report, without installing anything.
+pub fn color_warnings(settings: &Map<String, Value>) -> Vec<String> {
+    parse_colors(settings).1
+}
+
+/// The palette `theme_colors` describes: top-level roles apply to both
+/// themes, the `dark` and `light` tables win for theirs. Bad entries are
+/// skipped with a warning.
+fn parse_colors(settings: &Map<String, Value>) -> (Palette, Vec<String>) {
+    let mut palette: Palette = [[None; ROLES.len()]; 2];
+    let mut warnings = Vec::new();
+    let mut set = |path: String, role: &str, v: &Value, themes: &[Theme]| {
+        let Some(i) = ROLES.iter().position(|(name, _)| name.eq_ignore_ascii_case(role.trim())) else {
+            let names: Vec<&str> = ROLES.iter().map(|(name, _)| *name).collect();
+            return Err(format!("{path}: unknown role (one of {}) (ignored)", names.join(", ")));
+        };
+        let c = parse_color(v).ok_or_else(|| {
+            format!("{path}: expected \"#rrggbb\" or a color index 0-255, got {v} (ignored)")
+        })?;
+        for &t in themes {
+            palette[t as usize][i] = Some(c);
+        }
+        Ok(())
+    };
+    // The top level first, so the theme tables overwrite it.
+    for (role, v) in settings.iter().filter(|(k, _)| parse(k).is_none()) {
+        warnings.extend(set(format!("theme_colors.{role}"), role, v, &[Theme::Dark, Theme::Light]).err());
+    }
+    for (table, v) in settings {
+        let Some(theme) = parse(table) else { continue };
+        let Some(entries) = v.as_object() else {
+            warnings.push(format!("theme_colors.{table}: expected a table of role colors (ignored)"));
+            continue;
+        };
+        for (role, v) in entries {
+            warnings.extend(set(format!("theme_colors.{table}.{role}"), role, v, &[theme]).err());
+        }
+    }
+    (palette, warnings)
+}
+
+/// `"#rrggbb"` or an xterm color index (0-255).
+fn parse_color(v: &Value) -> Option<Color> {
+    if let Some(n) = v.as_u64() {
+        return u8::try_from(n).ok().map(Color::Fixed);
+    }
+    let hex = v.as_str()?.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Color::Rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
 /// Whether the environment promises 24-bit color.
@@ -186,9 +274,20 @@ pub fn to_256(r: u8, g: u8, b: u8) -> u8 {
 /// `c` in the active theme and color depth.
 pub fn color(c: Color) -> Color {
     let bits = MODE.load(Ordering::Relaxed);
-    let c = if bits & LIGHT != 0 { light(c) } else { c };
+    let theme = if bits & LIGHT != 0 { Theme::Light } else { Theme::Dark };
+    let truecolor = bits & NO_TRUECOLOR == 0;
+    if !OVERRIDDEN.load(Ordering::Relaxed) {
+        return resolve(c, theme, truecolor, None);
+    }
+    resolve(c, theme, truecolor, Some(&PALETTE.read().unwrap_or_else(|e| e.into_inner())))
+}
+
+/// A role's override, else its built-in color for `theme`, at the color depth.
+fn resolve(c: Color, theme: Theme, truecolor: bool, palette: Option<&Palette>) -> Color {
+    let over = palette.and_then(|p| p[theme as usize][ROLES.iter().position(|&(_, r)| r == c)?]);
+    let c = over.unwrap_or(if theme == Theme::Light { light(c) } else { c });
     match c {
-        Color::Rgb(r, g, b) if bits & NO_TRUECOLOR != 0 => Color::Fixed(to_256(r, g, b)),
+        Color::Rgb(r, g, b) if !truecolor => Color::Fixed(to_256(r, g, b)),
         c => c,
     }
 }
@@ -200,6 +299,7 @@ pub fn fg(c: Color) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn detects_backgrounds() {
@@ -233,5 +333,81 @@ mod tests {
         assert_eq!(to_256(215, 95, 95), 167);
         assert_eq!(light(BRIGHT), Color::Rgb(28, 28, 28));
         assert_eq!(light(Color::Green), Color::Green);
+    }
+
+    fn colors(v: Value) -> (Palette, Vec<String>) {
+        parse_colors(v.as_object().unwrap())
+    }
+
+    fn role(name: &str) -> usize {
+        ROLES.iter().position(|(n, _)| *n == name).unwrap()
+    }
+
+    #[test]
+    fn parses_role_colors() {
+        assert_eq!(parse_color(&json!("#5fAFd7")), Some(Color::Rgb(95, 175, 215)));
+        assert_eq!(parse_color(&json!(" #000000 ")), Some(Color::Rgb(0, 0, 0)));
+        assert_eq!(parse_color(&json!(208)), Some(Color::Fixed(208)));
+        for bad in [json!("5fafd7"), json!("#5faf"), json!("#5fafzz"), json!(256), json!(-1), json!(1.5), json!(true)] {
+            assert_eq!(parse_color(&bad), None, "{bad}");
+        }
+        let (p, warnings) = colors(json!({"blue": "#5fafd7", "red": 160}));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        for t in [Theme::Dark, Theme::Light] {
+            assert_eq!(p[t as usize][role("blue")], Some(Color::Rgb(95, 175, 215)));
+            assert_eq!(p[t as usize][role("red")], Some(Color::Fixed(160)));
+        }
+    }
+
+    #[test]
+    fn theme_tables_win_over_the_top_level() {
+        let (p, warnings) = colors(json!({
+            "light": {"blue": "#005f87", "green": 28},
+            "blue": "#5fafd7",
+            "dark": {"faint": "#444444"},
+        }));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let check = |theme, c, want| assert_eq!(resolve(c, theme, true, Some(&p)), want, "{theme:?} {c:?}");
+        check(Theme::Dark, BLUE, Color::Rgb(95, 175, 215));
+        check(Theme::Light, BLUE, Color::Rgb(0, 95, 135));
+        check(Theme::Light, GREEN, Color::Fixed(28));
+        check(Theme::Dark, GREEN, GREEN);
+        check(Theme::Dark, FAINT, Color::Rgb(68, 68, 68));
+        // Unset roles keep their built-in colors; other colors pass through.
+        check(Theme::Light, FAINT, light(FAINT));
+        check(Theme::Light, Color::Green, Color::Green);
+        assert_eq!(resolve(BLUE, Theme::Light, true, None), light(BLUE));
+    }
+
+    #[test]
+    fn overrides_fall_back_to_256_colors() {
+        let (p, _) = colors(json!({"blue": "#d75f5f", "red": 9}));
+        assert_eq!(resolve(BLUE, Theme::Dark, false, Some(&p)), Color::Fixed(167));
+        assert_eq!(resolve(RED, Theme::Light, false, Some(&p)), Color::Fixed(9));
+        assert_eq!(resolve(GRAY, Theme::Dark, false, Some(&p)), Color::Fixed(245));
+    }
+
+    #[test]
+    fn bad_entries_warn_and_are_skipped() {
+        let (p, warnings) = colors(json!({
+            "blu": "#5fafd7",
+            "red": "crimson",
+            "green": "#00af00",
+            "light": 3,
+            "dark": {"blue": 300, "purple": 250, "Mid": 250},
+        }));
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
+        for start in [
+            "theme_colors.blu: unknown role",
+            "theme_colors.red: expected",
+            "theme_colors.light: expected a table",
+            "theme_colors.dark.blue: expected",
+            "theme_colors.dark.purple: unknown role",
+        ] {
+            assert!(warnings.iter().any(|w| w.starts_with(start)), "{start}: {warnings:?}");
+        }
+        assert_eq!(p.iter().flatten().filter(|c| c.is_some()).count(), 3);
+        assert_eq!(p[Theme::Light as usize][role("green")], Some(Color::Rgb(0, 175, 0)));
+        assert_eq!(color_warnings(&Map::new()), Vec::<String>::new());
     }
 }
