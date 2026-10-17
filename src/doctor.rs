@@ -351,6 +351,13 @@ pub async fn doctor(
         settings_warning.unwrap_or_else(|| "settings.json parses (or is absent)".into()),
         "fix settings.json; nyq uses the defaults until then",
     ));
+    let (_, key_warnings) = crate::ui::keys::load(home);
+    checks.push(info(
+        "keybindings",
+        key_warnings.is_empty(),
+        if key_warnings.is_empty() { "keybindings.toml parses (or is absent)".into() } else { key_warnings.join("; ") },
+        "fix keybindings.toml; nyq skips the entries it warned about",
+    ));
     checks.push(sessions_check(facts.sessions_dir));
     let (steps, steps_source) = crate::agent::step_limit();
     checks.push(info(
