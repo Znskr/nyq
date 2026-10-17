@@ -2529,8 +2529,11 @@ for line in sys.stdin:
                     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
                     if head.starts_with("GET /sse") {
                         let open = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /messages?session=1\n\n";
+                        // Hold the lock until the stream is stored: the client may
+                        // POST as soon as it sees the endpoint event.
+                        let mut slot = stream.lock().await;
                         let _ = sock.write_all(open).await;
-                        *stream.lock().await = Some(sock);
+                        *slot = Some(sock);
                         return;
                     }
                     if !head.starts_with("POST /messages") {
