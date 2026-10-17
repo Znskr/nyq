@@ -183,7 +183,18 @@ const SKILLS: &[ArgOption] = &[
     ("remove", "remove an installed skill: remove NAME", true),
     ("info", "show a skill: info NAME", true),
     ("create", "create a skill: create NAME [--project]", true),
+    ("disable", "turn a skill off (disabled_skills): disable NAME", true),
+    ("enable", "turn a skill back on: enable NAME", true),
+    ("copy", "copy into nyq's skills: copy NAME [--project] [--force]", true),
     ("path", "where skills are installed", false),
+];
+const TOOLS: &[ArgOption] = &[
+    ("list", "every tool with its state", false),
+    ("info", "description and parameters: info NAME", true),
+    ("disable", "turn a tool off (disabled_tools): disable NAME", true),
+    ("enable", "turn a tool back on: enable NAME", true),
+    ("trust", "always allow it (permissions.json): trust NAME", true),
+    ("untrust", "stop always allowing it: untrust NAME", true),
 ];
 const MCP: &[ArgOption] = &[
     ("list", "servers, state and tools", false),
@@ -269,6 +280,7 @@ pub fn arg_options(cmd: &str, prior: &[&str]) -> &'static [ArgOption] {
         ("/allowlist", ["remove"]) => ALLOWLIST_KINDS,
         ("/allowlist", ["reset"] | ["local" | "user", "reset"]) => ALLOWLIST_RESET,
         ("/skills", []) => SKILLS,
+        ("/tools", []) if crate::config::debug() => TOOLS,
         ("/mcp", []) => MCP,
         ("/mcp", ["trust"]) => MCP_TRUST,
         ("/mcp", ["resource" | "resources"]) => MCP_RESOURCE,

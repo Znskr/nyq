@@ -7,9 +7,11 @@ pub mod editor;
 mod files;
 pub mod help_menu;
 pub mod keys;
+pub mod menu;
 pub mod history;
 pub mod mode_menu;
 pub mod skills_menu;
+pub mod tools_menu;
 mod highlight;
 mod render;
 pub mod theme;
@@ -28,6 +30,23 @@ use crate::tools::ToolOutput;
 use crate::types::{Item, StreamEvent};
 pub(crate) use render::one_line;
 use render::{dim, paint, sanitize_text};
+
+/// Whether an interactive menu can open: the TUI runs and stdin and stdout
+/// are terminals. Every menu entry point asks this; elsewhere (piped input,
+/// `-p`, editors over ACP, CI) commands print text instead.
+pub fn menus_available() -> bool {
+    tui::active().is_some() && io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// When no menu can open: print `hint` (the subcommands that do the same)
+/// and return false.
+pub fn menu_or_hint(hint: &str) -> bool {
+    let ok = menus_available();
+    if !ok {
+        info(hint);
+    }
+    ok
+}
 
 fn color_err() -> bool {
     std::env::var_os("NO_COLOR").is_none() && io::stderr().is_terminal()
@@ -330,6 +349,13 @@ pub fn error(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_menus_without_the_tui_and_a_terminal() {
+        // Tests run without the TUI (and usually without a terminal).
+        assert!(!menus_available());
+        assert!(!menu_or_hint("  use /skills list"));
+    }
 
     #[test]
     fn run_record_tracks_the_final_answer_and_tool_results() {

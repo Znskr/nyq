@@ -32,6 +32,9 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/trace", "write a redacted diagnostic trace and copy its path"),
 ];
 
+/// What `/settings` and `/statusline` say where their menu can't open.
+const SETTINGS_HINT: &str = "  The settings menu needs a terminal: edit ~/.nyq/settings.toml, or use /statusline SEGMENT, /sound, /notifications, /fast or /permissions MODE.";
+
 /// A command's description with `{key}` replaced by the key bound to its
 /// action; when the action is unbound the parenthetical naming it is dropped.
 pub fn describe(cmd: &str, description: &str) -> String {
@@ -200,7 +203,8 @@ pub async fn permissions(agent: &mut Agent, tui: &Tui, home: &Path, args: &[&str
             apply_mode(home, agent, crate::permissions::Mode::Ask);
             ui::info("  Forgot this session's grants and rules.");
         }
-        [] => tui.screen().open_permission_modes(),
+        [] if ui::menus_available() => tui.screen().open_permission_modes(),
+        [] => list_rules(agent),
         ["reload"] => {
             let (perms, warnings) = crate::permissions::Permissions::load(home, &agent.cwd);
             for warning in &warnings {
@@ -283,8 +287,10 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
         templates,
     } = ctx;
     match cmd {
-        "/settings" => tui.screen().open_settings(Category::All),
-        "/statusline" if args.is_empty() => tui.screen().open_settings(Category::StatusLine),
+        "/settings" if ui::menu_or_hint(SETTINGS_HINT) => tui.screen().open_settings(Category::All),
+        "/settings" => {}
+        "/statusline" if args.is_empty() && ui::menu_or_hint(SETTINGS_HINT) => tui.screen().open_settings(Category::StatusLine),
+        "/statusline" if args.is_empty() => {}
         "/statusline" => {
             let mut changes = Vec::new();
             for a in args {

@@ -58,6 +58,24 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     result.with_context(|| format!("writing {}", path.display()))
 }
 
+static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn on developer-only features for this run (`--debug` or `NYQ_DEBUG=1`).
+pub fn set_debug(on: bool) {
+    DEBUG.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether developer-only features (for now the `/tools` menu) are shown.
+pub fn debug() -> bool {
+    DEBUG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `NYQ_DEBUG` set to anything but empty, `0`, `false` or `off`.
+pub fn debug_from_env() -> bool {
+    std::env::var("NYQ_DEBUG")
+        .is_ok_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no"))
+}
+
 pub fn home() -> PathBuf {
     if let Some(h) = std::env::var_os("NYQ_HOME") {
         return PathBuf::from(h);
