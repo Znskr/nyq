@@ -367,6 +367,17 @@ pub async fn doctor(
         },
         "check the names in disabled_tools against /tools",
     ));
+    let color_warnings = crate::ui::theme::color_warnings(&crate::settings::current().theme_colors);
+    checks.push(info(
+        "theme colors",
+        color_warnings.is_empty(),
+        if color_warnings.is_empty() {
+            "theme_colors valid (or unset)".into()
+        } else {
+            color_warnings.join("; ")
+        },
+        "fix theme_colors; the entries listed keep their built-in colors",
+    ));
     checks.push(sessions_check(facts.sessions_dir));
     let (steps, steps_source) = crate::agent::step_limit();
     checks.push(info(
