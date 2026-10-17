@@ -6,7 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nu_ansi_term::{Color, Style};
 use unicode_width::UnicodeWidthChar;
 
-use super::theme::{color, fg, BRIGHT, FAINT, GRAY, MID, RED, YELLOW};
+use super::chrome::{self, Mark};
+use super::theme::{fg, on, BRIGHT, FAINT, GRAY, MID, RED, YELLOW};
 use super::render::{looks_like_diff, numbered_diff, sanitize_text, strip_ansi, truncate, visible_width, wrap_row, Markdown};
 
 /// Tool output kept per call.
@@ -156,8 +157,8 @@ pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
         }
         match e {
             Entry::User(t) => {
-                let bar = paint(fg(BRIGHT), "┃ ");
-                block(&mut rows, t.trim(), width, &bar, &bar, Style::new().bold());
+                let lead = format!("{} ", paint(fg(chrome::ACCENT).bold(), "›"));
+                block(&mut rows, t.trim(), width, &lead, "  ", fg(BRIGHT).bold());
             }
             Entry::Assistant(t) => {
                 let mut md = Markdown::default();
@@ -175,7 +176,12 @@ pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
                 block(&mut rows, t.trim(), width, "  ", "  ", fg(GRAY).italic());
             }
             Entry::Tool { name, summary, output, display, is_error } => {
-                let head = format!("{} {}", paint(fg(if *is_error { RED } else { BRIGHT }), "●"), paint(fg(BRIGHT), name));
+                let mark = match (output, is_error) {
+                    (None, _) => Mark::Running,
+                    (Some(_), true) => Mark::Failed,
+                    (Some(_), false) => Mark::Ok,
+                };
+                let head = format!("{} {}", chrome::mark(mark, 0), paint(fg(if *is_error { RED } else { BRIGHT }), name));
                 let summary = sanitize_text(summary).replace('\n', " ");
                 let room = width.saturating_sub(visible_width(&head) + 1);
                 rows.push(format!("{head} {}", paint(fg(GRAY), &truncate(&summary, room))));
@@ -217,7 +223,7 @@ pub fn find_matches(plain: &[String], query: &str) -> Vec<usize> {
 fn highlight(row: &str, query: &str, current: bool) -> String {
     let lower = row.to_lowercase();
     let q = query.to_lowercase();
-    let hit = if current { fg(Color::Black).on(color(YELLOW)) } else { Style::new().reverse() };
+    let hit = if current { on(fg(Color::Black), YELLOW) } else { Style::new().reverse() };
     if q.is_empty() || lower.len() != row.len() {
         return paint(hit, row);
     }
@@ -463,7 +469,8 @@ mod tests {
     #[test]
     fn rendering_expands_tool_output() {
         let rows: Vec<String> = render(&log().entries, 40, false).iter().map(|r| strip_ansi(r)).collect();
-        assert!(rows.iter().any(|r| r == "┃ find the bug"), "{rows:?}");
+        assert!(rows.iter().any(|r| r == "› find the bug"), "{rows:?}");
+        assert!(rows.iter().any(|r| r == "✓ bash cargo test"), "{rows:?}");
         assert!(rows.iter().any(|r| r == "  │ NEEDLE here"), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("Looking at main.")), "{rows:?}");
         assert!(rows.iter().any(|r| r == "  Thinking about it"), "{rows:?}");

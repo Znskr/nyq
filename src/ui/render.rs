@@ -1,11 +1,11 @@
 //! Pure text renderers: markdown-lite lines and colored diffs. Every function
 //! takes a `color` flag; with `color == false` the input text is preserved.
 
-use nu_ansi_term::{Color, Style};
+use nu_ansi_term::Style;
 use unicode_width::UnicodeWidthChar;
 
 use super::highlight::Code;
-use super::theme::{fg, BLUE, BRIGHT, FAINT, GRAY, MID};
+use super::theme::{fg, BLUE, BRIGHT, FAINT, GRAY, GREEN, MID, RED};
 
 
 pub fn dim() -> Style {
@@ -449,7 +449,7 @@ pub fn continuation(row: &str) -> String {
                 out.push(c);
                 c.len_utf8()
             }
-            '•' | '-' | '*' | '+' if !marker && then(c.len_utf8()) == Some(' ') => {
+            '•' | '›' | '-' | '*' | '+' if !marker && then(c.len_utf8()) == Some(' ') => {
                 marker = true;
                 out.push(' ');
                 c.len_utf8()
@@ -624,7 +624,7 @@ pub fn capped<'a>(
     out
 }
 
-/// Colorize a unified diff (+ green, - red, @@ cyan). File header lines
+/// Colorize a unified diff (+ green, - red, @@ blue). File header lines
 /// before the first hunk are dropped when hunks are present.
 pub fn diff(text: &str, color: bool, max: usize, width: usize, indent: &str) -> String {
     let has_hunks = text.lines().any(|l| l.starts_with("@@"));
@@ -637,11 +637,11 @@ pub fn diff(text: &str, color: bool, max: usize, width: usize, indent: &str) -> 
         let style = if l.starts_with("+++ ") || l.starts_with("--- ") {
             Style::new().bold()
         } else if l.starts_with('+') {
-            Style::new().fg(Color::Green)
+            fg(GREEN)
         } else if l.starts_with('-') {
-            Style::new().fg(Color::Red)
+            fg(RED)
         } else if l.starts_with("@@") {
-            Style::new().fg(Color::Cyan)
+            fg(BLUE)
         } else if l.starts_with('\\') {
             dim()
         } else {
@@ -696,15 +696,17 @@ pub fn numbered_diff(text: &str, color: bool, width: usize, indent: &str) -> Vec
         .map(|l| match l {
             None => format!("{indent}{}", paint(color, fg(FAINT), &format!("{:>gutter$}", "⋯"))),
             Some((n, sign, t)) => {
+                // The sign sits in the gutter, bold; the line keeps its color.
                 let style = match sign {
-                    '+' => Style::new().fg(Color::Green),
-                    '-' => Style::new().fg(Color::Red),
+                    '+' => fg(GREEN),
+                    '-' => fg(RED),
                     _ => fg(GRAY),
                 };
                 format!(
-                    "{indent}{} {}",
+                    "{indent}{} {}{}",
                     paint(color, fg(FAINT), &format!("{n:>gutter$}")),
-                    paint(color, style, &format!("{sign} {}", truncate(t.trim_end_matches('\r'), room)))
+                    paint(color, style.bold(), &format!("{sign} ")),
+                    paint(color, style, &truncate(t.trim_end_matches('\r'), room))
                 )
             }
         })
@@ -825,6 +827,7 @@ mod tests {
         let rows: Vec<String> = wrap_row(&quote, 16).iter().map(|r| strip_ansi(r)).collect();
         assert_eq!(rows, ["│ │ one two", "│ │ three four", "│ │ five six"]);
         assert_eq!(strip_ansi(&continuation("  12. item")), "      ");
+        assert_eq!(strip_ansi(&continuation(&format!("{} text", fg(BLUE).paint("›")))), "  ");
         assert_eq!(continuation("plain"), "");
         // Links reopen on the next row and long words hard-wrap.
         let rows = wrap_styled(&link("https://a.b", "aaaa bbbb"), 6, "");
@@ -840,7 +843,8 @@ mod tests {
         let rows: Vec<String> = numbered_diff(d, true, 40, "  ").iter().map(|r| strip_ansi(r)).collect();
         assert_eq!(rows, ["    8   ctx", "    9 - old", "    9 + new", "   10   ctx2", "    ⋯", "  120 - a", "  120 + b"]);
         let colored = numbered_diff(d, true, 40, "");
-        assert!(colored[1].contains(&Color::Red.paint("- old").to_string()), "{colored:?}");
+        assert!(colored[1].contains(&fg(RED).paint("old").to_string()), "{colored:?}");
+        assert!(colored[1].contains(&fg(RED).bold().paint("- ").to_string()), "{colored:?}");
         assert!(numbered_diff(&format!("@@ -1 +1 @@\n+{}", "x".repeat(99)), false, 20, "").iter().all(|r| visible_width(r) <= 20));
         assert_eq!(numbered_diff("not a diff", false, 40, ""), ["not a diff"]);
     }
@@ -856,9 +860,9 @@ mod tests {
         let d = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new";
         let out = diff(d, true, 60, usize::MAX, "  ");
         assert!(!out.contains("a/x")); // header dropped
-        assert!(out.contains(&Color::Green.paint("+new").to_string()));
-        assert!(out.contains(&Color::Red.paint("-old").to_string()));
-        assert!(out.contains(&Color::Cyan.paint("@@ -1,2 +1,2 @@").to_string()));
+        assert!(out.contains(&fg(GREEN).paint("+new").to_string()));
+        assert!(out.contains(&fg(RED).paint("-old").to_string()));
+        assert!(out.contains(&fg(BLUE).paint("@@ -1,2 +1,2 @@").to_string()));
         assert_eq!(diff(d, false, 60, usize::MAX, ""), "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n");
         let long: String = (0..100).map(|i| format!("+{i}\n")).collect();
         let out = diff(&long, false, 60, usize::MAX, "");
