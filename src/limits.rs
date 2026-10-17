@@ -14,7 +14,7 @@ pub const LIMITS: &[(&str, Option<usize>, &str)] = &[
     ("mcp_description_bytes", None, "each MCP tool description"),
     ("mcp_content_block_bytes", Some(8 * 1024), "each text block of an MCP prompt or resource"),
     ("mcp_content_total_bytes", Some(32 * 1024), "a whole MCP prompt or resource"),
-    ("project_instruction_file_bytes", None, "each project instruction file (AGENTS.md, ...)"),
+    ("project_instruction_file_bytes", None, "each project instruction or prompt file (AGENTS.md, system.md, ...)"),
     ("project_instructions_total_bytes", None, "all project instructions together"),
 ];
 
