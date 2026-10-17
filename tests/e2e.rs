@@ -506,7 +506,7 @@ fn print_mode_runs_user_hooks_but_not_untrusted_project_hooks() {
 fn print_mode_ignores_a_saved_yolo_mode() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("settings.json"), r#"{"permission_mode":"yolo"}"#).unwrap();
+    std::fs::write(home.path().join("settings.toml"), "permission_mode = \"yolo\"\n").unwrap();
     let write_call = delta(json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
         "function": {"name": "write_file", "arguments": "{\"path\":\"x.txt\",\"content\":\"x\"}"}}]}));
     let (url, _seen) = fake_server(vec![vec![write_call], vec![delta(json!({"content": "Okay."}))]]);
@@ -535,7 +535,7 @@ fn acp_ignores_saved_yolo_unless_explicit() {
     ] {
         let work = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("settings.json"), r#"{"permission_mode":"yolo"}"#).unwrap();
+        std::fs::write(home.path().join("settings.toml"), "permission_mode = \"yolo\"\n").unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_nyq"));
         cmd.args(["acp", "--sandbox", "off", "--provider", "openai"]).args(flags)
             .current_dir(work.path()).env("NYQ_HOME", home.path()).env("HOME", home.path())

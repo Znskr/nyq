@@ -74,7 +74,7 @@ fn item_event(item: &Item) -> Value {
 }
 
 /// Settings with secret-looking values removed (e.g. an `api_key` someone
-/// put in settings.json).
+/// put in settings.toml).
 fn scrub(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
