@@ -199,7 +199,7 @@ fn gh_token() -> Option<String> {
 
 impl Github {
     pub(crate) fn new(timeout: Duration) -> Result<Github> {
-        let client = reqwest::Client::builder()
+        let client = crate::http::builder()
             .user_agent(crate::config::USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout)

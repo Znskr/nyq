@@ -187,7 +187,7 @@ async fn login_with_issuer(
         ("code_verifier", &verifier),
     ]);
 
-    let response = reqwest::Client::builder()
+    let response = crate::http::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?
         .post(format!("{}/oauth/token", issuer.trim_end_matches('/')))

@@ -215,10 +215,10 @@ fn loopback_http(url: &str) -> bool {
 }
 
 fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| crate::http::client())
 }
 
 fn form(pairs: &[(&str, &str)]) -> String {
@@ -1354,7 +1354,7 @@ mod tests {
                 let state = pairs["state"].clone();
                 let origin = redirect.trim_end_matches("/callback").to_owned();
                 let handle = tokio::spawn(async move {
-                    let client = reqwest::Client::new();
+                    let client = crate::http::client();
                     let favicon = client.get(format!("{origin}/favicon.ico")).send().await.unwrap();
                     assert_eq!(favicon.status(), 404);
                     let preflight = client
