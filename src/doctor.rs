@@ -348,9 +348,18 @@ pub async fn doctor(
     checks.push(info(
         "settings",
         settings_warning.is_none(),
-        settings_warning.unwrap_or_else(|| "settings.json parses (or is absent)".into()),
-        "fix settings.json; nyq uses the defaults until then",
+        settings_warning.unwrap_or_else(|| "settings.toml parses (or is absent)".into()),
+        "fix settings.toml; nyq uses the defaults until then",
     ));
+    let notes = crate::settings::file::notes(home, cwd);
+    if !notes.is_empty() {
+        checks.push(info(
+            "settings files",
+            false,
+            notes.join("; "),
+            "convert a project settings.json to TOML; delete an ignored one once no older nyq needs it",
+        ));
+    }
     checks.push(sessions_check(facts.sessions_dir));
     let (steps, steps_source) = crate::agent::step_limit();
     checks.push(info(
