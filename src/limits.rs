@@ -1,5 +1,5 @@
 //! Prompt-budget limits: how much skill, MCP and project text goes to the
-//! model. Each has a default; `context_limits` in settings.json and
+//! model. Each has a default; `context_limits` in settings.toml and
 //! `--context-limit NAME=BYTES|off` (highest) override it for a run.
 
 use std::sync::Mutex;
@@ -76,12 +76,12 @@ fn build(settings: &crate::settings::Settings, flags: &[String]) -> Result<Overr
     let mut out = Vec::new();
     if let Some(map) = settings.extra.get("context_limits").and_then(Value::as_object) {
         for (name, value) in map {
-            let name = known(name).context("settings.json context_limits")?;
+            let name = known(name).context("settings.toml context_limits")?;
             let limit = match value {
                 Value::Number(n) => parse_value(name, &n.to_string())?,
                 Value::String(s) => parse_value(name, s)?,
                 Value::Null => None,
-                other => bail!("settings.json context_limits.{name}: unexpected value {other}"),
+                other => bail!("settings.toml context_limits.{name}: unexpected value {other}"),
             };
             out.push((name, limit, Source::Settings));
         }

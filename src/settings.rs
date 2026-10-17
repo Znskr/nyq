@@ -1,13 +1,18 @@
-//! User settings in `<home>/settings.json` and the catalog the `/settings`
+//! User settings in `<home>/settings.toml` and the catalog the `/settings`
 //! menu shows. Saving merges into the existing file, so keys other parts of
-//! nyq read (`provider`, `models`) and unknown keys survive.
+//! nyq read (`provider`, `models`) and unknown keys survive. Reading and
+//! writing the files is in [`file`].
+
+pub mod file;
 
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use file::write_changes;
 
 /// Footer segments that `/statusline` toggles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,8 +310,8 @@ pub fn update(
 
 // ------------------------------------------------------------------ layers
 
-/// A settings layer above the user's `settings.json`. Later layers win:
-/// the user file, then the project's `.nyq/settings.json`, then the user's
+/// A settings layer above the user's `settings.toml`. Later layers win:
+/// the user file, then the project's `.nyq/settings.toml`, then the user's
 /// override for this workspace (`workspaces.<path>` in the user file).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
@@ -324,8 +329,8 @@ impl Layer {
 
     fn describe(self) -> &'static str {
         match self {
-            Layer::Project => ".nyq/settings.json",
-            Layer::Workspace => "workspaces in settings.json",
+            Layer::Project => ".nyq/settings.toml",
+            Layer::Workspace => "workspaces in settings.toml",
         }
     }
 }
@@ -421,27 +426,6 @@ fn diff(old: &Value, new: &Value, path: &mut Vec<String>, out: &mut Vec<(Vec<Str
     }
 }
 
-/// Apply changed paths to the user file, keeping everything else in it.
-fn write_changes(home: &Path, changes: &[(Vec<String>, Option<Value>)]) -> Result<()> {
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let path = home.join("settings.json");
-    let mut file = match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-    {
-        Some(v @ Value::Object(_)) => v,
-        _ => Value::Object(Map::new()),
-    };
-    for (p, v) in changes {
-        set_path(&mut file, p, v.clone());
-    }
-    let bytes = serde_json::to_vec_pretty(&file)?;
-    crate::session::write_private(&path, &bytes)
-        .with_context(|| format!("writing {}", path.display()))
-}
-
 fn merge(into: &mut Map<String, Value>, over: &Map<String, Value>) {
     for (k, v) in over {
         match (into.get_mut(k), v) {
@@ -450,18 +434,6 @@ fn merge(into: &mut Map<String, Value>, over: &Map<String, Value>) {
                 into.insert(k.clone(), v.clone());
             }
         }
-    }
-}
-
-fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(t) => match serde_json::from_str::<Value>(&t) {
-            Ok(Value::Object(m)) => Ok(m),
-            Ok(_) => Err(format!("{}: expected a JSON object", path.display())),
-            Err(e) => Err(format!("{}: {e}", path.display())),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
-        Err(e) => Err(format!("reading {}: {e}", path.display())),
     }
 }
 
@@ -489,15 +461,22 @@ fn workspace_overrides(user: &Map<String, Value>, cwd: &Path) -> Map<String, Val
 /// Problems come back as warnings; a broken layer is skipped.
 pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
     let mut warnings = Vec::new();
-    let mut read = |path: &Path| {
-        read_object(path).unwrap_or_else(|e| {
-            warnings.push(format!("{e} (ignored)"));
-            Map::new()
-        })
-    };
-    let user = read(&home.join("settings.json"));
-    let project_path = cwd.join(".nyq").join("settings.json");
-    let mut project = read(&project_path);
+    let user = file::read_user(home).unwrap_or_else(|e| {
+        warnings.push(format!("{e} (ignored)"));
+        Map::new()
+    });
+    let project_path = file::project_path(cwd);
+    let mut project = file::read(&project_path).unwrap_or_else(|e| {
+        warnings.push(format!("{e} (ignored)"));
+        Map::new()
+    });
+    if file::is_legacy(&project_path) && project_path.exists() {
+        warnings.push(format!(
+            "{}: the old format, still read for now; convert it to .nyq/{}",
+            project_path.display(),
+            file::FILE
+        ));
+    }
     let mut workspace = workspace_overrides(&user, cwd);
     let ignored: Vec<String> = project
         .keys()
@@ -507,7 +486,7 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
     if !ignored.is_empty() {
         project.retain(|k, _| PROJECT_KEYS.contains(&k.as_str()));
         warnings.push(format!(
-            "{}: ignored {} (only your own settings.json may set these)",
+            "{}: ignored {} (only your own settings.toml may set these)",
             project_path.display(),
             ignored.join(", ")
         ));
@@ -517,7 +496,7 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
     merge(&mut merged, &workspace);
     let settings = serde_json::from_value(Value::Object(merged))
         .or_else(|e| {
-            warnings.push(format!("project or workspace settings: {e} (using your settings.json)"));
+            warnings.push(format!("project or workspace settings: {e} (using your settings.toml)"));
             // The layers are unusable: none of them may be reported as the
             // source of a value or shadow a later change.
             project.clear();
@@ -525,7 +504,7 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
             serde_json::from_value(Value::Object(user))
         })
         .unwrap_or_else(|e| {
-            warnings.push(format!("settings.json: {e} (using default settings)"));
+            warnings.push(format!("{}: {e} (using default settings)", file::FILE));
             Settings::default()
         });
     *OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()) = Some(Overrides { project, workspace });
@@ -556,26 +535,18 @@ pub fn source(id: Id) -> Option<Layer> {
     overrides().layer(&path)
 }
 
-/// Read `<home>/settings.json`. Problems are returned as a warning and the
-/// defaults are used.
+/// Read the user's settings file. Problems are returned as a warning and
+/// the defaults are used.
 pub fn load(home: &Path) -> (Settings, Option<String>) {
-    let path = home.join("settings.json");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), None),
-        Err(e) => {
-            return (
+    match file::read_user(home) {
+        Ok(map) => match serde_json::from_value::<Settings>(Value::Object(map)) {
+            Ok(s) => (s, None),
+            Err(e) => (
                 Settings::default(),
-                Some(format!("reading {}: {e}", path.display())),
-            )
-        }
-    };
-    match serde_json::from_str::<Settings>(&text) {
-        Ok(s) => (s, None),
-        Err(e) => (
-            Settings::default(),
-            Some(format!("{}: {e} (using default settings)", path.display())),
-        ),
+                Some(format!("{}: {e} (using default settings)", file::user_path(home).display())),
+            ),
+        },
+        Err(e) => (Settings::default(), Some(format!("{e} (using default settings)"))),
     }
 }
 
@@ -907,26 +878,28 @@ mod tests {
         write_changes(home, &changes)
     }
 
+    /// The user file as JSON.
+    fn user_file(home: &Path) -> Value {
+        Value::Object(file::read_user(home).unwrap())
+    }
+
     #[test]
     fn project_and_workspace_layers() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let ws = cwd.path().canonicalize().unwrap();
         std::fs::write(
-            home.path().join("settings.json"),
-            serde_json::json!({
-                "sound": "on",
-                "auto_compact": 70,
-                "statusline": {"tokens": false},
-                "workspaces": {ws.to_string_lossy(): {"auto_compact": 50}}
-            })
-            .to_string(),
+            home.path().join("settings.toml"),
+            format!(
+                "sound = \"on\"\nauto_compact = 70\n\n[statusline]\ntokens = false\n\n[workspaces.{:?}]\nauto_compact = 50\n",
+                ws.to_string_lossy()
+            ),
         )
         .unwrap();
         std::fs::create_dir_all(cwd.path().join(".nyq")).unwrap();
         std::fs::write(
-            cwd.path().join(".nyq/settings.json"),
-            r#"{"sound": "max", "auto_compact": 60, "statusline": {"branch": false}, "permission_mode": "yolo"}"#,
+            cwd.path().join(".nyq/settings.toml"),
+            "sound = \"max\"\nauto_compact = 60\nstatusline = { branch = false }\npermission_mode = \"yolo\"\n",
         )
         .unwrap();
         let (s, warnings) = load_layered(home.path(), cwd.path());
@@ -951,8 +924,7 @@ mod tests {
         diff(&serde_json::to_value(&s).unwrap(), &serde_json::to_value(&next).unwrap(), &mut Vec::new(), &mut changes);
         assert_eq!(changes.len(), 2);
         write_changes(home.path(), &changes).unwrap();
-        let raw: Value =
-            serde_json::from_slice(&std::fs::read(home.path().join("settings.json")).unwrap()).unwrap();
+        let raw = user_file(home.path());
         assert_eq!(raw["sound"], "off");
         assert_eq!(raw["notifications"], true);
         assert_eq!(raw["auto_compact"], 70, "layer values stay out of the user file");
@@ -960,7 +932,7 @@ mod tests {
         assert_eq!(o.layer(&["sound".to_string()]), Some(Layer::Project));
         assert_eq!(o.layer(&["notifications".to_string()]), None);
         // A broken project file is skipped with a warning.
-        std::fs::write(cwd.path().join(".nyq/settings.json"), "{").unwrap();
+        std::fs::write(cwd.path().join(".nyq/settings.toml"), "sound = ").unwrap();
         let (s, warnings) = load_layered(home.path(), cwd.path());
         assert_eq!((s.sound.as_str(), s.auto_compact), ("off", 50));
         assert_eq!(warnings.len(), 1);
@@ -968,16 +940,13 @@ mod tests {
         // A workspace layer with an unusable value is dropped entirely: the
         // user file applies, no layer is reported as a value's source, and a
         // later change is not reverted as shadowed.
-        std::fs::write(cwd.path().join(".nyq/settings.json"), r#"{"sound": "max"}"#).unwrap();
+        std::fs::write(cwd.path().join(".nyq/settings.toml"), "sound = \"max\"\n").unwrap();
         std::fs::write(
-            home.path().join("settings.json"),
-            serde_json::json!({
-                "sound": "on",
-                "auto_compact": 70,
-                "statusline": {"tokens": false},
-                "workspaces": {ws.to_string_lossy(): {"sound": 5}}
-            })
-            .to_string(),
+            home.path().join("settings.toml"),
+            format!(
+                "sound = \"on\"\nauto_compact = 70\nstatusline = {{ tokens = false }}\nworkspaces = {{ {:?} = {{ sound = 5 }} }}\n",
+                ws.to_string_lossy()
+            ),
         )
         .unwrap();
         let (s, warnings) = load_layered(home.path(), cwd.path());
@@ -990,9 +959,17 @@ mod tests {
         let (effective, notice) = update(home.path(), |s| s.sound = "off".into()).unwrap();
         assert_eq!(effective.sound, "off");
         assert!(notice.is_none(), "{notice:?}");
-        let raw: Value =
-            serde_json::from_slice(&std::fs::read(home.path().join("settings.json")).unwrap()).unwrap();
-        assert_eq!(raw["sound"], "off");
+        assert_eq!(user_file(home.path())["sound"], "off");
+
+        // A legacy project settings.json is still read, with a hint to convert it.
+        std::fs::write(home.path().join("settings.toml"), "sound = \"off\"\n").unwrap();
+        std::fs::remove_file(cwd.path().join(".nyq/settings.toml")).unwrap();
+        std::fs::write(cwd.path().join(".nyq/settings.json"), r#"{"sound": "max"}"#).unwrap();
+        let (s, warnings) = load_layered(home.path(), cwd.path());
+        assert_eq!(s.sound, "max");
+        assert!(warnings.iter().any(|w| w.contains("convert it to .nyq/settings.toml")), "{warnings:?}");
+        assert_eq!(source(Id::Sound), Some(Layer::Project));
+        assert!(!cwd.path().join(".nyq/settings.toml").exists(), "nyq never writes into the project");
         *CURRENT.lock().unwrap() = None;
         *OVERRIDES.lock().unwrap() = None;
     }
@@ -1001,8 +978,8 @@ mod tests {
     fn save_merges_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join("settings.json"),
-            r#"{"provider":"codex","models":{"codex":"m"},"custom":1}"#,
+            dir.path().join("settings.toml"),
+            "# mine\nprovider = \"codex\"\ncustom = 1\n\n[models]\ncodex = \"m\" # pinned\n",
         )
         .unwrap();
         let (mut s, warn) = load(dir.path());
@@ -1013,27 +990,24 @@ mod tests {
         s.statusline.set(Segment::Branch, false);
         s.effort = Some("high".into());
         save(dir.path(), &s).unwrap();
-        let raw: Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap())
-                .unwrap();
+        let raw = user_file(dir.path());
         assert_eq!(raw["provider"], "codex");
         assert_eq!(raw["models"]["codex"], "m");
         assert_eq!(raw["custom"], 1);
         assert_eq!(raw["statusline"]["branch"], false);
         assert_eq!(raw["effort"], "high");
+        let text = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+        assert!(text.starts_with("# mine\n") && text.contains("codex = \"m\" # pinned"), "{text}");
         let (back, _) = load(dir.path());
         assert_eq!(back, s);
         // Clearing the effort removes the key instead of leaving a stale one.
         s.effort = None;
         save(dir.path(), &s).unwrap();
-        let raw: Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap())
-                .unwrap();
-        assert!(raw.get("effort").is_none());
+        assert!(user_file(dir.path()).get("effort").is_none());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join("settings.json"))
+            let mode = std::fs::metadata(dir.path().join("settings.toml"))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -1046,17 +1020,25 @@ mod tests {
     #[test]
     fn partial_and_bad_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("settings.json"),
-            r#"{"statusline":{"tokens":false}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("settings.toml"), "[statusline]\ntokens = false\n").unwrap();
         let (s, warn) = load(dir.path());
         assert!(warn.is_none());
         assert!(!s.statusline.tokens && s.statusline.model && s.prompt_history && s.auto_upgrade);
-        std::fs::write(dir.path().join("settings.json"), r#"{"sound": 5}"#).unwrap();
+        std::fs::write(dir.path().join("settings.toml"), "sound = 5\n").unwrap();
         let (s, warn) = load(dir.path());
         assert!(warn.is_some());
+        assert_eq!(s, Settings::default());
+        std::fs::write(dir.path().join("settings.toml"), "sound = \n").unwrap();
+        let (s, warn) = load(dir.path());
+        assert!(warn.is_some_and(|w| w.contains("settings.toml")));
+        assert_eq!(s, Settings::default());
+        // A settings.json that can't be converted keeps the old behavior:
+        // a warning and the defaults.
+        std::fs::remove_file(dir.path().join("settings.toml")).unwrap();
+        std::fs::write(dir.path().join("settings.json"), "{").unwrap();
+        assert_eq!(file::migrate(dir.path()), Ok(None));
+        let (s, warn) = load(dir.path());
+        assert!(warn.is_some_and(|w| w.contains("settings.json")));
         assert_eq!(s, Settings::default());
         assert_eq!(load(&dir.path().join("missing")).0, Settings::default());
     }
@@ -1076,7 +1058,7 @@ mod tests {
         // Back to auto removes the key.
         assert!(apply(Id::ClassifierModel, "auto", &mut s) && s.classifier_model.is_none());
         save(dir.path(), &s).unwrap();
-        assert!(!std::fs::read_to_string(dir.path().join("settings.json")).unwrap().contains("classifier_model"));
+        assert!(!std::fs::read_to_string(dir.path().join("settings.toml")).unwrap().contains("classifier_model"));
         assert_eq!(filtered(Category::Agent, "classifier model", &s, &live)[0].id, Id::ClassifierModel);
     }
 

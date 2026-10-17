@@ -8,7 +8,7 @@
 //! `<home>/logs/ext-<name>.log`. Project extensions start only once trusted
 //! (`/extensions trust` records the directory's content hash in
 //! `<home>/trusted-extensions.json`); `"extensions": {"name": false}` in
-//! settings.json disables one. A crashed extension is restarted once.
+//! settings.toml disables one. A crashed extension is restarted once.
 //!
 //! The protocol is described in `docs/extensions.md`.
 
@@ -86,7 +86,7 @@ pub struct Found {
     pub enabled: bool,
 }
 
-/// Names disabled with `"extensions": {"name": false}` in settings.json.
+/// Names disabled with `[extensions]` `name = false` in settings.toml.
 fn disabled() -> HashSet<String> {
     match crate::settings::current().extra.get("extensions") {
         Some(Value::Object(m)) => m.iter().filter(|(_, v)| **v == Value::Bool(false)).map(|(k, _)| k.clone()).collect(),

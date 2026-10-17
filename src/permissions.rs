@@ -741,7 +741,7 @@ pub fn format_report(perms: &Permissions, mode: Mode, warnings: &[String], json:
     );
     out.push("Session grants only exist inside a conversation; see /allowlist.".into());
     out.push(
-        "Change the mode with /permissions, --permission-mode, or `permission_mode` in settings.json; --yolo skips approvals for one run."
+        "Change the mode with /permissions, --permission-mode, or `permission_mode` in settings.toml; --yolo skips approvals for one run."
             .into(),
     );
     out.join("\n")
