@@ -336,6 +336,21 @@ mod tests {
     }
 
     #[test]
+    fn skill_tools_can_be_trusted() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut p = perms(home.path(), cwd.path());
+        let mut session = HashSet::new();
+        let args = json!({"source": "o/r"});
+        let decide = |p: &Permissions| p.decide(&HashSet::new(), "install_skill", &args, cwd.path(), true, permissions::Mode::Ask);
+        assert_eq!(decide(&p), permissions::Decision::Ask { forced: None });
+        allowlist(&mut p, &mut session, &["add", "tool", "install_skill"]).unwrap();
+        allowlist(&mut p, &mut session, &["add", "tool", "skill"]).unwrap();
+        assert_eq!(decide(&p), permissions::Decision::Run);
+        assert_eq!(perms(home.path(), cwd.path()).allow, ["install_skill", "skill"]);
+    }
+
+    #[test]
     fn exact_session_rules_decide_before_grants_and_modes() {
         let mut p = Permissions::default();
         let args = json!({"command": "make deploy"});
