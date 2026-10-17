@@ -505,6 +505,12 @@ async fn run() -> Result<()> {
     let home = config::home();
     let sessions_dir = home.join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
+    // A settings.json from an earlier version becomes settings.toml once.
+    match settings::file::migrate(&home) {
+        Ok(Some(notice)) => ui::info(&notice),
+        Ok(None) => {}
+        Err(e) => ui::error(&format!("could not convert to settings.toml: {e}")),
+    }
     let (user_settings, settings_warnings) = settings::load_layered(&home, &cwd);
     settings::install(user_settings);
     for w in settings_warnings {
