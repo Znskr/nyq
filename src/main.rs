@@ -365,7 +365,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/model",
-        "switch model or provider (ctrl+l); /model ID|QUERY [effort] [fast|normal]",
+        "switch model or provider ({key}); /model ID|QUERY [effort] [fast|normal]",
     ),
     ("/compact", "summarize the conversation to free up context"),
     ("/copy", "copy the last answer to the clipboard"),
@@ -826,7 +826,7 @@ async fn run() -> Result<()> {
     let commands: Vec<(String, String)> = COMMANDS
         .iter()
         .chain(commands::COMMANDS)
-        .map(|(c, d)| (c.to_string(), d.to_string()))
+        .map(|(c, d)| (c.to_string(), commands::describe(c, d)))
         .chain(templates.iter().map(|t| {
             (
                 format!("/{}", t.name),
