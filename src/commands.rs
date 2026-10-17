@@ -26,6 +26,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/images", "pending image attachments: /images [clear|remove N]"),
     ("/paste", "attach an image from the clipboard (also ctrl+v)"),
     ("/transcript", "full-screen transcript with search (ctrl+o)"),
+    ("/keys", "key bindings and their keys (edit ~/.nyq/keybindings.toml)"),
     ("/alias", "list prompt templates from prompts/*.md (each is a /command)"),
     ("/feedback", "open nyq's issue page in your browser"),
     ("/trace", "write a redacted diagnostic trace and copy its path"),
@@ -419,6 +420,11 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
             }
         }
         "/transcript" => tui.screen().open_transcript(),
+        "/keys" => {
+            let mut lines = ui::keys::current().lines();
+            lines.push(format!("Edit {} to change these (see README).", crate::config::home().join("keybindings.toml").display()));
+            ui::list(&lines);
+        }
         "/alias" => match args.first() {
             Some(name) => {
                 let name = name.trim_start_matches('/');
