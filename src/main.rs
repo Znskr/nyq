@@ -847,7 +847,6 @@ async fn run() -> Result<()> {
     tui.screen().editor.set_skills(skill_invoke::entries(&skills));
     sync_footer(&tui, &agent, None);
     ui::banner(env!("CARGO_PKG_VERSION"));
-    ui::info(&sandbox::describe(&agent.sandbox));
     let exe = upgrade::current_exe().ok();
     let upgrader = auto_upgrade::should_start(settings::current().auto_upgrade, exe.as_deref())
         .then(|| auto_upgrade::Upgrader::start(&home));

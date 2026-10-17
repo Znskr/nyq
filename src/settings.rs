@@ -480,10 +480,15 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
         Map::new()
     });
     let project_path = file::project_path(cwd);
-    let mut project = file::read(&project_path).unwrap_or_else(|e| {
-        warnings.push(format!("{e} (ignored)"));
+    // Started in the home directory, the "project" file is the user's own.
+    let mut project = if file::project_path(cwd) == file::user_path(home) || crate::config::workspace_is_profile(cwd) {
         Map::new()
-    });
+    } else {
+        file::read(&project_path).unwrap_or_else(|e| {
+            warnings.push(format!("{e} (ignored)"));
+            Map::new()
+        })
+    };
     let mut workspace = workspace_overrides(&user, cwd);
     let ignored: Vec<String> = project
         .keys()
@@ -899,6 +904,19 @@ mod tests {
     /// The user file as JSON.
     fn user_file(home: &Path) -> Value {
         Value::Object(file::read_user(home).unwrap())
+    }
+
+    #[test]
+    fn home_directory_is_not_also_a_project() {
+        // Started in the home directory, ~/.nyq/settings.toml is only the
+        // user's file: no "ignored permission_mode" warning, and it applies.
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join(".nyq");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("settings.toml"), "permission_mode = \"auto\"\ntheme = \"light\"\n").unwrap();
+        let (s, warnings) = load_layered(&home, t.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(s.permission_mode, "auto");
     }
 
     #[test]
