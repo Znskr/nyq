@@ -13,6 +13,7 @@ mod extensions;
 mod github;
 mod grants;
 mod hooks;
+mod http;
 mod limits;
 mod login;
 mod mcp;
@@ -413,6 +414,7 @@ const COMMANDS: &[(&str, &str)] = &[
 ];
 
 fn main() {
+    http::init();
     // Re-exec entry point used to confine a command before it starts. Runs
     // before the async runtime so no other threads exist yet.
     let args: Vec<String> = std::env::args().collect();

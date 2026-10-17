@@ -340,7 +340,7 @@ impl Provider for AnthropicProvider {
         Box::new(self.clone())
     }
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
-        let request = reqwest::Client::new()
+        let request = crate::http::client()
             .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
             .header("anthropic-version", VERSION)
             .header("accept", "text/event-stream")
@@ -416,7 +416,7 @@ fn models_request(client: &reqwest::Client, url: String, key: Option<&str>, bear
 
 /// Every model `GET {base}/models` lists, following `has_more`/`last_id`.
 pub async fn list_models(base_url: &str, key: Option<&str>, bearer: bool) -> Result<Vec<ModelInfo>> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let base = base_url.trim_end_matches('/');
     let mut models = Vec::new();
     let mut after: Option<String> = None;
@@ -442,7 +442,7 @@ pub async fn list_models(base_url: &str, key: Option<&str>, bearer: bool) -> Res
 /// `GET {base}/models/{id}`; None when the endpoint does not describe it.
 pub async fn retrieve_model(base_url: &str, key: Option<&str>, bearer: bool, model: &str) -> Option<ModelInfo> {
     let url = format!("{}/models/{}", base_url.trim_end_matches('/'), model);
-    let response = models_request(&reqwest::Client::new(), url, key, bearer).timeout(std::time::Duration::from_secs(4)).send().await.ok()?;
+    let response = models_request(&crate::http::client(), url, key, bearer).timeout(std::time::Duration::from_secs(4)).send().await.ok()?;
     let value: Value = sse::checked(response).await.ok()?.json().await.ok()?;
     parse_model(&value).filter(|m| m.id == model)
 }

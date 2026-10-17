@@ -211,7 +211,7 @@ fn writable(home: &Path) -> bool {
 async fn reachable(endpoint: &str) -> bool {
     // Bound the entire HEAD/GET probe, including fallback, to five seconds.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let Ok(client) = reqwest::Client::builder()
+        let Ok(client) = crate::http::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
         else {

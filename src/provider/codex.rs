@@ -91,7 +91,7 @@ async fn latest_published() -> Option<String> {
         return cached();
     }
     let fetched = async {
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().ok()?;
+        let client = crate::http::builder().timeout(std::time::Duration::from_secs(3)).build().ok()?;
         let body: serde_json::Value = client
             .get("https://registry.npmjs.org/@openai/codex/latest")
             .header("User-Agent", concat!("nyq/", env!("CARGO_PKG_VERSION")))
@@ -143,7 +143,7 @@ impl CodexProvider {
             fast: false,
             auth: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4().to_string(),
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
         }
     }
 

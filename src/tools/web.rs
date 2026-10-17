@@ -177,7 +177,7 @@ async fn fetch(raw: &str, allow_loopback: bool) -> Result<Fetched> {
     let mut url = Url::parse(raw.trim()).map_err(|e| anyhow!("invalid URL: {e}"))?;
     url.set_fragment(None);
     check_url(&url, allow_loopback)?;
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .user_agent(USER_AGENT)
         .timeout(TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -589,7 +589,7 @@ impl Domains {
 async fn search(endpoint: &str, query: &str, max: usize, domains: &Domains) -> Result<String> {
     let mut form = Url::parse("x:").unwrap();
     form.query_pairs_mut().append_pair("q", &domains.query(query)).append_pair("kl", "wt-wt");
-    let resp = reqwest::Client::builder()
+    let resp = crate::http::builder()
         .user_agent(USER_AGENT)
         .timeout(TIMEOUT)
         .build()?

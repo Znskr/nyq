@@ -252,7 +252,7 @@ pub enum KeyCheck {
 /// Probe `base_url` with `key` through the models list (Anthropic: with
 /// `x-api-key` and `anthropic-version`).
 pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck {
-    let request = reqwest::Client::new()
+    let request = crate::http::client()
         .get(format!("{}/models", base_url.trim_end_matches('/')))
         .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
         .timeout(std::time::Duration::from_secs(10));

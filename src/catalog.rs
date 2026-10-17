@@ -213,7 +213,7 @@ pub async fn refresh(home: &Path) {
     }
     let url = std::env::var("NYQ_MODELS_DEV_URL").unwrap_or_else(|_| URL.into());
     let fetched = async {
-        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).timeout(Duration::from_secs(8)).build().ok()?;
+        let client = crate::http::builder().connect_timeout(Duration::from_secs(3)).timeout(Duration::from_secs(8)).build().ok()?;
         let response = client.get(url).header("User-Agent", crate::config::USER_AGENT).send().await.ok()?;
         let bytes = crate::provider::sse::checked(response).await.ok()?.bytes().await.ok()?;
         serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok()?;

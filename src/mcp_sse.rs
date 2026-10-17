@@ -35,7 +35,7 @@ impl SseTransport {
             value.set_sensitive(true);
             map.insert(name, value);
         }
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let response = tokio::time::timeout(
             timeout,
             client.get(base.clone()).headers(map.clone()).header(reqwest::header::ACCEPT, "text/event-stream").send(),
