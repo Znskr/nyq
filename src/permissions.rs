@@ -146,6 +146,56 @@ pub enum Decision {
     Classify,
 }
 
+/// How a tool's calls are approved when nothing call-specific applies
+/// (see [`Permissions::tool_approval`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolApproval {
+    /// A deny rule blocks every call (the rule, with its source).
+    Denied(String),
+    /// An ask rule makes every call ask, in every mode but yolo.
+    AskRule(String),
+    /// Runs without asking: the tool only reads or changes nothing risky.
+    Free,
+    /// An allow rule (yours or this workspace's) lets it run.
+    Allowed(String),
+    /// An "always" answer this session lets it run.
+    Session,
+    /// Up to the mode: ask asks, auto classifies, yolo runs.
+    Mode(Mode),
+}
+
+impl ToolApproval {
+    /// A short badge for menus and listings.
+    pub fn badge(&self) -> &'static str {
+        match self {
+            ToolApproval::Denied(_) => "denied",
+            ToolApproval::AskRule(_) => "asks (rule)",
+            ToolApproval::Free => "auto",
+            ToolApproval::Allowed(_) => "always allowed",
+            ToolApproval::Session => "allowed (session)",
+            ToolApproval::Mode(Mode::Ask) => "asks",
+            ToolApproval::Mode(Mode::Auto) => "classifier",
+            ToolApproval::Mode(Mode::Yolo) => "yolo",
+        }
+    }
+
+    /// One sentence for the tool's detail view.
+    pub fn explain(&self) -> String {
+        // Rules come as `ACTION PATTERN [(source)]`; the action is implied here.
+        let rule = |r: &str| r.split_once(' ').map_or(r, |(_, rest)| rest).to_string();
+        match self {
+            ToolApproval::Denied(r) => format!("Blocked by the deny rule `{}`; it never runs.", rule(r)),
+            ToolApproval::AskRule(r) => format!("Every call asks first (ask rule `{}`), except in yolo mode.", rule(r)),
+            ToolApproval::Free => "Runs without asking by default; some calls (such as reads outside the workspace) still ask.".into(),
+            ToolApproval::Allowed(r) => format!("Runs without asking: always allowed by `{}`.", rule(r)),
+            ToolApproval::Session => "Runs without asking: you answered \"always\" this session.".into(),
+            ToolApproval::Mode(Mode::Ask) => "Asks before each call (ask mode).".into(),
+            ToolApproval::Mode(Mode::Auto) => "The classifier allows, asks or denies each call (auto mode).".into(),
+            ToolApproval::Mode(Mode::Yolo) => "Runs without asking (yolo mode).".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Permissions {
     /// The user's file (`<home>/nyq/permissions.json`); empty when there is none.
@@ -351,6 +401,43 @@ impl Permissions {
             Mode::Ask => Decision::Ask { forced: None },
             Mode::Auto => Decision::Classify,
         }
+    }
+
+    /// How calls to `tool` as a whole are approved, for `/tools`: rules that
+    /// name the tool (not one command, path or URL), the tool's own default
+    /// (`needs_approval`, probed without arguments), session grants and the
+    /// mode, in the order [`decide_in`] applies them.
+    pub fn tool_approval(
+        &self,
+        session: &HashSet<String>,
+        tool: &str,
+        cwd: &Path,
+        needs_approval: bool,
+        mode: Mode,
+    ) -> ToolApproval {
+        let none = Value::Object(Default::default());
+        if let Some(rule) = self.find(Action::Deny, tool, &none, cwd) {
+            return ToolApproval::Denied(rule);
+        }
+        if let Some(rule) = self.find(Action::Ask, tool, &none, cwd) {
+            return ToolApproval::AskRule(rule);
+        }
+        if !needs_approval {
+            return ToolApproval::Free;
+        }
+        if let Some(rule) = self.find(Action::Allow, tool, &none, cwd) {
+            return ToolApproval::Allowed(rule);
+        }
+        if session.contains(tool) {
+            return ToolApproval::Session;
+        }
+        ToolApproval::Mode(mode)
+    }
+
+    /// Whether the user's or this workspace's allow list holds exactly `tool`
+    /// (what `/allowlist add tool NAME` writes and `/tools` can take back).
+    pub fn allows_exactly(&self, tool: &str) -> bool {
+        self.allow.iter().chain(&self.local).any(|r| r == tool)
     }
 
     /// The action every tool of an MCP server gets from server-wide rules
@@ -976,6 +1063,30 @@ mod tests {
             assert!(!matches("bash:git status", "bash", &args, true), "{cmd}");
             assert!(matches("bash:git status", "bash", &args, false), "{cmd}");
         }
+    }
+
+    #[test]
+    fn tool_approval_follows_decide_order() {
+        let cwd = Path::new("/w");
+        let mut p = perms(&["mcp__gh__*", "write_file"], &["web_fetch"], &["mcp__gh__delete*", "bash:rm"]);
+        p.local = vec!["mcp__db__query".into()];
+        let none = HashSet::new();
+        let a = |p: &Permissions, s: &HashSet<String>, tool: &str, needs: bool, mode| p.tool_approval(s, tool, cwd, needs, mode);
+        assert_eq!(a(&p, &none, "mcp__gh__delete_repo", true, Mode::Yolo), ToolApproval::Denied("deny mcp__gh__delete*".into()));
+        assert_eq!(a(&p, &none, "web_fetch", true, Mode::Ask), ToolApproval::AskRule("ask web_fetch".into()));
+        assert_eq!(a(&p, &none, "read_file", false, Mode::Ask), ToolApproval::Free);
+        assert_eq!(a(&p, &none, "mcp__gh__list", true, Mode::Ask), ToolApproval::Allowed("allow mcp__gh__*".into()));
+        assert_eq!(
+            a(&p, &none, "mcp__db__query", true, Mode::Ask),
+            ToolApproval::Allowed("allow mcp__db__query (this workspace)".into())
+        );
+        // A rule for one command doesn't decide the whole tool.
+        assert_eq!(a(&p, &none, "bash", true, Mode::Auto), ToolApproval::Mode(Mode::Auto));
+        let session: HashSet<String> = ["edit_file".to_string()].into();
+        assert_eq!(a(&p, &session, "edit_file", true, Mode::Ask), ToolApproval::Session);
+        assert_eq!(a(&p, &none, "edit_file", true, Mode::Ask).badge(), "asks");
+        assert!(p.allows_exactly("write_file") && p.allows_exactly("mcp__db__query"));
+        assert!(!p.allows_exactly("mcp__gh__list"), "a pattern is not an exact entry");
     }
 
     #[test]

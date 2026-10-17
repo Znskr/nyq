@@ -39,6 +39,7 @@ mod skills;
 mod slash;
 mod subagents;
 mod templates;
+mod tool_list;
 mod trace;
 mod tools;
 mod types;
@@ -116,6 +117,9 @@ struct Cli {
     /// Override a prompt budget for this run: NAME=BYTES or NAME=off. Repeatable.
     #[arg(long = "context-limit", value_name = "NAME=BYTES", global = true)]
     context_limit: Vec<String>,
+    /// Show developer-only commands (`/tools`) for this run. Also NYQ_DEBUG=1.
+    #[arg(long, global = true)]
+    debug: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -371,7 +375,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "summarize the conversation to free up context"),
     ("/copy", "copy the last answer to the clipboard"),
     ("/undo", "revert the last file change nyq made"),
-    ("/tools", "list available tools"),
+    ("/tools", "every tool, whether it is on and how it is approved (with --debug): /tools [list|info|disable|enable|trust|untrust NAME]"),
     ("/skills", "skills: browse, use and manage skills; /skills [list|install SOURCE [--project]|remove NAME|info NAME|create NAME|path]"),
     ("/agents", "named subagents: /agents [list|show NAME|stop NAME|delete NAME]"),
     ("/login", "sign in: ChatGPT or Grok in the browser, or an API key (hidden input)"),
@@ -412,6 +416,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/version", "show nyq version"),
     ("/exit", "quit (also Ctrl-D)"),
 ];
+
+/// Commands listed only with `--debug` (see [`config::debug`]).
+const DEBUG_COMMANDS: &[&str] = &["/tools"];
 
 fn main() {
     http::init();
@@ -503,6 +510,7 @@ async fn run() -> Result<()> {
         _ => cli.ask.clone(),
     };
     JSON_ERRORS.store(ask.json, std::sync::atomic::Ordering::Relaxed);
+    config::set_debug(cli.debug || config::debug_from_env());
     trace::init_from_env();
     let home = config::home();
     let sessions_dir = home.join("sessions");
@@ -843,6 +851,10 @@ async fn run() -> Result<()> {
         .map(|(c, _)| c.clone())
         .chain(slash::ALIASES.iter().map(|(a, _)| a.to_string()))
         .collect();
+    // Developer-only commands still run (and say how to get them), but only
+    // `--debug` lists them in the `/` menu, `/help` and completion.
+    let commands: Vec<(String, String)> =
+        commands.into_iter().filter(|(c, _)| config::debug() || !DEBUG_COMMANDS.contains(&c.as_str())).collect();
     let mut tui = Tui::start(footer, home.clone(), commands)?;
     tui.screen().editor.set_skills(skill_invoke::entries(&skills));
     sync_footer(&tui, &agent, None);
@@ -1271,6 +1283,11 @@ async fn model_command(
             return Ok(());
         }
         [] => anyhow::bail!("no model matches `{}`", wanted.query),
+        _ if !ui::menus_available() => {
+            let names: Vec<String> = choices.iter().map(|c| format!("  {} · {}", c.provider, c.model)).collect();
+            ui::list(&names);
+            anyhow::bail!("`{}` matches {} models; name one exactly", wanted.query, choices.len())
+        }
         _ => {
             tui.screen().show_models(choices, warnings, &wanted.query);
             return Ok(());
@@ -1608,8 +1625,14 @@ async fn resume_session(
     Ok(())
 }
 
-/// Open the session picker (this folder's sessions first).
+/// Open the session picker (this folder's sessions first); without a
+/// terminal, list them.
 fn open_sessions(tui: &Tui, sessions_dir: &std::path::Path, agent: &Agent) -> Result<()> {
+    if !ui::menus_available() {
+        ui::list(&session_lines(sessions_dir)?);
+        ui::info("  Resume one with /resume ID or /resume last.");
+        return Ok(());
+    }
     let all = session::list(sessions_dir)?;
     let current = agent.session.as_ref().map(|s| s.id.as_str());
     tui.screen().open_sessions(all, &agent.cwd, current);
@@ -1660,7 +1683,13 @@ async fn slash(
     match cmd {
         "/exit" | "/quit" | "/q" => return Ok(false),
         "/help" | "/?" => {
-            tui.screen().open_help();
+            if ui::menus_available() {
+                tui.screen().open_help();
+            } else {
+                let lines: Vec<String> =
+                    tui.screen().editor.commands().iter().map(|(c, d)| format!("{c:<14} {d}")).collect();
+                ui::list(&lines);
+            }
             let k = ui::keys::current();
             use ui::keys::KeyAction as K;
             ui::info(&format!(
@@ -1748,21 +1777,7 @@ async fn slash(
             Some(which) => resume_session(agent, sessions_dir, which).await?,
             None => open_sessions(tui, sessions_dir, agent)?,
         },
-        "/tools" => {
-            let lines: Vec<String> = agent
-                .tools
-                .specs()
-                .iter()
-                .map(|t| {
-                    format!(
-                        "{:<24} {}",
-                        t.name,
-                        t.description.lines().next().unwrap_or("")
-                    )
-                })
-                .collect();
-            ui::list(&lines);
-        }
+        "/tools" => tool_list::command(agent, tui, &arg),
         "/mcp" => mcp_slash::command(agent, mcp, servers, tui, &arg).await?,
         "/permissions" => commands::permissions(agent, tui, &config::home(), &arg).await,
         "/allowlist" => commands::allowlist(agent, &arg),

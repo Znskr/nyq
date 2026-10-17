@@ -428,6 +428,28 @@ impl Registry {
         self.disabled.extend(names.iter().cloned());
     }
 
+    /// Make `names` the disabled tools (after `disabled_tools` changed).
+    pub fn set_disabled(&mut self, names: &[String]) {
+        self.disabled = names.iter().cloned().collect();
+    }
+
+    /// Every registered tool, disabled ones included, for `/tools`: its spec,
+    /// whether it is disabled, and whether a call asks by default (probed
+    /// with no arguments, inside `cwd`).
+    pub fn catalog(&self, cwd: &Path) -> Vec<(ToolSpec, bool, bool)> {
+        let none = Value::Object(Default::default());
+        self.tools
+            .iter()
+            .map(|t| {
+                let spec = t.spec();
+                let disabled = self.disabled.contains(&spec.name);
+                // Reads inside the workspace never ask (see `Agent::prepare`).
+                let asks = t.needs_approval_for(&none, cwd) && !crate::permissions::is_read_tool(&spec.name);
+                (spec, disabled, asks)
+            })
+            .collect()
+    }
+
     /// Receive tool changes and server instructions from `live`.
     pub fn attach(&mut self, live: LiveTools) {
         self.live = Some(live);
