@@ -212,6 +212,9 @@ pub struct Settings {
     /// Checked by `ui::theme::set_colors`, which skips bad entries.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub theme_colors: Map<String, Value>,
+    /// `classic` (plain bars and bullets) or `fancy` (logo, input box,
+    /// colored status line, tool marks and times).
+    pub ui_style: String,
     /// Show finished tool groups as their header line only.
     pub collapse_tool_calls: bool,
     /// Push the shell output on screen into the scrollback at start, so the
@@ -256,6 +259,7 @@ impl Default for Settings {
             slash_menu_categories: true,
             theme: "auto".into(),
             theme_colors: Map::new(),
+            ui_style: "classic".into(),
             collapse_tool_calls: false,
             startup_scrollback: false,
             disabled_tools: Vec::new(),
@@ -638,6 +642,7 @@ pub fn source(id: Id) -> Option<Layer> {
         Id::AutoUpgrade => vec!["auto_upgrade".into()],
         Id::SlashCategories => vec!["slash_menu_categories".into()],
         Id::Theme => vec!["theme".into()],
+        Id::UiStyle => vec!["ui_style".into()],
         Id::CollapseToolCalls => vec!["collapse_tool_calls".into()],
         Id::StartupScrollback => vec!["startup_scrollback".into()],
     };
@@ -710,6 +715,7 @@ pub enum Id {
     AutoUpgrade,
     SlashCategories,
     Theme,
+    UiStyle,
     CollapseToolCalls,
     StartupScrollback,
 }
@@ -815,6 +821,12 @@ pub fn specs() -> Vec<Spec> {
         description: "Colors for dark or light terminals; auto follows the background",
     });
     v.push(Spec {
+        id: Id::UiStyle,
+        category: Category::Display,
+        label: "UI style",
+        description: "classic: plain bars and bullets; fancy: logo, input box, colored status line, tool marks",
+    });
+    v.push(Spec {
         id: Id::CollapseToolCalls,
         category: Category::Display,
         label: "Collapse tool calls",
@@ -877,6 +889,7 @@ pub fn value(id: Id, s: &Settings, live: &Live) -> String {
         Id::AutoUpgrade => on_off(s.auto_upgrade),
         Id::SlashCategories => on_off(s.slash_menu_categories),
         Id::Theme => s.theme.clone(),
+        Id::UiStyle => s.ui_style.clone(),
         Id::CollapseToolCalls => on_off(s.collapse_tool_calls),
         Id::StartupScrollback => on_off(s.startup_scrollback),
     }
@@ -899,6 +912,7 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
         Id::Sound => list(&["off", "on", "max"]),
         Id::NotifyAfter => list(&["0s", "5s", "10s", "30s", "60s", "120s"]),
         Id::Theme => list(&["auto", "dark", "light"]),
+        Id::UiStyle => list(&["classic", "fancy"]),
         Id::Fast
         | Id::Notifications
         | Id::Segment(_)
@@ -943,6 +957,7 @@ pub fn apply(id: Id, value: &str, s: &mut Settings) -> bool {
         Id::AutoUpgrade => s.auto_upgrade = on,
         Id::SlashCategories => s.slash_menu_categories = on,
         Id::Theme => s.theme = value.into(),
+        Id::UiStyle => s.ui_style = value.into(),
         Id::CollapseToolCalls => s.collapse_tool_calls = on,
         Id::StartupScrollback => s.startup_scrollback = on,
         Id::Model | Id::Effort | Id::Fast | Id::Permission => return false,
@@ -1282,8 +1297,11 @@ mod tests {
         assert_eq!(cycle(Id::Theme, &s, &live, 1).as_deref(), Some("dark"));
         assert!(apply(Id::Theme, "light", &mut t) && t.theme == "light");
         assert!(apply(Id::CollapseToolCalls, "on", &mut t) && t.collapse_tool_calls);
+        assert_eq!(value(Id::UiStyle, &s, &live), "classic");
+        assert_eq!(cycle(Id::UiStyle, &s, &live, 1).as_deref(), Some("fancy"));
+        assert!(apply(Id::UiStyle, "fancy", &mut t) && t.ui_style == "fancy");
         assert!(apply(Id::StartupScrollback, "on", &mut t) && t.startup_scrollback);
-        assert_eq!(filtered(Category::Display, "", &s, &live).len(), 4);
+        assert_eq!(filtered(Category::Display, "", &s, &live).len(), 5);
         assert_eq!(
             sandbox_mode(&Settings {
                 sandbox: "read-only".into(),

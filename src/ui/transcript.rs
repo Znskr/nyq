@@ -157,8 +157,13 @@ pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
         }
         match e {
             Entry::User(t) => {
-                let lead = format!("{} ", paint(fg(chrome::ACCENT).bold(), "›"));
-                block(&mut rows, t.trim(), width, &lead, "  ", fg(BRIGHT).bold());
+                if chrome::fancy() {
+                    let lead = format!("{} ", paint(fg(chrome::ACCENT).bold(), "›"));
+                    block(&mut rows, t.trim(), width, &lead, "  ", fg(BRIGHT).bold());
+                } else {
+                    let bar = paint(fg(BRIGHT), "┃ ");
+                    block(&mut rows, t.trim(), width, &bar, &bar, Style::new().bold());
+                }
             }
             Entry::Assistant(t) => {
                 let mut md = Markdown::default();
@@ -181,7 +186,12 @@ pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
                     (Some(_), true) => Mark::Failed,
                     (Some(_), false) => Mark::Ok,
                 };
-                let head = format!("{} {}", chrome::mark(mark, 0), paint(fg(if *is_error { RED } else { BRIGHT }), name));
+                let lead = if chrome::fancy() {
+                    chrome::mark(mark, 0)
+                } else {
+                    paint(fg(if *is_error { RED } else { BRIGHT }), "●")
+                };
+                let head = format!("{lead} {}", paint(fg(if *is_error { RED } else { BRIGHT }), name));
                 let summary = sanitize_text(summary).replace('\n', " ");
                 let room = width.saturating_sub(visible_width(&head) + 1);
                 rows.push(format!("{head} {}", paint(fg(GRAY), &truncate(&summary, room))));
