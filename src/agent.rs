@@ -2265,6 +2265,34 @@ impl Provider for ScriptedTurns {
     }
 }
 
+/// An agent with the built-in tools, in ask mode, that never talks to a model.
+#[cfg(test)]
+pub(crate) fn test_agent() -> Agent {
+    Agent {
+        provider: Box::new(ScriptedTurns { left: Default::default() }),
+        tools: Registry::builtin(),
+        system: String::new(),
+        items: Vec::new(),
+        session: None,
+        usage_session_id: None,
+        cwd: PathBuf::from("."),
+        permission_mode: crate::permissions::Mode::Ask,
+        review_cache: Default::default(),
+        allowed: HashSet::new(),
+        permissions: Default::default(),
+        usage: Usage::default(),
+        stats: Default::default(),
+        context_window: 1000,
+        context_tokens: 0,
+        context_estimated: false,
+        suppress_auto_compact: false,
+        submitted: 0,
+        hooks: Default::default(),
+        sandbox: Default::default(),
+        undo: Default::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
