@@ -67,9 +67,19 @@ type PromptFile = (PathBuf, String);
 fn prompt_files_in(cwd: &Path, home: &Path) -> (Option<PromptFile>, Vec<PromptFile>) {
     let project = cwd.join(".nyq");
     let read = |root: &Path, path: PathBuf| read_prompt_file(root, &path).map(|text| (path, text));
-    let base = read(cwd, project.join(SYSTEM_FILE)).or_else(|| read(home, home.join(SYSTEM_FILE)));
-    let appends = [read(home, home.join(APPEND_FILE)), read(cwd, project.join(APPEND_FILE))];
+    // Started in the home directory, the project's files are the user's own.
+    let own = same_dir(&project, home);
+    let read_project = |name: &str| if own { None } else { read(cwd, project.join(name)) };
+    let base = read_project(SYSTEM_FILE).or_else(|| read(home, home.join(SYSTEM_FILE)));
+    let appends = [read(home, home.join(APPEND_FILE)), read_project(APPEND_FILE)];
     (base, appends.into_iter().flatten().collect())
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Paths of the active `system.md` / `append-system.md` files, for status.

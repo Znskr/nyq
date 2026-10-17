@@ -65,7 +65,9 @@ fn read_dir(dir: &Path, scope: &'static str, out: &mut Vec<Template>) {
 pub fn discover(home: &Path, cwd: &Path, reserved: &[&str]) -> Vec<Template> {
     let mut out = Vec::new();
     read_dir(&home.join("prompts"), "profile", &mut out);
-    read_dir(&cwd.join(".nyq").join("prompts"), "project", &mut out);
+    if !crate::config::workspace_is_profile(cwd) {
+        read_dir(&cwd.join(".nyq").join("prompts"), "project", &mut out);
+    }
     out.retain(|t| !reserved.contains(&t.name.as_str()));
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
