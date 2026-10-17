@@ -2199,6 +2199,7 @@ impl Screen {
                         Ok((saved, notice)) => {
                             self.footer.segments = saved.statusline;
                             crate::agent::set_auto_compact_percent(saved.auto_compact);
+                            super::theme::set_colors(&saved.theme_colors);
                             self.hint = notice;
                         }
                         Err(e) => self.hint = Some(format!("Could not save settings: {e:#}")),

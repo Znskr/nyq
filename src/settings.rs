@@ -202,6 +202,11 @@ pub struct Settings {
     pub slash_menu_categories: bool,
     /// `auto` (follow the terminal background), `dark` or `light`. `NYQ_THEME` overrides it.
     pub theme: String,
+    /// Role color overrides (`blue = "#5fafd7"` or a color index), for both
+    /// themes at the top level or for one in a `dark`/`light` table.
+    /// Checked by `ui::theme::set_colors`, which skips bad entries.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub theme_colors: Map<String, Value>,
     /// Show finished tool groups as their header line only.
     pub collapse_tool_calls: bool,
     /// Push the shell output on screen into the scrollback at start, so the
@@ -240,6 +245,7 @@ impl Default for Settings {
             max_agent_steps: None,
             slash_menu_categories: true,
             theme: "auto".into(),
+            theme_colors: Map::new(),
             collapse_tool_calls: false,
             startup_scrollback: false,
             disabled_tools: Vec::new(),
@@ -349,6 +355,7 @@ const PROJECT_KEYS: &[&str] = &[
     "slash_menu_categories",
     // Only ever narrows what the model can do (merged with the user's list).
     "disabled_tools",
+    "theme_colors",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -936,6 +943,7 @@ mod tests {
                 "sound": "on",
                 "auto_compact": 70,
                 "statusline": {"tokens": false},
+                "theme_colors": {"blue": "#5fafd7", "light": {"red": 124}},
                 "workspaces": {ws.to_string_lossy(): {"auto_compact": 50}}
             })
             .to_string(),
@@ -944,13 +952,19 @@ mod tests {
         std::fs::create_dir_all(cwd.path().join(".nyq")).unwrap();
         std::fs::write(
             cwd.path().join(".nyq/settings.json"),
-            r#"{"sound": "max", "auto_compact": 60, "statusline": {"branch": false}, "permission_mode": "yolo"}"#,
+            r##"{"sound": "max", "auto_compact": 60, "statusline": {"branch": false}, "permission_mode": "yolo",
+                "theme_colors": {"light": {"blue": "#005f87"}}}"##,
         )
         .unwrap();
         let (s, warnings) = load_layered(home.path(), cwd.path());
         assert_eq!(s.sound, "max");
         assert_eq!(s.auto_compact, 50);
         assert!(!s.statusline.tokens && !s.statusline.branch && s.statusline.model);
+        // Projects may set theme colors, merged into the user's.
+        assert_eq!(
+            Value::Object(s.theme_colors.clone()),
+            serde_json::json!({"blue": "#5fafd7", "light": {"red": 124, "blue": "#005f87"}})
+        );
         // A project can't loosen permissions.
         assert_eq!(s.permission_mode, "ask");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
