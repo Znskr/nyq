@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>GitHub - BurntSushi/ripgrep: ripgrep recursively searches directories for a regex pattern while respecting your gitignore · GitHub</title></head>
+<body>
+<article class="markdown-body entry-content container-lg" itemprop="text"><div class="markdown-heading" dir="auto"><h2 tabindex="-1" class="heading-element" dir="auto">ripgrep (rg)</h2><a id="user-content-ripgrep-rg" class="anchor" aria-label="Permalink: ripgrep (rg)" href="#ripgrep-rg"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">ripgrep is a line-oriented search tool that recursively searches the current
+directory for a regex pattern. By default, ripgrep will respect gitignore rules
+and automatically skip hidden files/directories and binary files. (To disable
+all automatic filtering by default, use <code>rg -uuu</code>.) ripgrep has first class
+support on Windows, macOS and Linux, with binary downloads available for <a href="https://github.com/BurntSushi/ripgrep/releases">every
+release</a>. ripgrep is similar to
+other popular search tools like The Silver Searcher, ack and grep.</p>
+<p dir="auto"><a href="https://github.com/BurntSushi/ripgrep/actions"><img src="https://github.com/BurntSushi/ripgrep/workflows/ci/badge.svg" alt="Build status" style="max-width: 100%;"></a>
+<a href="https://crates.io/crates/ripgrep" rel="nofollow"><img src="https://camo.githubusercontent.com/7b45c9ce9ded7e8cf4779da0fc010fc1df40c56b24a601ee1c45038819d4c5d9/68747470733a2f2f696d672e736869656c64732e696f2f6372617465732f762f726970677265702e737667" alt="Crates.io" data-canonical-src="https://img.shields.io/crates/v/ripgrep.svg" style="max-width: 100%;"></a>
+<a href="https://repology.org/project/ripgrep/badges" rel="nofollow"><img src="https://camo.githubusercontent.com/91aa8f4612d941ec581f963cffb02e179ddadc94bc518e45e7f01bfdbe0b9404/68747470733a2f2f7265706f6c6f67792e6f72672f62616467652f74696e792d7265706f732f726970677265702e737667" alt="Packaging status" data-canonical-src="https://repology.org/badge/tiny-repos/ripgrep.svg" style="max-width: 100%;"></a></p>
+<p dir="auto">Dual-licensed under MIT or the <a href="https://unlicense.org" rel="nofollow">UNLICENSE</a>.</p>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">CHANGELOG</h3><a id="user-content-changelog" class="anchor" aria-label="Permalink: CHANGELOG" href="#changelog"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">Please see the <a href="/BurntSushi/ripgrep/blob/master/CHANGELOG.md">CHANGELOG</a> for a release history.</p>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Documentation quick links</h3><a id="user-content-documentation-quick-links" class="anchor" aria-label="Permalink: Documentation quick links" href="#documentation-quick-links"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<ul dir="auto">
+<li><a href="#installation">Installation</a></li>
+<li><a href="/BurntSushi/ripgrep/blob/master/GUIDE.md">User Guide</a></li>
+<li><a href="/BurntSushi/ripgrep/blob/master/FAQ.md">Frequently Asked Questions</a></li>
+<li><a href="https://docs.rs/regex/1/regex/#syntax" rel="nofollow">Regex syntax</a></li>
+<li><a href="/BurntSushi/ripgrep/blob/master/GUIDE.md#configuration-file">Configuration files</a></li>
+<li><a href="/BurntSushi/ripgrep/blob/master/FAQ.md#complete">Shell completions</a></li>
+<li><a href="#building">Building</a></li>
+<li><a href="#translations">Translations</a></li>
+</ul>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Screenshot of search results</h3><a id="user-content-screenshot-of-search-results" class="anchor" aria-label="Permalink: Screenshot of search results" href="#screenshot-of-search-results"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto"><a href="https://burntsushi.net/stuff/ripgrep1.png" rel="nofollow"><img src="https://camo.githubusercontent.com/b1ea0cb74f8e8453630739cb1661bb9e8ac14666666b57f950b8af5605dca35d/68747470733a2f2f6275726e7473757368692e6e65742f73747566662f72697067726570312e706e67" alt="A screenshot of a sample search with ripgrep" data-canonical-src="https://burntsushi.net/stuff/ripgrep1.png" style="max-width: 100%;"></a></p>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Quick examples comparing tools</h3><a id="user-content-quick-examples-comparing-tools" class="anchor" aria-label="Permalink: Quick examples comparing tools" href="#quick-examples-comparing-tools"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">This example searches the entire
+<a href="https://github.com/BurntSushi/linux">Linux kernel source tree</a>
+(after running <code>make defconfig &amp;&amp; make -j8</code>) for <code>[A-Z]+_SUSPEND</code>, where
+all matches must be words. Timings were collected on a system with an Intel
+i9-12900K 5.2 GHz.</p>
+<p dir="auto">Please remember that a single benchmark is never enough! See my
+<a href="https://blog.burntsushi.net/ripgrep/" rel="nofollow">blog post on ripgrep</a>
+for a very detailed comparison with more benchmarks and analysis.</p>
+<markdown-accessiblity-table><table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Command</th>
+<th>Line count</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ripgrep (Unicode)</td>
+<td><code>rg -n -w '[A-Z]+_SUSPEND'</code></td>
+<td>536</td>
+<td><strong>0.082s</strong> (1.00x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/p-ranav/hypergrep">hypergrep</a></td>
+<td><code>hgrep -n -w '[A-Z]+_SUSPEND'</code></td>
+<td>536</td>
+<td>0.167s (2.04x)</td>
+</tr>
+<tr>
+<td><a href="https://www.kernel.org/pub/software/scm/git/docs/git-grep.html" rel="nofollow">git grep</a></td>
+<td><code>git grep -P -n -w '[A-Z]+_SUSPEND'</code></td>
+<td>536</td>
+<td>0.273s (3.34x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/ggreer/the_silver_searcher">The Silver Searcher</a></td>
+<td><code>ag -w '[A-Z]+_SUSPEND'</code></td>
+<td>534</td>
+<td>0.443s (5.43x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Genivia/ugrep">ugrep</a></td>
+<td><code>ugrep -r --ignore-files --no-hidden -I -w '[A-Z]+_SUSPEND'</code></td>
+<td>536</td>
+<td>0.639s (7.82x)</td>
+</tr>
+<tr>
+<td><a href="https://www.kernel.org/pub/software/scm/git/docs/git-grep.html" rel="nofollow">git grep</a></td>
+<td><code>LC_ALL=C git grep -E -n -w '[A-Z]+_SUSPEND'</code></td>
+<td>536</td>
+<td>0.727s (8.91x)</td>
+</tr>
+<tr>
+<td><a href="https://www.kernel.org/pub/software/scm/git/docs/git-grep.html" rel="nofollow">git grep (Unicode)</a></td>
+<td><code>LC_ALL=en_US.UTF-8 git grep -E -n -w '[A-Z]+_SUSPEND'</code></td>
+<td>536</td>
+<td>2.670s (32.70x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/beyondgrep/ack3">ack</a></td>
+<td><code>ack -w '[A-Z]+_SUSPEND'</code></td>
+<td>2677</td>
+<td>2.935s (35.94x)</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p dir="auto">Here's another benchmark on the same corpus as above that disregards gitignore
+files and searches with a whitelist instead. The corpus is the same as in the
+previous benchmark, and the flags passed to each command ensure that they are
+doing equivalent work:</p>
+<markdown-accessiblity-table><table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Command</th>
+<th>Line count</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ripgrep</td>
+<td><code>rg -uuu -tc -n -w '[A-Z]+_SUSPEND'</code></td>
+<td>447</td>
+<td><strong>0.063s</strong> (1.00x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Genivia/ugrep">ugrep</a></td>
+<td><code>ugrep -r -n --include='*.c' --include='*.h' -w '[A-Z]+_SUSPEND'</code></td>
+<td>447</td>
+<td>0.607s (9.62x)</td>
+</tr>
+<tr>
+<td><a href="https://www.gnu.org/software/grep/" rel="nofollow">GNU grep</a></td>
+<td><code>grep -E -r -n --include='*.c' --include='*.h' -w '[A-Z]+_SUSPEND'</code></td>
+<td>447</td>
+<td>0.674s (10.69x)</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p dir="auto">Now we'll move to searching on single large file. Here is a straight-up
+comparison between ripgrep, ugrep and GNU grep on a file cached in memory
+(~13GB, <a href="https://object.pouta.csc.fi/OPUS-OpenSubtitles/v2018/mono/en.txt.gz" rel="nofollow"><code>OpenSubtitles.raw.en.gz</code></a>, decompressed):</p>
+<markdown-accessiblity-table><table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Command</th>
+<th>Line count</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ripgrep (Unicode)</td>
+<td><code>rg -w 'Sherlock [A-Z]\w+'</code></td>
+<td>7882</td>
+<td><strong>1.042s</strong> (1.00x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Genivia/ugrep">ugrep</a></td>
+<td><code>ugrep -w 'Sherlock [A-Z]\w+'</code></td>
+<td>7882</td>
+<td>1.339s (1.28x)</td>
+</tr>
+<tr>
+<td><a href="https://www.gnu.org/software/grep/" rel="nofollow">GNU grep (Unicode)</a></td>
+<td><code>LC_ALL=en_US.UTF-8 egrep -w 'Sherlock [A-Z]\w+'</code></td>
+<td>7882</td>
+<td>6.577s (6.31x)</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p dir="auto">In the above benchmark, passing the <code>-n</code> flag (for showing line numbers)
+increases the times to <code>1.664s</code> for ripgrep and <code>9.484s</code> for GNU grep. ugrep
+times are unaffected by the presence or absence of <code>-n</code>.</p>
+<p dir="auto">Beware of performance cliffs though:</p>
+<markdown-accessiblity-table><table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Command</th>
+<th>Line count</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ripgrep (Unicode)</td>
+<td><code>rg -w '[A-Z]\w+ Sherlock [A-Z]\w+'</code></td>
+<td>485</td>
+<td><strong>1.053s</strong> (1.00x)</td>
+</tr>
+<tr>
+<td><a href="https://www.gnu.org/software/grep/" rel="nofollow">GNU grep (Unicode)</a></td>
+<td><code>LC_ALL=en_US.UTF-8 grep -E -w '[A-Z]\w+ Sherlock [A-Z]\w+'</code></td>
+<td>485</td>
+<td>6.234s (5.92x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Genivia/ugrep">ugrep</a></td>
+<td><code>ugrep -w '[A-Z]\w+ Sherlock [A-Z]\w+'</code></td>
+<td>485</td>
+<td>28.973s (27.51x)</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p dir="auto">And performance can drop precipitously across the board when searching big
+files for patterns without any opportunities for literal optimizations:</p>
+<markdown-accessiblity-table><table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Command</th>
+<th>Line count</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ripgrep</td>
+<td><code>rg '[A-Za-z]{30}'</code></td>
+<td>6749</td>
+<td><strong>15.569s</strong> (1.00x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Genivia/ugrep">ugrep</a></td>
+<td><code>ugrep -E '[A-Za-z]{30}'</code></td>
+<td>6749</td>
+<td>21.857s (1.40x)</td>
+</tr>
+<tr>
+<td><a href="https://www.gnu.org/software/grep/" rel="nofollow">GNU grep</a></td>
+<td><code>LC_ALL=C grep -E '[A-Za-z]{30}'</code></td>
+<td>6749</td>
+<td>32.409s (2.08x)</td>
+</tr>
+<tr>
+<td><a href="https://www.gnu.org/software/grep/" rel="nofollow">GNU grep (Unicode)</a></td>
+<td><code>LC_ALL=en_US.UTF-8 grep -E '[A-Za-z]{30}'</code></td>
+<td>6795</td>
+<td>8m30s (32.74x)</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p dir="auto">Finally, high match counts also tend to both tank performance and smooth
+out the differences between tools (because performance is dominated by how
+quickly one can handle a match and not the algorithm used to detect the match,
+generally speaking):</p>
+<markdown-accessiblity-table><table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Command</th>
+<th>Line count</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ripgrep</td>
+<td><code>rg the</code></td>
+<td>83499915</td>
+<td><strong>6.948s</strong> (1.00x)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Genivia/ugrep">ugrep</a></td>
+<td><code>ugrep the</code></td>
+<td>83499915</td>
+<td>11.721s (1.69x)</td>
+</tr>
+<tr>
+<td><a href="https://www.gnu.org/software/grep/" rel="nofollow">GNU grep</a></td>
+<td><code>LC_ALL=C grep the</code></td>
+<td>83499915</td>
+<td>15.217s (2.19x)</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Why should I use ripgrep?</h3><a id="user-content-why-should-i-use-ripgrep" class="anchor" aria-label="Permalink: Why should I use ripgrep?" href="#why-should-i-use-ripgrep"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<ul dir="auto">
+<li>It can replace many use cases served by other search tools
+because it contains most of their features and is generally faster. (See
+<a href="/BurntSushi/ripgrep/blob/master/FAQ.md#posix4ever">the FAQ</a> for more details on whether ripgrep can truly
+replace grep.)</li>
+<li>Like other tools specialized to code search, ripgrep defaults to
+<a href="/BurntSushi/ripgrep/blob/master/GUIDE.md#recursive-search">recursive search</a> and does <a href="/BurntSushi/ripgrep/blob/master/GUIDE.md#automatic-filtering">automatic
+filtering</a>. Namely, ripgrep won't search files
+ignored by your <code>.gitignore</code>/<code>.ignore</code>/<code>.rgignore</code> files, it won't search
+hidden files and it won't search binary files. Automatic filtering can be
+disabled with <code>rg -uuu</code>.</li>
+<li>ripgrep can <a href="/BurntSushi/ripgrep/blob/master/GUIDE.md#manual-filtering-file-types">search specific types of files</a>.
+For example, <code>rg -tpy foo</code> limits your search to Python files and <code>rg -Tjs foo</code> excludes JavaScript files from your search. ripgrep can be taught about
+new file types with custom matching rules.</li>
+<li>ripgrep supports many features found in <code>grep</code>, such as showing the context
+of search results, searching multiple patterns, highlighting matches with
+color and full Unicode support. Unlike GNU grep, ripgrep stays fast while
+supporting Unicode (which is always on).</li>
+<li>ripgrep has optional support for switching its regex engine to use PCRE2.
+Among other things, this makes it possible to use look-around and
+backreferences in your patterns, which are not supported in ripgrep's default
+regex engine. PCRE2 support can be enabled with <code>-P/--pcre2</code> (use PCRE2
+always) or <code>--auto-hybrid-regex</code> (use PCRE2 only if needed). An alternative
+syntax is provided via the <code>--engine (default|pcre2|auto)</code> option.</li>
+<li>ripgrep has <a href="/BurntSushi/ripgrep/blob/master/GUIDE.md#replacements">rudimentary support for replacements</a>,
+which permit rewriting output based on what was matched.</li>
+<li>ripgrep supports <a href="/BurntSushi/ripgrep/blob/master/GUIDE.md#file-encoding">searching files in text encodings</a>
+other than UTF-8, such as UTF-16, latin-1, GBK, EUC-JP, Shift_JIS and more.
+(Some support for automatically detecting UTF-16 is provided. Other text
+encodings must be specifically specified with the <code>-E/--encoding</code> flag.)</li>
+<li>ripgrep supports searching files compressed in a common format (brotli,
+bzip2, gzip, lz4, lzma, xz, or zstandard) with the <code>-z/--search-zip</code> flag.</li>
+<li>ripgrep supports
+<a href="/BurntSushi/ripgrep/blob/master/GUIDE.md#preprocessor">arbitrary input preprocessing filters</a>
+which could be PDF text extraction, less supported decompression, decrypting,
+automatic encoding detection and so on.</li>
+<li>ripgrep can be configured via a
+<a href="/BurntSushi/ripgrep/blob/master/GUIDE.md#configuration-file">configuration file</a>.</li>
+</ul>
+<p dir="auto">In other words, use ripgrep if you like speed, filtering by default, fewer
+bugs and Unicode support.</p>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Why shouldn't I use ripgrep?</h3><a id="user-content-why-shouldnt-i-use-ripgrep" class="anchor" aria-label="Permalink: Why shouldn't I use ripgrep?" href="#why-shouldnt-i-use-ripgrep"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">Despite initially not wanting to add every feature under the sun to ripgrep,
+over time, ripgrep has grown support for most features found in other file
+searching tools. This includes searching for results spanning across multiple
+lines, and opt-in support for PCRE2, which provides look-around and
+backreference support.</p>
+<p dir="auto">At this point, the primary reasons not to use ripgrep probably consist of one
+or more of the following:</p>
+<ul dir="auto">
+<li>You need a portable and ubiquitous tool. While ripgrep works on Windows,
+macOS and Linux, it is not ubiquitous and it does not conform to any
+standard such as POSIX. The best tool for this job is good old grep.</li>
+<li>There still exists some other feature (or bug) not listed in this README that
+you rely on that's in another tool that isn't in ripgrep.</li>
+<li>There is a performance edge case where ripgrep doesn't do well where another
+tool does do well. (Please file a bug report!)</li>
+<li>ripgrep isn't possible to install on your machine or isn't available for your
+platform. (Please file a bug report!)</li>
+</ul>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Is it really faster than everything else?</h3><a id="user-content-is-it-really-faster-than-everything-else" class="anchor" aria-label="Permalink: Is it really faster than everything else?" href="#is-it-really-faster-than-everything-else"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">Generally, yes. A large number of benchmarks with detailed analysis for each is
+<a href="https://blog.burntsushi.net/ripgrep/" rel="nofollow">available on my blog</a>.</p>
+<p dir="auto">Summarizing, ripgrep is fast because:</p>
+<ul dir="auto">
+<li>It is built on top of
+<a href="https://github.com/rust-lang/regex">Rust's regex engine</a>.
+Rust's regex engine uses finite automata, SIMD and aggressive literal
+optimizations to make searching very fast. (PCRE2 support can be opted into
+with the <code>-P/--pcre2</code> flag.)</li>
+<li>Rust's regex library maintains performance with full Unicode support by
+building UTF-8 decoding directly into its deterministic finite automaton
+engine.</li>
+<li>It supports searching with either memory maps or by searching incrementally
+with an intermediate buffer. The former is better for single files and the
+latter is better for large directories. ripgrep chooses the best searching
+strategy for you automatically.</li>
+<li>Applies your ignore patterns in <code>.gitignore</code> files using a
+<a href="https://docs.rs/regex/1/regex/struct.RegexSet.html" rel="nofollow"><code>RegexSet</code></a>.
+That means a single file path can be matched against multiple glob patterns
+simultaneously.</li>
+<li>It uses a lock-free parallel recursive directory iterator, courtesy of
+<a href="https://docs.rs/crossbeam" rel="nofollow"><code>crossbeam</code></a> and
+<a href="https://docs.rs/ignore" rel="nofollow"><code>ignore</code></a>.</li>
+</ul>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Feature comparison</h3><a id="user-content-feature-comparison" class="anchor" aria-label="Permalink: Feature comparison" href="#feature-comparison"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">Andy Lester, author of <a href="https://beyondgrep.com/" rel="nofollow">ack</a>, has published an
+excellent table comparing the features of ack, ag, git-grep, GNU grep and
+ripgrep: <a href="https://beyondgrep.com/feature-comparison/" rel="nofollow">https://beyondgrep.com/feature-comparison/</a></p>
+<p dir="auto">Note that ripgrep has grown a few significant new features recently that
+are not yet present in Andy's table. This includes, but is not limited to,
+configuration files, passthru, support for searching compressed files,
+multiline search and opt-in fancy regex support via PCRE2.</p>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Playground</h3><a id="user-content-playground" class="anchor" aria-label="Permalink: Playground" href="#playground"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">If you'd like to try ripgrep before installing, there's an unofficial
+<a href="https://codapi.org/ripgrep/" rel="nofollow">playground</a> and an <a href="https://codapi.org/try/ripgrep/" rel="nofollow">interactive
+tutorial</a>.</p>
+<p dir="auto">If you have any questions about these, please open an issue in the <a href="https://github.com/nalgeon/tryxinyminutes">tutorial
+repo</a>.</p>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Installation</h3><a id="user-content-installation" class="anchor" aria-label="Permalink: Installation" href="#installation"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">The binary name for ripgrep is <code>rg</code>.</p>
+<p dir="auto"><strong><a href="https://github.com/BurntSushi/ripgrep/releases">Archives of precompiled binaries for ripgrep are available for Windows,
+macOS and Linux.</a></strong> Linux and
+Windows binaries are static executables. Users of platforms not explicitly
+mentioned below are advised to download one of these archives.</p>
+<p dir="auto">If you're a <strong>macOS Homebrew</strong> or a <strong>Linuxbrew</strong> user, then you can install
+ripgrep from homebrew-core:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ brew install ripgrep"><pre class="notranslate"><code>$ brew install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>MacPorts</strong> user, then you can install ripgrep from the
+<a href="https://www.macports.org/ports.php?by=name&amp;substr=ripgrep" rel="nofollow">official ports</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo port install ripgrep"><pre class="notranslate"><code>$ sudo port install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Windows Chocolatey</strong> user, then you can install ripgrep from the
+<a href="https://chocolatey.org/packages/ripgrep" rel="nofollow">official repo</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ choco install ripgrep"><pre class="notranslate"><code>$ choco install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Windows Scoop</strong> user, then you can install ripgrep from the
+<a href="https://github.com/ScoopInstaller/Main/blob/master/bucket/ripgrep.json">official bucket</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ scoop install ripgrep"><pre class="notranslate"><code>$ scoop install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Windows Winget</strong> user, then you can install ripgrep from the
+<a href="https://github.com/microsoft/winget-pkgs/tree/master/manifests/b/BurntSushi/ripgrep">winget-pkgs</a>
+repository:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ winget install BurntSushi.ripgrep.MSVC"><pre class="notranslate"><code>$ winget install BurntSushi.ripgrep.MSVC
+</code></pre></div>
+<p dir="auto">If you're an <strong>Arch Linux</strong> user, then you can install ripgrep from the official repos:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo pacman -S ripgrep"><pre class="notranslate"><code>$ sudo pacman -S ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Gentoo</strong> user, you can install ripgrep from the
+<a href="https://packages.gentoo.org/packages/sys-apps/ripgrep" rel="nofollow">official repo</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo emerge sys-apps/ripgrep"><pre class="notranslate"><code>$ sudo emerge sys-apps/ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Fedora</strong> user, you can install ripgrep from official
+repositories.</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo dnf install ripgrep"><pre class="notranslate"><code>$ sudo dnf install ripgrep
+</code></pre></div>
+<p dir="auto">If you're an <strong>openSUSE</strong> user, ripgrep is included in <strong>openSUSE Tumbleweed</strong>
+and <strong>openSUSE Leap</strong> since 15.1.</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo zypper install ripgrep"><pre class="notranslate"><code>$ sudo zypper install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>CentOS Stream 10</strong> user, you can install ripgrep from the
+<a href="https://docs.fedoraproject.org/en-US/epel/getting-started/" rel="nofollow">EPEL</a> repository:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo dnf config-manager --set-enabled crb
+$ sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+$ sudo dnf install ripgrep"><pre class="notranslate"><code>$ sudo dnf config-manager --set-enabled crb
+$ sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+$ sudo dnf install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Red Hat 10</strong> user, you can install ripgrep from the
+<a href="https://docs.fedoraproject.org/en-US/epel/getting-started/" rel="nofollow">EPEL</a> repository:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo subscription-manager repos --enable codeready-builder-for-rhel-10-$(arch)-rpms
+$ sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+$ sudo dnf install ripgrep"><pre class="notranslate"><code>$ sudo subscription-manager repos --enable codeready-builder-for-rhel-10-$(arch)-rpms
+$ sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+$ sudo dnf install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Rocky Linux 10</strong> user, you can install ripgrep from the
+<a href="https://docs.fedoraproject.org/en-US/epel/getting-started/" rel="nofollow">EPEL</a> repository:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+$ sudo dnf install ripgrep"><pre class="notranslate"><code>$ sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+$ sudo dnf install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Nix</strong> user, you can install ripgrep from
+<a href="https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/ri/ripgrep/package.nix">nixpkgs</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ nix-env --install ripgrep"><pre class="notranslate"><code>$ nix-env --install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Flox</strong> user, you can install ripgrep as follows:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ flox install ripgrep"><pre class="notranslate"><code>$ flox install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Guix</strong> user, you can install ripgrep from the official
+package collection:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ guix install ripgrep"><pre class="notranslate"><code>$ guix install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Debian</strong> user (or a user of a Debian derivative like <strong>Ubuntu</strong>),
+then ripgrep can be installed using a binary <code>.deb</code> file provided in each
+<a href="https://github.com/BurntSushi/ripgrep/releases">ripgrep release</a>.</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep_14.1.1-1_amd64.deb
+$ sudo dpkg -i ripgrep_14.1.1-1_amd64.deb"><pre class="notranslate"><code>$ curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep_14.1.1-1_amd64.deb
+$ sudo dpkg -i ripgrep_14.1.1-1_amd64.deb
+</code></pre></div>
+<p dir="auto">If you run Debian stable, ripgrep is <a href="https://tracker.debian.org/pkg/rust-ripgrep" rel="nofollow">officially maintained by
+Debian</a>, although its version may
+be older than the <code>deb</code> package available in the previous step.</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo apt-get install ripgrep"><pre class="notranslate"><code>$ sudo apt-get install ripgrep
+</code></pre></div>
+<p dir="auto">If you're an <strong>Ubuntu Cosmic (18.10)</strong> (or newer) user, ripgrep is
+<a href="https://launchpad.net/ubuntu/+source/rust-ripgrep" rel="nofollow">available</a> using the same
+packaging as Debian:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo apt-get install ripgrep"><pre class="notranslate"><code>$ sudo apt-get install ripgrep
+</code></pre></div>
+<p dir="auto">(N.B. Various snaps for ripgrep on Ubuntu are also available, but none of them
+seem to work right and generate a number of very strange bug reports that I
+don't know how to fix and don't have the time to fix. Therefore, it is no
+longer a recommended installation option.)</p>
+<p dir="auto">If you're an <strong>ALT</strong> user, you can install ripgrep from the
+<a href="https://packages.altlinux.org/en/search?name=ripgrep" rel="nofollow">official repo</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo apt-get install ripgrep"><pre class="notranslate"><code>$ sudo apt-get install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>FreeBSD</strong> user, then you can install ripgrep from the
+<a href="https://www.freshports.org/textproc/ripgrep/" rel="nofollow">official ports</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo pkg install ripgrep"><pre class="notranslate"><code>$ sudo pkg install ripgrep
+</code></pre></div>
+<p dir="auto">If you're an <strong>OpenBSD</strong> user, then you can install ripgrep from the
+<a href="https://openports.se/textproc/ripgrep" rel="nofollow">official ports</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ doas pkg_add ripgrep"><pre class="notranslate"><code>$ doas pkg_add ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>NetBSD</strong> user, then you can install ripgrep from
+<a href="https://pkgsrc.se/textproc/ripgrep" rel="nofollow">pkgsrc</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo pkgin install ripgrep"><pre class="notranslate"><code>$ sudo pkgin install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Haiku x86_64</strong> user, then you can install ripgrep from the
+<a href="https://github.com/haikuports/haikuports/tree/master/sys-apps/ripgrep">official ports</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo pkgman install ripgrep"><pre class="notranslate"><code>$ sudo pkgman install ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Haiku x86_gcc2</strong> user, then you can install ripgrep from the
+same port as Haiku x86_64 using the x86 secondary architecture build:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo pkgman install ripgrep_x86"><pre class="notranslate"><code>$ sudo pkgman install ripgrep_x86
+</code></pre></div>
+<p dir="auto">If you're a <strong>Void Linux</strong> user, then you can install ripgrep from the
+<a href="https://voidlinux.org/packages/?arch=x86_64&amp;q=ripgrep" rel="nofollow">official repository</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ sudo xbps-install -Syv ripgrep"><pre class="notranslate"><code>$ sudo xbps-install -Syv ripgrep
+</code></pre></div>
+<p dir="auto">If you're a <strong>Rust programmer</strong>, ripgrep can be installed with <code>cargo</code>.</p>
+<ul dir="auto">
+<li>Note that the minimum supported version of Rust for ripgrep is <strong>1.96.0</strong>,
+although ripgrep may work with older versions.</li>
+<li>Note that the binary may be bigger than expected because it contains debug
+symbols. This is intentional. To remove debug symbols and therefore reduce
+the file size, run <code>strip</code> on the binary.</li>
+</ul>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ cargo install ripgrep"><pre class="notranslate"><code>$ cargo install ripgrep
+</code></pre></div>
+<p dir="auto">Alternatively, one can use <a href="https://github.com/cargo-bins/cargo-binstall"><code>cargo binstall</code></a> to install a ripgrep
+binary directly from GitHub:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ cargo binstall ripgrep"><pre class="notranslate"><code>$ cargo binstall ripgrep
+</code></pre></div>
+<div class="markdown-heading" dir="auto"><h3 tabindex="-1" class="heading-element" dir="auto">Building</h3><a id="user-content-building" class="anchor" aria-label="Permalink: Building" href="#building"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">ripgrep is written in Rust, so you'll need to grab a
+<a href="https://www.rust-lang.org/" rel="nofollow">Rust installation</a> in order to compile it.
+ripgrep compiles with Rust 1.96.0 (stable) or newer. In general, ripgrep tracks
+the latest stable release of the Rust compiler.</p>
+<p dir="auto">To build ripgrep:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ git clone https://github.com/BurntSushi/ripgrep
+$ cd ripgrep
+$ cargo build --release
+$ ./target/release/rg --version
+0.1.3"><pre class="notranslate"><code>$ git clone https://github.com/BurntSushi/ripgrep
+$ cd ripgrep
+$ cargo build --release
+$ ./target/release/rg --version
+0.1.3
+</code></pre></div>
+<p dir="auto"><strong>NOTE:</strong> In the past, ripgrep supported a <code>simd-accel</code> Cargo feature when
+using a Rust nightly compiler. This only benefited UTF-16 transcoding.
+Since it required unstable features, this build mode was prone to breakage.
+Because of that, support for it has been removed. If you want SIMD
+optimizations for UTF-16 transcoding, then you'll have to petition the
+<a href="https://github.com/hsivonen/encoding_rs"><code>encoding_rs</code></a> project to use stable
+APIs.</p>
+<p dir="auto">Finally, optional PCRE2 support can be built with ripgrep by enabling the
+<code>pcre2</code> feature:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="$ cargo build --release --features 'pcre2'"><pre class="notranslate"><code>$ cargo build --release --features 'pcre2'
+</code></pre></div>
+<p dir="auto">Enabling the PCRE2 feature works with a stable Rust compiler and will
+attempt to automatically find and link with your system's PCRE2 library via
+<code>pkg-config</code>. If one doesn't exist, then ripgrep will build PCRE2 from source
+using your system's C compiler and then statically link it into the final
+executable. Static linking can be forced even when there is an available PCRE2
+system library by either building ripgrep with the MUSL target or by setting
+<code>PCRE2_SYS_STATIC=1</code>.</p>
+<p dir="auto">ripgrep can be built with the MUSL target on Linux by first installing the MUSL
+library on your system (consult your friendly neighborhood package manager).
+Then you just need to add MUSL support to your Rust toolchain and rebuild
+ripgrep, which yields a fully static executable:</p>
+
+</body></html>
