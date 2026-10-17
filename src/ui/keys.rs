@@ -111,18 +111,117 @@ pub const SPECS: &[Spec] = &[
     spec(A::Yank, "yank", Editor, &["ctrl+y"], "Paste the last deleted text"),
 ];
 
+/// The same actions on their default keys with extra modifiers, which the
+/// keys accepted before they were configurable (`ctrl+enter` sent, `alt+home`
+/// went to the line start). They stay bound until the action is set in
+/// keybindings.toml, and `/keys` only counts them.
+pub const VARIANTS: &[(KeyAction, &[&str])] = &[
+    (A::Reload, &["ctrl+shift+g", "ctrl+super+g", "ctrl+super+shift+g"]),
+    (A::ExpandTools, &["ctrl+shift+o", "ctrl+super+o", "ctrl+super+shift+o"]),
+    (A::PasteImage, &["ctrl+shift+v", "ctrl+super+v", "ctrl+super+shift+v"]),
+    (A::ModelMenu, &["ctrl+shift+l", "ctrl+super+l", "ctrl+super+shift+l"]),
+    (
+        A::CycleEffort,
+        &[
+            "alt+shift+tab", "ctrl+shift+tab", "super+shift+tab", "alt+super+shift+tab", "ctrl+alt+shift+tab",
+            "ctrl+super+shift+tab", "ctrl+alt+super+shift+tab",
+        ],
+    ),
+    (A::Suspend, &["ctrl+super+z"]),
+    (A::Submit, &["ctrl+enter", "super+enter", "ctrl+alt+enter", "ctrl+super+enter", "ctrl+alt+super+enter"]),
+    (
+        A::Newline,
+        &[
+            "ctrl+shift+enter", "ctrl+shift+j", "ctrl+super+j", "super+shift+enter", "ctrl+alt+shift+enter",
+            "ctrl+super+shift+enter", "ctrl+super+shift+j", "ctrl+alt+super+shift+enter",
+        ],
+    ),
+    (A::FollowUp, &["alt+shift+enter", "alt+super+enter", "alt+super+shift+enter"]),
+    (
+        A::Interrupt,
+        &[
+            "alt+esc", "ctrl+esc", "shift+esc", "super+esc", "alt+shift+esc", "alt+super+esc", "ctrl+alt+esc",
+            "ctrl+shift+esc", "ctrl+super+esc", "super+shift+esc", "alt+super+shift+esc",
+            "ctrl+alt+shift+esc", "ctrl+alt+super+esc", "ctrl+super+shift+esc", "ctrl+alt+super+shift+esc",
+        ],
+    ),
+    (A::Clear, &["ctrl+shift+c", "ctrl+super+c", "ctrl+super+shift+c"]),
+    (A::Exit, &["ctrl+shift+d", "ctrl+super+d", "ctrl+super+shift+d"]),
+    (A::Dequeue, &["alt+super+up"]),
+    (A::HistorySearch, &["ctrl+shift+r", "ctrl+super+r", "ctrl+super+shift+r"]),
+    (A::HistoryPrev, &["ctrl+up", "ctrl+alt+up", "ctrl+shift+p", "ctrl+super+p", "ctrl+super+shift+p"]),
+    (A::HistoryNext, &["alt+down", "ctrl+down", "ctrl+alt+down", "ctrl+shift+n", "ctrl+super+n", "ctrl+super+shift+n"]),
+    (
+        A::Complete,
+        &[
+            "alt+tab", "ctrl+tab", "super+tab", "alt+super+tab", "ctrl+alt+tab", "ctrl+super+tab",
+            "ctrl+alt+super+tab",
+        ],
+    ),
+    (A::Undo, &["alt+super+z", "ctrl+super+-", "ctrl+super+7", "ctrl+super+_", "ctrl+alt+super+z"]),
+    (A::Redo, &["alt+super+_", "alt+super+shift+z", "ctrl+super+shift+z", "ctrl+alt+super+shift+z"]),
+    (A::CharLeft, &["ctrl+alt+left", "ctrl+shift+b", "ctrl+super+b", "ctrl+super+shift+b"]),
+    (A::CharRight, &["ctrl+alt+right", "ctrl+shift+f", "ctrl+super+f", "ctrl+super+shift+f"]),
+    (A::WordLeft, &["alt+shift+b", "alt+super+b", "alt+super+left", "ctrl+super+left", "alt+super+shift+b"]),
+    (A::WordRight, &["alt+shift+f", "alt+super+f", "alt+super+right", "ctrl+super+right", "alt+super+shift+f"]),
+    (A::LineStart, &["alt+home", "ctrl+alt+home", "ctrl+shift+a", "ctrl+alt+super+left"]),
+    (
+        A::LineEnd,
+        &[
+            "alt+end", "ctrl+alt+end", "ctrl+shift+e", "ctrl+super+e", "ctrl+alt+super+right",
+            "ctrl+super+shift+e",
+        ],
+    ),
+    (
+        A::InputStart,
+        &[
+            "alt+super+<", "alt+super+home", "ctrl+super+home", "ctrl+super+up", "ctrl+alt+super+home",
+            "ctrl+alt+super+up",
+        ],
+    ),
+    (
+        A::InputEnd,
+        &[
+            "alt+super+>", "alt+super+down", "alt+super+end", "ctrl+super+down", "ctrl+super+end",
+            "ctrl+alt+super+down", "ctrl+alt+super+end",
+        ],
+    ),
+    (
+        A::DeleteWord,
+        &[
+            "alt+shift+backspace", "alt+super+backspace", "ctrl+shift+w", "ctrl+super+w",
+            "alt+super+shift+backspace", "ctrl+super+shift+w",
+        ],
+    ),
+    (
+        A::DeleteWordForward,
+        &[
+            "alt+shift+d", "alt+shift+delete", "alt+super+d", "alt+super+delete", "ctrl+shift+delete",
+            "ctrl+super+delete", "alt+super+shift+d", "alt+super+shift+delete", "ctrl+super+shift+delete",
+        ],
+    ),
+    (
+        A::DeleteToLineStart,
+        &[
+            "ctrl+shift+u", "ctrl+super+backspace", "ctrl+super+u", "super+shift+backspace",
+            "ctrl+alt+super+backspace", "ctrl+super+shift+backspace", "ctrl+super+shift+u",
+            "ctrl+alt+super+shift+backspace",
+        ],
+    ),
+    (A::DeleteToLineEnd, &["ctrl+shift+k", "ctrl+super+k", "ctrl+super+shift+k"]),
+    (A::Yank, &["ctrl+shift+y", "ctrl+super+y", "ctrl+super+shift+y"]),
+];
+
 fn index(action: KeyAction) -> usize {
     SPECS.iter().position(|s| s.action == action).expect("every action has a spec")
 }
 
-/// The modifiers a binding can name; any other modifier on an event (Hyper,
-/// Meta) keeps it from matching.
+/// The modifiers a binding can name; others on an event (Hyper, Meta) are
+/// ignored, as they always were.
 const MODS: KeyModifiers = KeyModifiers::CONTROL
     .union(KeyModifiers::ALT)
     .union(KeyModifiers::SHIFT)
-    .union(KeyModifiers::SUPER)
-    .union(KeyModifiers::HYPER)
-    .union(KeyModifiers::META);
+    .union(KeyModifiers::SUPER);
 
 /// A key with its modifiers, normalized so that a parsed binding and a key
 /// event compare equal: letters are lowercase with Shift as a modifier,
@@ -268,16 +367,23 @@ impl Chord {
 pub struct Keymap {
     /// Indexed like [`SPECS`].
     keys: Vec<Vec<Chord>>,
+    /// Whether keybindings.toml set the action (its variants are gone).
+    custom: Vec<bool>,
 }
 
 impl Default for Keymap {
     fn default() -> Self {
+        let parse = |k: &&str| Chord::parse(k).expect("default keys parse");
         let keys = SPECS
             .iter()
-            .map(|s| s.defaults.iter().map(|k| Chord::parse(k).expect("default keys parse")).collect())
+            .map(|s| s.defaults.iter().chain(variants(s.action)).map(parse).collect())
             .collect();
-        Keymap { keys }
+        Keymap { keys, custom: vec![false; SPECS.len()] }
     }
+}
+
+fn variants(action: KeyAction) -> &'static [&'static str] {
+    VARIANTS.iter().find(|(a, _)| *a == action).map_or(&[], |(_, v)| v)
 }
 
 impl Keymap {
@@ -324,6 +430,7 @@ impl Keymap {
                 continue;
             }
             map.keys[i] = keys;
+            map.custom[i] = true;
             set.retain(|&j| j != i);
             set.push(i);
         }
@@ -335,6 +442,16 @@ impl Keymap {
                     map.keys[j].retain(|c| *c != k);
                 }
             }
+        }
+        // Variants go with the default keys they extend (`ctrl+shift+o`
+        // with `ctrl+o`).
+        for j in (0..SPECS.len()).filter(|j| !set.contains(j)) {
+            let defaults: Vec<Chord> = SPECS[j].defaults.iter().filter_map(|k| Chord::parse(k).ok()).collect();
+            let kept = map.keys[j].clone();
+            map.keys[j].retain(|v| {
+                let mut owners = defaults.iter().filter(|d| d.code == v.code && v.mods.contains(d.mods));
+                defaults.contains(v) || owners.clone().next().is_none() || owners.any(|d| kept.contains(d))
+            });
         }
         warnings.extend(map.conflicts());
         (map, warnings)
@@ -390,15 +507,26 @@ impl Keymap {
     /// `/keys`: every action with its keys.
     pub fn lines(&self) -> Vec<String> {
         let width = SPECS.iter().map(|s| s.name.len()).max().unwrap_or(0);
-        let labels: Vec<String> = self
-            .keys
+        let labels: Vec<String> = SPECS
             .iter()
-            .map(|keys| {
+            .zip(&self.keys)
+            .zip(&self.custom)
+            .map(|((s, keys), &custom)| {
                 if keys.is_empty() {
-                    "(unbound)".to_string()
-                } else {
-                    keys.iter().map(Chord::label).collect::<Vec<_>>().join(", ")
+                    return "(unbound)".to_string();
                 }
+                let extra: Vec<Chord> =
+                    if custom { Vec::new() } else { variants(s.action).iter().filter_map(|k| Chord::parse(k).ok()).collect() };
+                let shown: Vec<String> = keys.iter().filter(|k| !extra.contains(k)).map(Chord::label).collect();
+                let hidden = keys.len() - shown.len();
+                if shown.is_empty() {
+                    return keys.iter().map(Chord::label).collect::<Vec<_>>().join(", ");
+                }
+                let mut label = shown.join(", ");
+                if hidden > 0 {
+                    label.push_str(&format!(" (+{hidden} with extra modifiers)"));
+                }
+                label
             })
             .collect();
         let key_width = labels.iter().map(String::len).max().unwrap_or(0);
@@ -523,6 +651,17 @@ mod tests {
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(k.action(Global, &ev(Char('o'), M::CONTROL)), None);
         assert_eq!(k.action(Editor, &ev(Char('o'), M::CONTROL)), Some(A::DeleteWord));
+        assert_eq!(k.action(Global, &ev(Char('o'), M::CONTROL | M::SHIFT)), None, "its variants go too");
+        let line = |name: &str| k.lines().into_iter().find(|l| l.trim_start().starts_with(&format!("{name} "))).unwrap();
+        assert!(line("expand_tools").contains("(unbound)"), "{}", line("expand_tools"));
+        assert!(line("delete_word").contains(" ctrl+o "), "{}", line("delete_word"));
+        assert!(!line("delete_word").contains("ctrl+w"), "the file replaces the defaults");
+        assert!(Keymap::default().lines().iter().any(|l| l.contains(" enter (+5 with extra modifiers) ")));
+        // Stealing one of several defaults keeps the rest and their variants.
+        let (k, _) = Keymap::parse("yank = \"home\"");
+        assert_eq!(k.keys(A::LineStart)[0].label(), "ctrl+a");
+        assert_eq!(k.action(Editor, &ev(Home, M::ALT)), None, "alt+home went with home");
+        assert_eq!(k.action(Editor, &ev(Char('a'), M::CONTROL | M::SHIFT)), Some(A::LineStart));
 
         let (k, w) = Keymap::parse(
             "frobnicate = \"ctrl+x\"\nundo = [\"ctrl+nope\", 3, \"ctrl+u\"]\nredo = 5\nyank = \"y\"\n",
@@ -559,5 +698,130 @@ mod tests {
         let (k, w) = load(home.path());
         assert!(w.is_empty());
         assert_eq!(k.hint(A::ModelMenu).as_deref(), Some("f2"));
+    }
+
+    /// What a key did before bindings were configurable (no selection, no
+    /// search, idle): `Some(Some(action))`, `Some(None)` for the keys that
+    /// stay fixed (typing, Backspace, Delete, Super+A), `None` for nothing.
+    fn old_action(code: KeyCode, m: M) -> Option<Option<KeyAction>> {
+        let (ctrl, alt, shift, sup) = (
+            m.contains(M::CONTROL) && !m.contains(M::ALT),
+            m.contains(M::ALT) && !m.contains(M::CONTROL),
+            m.contains(M::SHIFT),
+            m.contains(M::SUPER),
+        );
+        let act = |a| Some(Some(a));
+        // Global keys, checked before the editor.
+        match code {
+            Char('g') if ctrl => return act(A::Reload),
+            Char('o') if ctrl => return act(A::ExpandTools),
+            Char('v') if ctrl => return act(A::PasteImage),
+            Char('l') if ctrl => return act(A::ModelMenu),
+            BackTab => return act(A::CycleEffort),
+            Char('z') if ctrl && !shift => return act(A::Suspend),
+            _ => {}
+        }
+        match code {
+            Char('r') if ctrl => return act(A::HistorySearch),
+            Char('_' | '7' | '-') if ctrl => return act(A::Undo),
+            Char('_') if alt => return act(A::Redo),
+            Char('z' | 'Z') if (ctrl || sup) && shift => return act(A::Redo),
+            Char('z') if sup => return act(A::Undo),
+            _ => {}
+        }
+        match code {
+            Char('c') if ctrl => act(A::Clear),
+            Esc => act(A::Interrupt),
+            Up if alt => act(A::Dequeue),
+            Char('d') if ctrl => act(A::Exit),
+            Enter if alt => act(A::FollowUp),
+            Enter if shift => act(A::Newline),
+            Char('j') if ctrl => act(A::Newline),
+            Enter => act(A::Submit),
+            Char('a') if sup => Some(None),
+            Home if ctrl => act(A::InputStart),
+            End if ctrl => act(A::InputEnd),
+            Up | Home if sup => act(A::InputStart),
+            Down | End if sup => act(A::InputEnd),
+            Char('<') if alt => act(A::InputStart),
+            Char('>') if alt => act(A::InputEnd),
+            Left if ctrl || alt => act(A::WordLeft),
+            Right if ctrl || alt => act(A::WordRight),
+            Char('b') if alt => act(A::WordLeft),
+            Char('f') if alt => act(A::WordRight),
+            Char('b') if ctrl => act(A::CharLeft),
+            Char('f') if ctrl => act(A::CharRight),
+            Backspace if alt => act(A::DeleteWord),
+            Char('w') if ctrl => act(A::DeleteWord),
+            Char('d') if alt => act(A::DeleteWordForward),
+            Delete if ctrl || alt => act(A::DeleteWordForward),
+            Char('u') if ctrl => act(A::DeleteToLineStart),
+            Backspace if sup => act(A::DeleteToLineStart),
+            Char('k') if ctrl => act(A::DeleteToLineEnd),
+            Char('y') if ctrl => act(A::Yank),
+            Left if sup => act(A::LineStart),
+            Right if sup => act(A::LineEnd),
+            Home => act(A::LineStart),
+            Char('a') if ctrl => act(A::LineStart),
+            End => act(A::LineEnd),
+            Char('e') if ctrl => act(A::LineEnd),
+            Backspace | Delete => Some(None),
+            Left => act(A::CharLeft),
+            Right => act(A::CharRight),
+            Up => act(A::HistoryPrev),
+            Char('p') if ctrl => act(A::HistoryPrev),
+            Down => act(A::HistoryNext),
+            Char('n') if ctrl => act(A::HistoryNext),
+            Tab => act(A::Complete),
+            Char(c) if !ctrl && !alt && !sup && !c.is_control() => Some(None),
+            _ => None,
+        }
+    }
+
+    /// What a key does now: global actions first, then the editor's (which
+    /// sees Shift+movement as the plain movement).
+    fn new_action(k: &Keymap, mut key: KeyEvent) -> Option<KeyAction> {
+        k.action(Global, &key).or_else(|| {
+            if matches!(key.code, Left | Right | Up | Down | Home | End) {
+                key.modifiers -= M::SHIFT;
+            }
+            k.action(Editor, &key)
+        })
+    }
+
+    /// Every key that did something before still does the same by default
+    /// (the old checks ignored extra modifiers, so the defaults list them).
+    #[test]
+    fn default_keys_do_everything_the_old_keys_did() {
+        let k = Keymap::default();
+        let mut codes = vec![Esc, Enter, Tab, BackTab, Backspace, Delete, Home, End, Left, Right, Up, Down];
+        codes.extend("abcdefghijklmnopqrstuvwxyz_7-<> ".chars().map(Char));
+        codes.extend(('A'..='Z').map(Char));
+        let mut missing = Vec::new();
+        for code in codes {
+            for bits in 0..32u8 {
+                let mut m = M::NONE;
+                for (bit, flag) in [M::CONTROL, M::ALT, M::SHIFT, M::SUPER, M::HYPER].into_iter().enumerate() {
+                    if bits & (1 << bit) != 0 {
+                        m |= flag;
+                    }
+                }
+                // Shifted letters arrive uppercase; Shift+Tab arrives as BackTab.
+                if matches!(code, Char(c) if c.is_uppercase()) && !m.contains(M::SHIFT)
+                    || code == Tab && m.contains(M::SHIFT)
+                {
+                    continue;
+                }
+                let now = new_action(&k, ev(code, m));
+                if let Some(old) = old_action(code, m) {
+                    if old != now {
+                        missing.push(format!("MISSING {:?} {}", old, Chord::of(&ev(code, m)).label()));
+                    }
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
     }
 }
