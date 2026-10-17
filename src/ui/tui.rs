@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::{Action, Editor};
+use super::keys::{KeyAction, Keymap};
 use super::render::{
     escape_len, is_table_sep, numbered_diff, looks_like_diff, one_line, sanitize_text, table, table_cells,
     truncate, visible_width, wrap_row, file_url, link, Fence, Markdown, RULE,
@@ -321,6 +322,8 @@ pub struct Screen {
     settings: Option<super::settings::SettingsMenu>,
     modes: Option<super::mode_menu::ModeMenu>,
     help: Option<super::help_menu::HelpMenu>,
+    /// Key bindings for the global actions (the editor holds its own copy).
+    keys: Arc<Keymap>,
     /// Everything shown so far, for the transcript viewer.
     pub log: super::transcript::Log,
     viewer: Option<super::transcript::Viewer>,
@@ -638,6 +641,7 @@ impl Screen {
             settings: None,
             modes: None,
             help: None,
+            keys: super::keys::current(),
             log: Default::default(),
             viewer: None,
             review: None,
@@ -724,7 +728,8 @@ impl Screen {
                 if shown.len() > INLINE_DIFF_ROWS {
                     let more = shown.len() - INLINE_DIFF_ROWS;
                     shown.truncate(INLINE_DIFF_ROWS);
-                    shown.push(format!("{bar}{}", paint(fg(FAINT), &format!("… {more} more lines (ctrl+o to view)"))));
+                    let view = self.keys.hint(KeyAction::ExpandTools).unwrap_or_else(|| "/transcript".into());
+                    shown.push(format!("{bar}{}", paint(fg(FAINT), &format!("… {more} more lines ({view} to view)"))));
                 }
                 rows.extend(shown);
             }
@@ -832,7 +837,9 @@ impl Screen {
             if !self.tally.is_empty() {
                 parts.push(tally_text(&self.tally));
             }
-            parts.push("esc to interrupt".into());
+            if let Some(key) = self.keys.hint(KeyAction::Interrupt) {
+                parts.push(format!("{key} to interrupt"));
+            }
             let suffix = format!(" ({})", parts.join(" · "));
             let label = truncate(label, w.saturating_sub(suffix.chars().count() + 4).max(1));
             let detail = if self.live_block == Block::Reasoning {
@@ -2352,8 +2359,20 @@ impl Screen {
         let _ = self.out.flush();
     }
 
+    /// Use `keys` for the global and editor actions.
+    #[cfg(test)]
+    fn set_keys(&mut self, keys: Keymap) {
+        let keys = Arc::new(keys);
+        self.editor.set_keys(keys.clone());
+        self.keys = keys;
+    }
+
     fn on_viewer_key(&mut self, key: KeyEvent) {
         let Some(v) = &mut self.viewer else { return };
+        // The key that opened the transcript also closes it.
+        if self.keys.matches(KeyAction::ExpandTools, &key) && !v.searching() {
+            return self.close_transcript();
+        }
         match v.on_key(key) {
             super::transcript::Action::Close => self.close_transcript(),
             super::transcript::Action::Stay => self.draw_viewer(true),
@@ -2446,12 +2465,9 @@ impl Screen {
 
     fn on_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
         // Ctrl+G aborts a Ctrl+R history search (it restores the draft).
-        // Otherwise it asks to reload an installed upgrade.
-        if key.code == KeyCode::Char('g')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-            && !self.editor.searching()
-        {
+        // Otherwise `reload` asks to reload an installed upgrade.
+        let ctrl_g = key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::CONTROL;
+        if self.keys.matches(KeyAction::Reload, &key) && !(ctrl_g && self.editor.searching()) {
             return self.request_upgrade(commands);
         }
         if self.approval.is_some() && self.viewer.is_some() {
@@ -2513,7 +2529,10 @@ impl Screen {
                 return self.redraw();
             }
             let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
-            if a.review.is_some() && ((plain && matches!(key.code, KeyCode::Char('v' | 'V'))) || (ctrl && key.code == KeyCode::Char('o'))) {
+            let review = (plain && matches!(key.code, KeyCode::Char('v' | 'V')))
+                || (ctrl && key.code == KeyCode::Char('o'))
+                || self.keys.matches(KeyAction::ExpandTools, &key);
+            if a.review.is_some() && review {
                 let (title, text) = (super::render::strip_ansi(&a.title), a.review.clone().unwrap_or_default());
                 self.approval = Some(a);
                 return self.open_review(&title, &text);
@@ -2607,28 +2626,27 @@ impl Screen {
             }
             return self.redraw();
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
-        if ctrl && key.code == KeyCode::Char('o') {
-            return self.open_transcript();
-        }
-        if ctrl && key.code == KeyCode::Char('v') {
-            self.clipboard_request = true;
-            self.hint = Some("Reading the clipboard…".into());
-            return self.redraw();
-        }
-        if ctrl && key.code == KeyCode::Char('l') {
-            let _ = commands.send(Command::Submit("/model".into()));
-            return;
-        }
-        if key.code == KeyCode::BackTab {
-            let _ = commands.send(Command::CycleEffort);
-            return;
-        }
-        if ctrl && key.code == KeyCode::Char('z') && !key.modifiers.contains(KeyModifiers::SHIFT) {
-            #[cfg(unix)]
-            self.suspend();
-            return;
+        match self.keys.action(super::keys::Context::Global, &key) {
+            Some(KeyAction::ExpandTools) => return self.open_transcript(),
+            Some(KeyAction::PasteImage) => {
+                self.clipboard_request = true;
+                self.hint = Some("Reading the clipboard…".into());
+                return self.redraw();
+            }
+            Some(KeyAction::ModelMenu) => {
+                let _ = commands.send(Command::Submit("/model".into()));
+                return;
+            }
+            Some(KeyAction::CycleEffort) => {
+                let _ = commands.send(Command::CycleEffort);
+                return;
+            }
+            Some(KeyAction::Suspend) => {
+                #[cfg(unix)]
+                self.suspend();
+                return;
+            }
+            _ => {}
         }
         // The `@` file picker takes arrows, Tab, Enter and Esc while it shows.
         let searching = self.editor.searching();
@@ -2720,7 +2738,8 @@ impl Screen {
         // An image lives as long as its token: deleting it drops the image.
         // Browsing history swaps the text without editing it.
         let browsing = matches!(key.code, KeyCode::Up | KeyCode::Down)
-            || (ctrl && matches!(key.code, KeyCode::Char('p' | 'n')));
+            || self.keys.matches(KeyAction::HistoryPrev, &key)
+            || self.keys.matches(KeyAction::HistoryNext, &key);
         match &action {
             Action::Submit(text) | Action::FollowUp(text) => self.prune_attachments(text),
             _ if !browsing && !self.attachments.is_empty() => self.prune_attachments(&self.editor.text()),
@@ -2745,7 +2764,9 @@ impl Screen {
                     c.cancel();
                 }
                 if !busy && !self.editor.is_empty() {
-                    self.hint = Some("Press esc again to clear the input".into());
+                    if let Some(key) = self.keys.hint(KeyAction::Interrupt) {
+                        self.hint = Some(format!("Press {key} again to clear the input"));
+                    }
                 }
             }
             Action::Copy(text) => {
@@ -2761,7 +2782,9 @@ impl Screen {
                 } else if exit && !busy {
                     let _ = commands.send(Command::Exit);
                 } else if was_empty && !busy {
-                    self.hint = Some("Press ctrl+c again to exit".into());
+                    if let Some(key) = self.keys.hint(KeyAction::Clear) {
+                        self.hint = Some(format!("Press {key} again to exit"));
+                    }
                 }
             }
             Action::Exit => {
@@ -3998,6 +4021,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rebound_keys_never_answer_an_approval() {
+        let (keys, warnings) = super::super::keys::Keymap::parse(
+            "reload = \"ctrl+y\"\nexpand_tools = \"alt+y\"\nsubmit = [\"enter\", \"ctrl+a\"]\nclear = \"ctrl+n\"",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let pending = |tx| PendingApproval {
+            title: "Approve".into(),
+            lines: Vec::new(),
+            prewrapped: false,
+            scroll: 0,
+            rule: Some("bash:ls".into()),
+            save_rule: Some("bash:ls".into()),
+            origin: None,
+            note: String::new(),
+            noting: false,
+            selected: None,
+            review: Some("preview".into()),
+            reply: tx,
+        };
+        for (code, modifiers) in [
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+            (KeyCode::Char('y'), KeyModifiers::ALT),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL),
+            (KeyCode::Char('n'), KeyModifiers::CONTROL),
+            (KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            let mut s = screen();
+            s.set_keys(keys.clone());
+            let (tx, mut rx) = oneshot::channel();
+            s.approval = Some(pending(tx));
+            s.on_key(KeyEvent::new(code, modifiers), &cmd_tx);
+            assert!(rx.try_recv().is_err(), "{code:?} {modifiers:?}");
+            assert!(s.approval.is_some());
+            // The rebound review key opens the review instead.
+            assert_eq!(s.viewer.is_some(), modifiers == KeyModifiers::ALT);
+        }
+    }
+
+    #[test]
+    fn rebound_global_keys() {
+        let (keys, _) = super::super::keys::Keymap::parse("expand_tools = \"f5\"\nmodel_menu = []");
+        let mut s = screen();
+        s.set_keys(keys);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        s.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), &cmd_tx);
+        assert!(s.viewer.is_none());
+        s.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL), &cmd_tx);
+        assert!(cmd_rx.try_recv().is_err(), "model_menu is unbound");
+        s.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &cmd_tx);
+        assert!(s.viewer.is_some());
+        s.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &cmd_tx);
+        assert!(s.viewer.is_none(), "the same key closes it");
+        s.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &cmd_tx);
+        assert!(matches!(cmd_rx.try_recv().unwrap(), Command::CycleEffort));
     }
 
     #[test]

@@ -378,6 +378,13 @@ pub async fn doctor(
         },
         "fix theme_colors; the entries listed keep their built-in colors",
     ));
+    let (_, key_warnings) = crate::ui::keys::load(home);
+    checks.push(info(
+        "keybindings",
+        key_warnings.is_empty(),
+        if key_warnings.is_empty() { "keybindings.toml parses (or is absent)".into() } else { key_warnings.join("; ") },
+        "fix keybindings.toml; nyq skips the entries it warned about",
+    ));
     checks.push(sessions_check(facts.sessions_dir));
     let (steps, steps_source) = crate::agent::step_limit();
     checks.push(info(

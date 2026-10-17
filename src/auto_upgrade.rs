@@ -184,7 +184,7 @@ impl Upgrader {
     pub fn status_label(&self) -> String {
         match self.state() {
             State::Downloading => format!("upgrading to {}...", self.latest()),
-            State::Ready => "update ready: ctrl+g to reload".into(),
+            State::Ready => format!("update ready: {} to reload", crate::ui::keys::hint(crate::ui::keys::KeyAction::Reload)),
             State::Failed => "upgrade failed".into(),
             State::Idle | State::Checking | State::Waiting => String::new(),
         }
