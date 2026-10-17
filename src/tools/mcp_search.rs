@@ -1,7 +1,8 @@
 //! MCP tool search. When connected MCP servers bring more tools than fit
 //! comfortably in every request, their schemas are not advertised; the model
 //! gets `mcp_search_tools` to find them and `mcp_select_tool` to make one
-//! available for the rest of the session.
+//! available for the rest of the session. The search also finds installed
+//! skills that match, so one query covers both kinds of capability.
 
 use std::collections::BTreeMap;
 
@@ -43,16 +44,17 @@ pub(crate) fn meta_specs(mcp: &[ToolSpec]) -> [ToolSpec; 2] {
     let search = ToolSpec {
         name: SEARCH.into(),
         description: format!(
-            "Search the {} tools of the connected MCP servers ({}) by keywords; their schemas are not listed \
-             directly to save context. Include the server name and the task in the query. Then call {SELECT} \
-             with an exact name to make that tool callable.",
+            "Search the {} tools of the connected MCP servers ({}) and the installed skills by keywords; MCP \
+             schemas are not listed directly to save context. Include the server name and the task in the query. \
+             Then call {SELECT} with an exact name to make that tool callable, or load a matching skill with \
+             the `skill` tool.",
             mcp.len(),
             servers.join(", ")
         ),
         parameters: json!({
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Keywords matched against tool names, descriptions, servers and parameters."},
+                "query": {"type": "string", "description": "Keywords matched against tool and skill names, descriptions, servers and parameters."},
                 "limit": {"type": "integer", "description": "Maximum results (default 8, max 20)."}
             },
             "required": ["query"]
@@ -101,9 +103,54 @@ fn score(spec: &ToolSpec, terms: &[String]) -> usize {
         .sum()
 }
 
-/// Ranked matches for `query`, formatted for the model, followed by the
-/// instructions (`notes`, by server name) of the servers that matched.
-pub(crate) fn search(mcp: &[ToolSpec], args: &Value, notes: &BTreeMap<String, String>) -> Result<String, String> {
+fn skill_score(skill: &crate::skills::Skill, terms: &[String]) -> usize {
+    let name = words(&skill.id);
+    let desc = skill.description.to_lowercase();
+    terms
+        .iter()
+        .map(|t| {
+            let mut s = 0;
+            if name.iter().any(|n| n == t) {
+                s += 6;
+            } else if name.iter().any(|n| n.contains(t.as_str())) {
+                s += 3;
+            }
+            if desc.contains(t.as_str()) {
+                s += 2;
+            }
+            s
+        })
+        .sum()
+}
+
+/// Matching skills (name, location, description), best first.
+fn skill_hits(skills: &[crate::skills::Skill], terms: &[String], limit: usize) -> String {
+    let mut hits: Vec<(usize, &crate::skills::Skill)> =
+        skills.iter().map(|s| (skill_score(s, terms), s)).filter(|(n, _)| *n > 0).collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    if hits.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Skills (load one with the `skill` tool):\n");
+    for (_, skill) in hits.iter().take(limit) {
+        let desc: String = skill.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+        out.push_str(&format!("- {} ({}) — {desc}\n", skill.id, skill.location));
+    }
+    if hits.len() > limit {
+        out.push_str(&format!("({} more matching skills; refine the query)\n", hits.len() - limit));
+    }
+    out
+}
+
+/// Ranked matches for `query`, formatted for the model: MCP tools, the
+/// instructions (`notes`, by server name) of the servers that matched, then
+/// matching skills.
+pub(crate) fn search(
+    mcp: &[ToolSpec],
+    skills: &[crate::skills::Skill],
+    args: &Value,
+    notes: &BTreeMap<String, String>,
+) -> Result<String, String> {
     let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
     let terms = words(query);
     if terms.is_empty() {
@@ -112,8 +159,13 @@ pub(crate) fn search(mcp: &[ToolSpec], args: &Value, notes: &BTreeMap<String, St
     let limit = args.get("limit").and_then(Value::as_u64).map_or(DEFAULT_RESULTS, |n| n as usize).clamp(1, MAX_RESULTS);
     let mut hits: Vec<(usize, &ToolSpec)> = mcp.iter().map(|s| (score(s, &terms), s)).filter(|(n, _)| *n > 0).collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    let skills = skill_hits(skills, &terms, limit);
     if hits.is_empty() {
-        return Ok(format!("No MCP tools match \"{query}\". Try other keywords or the server name."));
+        return Ok(if skills.is_empty() {
+            format!("No MCP tools or skills match \"{query}\". Try other keywords or the server name.")
+        } else {
+            format!("No MCP tools match \"{query}\".\n{skills}")
+        });
     }
     let more = hits.len().saturating_sub(limit);
     let mut out = String::new();
@@ -140,6 +192,9 @@ pub(crate) fn search(mcp: &[ToolSpec], args: &Value, notes: &BTreeMap<String, St
         out.push_str(&format!("Instructions from MCP server {server}:\n{}\n", note_text(&notes[server])));
     }
     out.push_str(&format!("Call {SELECT} with an exact name to make a tool callable."));
+    if !skills.is_empty() {
+        out.push_str(&format!("\n{}", skills.trim_end()));
+    }
     Ok(out)
 }
 
@@ -245,7 +300,7 @@ mod tests {
         assert!(!found.is_error);
         assert!(found.content.starts_with("- mcp__gh__create_issue"), "{}", found.content);
         assert!(r.handle_meta(SEARCH, r#"{"query": "  "}"#).unwrap().is_error);
-        assert!(r.handle_meta(SEARCH, r#"{"query": "zzzz"}"#).unwrap().content.contains("No MCP tools match"));
+        assert!(r.handle_meta(SEARCH, r#"{"query": "zzzz"}"#).unwrap().content.contains("No MCP tools or skills match"));
 
         let bad = r.handle_meta(SELECT, r#"{"name": "mcp__gh__nope"}"#).unwrap();
         assert!(bad.is_error);
@@ -261,6 +316,24 @@ mod tests {
         // All tools are still listed (for /tools) and callable.
         assert_eq!(r.specs().len(), 62 - 11);
         assert!(r.get("mcp__gh__tool_5").is_some());
+    }
+
+    #[test]
+    fn search_finds_skills_too() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join(".claude/skills/pdf-tools");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: pdf-tools\ndescription: Fill and merge PDF forms\n---\nbody\n").unwrap();
+        let skills = crate::skills::discover_with(&t.path().join("home"), None, t.path());
+        let mut r = registry(60);
+        r.set_skills(skills);
+        let found = r.handle_meta(SEARCH, r#"{"query": "github issue"}"#).unwrap().content;
+        assert!(!found.contains("Skills"), "{found}");
+        let found = r.handle_meta(SEARCH, r#"{"query": "merge pdf"}"#).unwrap().content;
+        assert!(found.starts_with("No MCP tools match"), "{found}");
+        assert!(found.contains("- pdf-tools (.claude/skills) — Fill and merge PDF forms"), "{found}");
+        let search = r.advertised().into_iter().find(|s| s.name == SEARCH).unwrap();
+        assert!(search.description.contains("installed skills"));
     }
 
     #[test]

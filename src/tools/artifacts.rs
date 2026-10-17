@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use super::{Registry, Tool, ToolCtx, ToolOutput};
 use crate::types::ToolSpec;
 
-/// Results larger than this are stored as artifacts.
+/// Results larger than this are stored as artifacts (not `skill` results,
+/// which `skill_chunk_bytes` already splits into parts).
 pub(crate) const SPILL_AT: usize = 16 * 1024;
 const HEAD: usize = 3 * 1024;
 const TAIL: usize = 1024;
@@ -63,7 +64,7 @@ fn ceil(s: &str, mut i: usize) -> usize {
 
 /// Store `content` when it is too large and return what the model should see.
 pub(crate) fn spill(home: &Path, key: &str, call_id: &str, tool: &str, content: String) -> String {
-    if content.len() <= SPILL_AT || tool == TOOL {
+    if content.len() <= SPILL_AT || tool == TOOL || tool == "skill" {
         return content;
     }
     let mut hash = Sha256::new();
@@ -254,6 +255,7 @@ mod tests {
         assert!(read(h, "other-session", &id, 0, 10, None).unwrap_err().contains("no stored tool result"));
         // The reader's own output is never stored again.
         assert_eq!(spill(h, "s1", "c", TOOL, full.clone()), full);
+        assert_eq!(spill(h, "s1", "c", "skill", full.clone()), full, "skills are chunked by skill_chunk_bytes");
 
         let _ = spill(h, "s2", "other", "bash", full);
         remove_session(h, "s1");

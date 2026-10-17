@@ -324,6 +324,7 @@ pub struct Screen {
     help: Option<super::help_menu::HelpMenu>,
     /// Key bindings for the global actions (the editor holds its own copy).
     keys: Arc<Keymap>,
+    skills: Option<super::skills_menu::SkillsMenu>,
     /// Everything shown so far, for the transcript viewer.
     pub log: super::transcript::Log,
     viewer: Option<super::transcript::Viewer>,
@@ -642,6 +643,7 @@ impl Screen {
             modes: None,
             help: None,
             keys: super::keys::current(),
+            skills: None,
             log: Default::default(),
             viewer: None,
             review: None,
@@ -1078,7 +1080,7 @@ impl Screen {
             approval: self.approval.is_some(),
             secret: self.secret.is_some(),
             session_picker: self.sessions.is_some(),
-            menu: self.menu.is_some() || self.settings.is_some() || self.modes.is_some(),
+            menu: self.menu.is_some() || self.settings.is_some() || self.modes.is_some() || self.skills.is_some(),
             transcript: self.viewer.is_some(),
             draft: !self.editor.is_empty(),
             attachments: !self.attachments.is_empty(),
@@ -1298,6 +1300,53 @@ impl Screen {
                         ("Esc", "Close"),
                     ],
                 )
+            } else if let Some(m) = &self.skills {
+                let visible = m.rows();
+                let tabs: Vec<String> = std::iter::once(None)
+                    .chain(m.groups.iter().copied().map(Some))
+                    .map(|g| {
+                        let label = g.unwrap_or("All");
+                        if g == m.group {
+                            paint(fg(BRIGHT), &format!("[{label}]"))
+                        } else {
+                            paint(fg(GRAY), label)
+                        }
+                    })
+                    .collect();
+                let prefix = format!(
+                    "{} {}  {}  ",
+                    paint(fg(BRIGHT).bold(), "Skills"),
+                    paint(fg(GRAY), &visible.len().to_string()),
+                    tabs.join(" ")
+                );
+                let filter_text = if m.filter.is_empty() {
+                    "Type to filter"
+                } else {
+                    m.filter.as_str()
+                };
+                let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
+                let items = visible
+                    .iter()
+                    .map(|e| MenuItem {
+                        label: sanitize_text(&e.skill.id),
+                        detail: one_line(&e.skill.description, 200),
+                        tag: format!("{} · {}", e.group, e.skill.scope),
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    m.selected,
+                    // Seven hints do not fit 80 columns; ↑↓ goes without saying.
+                    vec![
+                        ("Tab", "Source"),
+                        ("Enter", "Use"),
+                        ("→", "View"),
+                        ("Del", "Remove"),
+                        ("^N", "Install"),
+                        ("Esc", "Close"),
+                    ],
+                )
             } else if let Some(m) = &self.sessions {
                 let visible = m.visible();
                 let scope = |label: &str, on: bool| {
@@ -1420,6 +1469,22 @@ impl Screen {
         }
         if self.help.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No matching commands."));
+        }
+        if let Some(m) = &self.skills {
+            if items.is_empty() {
+                rows.push(paint(fg(GRAY), "  No matching skills. Ctrl+N installs one."));
+            }
+            let note = match (&m.confirm, &m.notice) {
+                (Some(id), _) => {
+                    let path = m.entry(id).map(|e| crate::tools::slash_path(&e.skill.dir)).unwrap_or_default();
+                    Some(format!("Remove skill {id} ({path})? Enter or y removes it, any other key keeps it."))
+                }
+                (None, notice) => notice.clone(),
+            };
+            if let Some(note) = note {
+                let line = one_line(&sanitize_text(&note), w.saturating_sub(3).max(1));
+                rows.push(paint(fg(YELLOW), &format!("  {line}")));
+            }
         }
         if self.sessions.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No saved sessions found."));
@@ -1992,6 +2057,7 @@ impl Screen {
         self.settings = None;
         self.modes = None;
         self.help = None;
+        self.skills = None;
         self.menu = Some(ModelMenu {
             choices: Vec::new(),
             tabs: vec!["All".into()],
@@ -2040,6 +2106,7 @@ impl Screen {
         self.settings = None;
         self.modes = None;
         self.help = None;
+        self.skills = None;
         self.sessions = Some(SessionMenu::new(all, cwd, current));
         self.redraw();
     }
@@ -2116,6 +2183,7 @@ impl Screen {
         self.sessions = None;
         self.modes = None;
         self.help = None;
+        self.skills = None;
         self.settings = Some(super::settings::SettingsMenu::new(category));
         self.redraw();
     }
@@ -2126,6 +2194,7 @@ impl Screen {
         self.sessions = None;
         self.settings = None;
         self.help = None;
+        self.skills = None;
         self.modes = Some(super::mode_menu::ModeMenu::new());
         self.redraw();
     }
@@ -2136,7 +2205,50 @@ impl Screen {
         self.sessions = None;
         self.settings = None;
         self.modes = None;
+        self.skills = None;
         self.help = Some(super::help_menu::HelpMenu::new(self.editor.commands()));
+        self.redraw();
+    }
+
+    /// Open the `/skills` menu over `entries`.
+    pub fn open_skills(&mut self, entries: Vec<super::skills_menu::Entry>) {
+        self.menu = None;
+        self.sessions = None;
+        self.settings = None;
+        self.modes = None;
+        self.help = None;
+        self.skills = Some(super::skills_menu::SkillsMenu::new(entries));
+        self.redraw();
+    }
+
+    fn on_skills_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        use super::skills_menu::Action;
+        let Some(m) = &mut self.skills else { return };
+        let known: Vec<String> = self.editor.commands().iter().map(|(c, _)| c.clone()).collect();
+        match m.on_key(key, |c| known.iter().any(|k| k == c)) {
+            Action::None => {}
+            Action::Close => self.skills = None,
+            Action::Insert(text) => {
+                self.skills = None;
+                self.editor.set_text(&text);
+            }
+            Action::View(id) => {
+                let Some(e) = m.entry(&id) else { return };
+                let body = crate::skills::raw_text(&e.skill).unwrap_or_else(|err| err);
+                let text = format!("{}\n\n{}", e.info.join("\n"), body.trim_end());
+                // The menu stays open under the viewer.
+                return self.open_review(&format!("Skill {id}"), &text);
+            }
+            Action::Run(cmd) => {
+                self.skills = None;
+                if self.is_busy() {
+                    self.hint = Some(format!("{cmd} runs when the current task finishes"));
+                    self.queue.push((Queued::FollowUp, cmd));
+                } else {
+                    let _ = commands.send(Command::Submit(cmd));
+                }
+            }
+        }
         self.redraw();
     }
 
@@ -2580,6 +2692,9 @@ impl Screen {
         if self.help.is_some() {
             return self.on_help_key(key, commands);
         }
+        if self.skills.is_some() {
+            return self.on_skills_key(key, commands);
+        }
         if self.sessions.is_some() {
             return self.on_sessions_key(key, commands);
         }
@@ -2965,7 +3080,7 @@ impl Tui {
                                 let now = Instant::now();
                                 let pasted = paste_key(k, previous, now, streak);
                                 streak = if previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10)) { streak + 1 } else { 0 };
-                                if let Some(text) = pasted.filter(|_| s.approval.is_none() && s.menu.is_none() && s.modes.is_none() && s.sessions.is_none() && s.secret.is_none()) {
+                                if let Some(text) = pasted.filter(|_| s.approval.is_none() && s.menu.is_none() && s.modes.is_none() && s.skills.is_none() && s.sessions.is_none() && s.secret.is_none()) {
                                     s.editor.paste(text);
                                     s.redraw();
                                     previous = Some(Instant::now());
@@ -4167,6 +4282,43 @@ mod tests {
         s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &cmd_tx);
         assert_eq!(s.editor.text(), "/permissions remember ", "options that need more input are inserted");
         assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn skills_menu_inserts_and_removes() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join(".claude/skills/pdf");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: pdf\ndescription: Fill PDF forms\n---\nbody\n").unwrap();
+        let skills = crate::skills::discover_with(&t.path().join("home"), None, t.path());
+        let entry = |managed| super::super::skills_menu::Entry {
+            group: crate::skills::source(&skills[0]),
+            managed,
+            info: Vec::new(),
+            skill: skills[0].clone(),
+        };
+        let mut s = screen();
+        s.width = 120;
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+        s.open_skills(vec![entry(false)]);
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("Skills 1") && text.contains("[All] Claude Code"), "{text}");
+        assert!(text.contains("pdf") && text.contains("Fill PDF forms") && text.contains("Claude Code · project"), "{text}");
+        s.on_key(key(KeyCode::Delete), &cmd_tx);
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("only removes skills it installed"), "{text}");
+        s.on_key(key(KeyCode::Enter), &cmd_tx);
+        assert!(s.skills.is_none());
+        assert_eq!(s.editor.text(), "/pdf ");
+
+        s.open_skills(vec![entry(true)]);
+        s.on_key(key(KeyCode::Delete), &cmd_tx);
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("Remove skill pdf"), "{text}");
+        s.on_key(key(KeyCode::Char('y')), &cmd_tx);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Command::Submit(c)) if c == "/skills remove pdf"));
+        assert!(s.skills.is_none());
     }
 
     #[test]
