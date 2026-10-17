@@ -61,6 +61,8 @@ pub fn status(
         "skills_count": skills_count, "permissions_file": crate::permissions::user_path(home),
         "project_permissions_file": crate::permissions::project_path(cwd), "context_window": context,
         "max_agent_steps": crate::agent::step_limit().0, "trace": crate::trace::describe(),
+        "system_prompt_files": crate::prompt::prompt_files(cwd, home),
+        "disabled_tools": crate::settings::current().disabled_tools,
         "context_limits": crate::limits::report()})
 }
 pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
@@ -85,6 +87,8 @@ pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
             "context_window",
             "max_agent_steps",
             "trace",
+            "system_prompt_files",
+            "disabled_tools",
         ] {
             let v = &value[key];
             lines.push(format!(
@@ -350,6 +354,18 @@ pub async fn doctor(
         settings_warning.is_none(),
         settings_warning.unwrap_or_else(|| "settings.json parses (or is absent)".into()),
         "fix settings.json; nyq uses the defaults until then",
+    ));
+    let disabled = crate::settings::current().disabled_tools;
+    let unknown = crate::tools::unknown_tool_names(&disabled);
+    checks.push(info(
+        "disabled tools",
+        unknown.is_empty(),
+        match (disabled.is_empty(), unknown.is_empty()) {
+            (true, _) => "none".to_string(),
+            (false, true) => disabled.join(", "),
+            (false, false) => format!("unknown: {}", unknown.join(", ")),
+        },
+        "check the names in disabled_tools against /tools",
     ));
     checks.push(sessions_check(facts.sessions_dir));
     let (steps, steps_source) = crate::agent::step_limit();

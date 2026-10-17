@@ -363,13 +363,50 @@ pub struct Registry {
     live: Option<LiveTools>,
     /// Tool changes from extensions (`crate::extensions`).
     extensions: Option<LiveTools>,
+    /// Names from the `disabled_tools` setting: never listed or callable,
+    /// including tools (MCP, extensions) added later.
+    disabled: HashSet<String>,
+}
+
+/// Tools registered outside [`Registry::builtin`] that `disabled_tools` may name.
+const OTHER_TOOLS: &[&str] = &[
+    "skill",
+    "install_skill",
+    crate::agent::ASK_USER,
+    "mcp_list_resources",
+    "mcp_read_resource",
+    "mcp_list_prompts",
+    "mcp_get_prompt",
+];
+
+/// The `disabled_tools` entries that name no nyq tool. MCP (`mcp__…`) and
+/// extension (`ext__…`) names can't be checked before those start.
+pub fn unknown_tool_names(names: &[String]) -> Vec<String> {
+    let known = Registry::all_builtin().tools.iter().map(|t| t.spec().name).collect::<Vec<_>>();
+    names
+        .iter()
+        .filter(|n| {
+            !(known.contains(n)
+                || OTHER_TOOLS.contains(&n.as_str())
+                || mcp_search::is_mcp(n)
+                || n.starts_with(crate::extensions::TOOL_PREFIX))
+        })
+        .cloned()
+        .collect()
 }
 
 impl Registry {
     /// The built-in workspace tools: read_file, write_file, edit_file, bash,
     /// glob, grep, list_dir, view_image, web_fetch, web_search, subagent,
-    /// memory, bash_output, kill_shell, read_tool_result.
+    /// memory, bash_output, kill_shell, read_tool_result. Tools named in the
+    /// `disabled_tools` setting are hidden.
     pub fn builtin() -> Self {
+        let mut r = Self::all_builtin();
+        r.disable(&crate::settings::current().disabled_tools);
+        r
+    }
+
+    fn all_builtin() -> Self {
         let mut r = Self::default();
         fs::register(&mut r);
         search::register(&mut r);
@@ -381,6 +418,11 @@ impl Registry {
         web::register(&mut r);
         subagent::register(&mut r);
         r
+    }
+
+    /// Hide these tools from the model, now and when added later.
+    pub fn disable(&mut self, names: &[String]) {
+        self.disabled.extend(names.iter().cloned());
     }
 
     /// Receive tool changes and server instructions from `live`.
@@ -434,9 +476,10 @@ impl Registry {
             .iter()
             .filter(|t| {
                 let name = t.spec().name;
-                mcp_search::is_mcp(&name)
+                !self.disabled.contains(&name)
+                    && (mcp_search::is_mcp(&name)
                     || name.starts_with(crate::extensions::TOOL_PREFIX)
-                    || SHARED.contains(&name.as_str())
+                        || SHARED.contains(&name.as_str()))
             })
             .cloned()
             .collect()
@@ -455,6 +498,9 @@ impl Registry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        if self.disabled.contains(name) {
+            return None;
+        }
         self.tools
             .iter()
             .find(|t| t.spec().name == name)
@@ -462,7 +508,11 @@ impl Registry {
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|t| t.spec()).collect()
+        self.tools
+            .iter()
+            .map(|t| t.spec())
+            .filter(|s| !self.disabled.contains(&s.name))
+            .collect()
     }
 
     fn mcp_specs(&self) -> Vec<ToolSpec> {
