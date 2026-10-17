@@ -3,8 +3,13 @@
 //! Colors all go through the theme (so `NO_COLOR`, light and dark,
 //! `theme_colors` and 256-color terminals apply), and glyphs fall back to
 //! ASCII when the locale isn't UTF-8; `fold` catches the ones painted elsewhere.
+//!
+//! All of this is the `fancy` look (`ui_style = "fancy"`). The default,
+//! `classic`, keeps the plain look: `┃` bars, `●` tool rows, a one-line
+//! banner and a plain status line. Callers check `fancy()`.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use nu_ansi_term::{Color, Style};
@@ -25,6 +30,34 @@ const BOXED_INPUT: usize = 16;
 const LOGO: [&str; 2] = ["█▀█ █▄█ █▀█", "▀ ▀ ▄▄█ ▀▀█"];
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ASCII_SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+
+/// The fancy look is on. Tests render it unless they ask for classic.
+static FANCY: AtomicBool = AtomicBool::new(cfg!(test));
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FANCY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the UI draws the fancy look (`ui_style = "fancy"`).
+pub fn fancy() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_FANCY.with(|f| f.get()) {
+        return on;
+    }
+    FANCY.load(Ordering::Relaxed)
+}
+
+/// Apply the `ui_style` setting: `fancy`, else the classic look.
+pub fn set_style(style: &str) {
+    FANCY.store(style.trim().eq_ignore_ascii_case("fancy"), Ordering::Relaxed);
+}
+
+/// Render this test thread in the fancy or the classic look.
+#[cfg(test)]
+pub fn test_style(fancy: bool) {
+    TEST_FANCY.with(|f| f.set(Some(fancy)));
+}
 
 fn paint(style: Style, s: &str) -> String {
     if s.is_empty() {
@@ -172,6 +205,9 @@ pub fn tips(keys: &Keymap) -> Vec<(String, &'static str)> {
 /// runs on (model · provider · folder), then tip number `tip` (wrapping).
 /// One line below `WIDE_BANNER` columns; no logo in ASCII.
 pub fn banner(version: &str, f: &Footer, keys: &Keymap, width: usize, tip: usize) -> Vec<String> {
+    if !fancy() {
+        return vec![classic_banner(version, keys)];
+    }
     let version = format!("v{}", sanitize_text(version));
     let mut facts: Vec<String> = [&f.model, &f.provider].iter().filter(|s| !s.is_empty()).map(|s| sanitize_text(s)).collect();
     if !f.cwd.is_empty() {
@@ -206,6 +242,24 @@ pub fn banner(version: &str, f: &Footer, keys: &Keymap, width: usize, tip: usize
         ));
     }
     rows
+}
+
+/// The classic banner: `𝒏yq v0.4 · Run /help for commands · …` on one line.
+fn classic_banner(version: &str, keys: &Keymap) -> String {
+    let hint = |action, fallback: &str| keys.hint(action).unwrap_or_else(|| fallback.into());
+    format!(
+        "{} {}",
+        paint(fg(BRIGHT).bold(), "𝒏yq"),
+        paint(
+            fg(GRAY),
+            &format!(
+                "v{} · Run /help for commands · {} models · {} quit",
+                sanitize_text(version),
+                hint(KeyAction::ModelMenu, "/model"),
+                hint(KeyAction::Exit, "/exit")
+            )
+        )
+    )
 }
 
 /// Whether the input is boxed at `width`.
@@ -397,12 +451,19 @@ pub fn working_line(label: &str, facts: &[String], detail: &str, interrupt: Opti
 /// The row opening a fenced code block: a corner, the language, a rule.
 pub fn fence_open(lang: &str) -> String {
     let lang = if lang.is_empty() { "code" } else { lang };
+    if !fancy() {
+        let rule = "─".repeat((RULE - 2).saturating_sub(lang.chars().count()));
+        return format!("{} {} {}", paint(fg(FAINT), "─"), paint(fg(GRAY), lang), paint(fg(FAINT), &rule));
+    }
     let rule = "─".repeat(RULE.saturating_sub(lang.chars().count() + 4).max(1));
     format!("{}{} {}", paint(fg(FAINT), "╭─ "), paint(fg(GRAY).italic(), lang), paint(fg(FAINT), &rule))
 }
 
 /// The row closing a fenced code block.
 pub fn fence_close() -> String {
+    if !fancy() {
+        return paint(fg(FAINT), &"─".repeat(RULE));
+    }
     paint(fg(FAINT), &format!("╰{}", "─".repeat(RULE - 1)))
 }
 

@@ -576,6 +576,26 @@ fn diff_stat(d: &str) -> String {
     format!("+{add} / -{del}")
 }
 
+/// A tool call's row in the classic look: `lead`, the verb (bright for the
+/// turn's only call), the target and the note, no marks or times.
+fn classic_tool_row(t: &ToolRow, lead: &str, single: bool, live: bool, frame: usize, w: usize, cwd: &str) -> String {
+    let note = if t.note.is_empty() { String::new() } else { format!(" {}", t.note) };
+    let used = visible_width(lead) + t.verb.chars().count() + note.chars().count() + 1;
+    let mut target = paint(fg(GRAY), &truncate(&t.target, w.saturating_sub(used)));
+    if matches!(t.tool.as_str(), "read_file" | "write_file" | "edit_file") {
+        if let Some(url) = file_url(cwd, &t.target) {
+            target = link(&url, &target);
+        }
+    }
+    let verb = match t.status {
+        Status::Running if live => shimmer(&t.verb, frame),
+        Status::Failed => paint(fg(RED), &t.verb),
+        _ if single => paint(fg(BRIGHT), &t.verb),
+        _ => paint(fg(GRAY), &t.verb),
+    };
+    format!("{lead}{verb} {target}{}", paint(fg(GRAY), &note))
+}
+
 /// "3 read · 1 edited · 2 commands": a turn's tool calls by kind.
 fn tally_text(tally: &[(&str, usize)]) -> String {
     tally
@@ -706,7 +726,12 @@ impl Screen {
                 .map(|d| paint(fg(FAINT), &format!("  {}", chrome::elapsed(d))))
                 .unwrap_or_default()
         };
-        let row_text = |t: &ToolRow, lead: &str| {
+        let fancy = chrome::fancy();
+        // `single`: the turn's only call, whose verb stands out in the classic look.
+        let row_text = |t: &ToolRow, lead: &str, single: bool| {
+            if !fancy {
+                return classic_tool_row(t, lead, single, live, self.frame, w, &self.footer.cwd);
+            }
             let verb = match t.status {
                 Status::Running if live => shimmer(&t.verb, self.frame),
                 Status::Failed => paint(fg(RED), &t.verb),
@@ -759,7 +784,8 @@ impl Screen {
         };
         if n == 1 {
             let t = &self.tools[0];
-            rows.push(row_text(t, ""));
+            let lead = if fancy { String::new() } else { format!("{} ", paint(fg(BRIGHT), "●")) };
+            rows.push(row_text(t, &lead, true));
             detail(t, rows, "  │ ");
             return;
         }
@@ -789,13 +815,21 @@ impl Screen {
             .find(|s| self.tools.iter().any(|t| t.status == *s))
             .unwrap_or(Status::Ok);
         let total = self.tools.iter().filter_map(|t| t.took).sum::<Duration>();
-        rows.push(format!(
+        if !fancy {
+            rows.push(format!(
+                "{} {}",
+                paint(fg(BRIGHT), "●"),
+                paint(fg(GRAY), &format!("{n} tool calls · {}", parts.join(" · ")))
+            ));
+        } else {
+            rows.push(format!(
             "{} {}{}{}",
             mark(status),
             paint(fg(BRIGHT), &format!("{n} tool calls")),
             paint(fg(GRAY), &format!(" · {}", parts.join(" · "))),
             took((status != Status::Running).then_some(total))
-        ));
+            ));
+        }
         if !live && crate::settings::current().collapse_tool_calls {
             return;
         }
@@ -803,7 +837,8 @@ impl Screen {
             let last = i + 1 == n;
             rows.push(row_text(
                 t,
-                &paint(fg(FAINT), if last { "└ " } else { "├ " }),
+                &paint(fg(if fancy { FAINT } else { GRAY }), if last { "└ " } else { "├ " }),
+                false,
             ));
             detail(t, rows, if last { "  │ " } else { "│ │ " });
         }
@@ -852,8 +887,14 @@ impl Screen {
             }
         }
 
+        let fancy = chrome::fancy();
         // Status: what the agent is doing.
-        if let Some((label, start)) = &self.busy {
+        if let Some((label, start)) = &self.busy.as_ref().filter(|_| !fancy) {
+            if !rows.is_empty() {
+                rows.push(String::new());
+            }
+            rows.push(self.classic_working_line(label, *start));
+        } else if let Some((label, start)) = &self.busy {
             let mut facts = vec![chrome::clock(self.working_time(*start).as_secs())];
             if self.turn_tokens != (0, 0) {
                 facts.push(format!("↑{} ↓{}", tokens(self.turn_tokens.0), tokens(self.turn_tokens.1)));
@@ -884,13 +925,16 @@ impl Screen {
             let text = truncate(&one_line(text, w), w.saturating_sub(tag.len() + 3));
             rows.push(format!(
                 "{} {}{}",
-                paint(fg(FAINT), "›"),
+                paint(fg(FAINT), if fancy { "›" } else { "┃" }),
                 paint(fg(GRAY), &text),
                 paint(fg(FAINT), tag)
             ));
         }
-        // A blank row always separates the input from what is above it.
-        rows.push(String::new());
+        // A blank row separates the input from what is above it (always, in
+        // the fancy look).
+        if fancy || !rows.is_empty() {
+            rows.push(String::new());
+        }
 
         // Input, or the approval prompt in its place.
         let (mut cursor_row, mut cursor_col);
@@ -970,6 +1014,15 @@ impl Screen {
             rows.push(format!("{} {dots}", paint(fg(BRIGHT), "┃")));
             rows.push(rule(w));
             rows.push(hints(&[("Enter", "Save"), ("Esc", "Cancel")]));
+        } else if !fancy {
+            let view = self.editor.render(w.saturating_sub(2).max(1));
+            let top = rows.len();
+            for l in &view.lines {
+                rows.push(format!("{} {l}", paint(fg(BRIGHT), "┃")));
+            }
+            cursor_row = top + view.cursor_row;
+            cursor_col = 2 + view.cursor_col;
+            self.below_input(&mut rows, w);
         } else {
             let view = self.editor.render(chrome::input_width(w));
             let busy = self.busy.is_some();
@@ -979,46 +1032,7 @@ impl Screen {
             rows.extend(framed);
             cursor_row = top + text_row + view.cursor_row;
             cursor_col = text_col + view.cursor_col;
-            if let Some(q) = &self.question {
-                rows.push(rule(w));
-                rows.push(paint(fg(BRIGHT).bold(), q.menu.as_deref().unwrap_or("Question")));
-                let question = sanitize_text(&q.question);
-                for l in wrap(&question, w.saturating_sub(2).max(1)) {
-                    rows.push(paint(fg(MID), &l));
-                }
-                rows.push(String::new());
-                for (i, o) in q.options.iter().enumerate() {
-                    let sel = i == q.selected;
-                    let lead = if sel {
-                        paint(fg(BRIGHT), "› ")
-                    } else {
-                        "  ".into()
-                    };
-                    let text = one_line(&format!("{}. {o}", i + 1), w.saturating_sub(2).max(1));
-                    rows.push(format!(
-                        "{lead}{}",
-                        if sel {
-                            paint(fg(BRIGHT).bold(), &text)
-                        } else {
-                            paint(fg(MID), &text)
-                        }
-                    ));
-                }
-                rows.push(rule(w));
-                rows.push(if q.menu.is_some() {
-                    hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("Esc", "Close")])
-                } else {
-                    hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("type", "Own answer"), ("Esc", "Skip")])
-                });
-            } else {
-                let at = rows.len();
-                if !self.menu_rows(&mut rows) {
-                    rows.push(self.footer_line());
-                } else if chrome::boxed(w) && rows.get(at).is_some_and(|r| super::render::strip_ansi(r).chars().all(|c| c == '─')) {
-                    // The box already closes the input: no rule above the menu.
-                    rows.remove(at);
-                }
-            }
+            self.below_input(&mut rows, w);
         }
 
         // Keep the pane on screen: drop rows above the cursor first.
@@ -1035,8 +1049,124 @@ impl Screen {
         (rows, cursor_row - dropped, cursor_col)
     }
 
+    /// Under the input: an open question, a menu, or the status line.
+    fn below_input(&self, rows: &mut Vec<String>, w: usize) {
+        if let Some(q) = &self.question {
+            rows.push(rule(w));
+            rows.push(paint(fg(BRIGHT).bold(), q.menu.as_deref().unwrap_or("Question")));
+            let question = sanitize_text(&q.question);
+            for l in wrap(&question, w.saturating_sub(2).max(1)) {
+                rows.push(paint(fg(MID), &l));
+            }
+            rows.push(String::new());
+            for (i, o) in q.options.iter().enumerate() {
+                let sel = i == q.selected;
+                let lead = if sel {
+                    paint(fg(BRIGHT), "› ")
+                } else {
+                    "  ".into()
+                };
+                let text = one_line(&format!("{}. {o}", i + 1), w.saturating_sub(2).max(1));
+                rows.push(format!(
+                    "{lead}{}",
+                    if sel {
+                        paint(fg(BRIGHT).bold(), &text)
+                    } else {
+                        paint(fg(MID), &text)
+                    }
+                ));
+            }
+            rows.push(rule(w));
+            rows.push(if q.menu.is_some() {
+                hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("Esc", "Close")])
+            } else {
+                hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("type", "Own answer"), ("Esc", "Skip")])
+            });
+        } else if !chrome::fancy() {
+            if !self.menu_rows(rows) {
+                rows.push(String::new());
+                rows.push(self.footer_line());
+            }
+        } else {
+            let at = rows.len();
+            if !self.menu_rows(rows) {
+                rows.push(self.footer_line());
+            } else if chrome::boxed(w) && rows.get(at).is_some_and(|r| super::render::strip_ansi(r).chars().all(|c| c == '─')) {
+                // The box already closes the input: no rule above the menu.
+                rows.remove(at);
+            }
+        }
+    }
+
+    /// The classic working line: `• Working (12s · ↑1k ↓20 · esc to interrupt)`.
+    fn classic_working_line(&self, label: &str, start: Instant) -> String {
+        let w = self.width;
+        let mut parts = vec![format!("{}s", self.working_time(start).as_secs())];
+        if self.turn_tokens != (0, 0) {
+            parts.push(format!("↑{} ↓{}", tokens(self.turn_tokens.0), tokens(self.turn_tokens.1)));
+        }
+        if !self.tally.is_empty() {
+            parts.push(tally_text(&self.tally));
+        }
+        if let Some(key) = self.keys.hint(KeyAction::Interrupt) {
+            parts.push(format!("{key} to interrupt"));
+        }
+        let suffix = format!(" ({})", parts.join(" · "));
+        let label = truncate(label, w.saturating_sub(suffix.chars().count() + 4).max(1));
+        let detail = if self.live_block == Block::Reasoning {
+            let last = self.live.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            truncate(last, w.saturating_sub(label.chars().count() + suffix.chars().count() + 4))
+        } else {
+            String::new()
+        };
+        let mut line = format!("{} {}", paint(fg(BRIGHT), "•"), shimmer(&label, self.frame));
+        line.push_str(&paint(fg(GRAY), &suffix));
+        if !detail.is_empty() {
+            line.push_str(&paint(fg(FAINT).italic(), &format!(" {detail}")));
+        }
+        line
+    }
+
     fn footer_line(&self) -> String {
-        chrome::status_line(&self.footer, self.width, &self.upgrade_label())
+        if chrome::fancy() {
+            chrome::status_line(&self.footer, self.width, &self.upgrade_label())
+        } else {
+            self.classic_footer_line()
+        }
+    }
+
+    /// The classic status line: effort · model on the left, the segments in
+    /// one faint run on the right.
+    fn classic_footer_line(&self) -> String {
+        let f = &self.footer;
+        let left = match super::statusline::left(f) {
+            Some(text) => {
+                let (effort, rest) = text.split_once(" · ").unwrap_or((&text, ""));
+                format!("{} {} {}", paint(fg(MID), effort), paint(fg(GRAY), "·"), paint(fg(GRAY), &sanitize_text(rest)))
+            }
+            None => String::new(),
+        };
+        if visible_width(&left) > self.width {
+            return clip_width(&left, self.width);
+        }
+        let right: Vec<String> = super::statusline::segments(f, self.width).into_iter().map(|(_, s)| s).collect();
+        let right = right.join(" · ");
+        let mut room = self.width.saturating_sub(visible_width(&left) + 4);
+        let upgrade = self.upgrade_label();
+        let upgrade = if upgrade.is_empty() {
+            String::new()
+        } else {
+            let label = truncate(&upgrade, room);
+            room = room.saturating_sub(label.chars().count() + 3);
+            let color = if label.starts_with("upgrading") { GRAY } else { YELLOW };
+            let sep = if right.is_empty() || room == 0 { "" } else { " · " };
+            format!("{}{}", paint(fg(color), &label), paint(fg(FAINT), sep))
+        };
+        let right = format!("{upgrade}{}", paint(fg(FAINT), &truncate(&sanitize_text(&right), room)));
+        if left.is_empty() {
+            return right;
+        }
+        spread(&left, &right, self.width)
     }
 
     /// The auto-upgrade status for the status line (empty: nothing to show).
@@ -1659,7 +1789,12 @@ impl Screen {
         self.log.user(&text);
         self.flush_all();
         let mut rows = self.begin(Block::User);
+        let fancy = chrome::fancy();
         for (i, line) in text.trim().lines().enumerate() {
+            if !fancy {
+                rows.push(format!("{} {}", paint(fg(BRIGHT), "┃"), paint(Style::new().bold(), line)));
+                continue;
+            }
             let lead = if i == 0 { paint(fg(chrome::ACCENT).bold(), "›") } else { " ".into() };
             rows.push(format!("{lead} {}", paint(fg(BRIGHT).bold(), line)));
         }
@@ -2341,6 +2476,9 @@ impl Screen {
                     }
                     if id == Id::Theme {
                         super::theme::apply_setting(&value);
+                    }
+                    if id == Id::UiStyle {
+                        chrome::set_style(&value);
                     }
                     if id == Id::Sandbox {
                         self.hint = Some("The default sandbox applies from the next start.".into());
@@ -3052,6 +3190,7 @@ impl Tui {
         let mut setup = TerminalSetup::arm();
         // Before anything else reads input: the background query's reply arrives there.
         super::theme::init(&crate::settings::current().theme, true);
+        chrome::set_style(&crate::settings::current().ui_style);
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
         let mut out = crate::record_tape::stdout();
         execute!(out, crossterm::event::EnableBracketedPaste)?;
@@ -4579,6 +4718,26 @@ mod tests {
         s.redraw();
         assert!(s.pause_start.is_none() && s.paused >= Duration::from_secs(4));
         assert_eq!(tally_text(&[("edit", 2), ("tool", 1)]), "2 edited, 1 tool");
+    }
+
+    #[test]
+    fn classic_style_keeps_the_plain_look() {
+        chrome::test_style(false);
+        let mut s = screen();
+        s.width = 80;
+        s.height = 40;
+        s.footer.model = "m".into();
+        s.set_busy(Some("Working"), None);
+        s.tool_start("edit_file", "a.rs");
+        let diff = "@@ -1 +1 @@\n-old\n+new\n";
+        s.tool_end(&ToolOutput { content: "Edited a.rs.".into(), display: Some(diff.into()), ..ToolOutput::default() });
+        let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
+        assert!(text.contains("● Edited a.rs +1 / -1"), "{text}");
+        assert!(text.contains("• Working (0s · 1 edited · esc to interrupt)"), "{text}");
+        assert!(text.lines().any(|l| l == "┃ "), "{text}");
+        assert!(!text.contains('╭') && !text.contains('✓'), "{text}");
+        let banner = super::super::render::strip_ansi(&chrome::banner("0.4", &s.footer, &s.keys, 80, 0).join("\n"));
+        assert!(banner.starts_with("𝒏yq v0.4 · Run /help for commands ·"), "{banner}");
     }
 
     #[test]
