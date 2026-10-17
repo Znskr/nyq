@@ -352,8 +352,8 @@ pub async fn doctor(
     checks.push(info(
         "settings",
         settings_warning.is_none(),
-        settings_warning.unwrap_or_else(|| "settings.json parses (or is absent)".into()),
-        "fix settings.json; nyq uses the defaults until then",
+        settings_warning.unwrap_or_else(|| "settings.toml parses (or is absent)".into()),
+        "fix settings.toml; nyq uses the defaults until then",
     ));
     let disabled = crate::settings::current().disabled_tools;
     let unknown = crate::tools::unknown_tool_names(&disabled);

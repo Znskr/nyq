@@ -5,7 +5,7 @@
 //! one is downloaded, verified against SHA256SUMS and installed over the
 //! executable (the same steps as `nyq upgrade`), without a prompt. The status
 //! line then offers Ctrl+G, which relaunches the new binary on the same
-//! conversation. Disabled by `"auto_upgrade": false` in settings.json,
+//! conversation. Disabled by `auto_upgrade = false` in settings.toml,
 //! `NYQ_AUTO_UPGRADE=0`, and for binaries inside a cargo `target` directory.
 
 use std::ffi::OsString;

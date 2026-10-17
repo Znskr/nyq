@@ -7,7 +7,7 @@
 //!    `openai` | `ollama` | `opencode-go` | `opencode` | `xai`)
 //! 2. `NYQ_BASE_URL` set → `openai`
 //! 3. last-model.json (unless explicit model/provider flags or env are set)
-//! 4. `settings.json` `"provider"`
+//! 4. `settings.toml` `provider`
 //! 5. a ChatGPT login present (codex CLI or `chatgpt-auth.json`) → `codex`
 //! 6. a Grok subscription sign-in (`grok-auth.json`) → `grok`
 //! 7. `model.json` present → `openai`
@@ -93,7 +93,7 @@ pub(crate) fn openai_config(
     home: &Path,
 ) -> Result<(Option<String>, Option<String>, Option<String>)> {
     let file: ModelFile = read_json(&home.join("model.json"))?;
-    let settings: Settings = read_json(&home.join("settings.json"))?;
+    let settings = user_settings(home)?;
     Ok((
         env("NYQ_BASE_URL").or(file.base_url),
         env("NYQ_API_KEY").or(file.api_key),
@@ -123,6 +123,13 @@ fn ollama_url_from(host: &str) -> String {
     } else {
         format!("{url}/v1")
     }
+}
+
+/// The provider keys of the user's settings file.
+fn user_settings(home: &Path) -> Result<Settings> {
+    let map = crate::settings::file::read_user(home).map_err(anyhow::Error::msg)?;
+    serde_json::from_value(serde_json::Value::Object(map))
+        .with_context(|| format!("parsing {}", crate::settings::file::user_path(home).display()))
 }
 
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T> {
@@ -170,11 +177,11 @@ pub(crate) fn codex_auth_path(home: &Path) -> PathBuf {
 }
 
 /// The error for a provider name nyq does not know, which may come from a
-/// flag, the environment, or a saved setting (settings.json, last-model.json).
+/// flag, the environment, or a saved setting (settings.toml, last-model.json).
 pub fn unknown_provider(name: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "unknown provider `{name}` (expected codex, grok, anthropic, ollama, openai, opencode-go, opencode or xai). \
-         If it is saved in settings.json or last-model.json, choose another with `nyq provider NAME` or /model."
+         If it is saved in settings.toml or last-model.json, choose another with `nyq provider NAME` or /model."
     )
 }
 
@@ -183,7 +190,7 @@ pub fn provider(
     provider_flag: Option<&str>,
     model_flag: Option<&str>,
 ) -> Result<Box<dyn Provider>> {
-    let settings: Settings = read_json(&home.join("settings.json"))?;
+    let settings = user_settings(home)?;
     let model_file: ModelFile = read_json(&home.join("model.json"))?;
     let auth_path = codex_auth_path(home);
     let explicit = provider_flag.is_some()
@@ -351,7 +358,7 @@ mod tests {
         std::env::set_var("NYQ_HOME", dir.path());
         std::env::set_var("NYQ_CODEX_AUTH", dir.path().join("auth.json"));
         std::fs::write(dir.path().join("auth.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("settings.json"), r#"{"provider":"codex"}"#).unwrap();
+        std::fs::write(dir.path().join("settings.toml"), "provider = \"codex\"\n").unwrap();
         std::fs::write(
             dir.path().join("model.json"),
             r#"{"base_url":"http://example.test/v1","model":"configured"}"#,

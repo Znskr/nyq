@@ -104,13 +104,10 @@ fn stored_by_nyq(home: &Path, id: &str) -> bool {
 }
 
 fn read_settings(home: &Path) -> Value {
-    std::fs::read(home.join("settings.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or(Value::Null)
+    crate::settings::file::read_user(home).map_or(Value::Null, Value::Object)
 }
 
-/// The model a provider starts with: `settings.json` `models.<id>`, else its default.
+/// The model a provider starts with: `settings.toml` `models.<id>`, else its default.
 fn default_model(home: &Path, id: &str) -> Option<String> {
     if let Some(m) = read_settings(home)["models"][id].as_str().filter(|m| !m.trim().is_empty()) {
         return Some(m.to_string());
@@ -124,17 +121,11 @@ fn default_model(home: &Path, id: &str) -> Option<String> {
     }
 }
 
-/// Persist `id` as the default provider: `provider` in settings.json (other
+/// Persist `id` as the default provider: `provider` in settings.toml (other
 /// keys kept) and `last-model.json` pointing at its model, which startup
 /// prefers over settings. Returns the model, when one is known.
 fn persist_default(home: &Path, id: &str) -> Result<Option<String>> {
-    let path = home.join("settings.json");
-    let mut settings = match read_settings(home) {
-        Value::Object(m) => m,
-        _ => Default::default(),
-    };
-    settings.insert("provider".into(), json!(id));
-    crate::session::write_private(&path, &serde_json::to_vec_pretty(&settings)?).with_context(|| format!("writing {}", path.display()))?;
+    crate::settings::file::write_changes(home, &[(vec!["provider".into()], Some(json!(id)))])?;
     let model = default_model(home, id);
     match &model {
         Some(m) => {
@@ -513,11 +504,12 @@ mod tests {
     fn default_provider_persists() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        std::fs::write(home.join("settings.json"), r#"{"models":{"xai":"grok-custom"},"sound":"max","other":1}"#).unwrap();
+        std::fs::write(home.join("settings.toml"), "# keep me\nsound = \"max\"\nother = 1\n\n[models]\nxai = \"grok-custom\"\n").unwrap();
         std::fs::write(home.join("last-model.json"), r#"{"provider":"codex","model":"old","effort":"high"}"#).unwrap();
         assert_eq!(persist_default(home, "xai").unwrap().as_deref(), Some("grok-custom"));
-        let settings: Value = serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        let settings = read_settings(home);
         assert_eq!(settings["provider"], "xai");
+        assert!(std::fs::read_to_string(home.join("settings.toml")).unwrap().starts_with("# keep me\n"));
         assert_eq!((settings["sound"].as_str(), settings["other"].as_i64()), (Some("max"), Some(1)));
         let last: Value = serde_json::from_slice(&std::fs::read(home.join("last-model.json")).unwrap()).unwrap();
         assert_eq!((last["provider"].as_str(), last["model"].as_str()), (Some("xai"), Some("grok-custom")));
@@ -526,12 +518,11 @@ mod tests {
         assert_eq!(persist_default(home, "opencode").unwrap().as_deref(), Some(Service::Opencode.default_model().as_str()));
         assert_eq!(persist_default(home, "ollama").unwrap(), None);
         assert!(!home.join("last-model.json").exists());
-        let settings: Value = serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
-        assert_eq!(settings["provider"], "ollama");
+        assert_eq!(read_settings(home)["provider"], "ollama");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(home.join("settings.json")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(home.join("settings.toml")).unwrap().permissions().mode() & 0o777, 0o600);
         }
         assert!(set_default_provider(home, "bogus").is_err());
     }
