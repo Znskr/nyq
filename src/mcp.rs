@@ -824,13 +824,13 @@ impl McpManager {
                 .map_err(|_| anyhow!("MCP server '{name}': OAuth discovery timed out"))?
                 .with_context(|| format!("MCP server '{name}': loading saved sign-in"))?;
             if signed_in {
-                let auth = AuthClient::new(reqwest::Client::new(), manager);
+                let auth = AuthClient::new(crate::http::client(), manager);
                 initialize(client, StreamableHttpClientTransport::with_client(auth, config), timeout).await
             } else {
-                initialize(client, StreamableHttpClientTransport::with_client(reqwest::Client::new(), config), timeout).await
+                initialize(client, StreamableHttpClientTransport::with_client(crate::http::client(), config), timeout).await
             }
         } else {
-            initialize(client, StreamableHttpClientTransport::with_client(reqwest::Client::new(), config), timeout).await
+            initialize(client, StreamableHttpClientTransport::with_client(crate::http::client(), config), timeout).await
         };
         result.map_err(|e| init_error(name, e, explicit, timeout))
     }
@@ -1077,7 +1077,7 @@ impl McpManager {
         // Probe without saved credentials to learn the server's auth challenge.
         let timeout = cfg.options.startup_timeout;
         let client = Client { server: cfg.name.clone(), mcp: self.downgrade() };
-        let probe = initialize(client, StreamableHttpClientTransport::with_client(reqwest::Client::new(), http_config(url, headers)?), timeout);
+        let probe = initialize(client, StreamableHttpClientTransport::with_client(crate::http::client(), http_config(url, headers)?), timeout);
         let challenge = match probe.await {
             Ok(service) => return self.register(cfg, service, None).await, // no sign-in needed
             Err(Init::Failed(e)) if is_unauthorized(&e) => e.auth_challenge().map(String::from),
@@ -1253,7 +1253,7 @@ async fn revoke(url: &str, saved: &StoredCredentials) -> Result<()> {
     let manager = AuthorizationManager::new(url).await?;
     let metadata = manager.resolve_metadata().await?.metadata;
     let Some(endpoint) = metadata.additional_fields.get("revocation_endpoint").and_then(Value::as_str) else { return Ok(()) };
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     for hint in ["refresh_token", "access_token"] {
         let Some(value) = token.get(hint).and_then(Value::as_str) else { continue };
         let mut form = reqwest::Url::parse("http://form/")?;

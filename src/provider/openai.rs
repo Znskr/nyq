@@ -73,7 +73,7 @@ impl OpenAiProvider {
             #[serde(default)]
             context_window: Option<u64>,
         }
-        let client = reqwest::Client::builder()
+        let client = crate::http::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
@@ -201,7 +201,7 @@ impl Provider for OpenAiProvider {
     }
 
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let mut request = client
             .post(format!(
                 "{}/chat/completions",
