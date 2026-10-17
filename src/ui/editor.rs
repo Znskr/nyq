@@ -1,9 +1,12 @@
 //! Multi-line prompt editor: a pure state machine driven by key events.
 
 use std::cell::Cell;
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
+
+use super::keys::{Context, KeyAction, Keymap};
 
 /// Pastes longer than this (in characters) fold into a placeholder.
 const FOLD_PASTE: usize = 1000;
@@ -78,6 +81,7 @@ pub struct Editor {
     width: Cell<usize>,
     /// Folded pastes: (placeholder, text), expanded on submit.
     pastes: Vec<(String, String)>,
+    keys: Arc<Keymap>,
 }
 
 struct Search {
@@ -142,7 +146,14 @@ impl Editor {
             goal: None,
             width: Cell::new(usize::MAX),
             pastes: Vec::new(),
+            keys: super::keys::current(),
         }
+    }
+
+    /// Use `keys` for the editing actions.
+    #[cfg(test)]
+    pub fn set_keys(&mut self, keys: Arc<Keymap>) {
+        self.keys = keys;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, busy: bool) -> Action {
@@ -159,22 +170,24 @@ impl Editor {
         if let Some(action) = self.search_key(key, ctrl, alt) {
             return action;
         }
-        // Undo: Ctrl+_ (also sent as Ctrl+7 or Ctrl+-), Super+Z.
-        // Redo: Alt+_, Ctrl+Shift+Z, Super+Shift+Z.
-        let undo = match key.code {
-            KeyCode::Char('_' | '7' | '-') if ctrl => Some(false),
-            KeyCode::Char('_') if alt => Some(true),
-            KeyCode::Char('z' | 'Z') if (ctrl || sup) && shift => Some(true),
-            KeyCode::Char('z') if sup => Some(false),
-            _ => None,
-        };
-        if let Some(redo) = undo {
-            self.undo_step(redo);
+        // Shift+movement extends the selection, so it moves like the plain key.
+        let moving = matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
+        );
+        let selecting = shift && moving;
+        let mut bound = key;
+        if selecting {
+            bound.modifiers -= KeyModifiers::SHIFT;
+        }
+        let act = self.keys.action(Context::Editor, &bound);
+        if let Some(a @ (KeyAction::Undo | KeyAction::Redo)) = act {
+            self.undo_step(a == KeyAction::Redo);
             return Action::None;
         }
         let before = (self.lines.clone(), self.pos());
         let prev = std::mem::replace(&mut self.last, Edit::Other);
-        let action = self.dispatch(key, busy, prev, (ctrl, alt, shift, sup));
+        let action = self.dispatch(key, act, busy, prev, selecting, (ctrl, alt, sup));
         if self.lines != before.0 {
             // Typing a word is one undo step.
             if !(prev == Edit::Typing && self.last == Edit::Typing) {
@@ -184,21 +197,20 @@ impl Editor {
         action
     }
 
+    /// Act on `key`, which the keymap bound to `act` (if anything).
     fn dispatch(
         &mut self,
         key: KeyEvent,
+        act: Option<KeyAction>,
         busy: bool,
         prev: Edit,
-        (ctrl, alt, shift, sup): (bool, bool, bool, bool),
+        selecting: bool,
+        (ctrl, alt, sup): (bool, bool, bool),
     ) -> Action {
         let double = std::mem::take(&mut self.empty_ctrl_c);
         let esc = std::mem::take(&mut self.esc_armed);
         let goal = self.goal.take();
-        let moving = matches!(
-            key.code,
-            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
-        );
-        if shift && moving {
+        if selecting {
             self.anchor.get_or_insert(self.pos());
         } else if let Some(sel) = self.selection() {
             match key.code {
@@ -215,7 +227,7 @@ impl Editor {
                     self.remove(sel.0, sel.1);
                     return Action::None;
                 }
-                KeyCode::Esc if !busy => {
+                _ if act == Some(KeyAction::Interrupt) && !busy => {
                     self.anchor = None;
                     return Action::None;
                 }
@@ -228,8 +240,26 @@ impl Editor {
         } else {
             self.anchor = None;
         }
-        match key.code {
-            KeyCode::Char('c') if ctrl => {
+        let Some(act) = act else {
+            match key.code {
+                KeyCode::Char('a') if sup => {
+                    self.anchor = Some((0, 0));
+                    self.jump(false);
+                }
+                KeyCode::Backspace => self.backspace(),
+                KeyCode::Delete => self.delete(),
+                KeyCode::Char(c) if !ctrl && !alt && !sup && !c.is_control() => {
+                    self.insert(&c.to_string());
+                    if !c.is_whitespace() {
+                        self.last = Edit::Typing;
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        };
+        match act {
+            KeyAction::Clear => {
                 let empty = self.is_empty();
                 if empty {
                     self.empty_ctrl_c = true;
@@ -240,7 +270,7 @@ impl Editor {
                     exit: empty && double,
                 };
             }
-            KeyCode::Esc => {
+            KeyAction::Interrupt => {
                 if !busy && esc && !self.is_empty() {
                     self.set_text("");
                     return Action::None;
@@ -248,17 +278,16 @@ impl Editor {
                 self.esc_armed = !busy && !self.is_empty();
                 return Action::Interrupt;
             }
-            KeyCode::Up if alt => return Action::Dequeue,
-            KeyCode::Char('d') if ctrl => {
+            KeyAction::Dequeue => return Action::Dequeue,
+            KeyAction::Exit => {
                 if self.is_empty() {
                     return Action::Exit;
                 }
                 self.delete();
             }
-            KeyCode::Enter if alt && busy => return self.submit(true),
-            KeyCode::Enter if alt || shift => self.insert("\n"),
-            KeyCode::Char('j') if ctrl => self.insert("\n"),
-            KeyCode::Enter => {
+            KeyAction::FollowUp if busy => return self.submit(true),
+            KeyAction::FollowUp | KeyAction::Newline => self.insert("\n"),
+            KeyAction::Submit => {
                 if self.lines[self.row].chars().take(self.col).last() == Some('\\') {
                     self.backspace();
                     self.insert("\n");
@@ -266,37 +295,20 @@ impl Editor {
                     return self.submit(false);
                 }
             }
-            KeyCode::Char('a') if sup => {
-                self.anchor = Some((0, 0));
-                self.jump(false);
-            }
-            KeyCode::Home if ctrl => self.jump(true),
-            KeyCode::End if ctrl => self.jump(false),
-            KeyCode::Up | KeyCode::Home if sup => self.jump(true),
-            KeyCode::Down | KeyCode::End if sup => self.jump(false),
-            KeyCode::Char('<') if alt => self.jump(true),
-            KeyCode::Char('>') if alt => self.jump(false),
-            KeyCode::Left if ctrl || alt => self.word_left(),
-            KeyCode::Right if ctrl || alt => self.word_right(),
-            KeyCode::Char('b') if alt => self.word_left(),
-            KeyCode::Char('f') if alt => self.word_right(),
-            KeyCode::Char('b') if ctrl => self.left(),
-            KeyCode::Char('f') if ctrl => self.right(),
-            KeyCode::Backspace if alt => {
+            KeyAction::InputStart => self.jump(true),
+            KeyAction::InputEnd => self.jump(false),
+            KeyAction::WordLeft => self.word_left(),
+            KeyAction::WordRight => self.word_right(),
+            KeyAction::CharLeft => self.left(),
+            KeyAction::CharRight => self.right(),
+            KeyAction::DeleteWord => {
                 let end = self.pos();
                 self.word_left();
                 self.kill(self.pos(), end, prev, true);
             }
-            KeyCode::Char('w') if ctrl => {
-                let end = self.pos();
-                self.word_left();
-                self.kill(self.pos(), end, prev, true);
-            }
-            KeyCode::Char('d') if alt => self.kill_word_right(prev),
-            KeyCode::Delete if ctrl || alt => self.kill_word_right(prev),
-            KeyCode::Char('u') if ctrl => self.kill((self.row, 0), self.pos(), prev, true),
-            KeyCode::Backspace if sup => self.kill((self.row, 0), self.pos(), prev, true),
-            KeyCode::Char('k') if ctrl => {
+            KeyAction::DeleteWordForward => self.kill_word_right(prev),
+            KeyAction::DeleteToLineStart => self.kill((self.row, 0), self.pos(), prev, true),
+            KeyAction::DeleteToLineEnd => {
                 let end = if self.col < self.len() || self.row + 1 == self.lines.len() {
                     (self.row, self.len())
                 } else {
@@ -304,38 +316,25 @@ impl Editor {
                 };
                 self.kill(self.pos(), end, prev, false);
             }
-            KeyCode::Char('y') if ctrl => {
+            KeyAction::Yank => {
                 if let Some(text) = self.kills.last().cloned() {
                     self.insert(&text);
                 }
             }
-            KeyCode::Left if sup => self.col = 0,
-            KeyCode::Right if sup => self.col = self.len(),
-            KeyCode::Home | KeyCode::Char('a') if key.code == KeyCode::Home || ctrl => self.col = 0,
-            KeyCode::End | KeyCode::Char('e') if key.code == KeyCode::End || ctrl => {
-                self.col = self.len()
-            }
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left => self.left(),
-            KeyCode::Right => self.right(),
-            KeyCode::Up | KeyCode::Char('p') if key.code == KeyCode::Up || ctrl => {
+            KeyAction::LineStart => self.col = 0,
+            KeyAction::LineEnd => self.col = self.len(),
+            KeyAction::HistoryPrev => {
                 if !self.vertical(true, goal) && self.anchor.is_none() {
                     self.recall(true);
                 }
             }
-            KeyCode::Down | KeyCode::Char('n') if key.code == KeyCode::Down || ctrl => {
+            KeyAction::HistoryNext => {
                 if !self.vertical(false, goal) && self.anchor.is_none() {
                     self.recall(false);
                 }
             }
-            KeyCode::Tab => self.complete(),
-            KeyCode::Char(c) if !ctrl && !alt && !sup && !c.is_control() => {
-                self.insert(&c.to_string());
-                if !c.is_whitespace() {
-                    self.last = Edit::Typing;
-                }
-            }
+            KeyAction::Complete => self.complete(),
+            // Global actions, and undo and redo, are handled before this.
             _ => {}
         }
         Action::None
@@ -841,15 +840,16 @@ impl Editor {
     /// Ctrl+R starts (or steps) a reverse history search; typing refines it,
     /// Esc restores the earlier text, any other key keeps the match and acts.
     fn search_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool) -> Option<Action> {
+        let step = self.keys.matches(KeyAction::HistorySearch, &key);
         let Some(search) = &mut self.search else {
-            if ctrl && key.code == KeyCode::Char('r') {
+            if step {
                 self.search = Some(Search { query: String::new(), at: None, draft: self.text(), failed: false });
                 return Some(Action::None);
             }
             return None;
         };
         let older = match key.code {
-            KeyCode::Char('r') if ctrl => true,
+            _ if step => true,
             KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
                 search.query.push(c);
                 false
@@ -1477,6 +1477,37 @@ mod tests {
         ctrl(&mut e, 'p');
         ctrl(&mut e, 'p');
         assert_eq!(e.text(), "old");
+    }
+
+    #[test]
+    fn rebound_and_unbound_keys() {
+        let (keys, warnings) = Keymap::parse(
+            "history_search = \"alt+r\"\nnewline = []\nline_start = \"f2\"\ndelete_word = \"ctrl+backspace\"",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut e = Editor::new(vec!["cargo test".into()], vec![]);
+        e.set_keys(Arc::new(keys));
+        ctrl(&mut e, 'r');
+        assert!(!e.searching(), "ctrl+r no longer searches");
+        key(&mut e, Char('r'), M::ALT);
+        assert!(e.searching());
+        for c in "test".chars() {
+            plain(&mut e, Char(c));
+        }
+        assert_eq!(e.text(), "cargo test");
+        plain(&mut e, Esc);
+        e.set_text("ab");
+        key(&mut e, Enter, M::SHIFT);
+        ctrl(&mut e, 'j');
+        assert_eq!(e.text(), "ab", "newline is unbound");
+        plain(&mut e, F(2));
+        assert_eq!(e.pos(), (0, 0));
+        ctrl(&mut e, 'e');
+        key(&mut e, Backspace, M::CONTROL);
+        assert_eq!(e.text(), "");
+        // Alt+Enter still queues a follow-up while busy.
+        e.set_text("next");
+        assert_eq!(e.handle_key(KeyEvent::new(Enter, M::ALT), true), Action::FollowUp("next".into()));
     }
 
     #[test]
