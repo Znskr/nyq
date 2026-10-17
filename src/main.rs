@@ -371,7 +371,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the last answer to the clipboard"),
     ("/undo", "revert the last file change nyq made"),
     ("/tools", "list available tools"),
-    ("/skills", "skills: /skills [list|install SOURCE [--project]|remove NAME|info NAME|create NAME|path]"),
+    ("/skills", "skills: browse, use and manage skills; /skills [list|install SOURCE [--project]|remove NAME|info NAME|create NAME|path]"),
     ("/agents", "named subagents: /agents [list|show NAME|stop NAME|delete NAME]"),
     ("/login", "sign in: ChatGPT or Grok in the browser, or an API key (hidden input)"),
     ("/logout", "remove nyq's stored sign-in: /logout [provider]"),

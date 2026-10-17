@@ -7,6 +7,7 @@ mod files;
 pub mod help_menu;
 pub mod history;
 pub mod mode_menu;
+pub mod skills_menu;
 mod highlight;
 mod render;
 pub mod theme;
