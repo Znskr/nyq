@@ -64,7 +64,13 @@ pub fn source(skill: &Skill) -> &'static str {
 /// Skill roots in precedence order (for same-named skills, the first keeps
 /// the plain name).
 fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<Root> {
-    let mut roots: Vec<Root> = PROJECT_ROOTS
+    // Started in the home directory, the project roots are the user roots.
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    let at_home = same(&cwd.join(".nyq"), home) || user_home.is_some_and(|h| same(cwd, h));
+    let mut roots: Vec<Root> = if at_home { Vec::new() } else { PROJECT_ROOTS.to_vec() }
         .iter()
         .map(|d| (cwd.join(d), cwd.to_path_buf(), "project", d.to_string()))
         .collect();
@@ -824,6 +830,19 @@ mod tests {
         let out = tool.run(json!({"name": "kubernetes-deploy"}), &ToolCtx::default()).await;
         assert_eq!(out.content, "Unknown skill \"kubernetes-deploy\". Available skills: pdf");
         assert!(tool.run(json!({}), &ToolCtx::default()).await.is_error);
+    }
+
+    #[test]
+    fn home_directory_is_not_also_a_project() {
+        // Started in the home directory: ~/.claude/skills and ~/.nyq/skills
+        // are listed once, as user skills.
+        let t = tempfile::tempdir().unwrap();
+        let user = t.path();
+        write_skill(&user.join(".claude/skills"), "review", &md("review", "claude review"));
+        write_skill(&user.join(".nyq/skills"), "mine", &md("mine", "nyq skill"));
+        let skills = discover_with(&user.join(".nyq"), Some(user), user);
+        let ids: Vec<(&str, &str)> = skills.iter().map(|s| (s.id.as_str(), s.scope)).collect();
+        assert_eq!(ids, [("mine", "user"), ("review", "user")]);
     }
 
     #[test]

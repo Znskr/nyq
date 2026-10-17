@@ -67,6 +67,18 @@ pub fn home() -> PathBuf {
         .join(".nyq")
 }
 
+/// True when `cwd`'s `.nyq` is the profile directory itself (nyq started in
+/// the home directory): its project files are the user's own, so they are
+/// not read a second time as a project's.
+pub fn workspace_is_profile(cwd: &Path) -> bool {
+    let dir = cwd.join(".nyq");
+    let home = home();
+    match (dir.canonicalize(), home.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => dir == home,
+    }
+}
+
 #[derive(Default, Deserialize)]
 struct Settings {
     provider: Option<String>,
