@@ -5,10 +5,6 @@
 //! Saving edits the parsed document in place: only the changed keys are
 //! touched, so the user's comments, ordering and other keys survive. TOML
 //! has no null; a removed value deletes its key.
-//!
-//! Earlier versions used `settings.json`. The user file is converted once
-//! ([`migrate`]) and the old file left for older nyq versions; a project's
-//! `.nyq/settings.json` is still read (never rewritten) when it has no TOML.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +13,6 @@ use serde_json::{Map, Number, Value};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike};
 
 pub const FILE: &str = "settings.toml";
-const LEGACY: &str = "settings.json";
 
 /// One changed setting: its key path and new value (`None`: removed).
 pub type Change = (Vec<String>, Option<Value>);
@@ -26,82 +21,26 @@ pub fn user_path(home: &Path) -> PathBuf {
     home.join(FILE)
 }
 
-fn project_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".nyq")
-}
-
-/// The project file in effect: `.nyq/settings.toml`, else a legacy
-/// `.nyq/settings.json` when only that exists.
 pub fn project_path(cwd: &Path) -> PathBuf {
-    let toml = project_dir(cwd).join(FILE);
-    let legacy = project_dir(cwd).join(LEGACY);
-    if !toml.exists() && legacy.exists() {
-        legacy
-    } else {
-        toml
-    }
+    cwd.join(".nyq").join(FILE)
 }
 
-/// Whether `path` is an old JSON settings file.
-pub fn is_legacy(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e == "json")
-}
-
-/// Read a settings file (TOML, or JSON for a legacy `.json` path) as an
-/// object. A missing file is empty.
+/// Read a settings file as an object. A missing file is empty.
 pub fn read(path: &Path) -> Result<Map<String, Value>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
-    if is_legacy(path) {
-        return match serde_json::from_str::<Value>(&text) {
-            Ok(Value::Object(m)) => Ok(m),
-            Ok(_) => Err(format!("{}: expected a JSON object", path.display())),
-            Err(e) => Err(format!("{}: {e}", path.display())),
-        };
-    }
     let doc = text
         .parse::<DocumentMut>()
         .map_err(|e| format!("{}: {}", path.display(), e.to_string().trim_end()))?;
     Ok(table_to_json(doc.as_table()))
 }
 
-/// The user's settings. Until [`migrate`] has run, a legacy `settings.json`
-/// is read instead.
+/// The user's settings.
 pub fn read_user(home: &Path) -> Result<Map<String, Value>, String> {
-    let path = user_path(home);
-    let legacy = home.join(LEGACY);
-    if !path.exists() && legacy.exists() {
-        return read(&legacy);
-    }
-    read(&path)
-}
-
-/// Convert the user's `settings.json` to `settings.toml` once, when only the
-/// JSON file exists. The JSON file stays for older nyq versions. Returns a
-/// notice when it converted. JSON that doesn't parse is left alone: nyq keeps
-/// reading it and warns as before, and converts it once it is fixed.
-pub fn migrate(home: &Path) -> Result<Option<String>, String> {
-    let path = user_path(home);
-    let legacy = home.join(LEGACY);
-    if path.exists() || !legacy.exists() {
-        return Ok(None);
-    }
-    let Ok(map) = read(&legacy) else { return Ok(None) };
-    let text = format!(
-        "# nyq settings. Migrated from settings.json, which nyq no longer reads\n\
-         # (it is kept for older nyq versions).\n\n{}",
-        json_to_document(&map)
-    );
-    crate::session::write_private(&path, text.as_bytes())
-        .map_err(|e| format!("writing {}: {e}", path.display()))?;
-    Ok(Some(format!(
-        "Settings moved to {}; {} is no longer read.",
-        path.display(),
-        legacy.display()
-    )))
+    read(&user_path(home))
 }
 
 /// Apply `changes` to the user file, keeping everything else in it
@@ -110,8 +49,6 @@ pub fn write_changes(home: &Path, changes: &[Change]) -> Result<()> {
     if changes.is_empty() {
         return Ok(());
     }
-    // Don't drop the keys of a settings.json that wasn't converted yet.
-    let _ = migrate(home);
     let path = user_path(home);
     let mut doc = match std::fs::read_to_string(&path) {
         Ok(t) => match t.parse::<DocumentMut>() {
@@ -127,24 +64,6 @@ pub fn write_changes(home: &Path, changes: &[Change]) -> Result<()> {
     }
     crate::session::write_private(&path, doc.to_string().as_bytes())
         .with_context(|| format!("writing {}", path.display()))
-}
-
-/// Notes for `nyq doctor` about old JSON files next to the TOML ones.
-pub fn notes(home: &Path, cwd: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let legacy = home.join(LEGACY);
-    if user_path(home).exists() && legacy.exists() {
-        out.push(format!("{} is ignored ({FILE} is used)", legacy.display()));
-    }
-    let legacy = project_dir(cwd).join(LEGACY);
-    if legacy.exists() {
-        if project_dir(cwd).join(FILE).exists() {
-            out.push(format!("{} is ignored ({FILE} is used)", legacy.display()));
-        } else {
-            out.push(format!("{} is the old format; convert it to .nyq/{FILE}", legacy.display()));
-        }
-    }
-    out
 }
 
 // ------------------------------------------------------------------ TOML -> JSON
@@ -176,14 +95,6 @@ fn value_to_json(v: &toml_edit::Value) -> Value {
 }
 
 // ------------------------------------------------------------------ JSON -> TOML
-
-fn json_to_document(map: &Map<String, Value>) -> DocumentMut {
-    let mut doc = DocumentMut::new();
-    for (k, v) in map {
-        set(doc.as_table_mut(), std::slice::from_ref(k), Some(v), false);
-    }
-    doc
-}
 
 /// A JSON value as a TOML item: objects become `[tables]` unless `inline`
 /// (inside an inline table or array). `None` for null.
@@ -347,61 +258,5 @@ mod tests {
         // TOML-only values read as strings.
         std::fs::write(user_path(dir.path()), "when = 1979-05-27T07:32:00Z\n").unwrap();
         assert_eq!(read_user(dir.path()).unwrap()["when"], "1979-05-27T07:32:00Z");
-    }
-
-    #[test]
-    fn migrates_the_user_json_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let json = r#"{"provider":"codex","sound":"max","effort":null,"models":{"codex":"m"},"workspaces":{"~/src/app":{"sound":"off"}}}"#;
-        std::fs::write(home.join(LEGACY), json).unwrap();
-        // Before the conversion the JSON file is still read.
-        assert_eq!(read_user(home).unwrap()["provider"], "codex");
-        let notice = migrate(home).unwrap().unwrap();
-        assert!(notice.contains(FILE), "{notice}");
-        assert_eq!(std::fs::read_to_string(home.join(LEGACY)).unwrap(), json, "settings.json stays as it was");
-        let text = std::fs::read_to_string(user_path(home)).unwrap();
-        assert!(text.starts_with("# nyq settings. Migrated from settings.json"), "{text}");
-        let map = read_user(home).unwrap();
-        assert_eq!(
-            Value::Object(map),
-            json!({"provider":"codex","sound":"max","models":{"codex":"m"},"workspaces":{"~/src/app":{"sound":"off"}}})
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(user_path(home)).unwrap().permissions().mode() & 0o777, 0o600);
-        }
-        // Only once: later the JSON file is ignored.
-        assert_eq!(migrate(home), Ok(None));
-        std::fs::write(home.join(LEGACY), r#"{"sound":"on"}"#).unwrap();
-        assert_eq!(read_user(home).unwrap()["sound"], "max");
-        assert_eq!(notes(home, home).len(), 1);
-        assert!(notes(home, home)[0].contains("ignored"));
-    }
-
-    #[test]
-    fn bad_json_is_not_migrated() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(LEGACY), "{").unwrap();
-        assert_eq!(migrate(dir.path()), Ok(None));
-        assert!(!user_path(dir.path()).exists());
-        assert!(read_user(dir.path()).is_err());
-    }
-
-    #[test]
-    fn legacy_project_json_is_read_not_written() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("repo");
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(cwd.join(".nyq")).unwrap();
-        assert_eq!(project_path(&cwd), cwd.join(".nyq").join(FILE));
-        std::fs::write(cwd.join(".nyq").join(LEGACY), r#"{"sound":"max"}"#).unwrap();
-        assert_eq!(project_path(&cwd), cwd.join(".nyq").join(LEGACY));
-        assert_eq!(read(&project_path(&cwd)).unwrap()["sound"], "max");
-        assert!(notes(&home, &cwd)[0].contains("convert it"));
-        std::fs::write(cwd.join(".nyq").join(FILE), "sound = \"on\"\n").unwrap();
-        assert_eq!(project_path(&cwd), cwd.join(".nyq").join(FILE));
-        assert!(notes(&home, &cwd)[0].contains("ignored"));
     }
 }

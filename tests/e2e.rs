@@ -445,17 +445,9 @@ fn usage_status_and_doctor_commands_work_without_model_requests() {
             .env("NYQ_CODEX_AUTH", home.path().join("missing.json"));
         cmd
     };
-    // A settings.json from an earlier version is converted once, with a notice.
-    std::fs::write(home.path().join("settings.json"), r#"{"sound":"max","workspaces":{"~/src/app":{"sound":"off"}}}"#).unwrap();
     let report = command().args(["usage", "--period", "24h"]).output().unwrap();
     assert!(report.status.success());
-    let text = String::from_utf8_lossy(&report.stderr);
-    assert!(text.contains("openai/priced: 1 requests"));
-    assert!(text.contains("Settings moved to"), "{text}");
-    let toml = std::fs::read_to_string(home.path().join("settings.toml")).unwrap();
-    assert!(toml.contains("sound = \"max\"") && toml.contains("[workspaces.\"~/src/app\"]"), "{toml}");
-    let report = command().args(["usage", "--period", "24h"]).output().unwrap();
-    assert!(!String::from_utf8_lossy(&report.stderr).contains("Settings moved"));
+    assert!(String::from_utf8_lossy(&report.stderr).contains("openai/priced: 1 requests"));
     let status = command().args(["status", "--json", "--provider", "openai"])
         .env("NYQ_BASE_URL", "http://127.0.0.1:1/v1").env("NYQ_MODEL", "priced")
         .env("NYQ_API_KEY", "must-never-appear").output().unwrap();
@@ -471,7 +463,6 @@ fn usage_status_and_doctor_commands_work_without_model_requests() {
     assert!(text.contains("✗ auth:"));
     assert!(text.contains("run nyq login"));
     assert!(text.contains("✓ profile:"));
-    assert!(text.contains("settings.json is ignored"), "{text}");
 }
 
 #[test]

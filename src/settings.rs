@@ -470,13 +470,6 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
         warnings.push(format!("{e} (ignored)"));
         Map::new()
     });
-    if file::is_legacy(&project_path) && project_path.exists() {
-        warnings.push(format!(
-            "{}: the old format, still read for now; convert it to .nyq/{}",
-            project_path.display(),
-            file::FILE
-        ));
-    }
     let mut workspace = workspace_overrides(&user, cwd);
     let ignored: Vec<String> = project
         .keys()
@@ -961,15 +954,6 @@ mod tests {
         assert!(notice.is_none(), "{notice:?}");
         assert_eq!(user_file(home.path())["sound"], "off");
 
-        // A legacy project settings.json is still read, with a hint to convert it.
-        std::fs::write(home.path().join("settings.toml"), "sound = \"off\"\n").unwrap();
-        std::fs::remove_file(cwd.path().join(".nyq/settings.toml")).unwrap();
-        std::fs::write(cwd.path().join(".nyq/settings.json"), r#"{"sound": "max"}"#).unwrap();
-        let (s, warnings) = load_layered(home.path(), cwd.path());
-        assert_eq!(s.sound, "max");
-        assert!(warnings.iter().any(|w| w.contains("convert it to .nyq/settings.toml")), "{warnings:?}");
-        assert_eq!(source(Id::Sound), Some(Layer::Project));
-        assert!(!cwd.path().join(".nyq/settings.toml").exists(), "nyq never writes into the project");
         *CURRENT.lock().unwrap() = None;
         *OVERRIDES.lock().unwrap() = None;
     }
@@ -1031,14 +1015,6 @@ mod tests {
         std::fs::write(dir.path().join("settings.toml"), "sound = \n").unwrap();
         let (s, warn) = load(dir.path());
         assert!(warn.is_some_and(|w| w.contains("settings.toml")));
-        assert_eq!(s, Settings::default());
-        // A settings.json that can't be converted keeps the old behavior:
-        // a warning and the defaults.
-        std::fs::remove_file(dir.path().join("settings.toml")).unwrap();
-        std::fs::write(dir.path().join("settings.json"), "{").unwrap();
-        assert_eq!(file::migrate(dir.path()), Ok(None));
-        let (s, warn) = load(dir.path());
-        assert!(warn.is_some_and(|w| w.contains("settings.json")));
         assert_eq!(s, Settings::default());
         assert_eq!(load(&dir.path().join("missing")).0, Settings::default());
     }
