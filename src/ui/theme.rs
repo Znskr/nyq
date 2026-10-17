@@ -5,6 +5,8 @@
 //! The theme comes from `NYQ_THEME=light|dark`, else the `theme` setting,
 //! else the terminal background (an OSC 11 query, then `COLORFGBG`).
 //! The `theme_colors` setting replaces single roles, for both themes or one.
+//! `NO_COLOR` turns every role off (bold and italics stay), and a locale
+//! that isn't UTF-8 switches the UI to ASCII glyphs (see `ascii`).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::RwLock;
@@ -54,9 +56,33 @@ pub enum Theme {
 const LIGHT: u8 = 1;
 const NO_TRUECOLOR: u8 = 2;
 const DETECTED_LIGHT: u8 = 4;
+const NO_COLOR: u8 = 8;
+const ASCII: u8 = 16;
 
 /// Bits above. Zero (dark, truecolor) until `init` runs, which tests rely on.
 static MODE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// Bits for this test thread only, so tests can render without colors or
+    /// in ASCII without disturbing tests running alongside.
+    static TEST_MODE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+fn bits() -> u8 {
+    #[cfg(test)]
+    if let Some(bits) = TEST_MODE.with(|m| m.get()) {
+        return bits;
+    }
+    MODE.load(Ordering::Relaxed)
+}
+
+/// Render this test thread without colors (`NO_COLOR`), in ASCII, or in 256 colors.
+#[cfg(test)]
+pub fn test_mode(no_color: bool, ascii: bool, truecolor: bool) {
+    let bits = [(no_color, NO_COLOR), (ascii, ASCII), (!truecolor, NO_TRUECOLOR)];
+    TEST_MODE.with(|m| m.set(Some(bits.iter().filter(|(on, _)| *on).map(|(_, b)| b).sum())));
+}
 
 pub fn parse(s: &str) -> Option<Theme> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -73,11 +99,46 @@ pub fn init(setting: &str, query: bool) {
         .or_else(|| std::env::var("COLORFGBG").ok().and_then(|v| from_colorfgbg(&v)))
         .unwrap_or(Theme::Dark);
     let mut bits = if detected == Theme::Light { DETECTED_LIGHT } else { 0 };
-    if !truecolor(|k| std::env::var(k).ok()) {
+    let env = |k: &str| std::env::var(k).ok();
+    if !truecolor(env) {
         bits |= NO_TRUECOLOR;
+    }
+    if env("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        bits |= NO_COLOR;
+    }
+    if !utf8_locale(env) {
+        bits |= ASCII;
     }
     MODE.store(bits, Ordering::Relaxed);
     apply_setting(setting);
+}
+
+/// Whether the locale promises UTF-8: the first of `LC_ALL`, `LC_CTYPE` and
+/// `LANG` that is set decides. With none set (Windows, bare containers) the
+/// terminal is trusted to cope.
+fn utf8_locale(env: impl Fn(&str) -> Option<String>) -> bool {
+    match ["LC_ALL", "LC_CTYPE", "LANG"].iter().find_map(|k| env(k).filter(|v| !v.is_empty())) {
+        Some(v) => {
+            let v = v.to_ascii_lowercase();
+            v.contains("utf-8") || v.contains("utf8")
+        }
+        None => true,
+    }
+}
+
+/// Colors are off (`NO_COLOR`).
+pub fn no_color() -> bool {
+    bits() & NO_COLOR != 0
+}
+
+/// Glyphs must be ASCII: the locale isn't UTF-8.
+pub fn ascii() -> bool {
+    bits() & ASCII != 0
+}
+
+/// 24-bit color is on, so blends (the banner's gradient) render smoothly.
+pub fn truecolor_on() -> bool {
+    bits() & (NO_TRUECOLOR | NO_COLOR) == 0
 }
 
 /// Re-apply the `theme` setting (`auto`, `light` or `dark`); `NYQ_THEME` wins.
@@ -273,7 +334,7 @@ pub fn to_256(r: u8, g: u8, b: u8) -> u8 {
 
 /// `c` in the active theme and color depth.
 pub fn color(c: Color) -> Color {
-    let bits = MODE.load(Ordering::Relaxed);
+    let bits = bits();
     let theme = if bits & LIGHT != 0 { Theme::Light } else { Theme::Dark };
     let truecolor = bits & NO_TRUECOLOR == 0;
     if !OVERRIDDEN.load(Ordering::Relaxed) {
@@ -292,8 +353,22 @@ fn resolve(c: Color, theme: Theme, truecolor: bool, palette: Option<&Palette>) -
     }
 }
 
+/// A style in role color `c`; no color at all under `NO_COLOR`.
 pub fn fg(c: Color) -> Style {
-    Style::new().fg(color(c))
+    if no_color() {
+        Style::new()
+    } else {
+        Style::new().fg(color(c))
+    }
+}
+
+/// `style` on a role-colored background; reversed under `NO_COLOR`.
+pub fn on(style: Style, c: Color) -> Style {
+    if no_color() {
+        style.reverse()
+    } else {
+        style.on(color(c))
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +398,26 @@ mod tests {
         assert!(truecolor(env(&[("COLORTERM", "truecolor")])));
         assert!(truecolor(env(&[("TERM_PROGRAM", "WezTerm")])));
         assert!(!truecolor(env(&[("TERM", "xterm-256color"), ("TERM_PROGRAM", "Apple_Terminal")])));
+    }
+
+    #[test]
+    fn utf8_locales_and_no_color() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert!(utf8_locale(env(&[("LANG", "en_US.UTF-8")])));
+        assert!(utf8_locale(env(&[("LC_CTYPE", "C.utf8"), ("LANG", "C")])));
+        assert!(utf8_locale(env(&[])), "nothing set trusts the terminal");
+        assert!(!utf8_locale(env(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")])), "LC_ALL wins");
+        assert!(!utf8_locale(env(&[("LANG", "POSIX")])));
+        assert!(utf8_locale(env(&[("LC_ALL", ""), ("LANG", "de_DE.UTF-8")])), "empty values don't count");
+        test_mode(true, true, true);
+        assert!(no_color() && ascii() && !truecolor_on());
+        assert_eq!(fg(BLUE), Style::new());
+        assert_eq!(on(Style::new(), YELLOW), Style::new().reverse());
+        test_mode(false, false, false);
+        assert!(!no_color() && !ascii() && !truecolor_on());
+        assert_eq!(fg(BLUE), Style::new().fg(Color::Fixed(74)));
     }
 
     #[test]
