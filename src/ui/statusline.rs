@@ -37,48 +37,63 @@ pub fn left(f: &Footer) -> Option<String> {
     Some(s)
 }
 
-/// The right-hand segments, in order, as plain text.
-pub fn right(f: &Footer, width: usize) -> Vec<String> {
+/// What a right-hand segment shows, so the status line can color it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    Title,
+    Provider,
+    /// The share of the context window in use (0 to 1).
+    Context(f64),
+    Tokens,
+    Sandbox,
+    Mode,
+    Folder,
+    Branch,
+    Extension,
+}
+
+/// The right-hand segments, in order, with their kinds.
+pub fn segments(f: &Footer, width: usize) -> Vec<(Kind, String)> {
     let on = |seg| f.segments.get(seg);
     let mut out = Vec::new();
     if on(Segment::Session) && !f.title.trim().is_empty() {
-        out.push(one_line(&f.title, 32));
+        out.push((Kind::Title, one_line(&f.title, 32)));
     }
     if on(Segment::Provider) && !f.provider.is_empty() {
-        out.push(f.provider.clone());
+        out.push((Kind::Provider, f.provider.clone()));
     }
     if on(Segment::Context) && f.context_window > 0 && f.context_tokens > 0 {
-        out.push(format!(
-            "{:.0}% of {}",
-            f.context_tokens as f64 * 100.0 / f.context_window as f64,
-            tokens(f.context_window)
-        ));
+        let used = f.context_tokens as f64 / f.context_window as f64;
+        out.push((Kind::Context(used), format!("{:.0}% of {}", used * 100.0, tokens(f.context_window))));
     }
     if on(Segment::Tokens) && f.usage.input_tokens + f.usage.output_tokens > 0 {
-        out.push(format!(
-            "↑{} ↓{}",
-            tokens(f.usage.input_tokens),
-            tokens(f.usage.output_tokens)
-        ));
+        out.push((Kind::Tokens, format!("↑{} ↓{}", tokens(f.usage.input_tokens), tokens(f.usage.output_tokens))));
     }
     if on(Segment::Sandbox) {
         if !f.sandbox.is_empty() {
-            out.push(f.sandbox.clone());
+            out.push((Kind::Sandbox, f.sandbox.clone()));
         }
         if !f.permission_mode.is_empty() {
-            out.push(f.permission_mode.clone());
+            out.push((Kind::Mode, f.permission_mode.clone()));
         }
     }
     if on(Segment::Folder) && !f.cwd.is_empty() {
-        out.push(one_line(&tilde(&f.cwd), width.max(1)));
+        out.push((Kind::Folder, one_line(&tilde(&f.cwd), width.max(1))));
     }
     if on(Segment::Branch) {
         if let Some(b) = &f.branch {
-            out.push(format!("⎇ {}", one_line(b, 60)));
+            let mark = if super::theme::ascii() { "git:" } else { "⎇ " };
+            out.push((Kind::Branch, format!("{mark}{}", one_line(b, 60))));
         }
     }
-    out.extend(f.extensions.iter().map(|s| one_line(s, 60)));
+    out.extend(f.extensions.iter().map(|s| (Kind::Extension, one_line(s, 60))));
     out
+}
+
+/// The right-hand segments, in order, as plain text.
+#[cfg(test)]
+pub fn right(f: &Footer, width: usize) -> Vec<String> {
+    segments(f, width).into_iter().map(|(_, s)| s).collect()
 }
 
 /// The branch named by a `.git/HEAD` file, or a short commit when detached.

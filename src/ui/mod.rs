@@ -1,6 +1,7 @@
 //! Terminal frontends: the interactive pi-style TUI (`tui`) and a plain
 //! renderer for `--print` and piped input.
 
+mod chrome;
 pub mod clipboard;
 pub mod editor;
 mod files;
@@ -19,7 +20,7 @@ pub mod tui;
 
 use std::io::{self, IsTerminal, Write};
 
-use nu_ansi_term::{Color, Style};
+use nu_ansi_term::Style;
 use serde_json::Value;
 
 use crate::agent::{Approval, ApprovalRequest, Approver, Ui};
@@ -275,42 +276,11 @@ pub fn replay(items: &[Item]) {
     }
 }
 
-fn banner_text(version: &str) -> String {
-    format!(
-        "{} {}",
-        paint(
-            true,
-            theme::fg(theme::BRIGHT).bold(),
-            "𝒏yq"
-        ),
-        paint(
-            true,
-            theme::fg(theme::GRAY),
-            &format!(
-                "v{} · Run /help for commands · {} models · {} quit",
-                sanitize_text(version),
-                keys::current().hint(keys::KeyAction::ModelMenu).unwrap_or_else(|| "/model".into()),
-                keys::current().hint(keys::KeyAction::Exit).unwrap_or_else(|| "/exit".into())
-            )
-        )
-    )
-}
-
+/// The startup banner. Only the interactive UI shows one: print mode and
+/// piped output stay quiet.
 pub fn banner(version: &str) {
-    let text = banner_text(version);
-    match tui::active() {
-        Some(screen) => screen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .print_styled_info(&text, Style::new()),
-        None => eprintln!(
-            "{}",
-            if color_err() {
-                text
-            } else {
-                sanitize_text(&text)
-            }
-        ),
+    if let Some(screen) = tui::active() {
+        screen.lock().unwrap_or_else(|e| e.into_inner()).print_banner(version);
     }
 }
 
@@ -347,7 +317,7 @@ pub fn info(msg: &str) {
 
 pub fn error(msg: &str) {
     let msg = sanitize_text(msg);
-    let style = Style::new().fg(Color::Red);
+    let style = theme::fg(theme::RED);
     match tui::active() {
         Some(screen) => screen
             .lock()
@@ -360,14 +330,6 @@ pub fn error(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn banner_keeps_its_own_colors() {
-        let text = banner_text("0.2\x1b]bad\x07");
-        assert!(text.contains("\x1b["));
-        assert!(!text.contains("bad"));
-        assert!(sanitize_text(&text).starts_with("𝒏yq v0.2 ·"));
-    }
 
     #[test]
     fn run_record_tracks_the_final_answer_and_tool_results() {
