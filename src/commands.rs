@@ -24,13 +24,38 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/fast", "toggle fast mode (Codex priority processing) when the model supports it"),
     ("/image", "attach an image to the next message: /image PATH"),
     ("/images", "pending image attachments: /images [clear|remove N]"),
-    ("/paste", "attach an image from the clipboard (also ctrl+v)"),
-    ("/transcript", "full-screen transcript with search (ctrl+o)"),
+    ("/paste", "attach an image from the clipboard (also {key})"),
+    ("/transcript", "full-screen transcript with search ({key})"),
     ("/keys", "key bindings and their keys (edit ~/.nyq/keybindings.toml)"),
     ("/alias", "list prompt templates from prompts/*.md (each is a /command)"),
     ("/feedback", "open nyq's issue page in your browser"),
     ("/trace", "write a redacted diagnostic trace and copy its path"),
 ];
+
+/// A command's description with `{key}` replaced by the key bound to its
+/// action; when the action is unbound the parenthetical naming it is dropped.
+pub fn describe(cmd: &str, description: &str) -> String {
+    describe_with(&ui::keys::current(), cmd, description)
+}
+
+fn describe_with(keys: &ui::keys::Keymap, cmd: &str, description: &str) -> String {
+    use crate::ui::keys::KeyAction;
+    let action = match cmd {
+        "/paste" => KeyAction::PasteImage,
+        "/transcript" => KeyAction::ExpandTools,
+        "/model" => KeyAction::ModelMenu,
+        _ => return description.to_string(),
+    };
+    let Some(at) = description.find("{key}") else { return description.to_string() };
+    match keys.hint(action) {
+        Some(key) => description.replace("{key}", &key),
+        None => {
+            let open = description[..at].rfind(" (").unwrap_or(at);
+            let close = description[at..].find(')').map_or(at + 5, |i| at + i + 1);
+            format!("{}{}", &description[..open], &description[close..])
+        }
+    }
+}
 
 /// Whether `cmd` is one of these commands.
 pub fn handles(cmd: &str) -> bool {
@@ -652,4 +677,24 @@ fn refresh(agent: &mut Agent, skills: &[Skill], runtime: &workspace::Runtime) ->
     }
     ui::list(&view.lines);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptions_name_the_bound_key() {
+        let paste = COMMANDS.iter().find(|(c, _)| *c == "/paste").unwrap().1;
+        assert_eq!(describe("/paste", paste), "attach an image from the clipboard (also ctrl+v)");
+        assert_eq!(describe("/image", "attach {key}"), "attach {key}", "only commands with a key action");
+        let (keys, _) = ui::keys::Keymap::parse("paste_image = \"f9\"\nexpand_tools = []");
+        assert_eq!(describe_with(&keys, "/paste", paste), "attach an image from the clipboard (also f9)");
+        let transcript = COMMANDS.iter().find(|(c, _)| *c == "/transcript").unwrap().1;
+        assert_eq!(describe_with(&keys, "/transcript", transcript), "full-screen transcript with search");
+        assert_eq!(
+            describe_with(&keys, "/model", "switch model or provider ({key}); /model ID"),
+            "switch model or provider (ctrl+l); /model ID"
+        );
+    }
 }
