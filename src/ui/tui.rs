@@ -20,11 +20,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
+use super::chrome::{self, Mark};
 use super::editor::{Action, Editor};
 use super::keys::{KeyAction, Keymap};
 use super::render::{
     escape_len, is_table_sep, numbered_diff, looks_like_diff, one_line, sanitize_text, table, table_cells,
-    truncate, visible_width, wrap_row, file_url, link, Fence, Markdown, RULE,
+    truncate, visible_width, wrap_row, file_url, link, Fence, Markdown,
 };
 use super::statusline::{tilde, tokens};
 use super::theme::{fg, BRIGHT, FAINT, GRAY, MID, RED, YELLOW};
@@ -134,6 +135,9 @@ struct ToolRow {
     status: Status,
     /// The change an edit or write made (a unified diff), shown inline.
     diff: Option<String>,
+    started: Instant,
+    /// How long the call took, once it finished.
+    took: Option<Duration>,
 }
 
 struct PendingApproval {
@@ -376,7 +380,7 @@ fn paint(style: Style, s: &str) -> String {
 
 /// Soft-wrap plain text into rows of at most `width` columns.
 /// Cut a possibly-styled row to `width` columns, keeping escape sequences.
-fn clip_width(s: &str, width: usize) -> String {
+pub(super) fn clip_width(s: &str, width: usize) -> String {
     if width == 0 || visible_width(s) <= width {
         return if width == 0 {
             String::new()
@@ -685,31 +689,45 @@ impl Screen {
         if n == 0 {
             return;
         }
+        let mark = |status: Status| {
+            let m = match status {
+                Status::Running => Mark::Running,
+                Status::Ok => Mark::Ok,
+                Status::Failed => Mark::Failed,
+            };
+            chrome::mark(m, self.frame)
+        };
+        // Durations under a tenth of a second are noise.
+        let took = |d: Option<Duration>| {
+            d.filter(|d| *d >= Duration::from_millis(100))
+                .map(|d| paint(fg(FAINT), &format!("  {}", chrome::elapsed(d))))
+                .unwrap_or_default()
+        };
         let row_text = |t: &ToolRow, lead: &str| {
-            let verb_style = match t.status {
-                Status::Failed => fg(RED),
-                Status::Running if live => fg(MID),
-                _ => fg(GRAY),
+            let verb = match t.status {
+                Status::Running if live => shimmer(&t.verb, self.frame),
+                Status::Failed => paint(fg(RED), &t.verb),
+                _ => paint(fg(BRIGHT), &t.verb),
             };
             let note = if t.note.is_empty() {
                 String::new()
             } else {
-                format!(" {}", t.note)
+                format!(" {}", chrome::note(&t.note))
             };
-            let used = visible_width(lead) + t.verb.chars().count() + note.chars().count() + 1;
+            let used = visible_width(lead) + 3 + t.verb.chars().count() + visible_width(&note);
+            // The time goes before the target has to be cut.
+            let took = Some(took(t.took))
+                .filter(|took| used + visible_width(took) + visible_width(&t.target) <= w)
+                .unwrap_or_default();
+            let used = used + visible_width(&took);
             let target = truncate(&t.target, w.saturating_sub(used));
-            let verb = if t.status == Status::Running && live {
-                shimmer(&t.verb, self.frame)
-            } else {
-                paint(verb_style, &t.verb)
-            };
             let mut target = paint(fg(GRAY), &target);
             if matches!(t.tool.as_str(), "read_file" | "write_file" | "edit_file") {
                 if let Some(url) = file_url(&self.footer.cwd, &t.target) {
                     target = link(&url, &target);
                 }
             }
-            format!("{lead}{verb} {target}{}", paint(fg(GRAY), &note))
+            format!("{lead}{} {verb} {target}{note}{took}", mark(t.status))
         };
         let detail = |t: &ToolRow, rows: &mut Vec<String>, bar: &str| {
             let style = if t.status == Status::Failed {
@@ -738,13 +756,7 @@ impl Screen {
         };
         if n == 1 {
             let t = &self.tools[0];
-            rows.push(
-                row_text(t, &format!("{} ", paint(fg(BRIGHT), "●"))).replacen(
-                    &paint(fg(GRAY), &t.verb),
-                    &paint(fg(BRIGHT), &t.verb),
-                    1,
-                ),
-            );
+            rows.push(row_text(t, ""));
             detail(t, rows, "  │ ");
             return;
         }
@@ -768,10 +780,18 @@ impl Screen {
                 (k, c) => format!("{c} {k}"),
             })
             .collect();
+        // The group's mark: running while any call runs, else failed if any failed.
+        let status = [Status::Running, Status::Failed]
+            .into_iter()
+            .find(|s| self.tools.iter().any(|t| t.status == *s))
+            .unwrap_or(Status::Ok);
+        let total = self.tools.iter().filter_map(|t| t.took).sum::<Duration>();
         rows.push(format!(
-            "{} {}",
-            paint(fg(BRIGHT), "●"),
-            paint(fg(GRAY), &format!("{n} tool calls · {}", parts.join(" · ")))
+            "{} {}{}{}",
+            mark(status),
+            paint(fg(BRIGHT), &format!("{n} tool calls")),
+            paint(fg(GRAY), &format!(" · {}", parts.join(" · "))),
+            took((status != Status::Running).then_some(total))
         ));
         if !live && crate::settings::current().collapse_tool_calls {
             return;
@@ -780,7 +800,7 @@ impl Screen {
             let last = i + 1 == n;
             rows.push(row_text(
                 t,
-                &paint(fg(GRAY), if last { "└ " } else { "├ " }),
+                &paint(fg(FAINT), if last { "└ " } else { "├ " }),
             ));
             detail(t, rows, if last { "  │ " } else { "│ │ " });
         }
@@ -831,43 +851,24 @@ impl Screen {
 
         // Status: what the agent is doing.
         if let Some((label, start)) = &self.busy {
-            let secs = self.working_time(*start).as_secs();
-            let mut parts = vec![format!("{secs}s")];
+            let mut facts = vec![chrome::clock(self.working_time(*start).as_secs())];
             if self.turn_tokens != (0, 0) {
-                parts.push(format!("↑{} ↓{}", tokens(self.turn_tokens.0), tokens(self.turn_tokens.1)));
+                facts.push(format!("↑{} ↓{}", tokens(self.turn_tokens.0), tokens(self.turn_tokens.1)));
             }
             if !self.tally.is_empty() {
-                parts.push(tally_text(&self.tally));
+                facts.push(tally_text(&self.tally));
             }
-            if let Some(key) = self.keys.hint(KeyAction::Interrupt) {
-                parts.push(format!("{key} to interrupt"));
-            }
-            let suffix = format!(" ({})", parts.join(" · "));
-            let label = truncate(label, w.saturating_sub(suffix.chars().count() + 4).max(1));
             let detail = if self.live_block == Block::Reasoning {
-                let last = self
-                    .live
-                    .lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("")
-                    .trim();
-                truncate(
-                    last,
-                    w.saturating_sub(label.chars().count() + suffix.chars().count() + 4),
-                )
+                self.live.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
             } else {
-                String::new()
+                ""
             };
-            let mut line = format!("{} {}", paint(fg(BRIGHT), "•"), shimmer(&label, self.frame));
-            line.push_str(&paint(fg(GRAY), &suffix));
-            if !detail.is_empty() {
-                line.push_str(&paint(fg(FAINT).italic(), &format!(" {detail}")));
-            }
+            let label = shimmer(&truncate(label, w.saturating_sub(24).max(8)), self.frame);
+            let interrupt = self.keys.hint(KeyAction::Interrupt);
             if !rows.is_empty() {
                 rows.push(String::new());
             }
-            rows.push(line);
+            rows.push(chrome::working_line(&label, &facts, detail, interrupt.as_deref(), self.frame, w));
         }
         if let Some(h) = &self.hint {
             rows.push(paint(fg(YELLOW), h));
@@ -880,14 +881,13 @@ impl Screen {
             let text = truncate(&one_line(text, w), w.saturating_sub(tag.len() + 3));
             rows.push(format!(
                 "{} {}{}",
-                paint(fg(FAINT), "┃"),
+                paint(fg(FAINT), "›"),
                 paint(fg(GRAY), &text),
                 paint(fg(FAINT), tag)
             ));
         }
-        if !rows.is_empty() {
-            rows.push(String::new());
-        }
+        // A blank row always separates the input from what is above it.
+        rows.push(String::new());
 
         // Input, or the approval prompt in its place.
         let (mut cursor_row, mut cursor_col);
@@ -968,13 +968,14 @@ impl Screen {
             rows.push(rule(w));
             rows.push(hints(&[("Enter", "Save"), ("Esc", "Cancel")]));
         } else {
-            let view = self.editor.render(w.saturating_sub(2).max(1));
+            let view = self.editor.render(chrome::input_width(w));
+            let busy = self.busy.is_some();
+            let placeholder = self.editor.is_empty().then(|| chrome::placeholder(busy, &self.keys));
+            let (framed, text_row, text_col) = chrome::input_box(&view.lines, placeholder.as_deref(), w, busy);
             let top = rows.len();
-            for l in &view.lines {
-                rows.push(format!("{} {l}", paint(fg(BRIGHT), "┃")));
-            }
-            cursor_row = top + view.cursor_row;
-            cursor_col = 2 + view.cursor_col;
+            rows.extend(framed);
+            cursor_row = top + text_row + view.cursor_row;
+            cursor_col = text_col + view.cursor_col;
             if let Some(q) = &self.question {
                 rows.push(rule(w));
                 rows.push(paint(fg(BRIGHT).bold(), q.menu.as_deref().unwrap_or("Question")));
@@ -1006,9 +1007,14 @@ impl Screen {
                 } else {
                     hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("type", "Own answer"), ("Esc", "Skip")])
                 });
-            } else if !self.menu_rows(&mut rows) {
-                rows.push(String::new());
-                rows.push(self.footer_line());
+            } else {
+                let at = rows.len();
+                if !self.menu_rows(&mut rows) {
+                    rows.push(self.footer_line());
+                } else if chrome::boxed(w) && rows.get(at).is_some_and(|r| super::render::strip_ansi(r).chars().all(|c| c == '─')) {
+                    // The box already closes the input: no rule above the menu.
+                    rows.remove(at);
+                }
             }
         }
 
@@ -1027,39 +1033,7 @@ impl Screen {
     }
 
     fn footer_line(&self) -> String {
-        let f = &self.footer;
-        let left = match super::statusline::left(f) {
-            Some(text) => {
-                let (effort, rest) = text.split_once(" · ").unwrap_or((&text, ""));
-                format!(
-                    "{} {} {}",
-                    paint(fg(MID), effort),
-                    paint(fg(GRAY), "·"),
-                    paint(fg(GRAY), &sanitize_text(rest))
-                )
-            }
-            None => String::new(),
-        };
-        if visible_width(&left) > self.width {
-            return clip_width(&left, self.width);
-        }
-        let right = super::statusline::right(f, self.width).join(" · ");
-        let mut room = self.width.saturating_sub(visible_width(&left) + 4);
-        let upgrade = self.upgrade_label();
-        let upgrade = if upgrade.is_empty() {
-            String::new()
-        } else {
-            let label = truncate(&upgrade, room);
-            room = room.saturating_sub(label.chars().count() + 3);
-            let color = if label.starts_with("upgrading") { GRAY } else { YELLOW };
-            let sep = if right.is_empty() || room == 0 { "" } else { " · " };
-            format!("{}{}", paint(fg(color), &label), paint(fg(FAINT), sep))
-        };
-        let right = format!("{upgrade}{}", paint(fg(FAINT), &truncate(&sanitize_text(&right), room)));
-        if left.is_empty() {
-            return right;
-        }
-        spread(&left, &right, self.width)
+        chrome::status_line(&self.footer, self.width, &self.upgrade_label())
     }
 
     /// The auto-upgrade status for the status line (empty: nothing to show).
@@ -1547,7 +1521,7 @@ impl Screen {
             if i > 0 {
                 let _ = self.out.write_all(b"\r\n");
             }
-            let _ = self.out.write_all(r.as_bytes());
+            let _ = self.out.write_all(chrome::fold(r).as_bytes());
         }
         let up = rows.len().saturating_sub(1).saturating_sub(row);
         if up > 0 {
@@ -1621,7 +1595,7 @@ impl Screen {
         self.clear_pane();
         for r in rows {
             for line in wrap_row(r, self.width) {
-                let _ = self.out.write_all(line.as_bytes());
+                let _ = self.out.write_all(chrome::fold(&line).as_bytes());
                 let _ = self.out.write_all(b"\r\n");
             }
         }
@@ -1657,7 +1631,7 @@ impl Screen {
             terminal::Clear(terminal::ClearType::FromCursorDown)
         );
         for r in rows {
-            let _ = self.out.write_all(r.as_bytes());
+            let _ = self.out.write_all(chrome::fold(&r).as_bytes());
             let _ = self.out.write_all(b"\r\n");
         }
         self.pane_rows = 0;
@@ -1692,6 +1666,14 @@ impl Screen {
         self.emit(&rows);
     }
 
+    /// The startup banner, sized to the terminal, with a tip that changes
+    /// from launch to launch.
+    pub fn print_banner(&mut self, version: &str) {
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as usize);
+        let rows = chrome::banner(version, &self.footer, &self.keys, self.width, seed);
+        self.print_styled_info(&rows.join("\n"), Style::new());
+    }
+
     /// Rows that should each stay on one screen line (listings).
     pub fn print_list(&mut self, lines: &[String]) {
         self.log.info(&sanitize_text(&lines.join("\n")));
@@ -1724,12 +1706,9 @@ impl Screen {
         self.log.user(&text);
         self.flush_all();
         let mut rows = self.begin(Block::User);
-        for line in text.trim().lines() {
-            rows.push(format!(
-                "{} {}",
-                paint(fg(BRIGHT), "┃"),
-                paint(Style::new().bold(), line)
-            ));
+        for (i, line) in text.trim().lines().enumerate() {
+            let lead = if i == 0 { paint(fg(chrome::ACCENT).bold(), "›") } else { " ".into() };
+            rows.push(format!("{lead} {}", paint(fg(BRIGHT).bold(), line)));
         }
         self.emit(&rows);
     }
@@ -1809,19 +1788,14 @@ impl Screen {
         if let Some(f) = &mut self.fence {
             if f.closes(line) {
                 self.fence = None;
-                return format!("  {}", paint(fg(FAINT), &"─".repeat(RULE)));
+                return format!("  {}", chrome::fence_close());
             }
             return format!("  {}", f.code_line(line, true));
         }
         if let Some(f) = Fence::open(line) {
-            let lang = if f.lang.is_empty() { "code".to_string() } else { f.lang.clone() };
+            let row = format!("  {}", chrome::fence_open(&sanitize_text(&f.lang)));
             self.fence = Some(f);
-            return format!(
-                "  {} {} {}",
-                paint(fg(FAINT), "─"),
-                paint(fg(GRAY), &lang),
-                paint(fg(FAINT), &"─".repeat((RULE - 2).saturating_sub(lang.chars().count())))
-            );
+            return row;
         }
         format!("  {}", self.md.line(line, true))
     }
@@ -1918,6 +1892,8 @@ impl Screen {
             detail: Vec::new(),
             status: Status::Running,
             diff: None,
+            started: Instant::now(),
+            took: None,
         });
         self.set_label(&format!("Running {}", tool.replace('_', " ")));
         self.redraw();
@@ -1939,6 +1915,7 @@ impl Screen {
         } else {
             Status::Ok
         };
+        t.took = Some(t.started.elapsed());
         if let Some(d) = output.display.as_deref().filter(|d| looks_like_diff(d)) {
             t.note = diff_stat(d);
             if !output.is_error && matches!(t.tool.as_str(), "edit_file" | "write_file") {
@@ -2465,7 +2442,7 @@ impl Screen {
                 cursor::MoveTo(0, i as u16),
                 terminal::Clear(terminal::ClearType::CurrentLine)
             );
-            let _ = self.out.write_all(row.as_bytes());
+            let _ = self.out.write_all(chrome::fold(row).as_bytes());
         }
         let _ = queue!(self.out, terminal::EndSynchronizedUpdate);
         let _ = self.out.flush();
@@ -4028,6 +4005,8 @@ mod tests {
             detail: Vec::new(),
             status: Status::Ok,
             diff: None,
+            started: Instant::now(),
+            took: Some(Duration::from_secs(2)),
         };
         s.tools = vec![row("a.rs", ""), row("src/lib.rs", "+1")];
         let (rows, _, _) = s.pane();
@@ -4468,7 +4447,7 @@ mod tests {
         let mut rows = Vec::new();
         s.tool_rows(&mut rows, false);
         let plain: Vec<String> = rows.iter().map(|r| super::super::render::strip_ansi(r)).collect();
-        assert!(plain[0].contains("+20 / -20"), "{plain:?}");
+        assert!(plain[0].starts_with("✓ Edited a.rs +20 -20"), "{plain:?}");
         assert_eq!(plain[1], "  │  1 - old 0");
         assert_eq!(plain.last().unwrap(), "  │ … 28 more lines (ctrl+o to view)");
         assert_eq!(plain.len(), 2 + INLINE_DIFF_ROWS);
@@ -4491,7 +4470,10 @@ mod tests {
         s.tool_start("bash", "ls");
         s.turn_tokens = (1500, 20);
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        assert!(text.contains("(0s · ↑1.5k ↓20 · 2 read, 1 command · esc to interrupt)"), "{text}");
+        let line = text.lines().find(|l| l.starts_with("⠋ Running bash")).unwrap_or_default();
+        assert!(line.starts_with("⠋ Running bash · 0s · ↑1.5k ↓20 · 2 read, 1 command "), "{text}");
+        assert!(line.ends_with(" esc to interrupt") && visible_width(line) == 120, "{text}");
+        assert!(text.contains("├ ⠋ Read a") && text.contains("│ › Steer the current task"), "{text}");
         let (tx, _rx) = oneshot::channel();
         s.approval = Some(pending_approval(tx, None));
         s.redraw();
@@ -4503,6 +4485,35 @@ mod tests {
         s.redraw();
         assert!(s.pause_start.is_none() && s.paused >= Duration::from_secs(4));
         assert_eq!(tally_text(&[("edit", 2), ("tool", 1)]), "2 edited, 1 tool");
+    }
+
+    #[test]
+    fn plain_terminals_get_no_colors_or_unicode() {
+        // NO_COLOR, and a locale that isn't UTF-8.
+        super::super::theme::test_mode(true, true, true);
+        let mut s = screen();
+        s.width = 60;
+        s.height = 40;
+        s.footer.model = "m".into();
+        s.footer.permission_mode = "yolo".into();
+        s.footer.branch = Some("main".into());
+        s.set_busy(Some("Working"), None);
+        s.tool_start("edit_file", "a.rs");
+        let diff = "@@ -1 +1 @@\n-old\n+new\n";
+        s.tool_end(&ToolOutput { content: "Edited a.rs.".into(), display: Some(diff.into()), ..ToolOutput::default() });
+        s.tool_start("bash", "ls");
+        s.turn_tokens = (10, 2);
+        let mut rows = s.pane().0;
+        s.tool_rows(&mut rows, false);
+        for r in &rows {
+            let params = r.split("\x1b[").skip(1).flat_map(|e| e.split('m').next().unwrap_or("").split(';'));
+            assert!(params.clone().all(|p| !matches!(p.parse::<u8>(), Ok(30..=49 | 90..=107))), "{r:?}");
+            let folded = super::super::render::strip_ansi(&chrome::fold(r));
+            assert!(folded.is_ascii(), "{folded:?}");
+        }
+        let text = super::super::render::strip_ansi(&chrome::fold(&rows.join("\n")));
+        assert!(text.contains("| + Edited a.rs +1 -1") && text.contains("| | 1 - old"), "{text}");
+        assert!(text.contains("| > Steer the current task") && text.contains("yolo - git:main"), "{text}");
     }
 
     #[test]
