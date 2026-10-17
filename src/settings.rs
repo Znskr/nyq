@@ -221,6 +221,11 @@ pub struct Settings {
     /// or `ext__…`. A project's list adds to the user's.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled_tools: Vec<String>,
+    /// Skills (by id, as `/skills` shows them) never offered to the model or
+    /// in `$`/`/` completion; `/skills` still lists them. A project's list
+    /// adds to the user's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disabled_skills: Vec<String>,
     /// Keys nyq doesn't manage here (`provider`, `models`, …), kept on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -254,6 +259,7 @@ impl Default for Settings {
             collapse_tool_calls: false,
             startup_scrollback: false,
             disabled_tools: Vec::new(),
+            disabled_skills: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -319,6 +325,83 @@ pub fn update(
     Ok((effective, notice))
 }
 
+/// A list setting that names things to turn off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum List {
+    /// `disabled_tools`
+    Tools,
+    /// `disabled_skills`
+    Skills,
+}
+
+impl List {
+    pub fn key(self) -> &'static str {
+        match self {
+            List::Tools => "disabled_tools",
+            List::Skills => "disabled_skills",
+        }
+    }
+
+    fn get(self, s: &mut Settings) -> &mut Vec<String> {
+        match self {
+            List::Tools => &mut s.disabled_tools,
+            List::Skills => &mut s.disabled_skills,
+        }
+    }
+}
+
+fn names(m: &Map<String, Value>, key: &str) -> Option<Vec<String>> {
+    m.get(key)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+}
+
+/// Put `name` on (`on`) or take it off the user's `list` in settings.toml
+/// and apply the change. Unlike [`update`], only the user's own entries are
+/// written: the project's stay in its file, and a name the project (or this
+/// workspace's override) lists stays off, with a notice saying so.
+pub fn set_listed(home: &Path, list: List, name: &str, on: bool) -> Result<(Settings, Option<String>)> {
+    let (s, notice) = listed(home, &overrides(), current(), list, name, on)?;
+    install(s.clone());
+    Ok((s, notice))
+}
+
+/// [`set_listed`] over explicit layers and settings, without applying them.
+fn listed(home: &Path, layers: &Overrides, mut s: Settings, list: List, name: &str, on: bool) -> Result<(Settings, Option<String>)> {
+    let key = list.key();
+    let user = file::read_user(home).map_err(|e| anyhow::anyhow!(e))?;
+    let mut mine = names(&user, key).unwrap_or_default();
+    let had = mine.iter().any(|n| n == name);
+    if on && !had {
+        mine.push(name.to_string());
+    } else if !on && had {
+        mine.retain(|n| n != name);
+    }
+    if on != had {
+        let value = (!mine.is_empty()).then(|| Value::from(mine.clone()));
+        write_changes(home, &[(vec![key.to_string()], value)])?;
+    }
+    // The same layering as `load_layered`: the project adds, the workspace replaces.
+    let effective = match names(&layers.workspace, key) {
+        Some(ws) => ws,
+        None => {
+            let mut all = mine;
+            for n in names(&layers.project, key).unwrap_or_default() {
+                if !all.contains(&n) {
+                    all.push(n);
+                }
+            }
+            all
+        }
+    };
+    let notice = (!on && effective.iter().any(|n| n == name)).then(|| {
+        let layer = layers.layer(&[key.to_string()]).unwrap_or(Layer::Project);
+        format!("{name} stays off: {} lists it in {key}", layer.describe())
+    });
+    *list.get(&mut s) = effective;
+    Ok((s, notice))
+}
+
 // ------------------------------------------------------------------ layers
 
 /// A settings layer above the user's `settings.toml`. Later layers win:
@@ -360,6 +443,7 @@ const PROJECT_KEYS: &[&str] = &[
     "slash_menu_categories",
     // Only ever narrows what the model can do (merged with the user's list).
     "disabled_tools",
+    "disabled_skills",
     "theme_colors",
 ];
 
@@ -503,15 +587,17 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
             ignored.join(", ")
         ));
     }
-    // A project may disable more tools, never re-enable the user's.
-    if let (Some(Value::Array(mine)), Some(Value::Array(theirs))) =
-        (user.get("disabled_tools"), project.get_mut("disabled_tools"))
-    {
-        let extra: Vec<Value> = theirs.drain(..).filter(|n| !mine.contains(n)).collect();
-        *theirs = mine.iter().cloned().chain(extra).collect();
+    // A project may disable more tools and skills, never re-enable the user's.
+    // The layer itself keeps only its own names, for `set_listed`.
+    let mut layered = project.clone();
+    for key in [List::Tools, List::Skills].map(List::key) {
+        if let (Some(Value::Array(mine)), Some(Value::Array(theirs))) = (user.get(key), layered.get_mut(key)) {
+            let extra: Vec<Value> = theirs.drain(..).filter(|n| !mine.contains(n)).collect();
+            *theirs = mine.iter().cloned().chain(extra).collect();
+        }
     }
     let mut merged = user.clone();
-    merge(&mut merged, &project);
+    merge(&mut merged, &layered);
     merge(&mut merged, &workspace);
     let settings: Settings = serde_json::from_value(Value::Object(merged))
         .or_else(|e| {
@@ -1016,8 +1102,52 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("unknown tool no_such_tool"), "{warnings:?}");
+
+        // Disabled skills merge the same way, and toggles only touch the user's list.
+        std::fs::write(home.path().join("settings.toml"), "# mine\nsound = \"on\"\ndisabled_skills = [\"pdf\"]\ndisabled_tools = [\"bash\"]\n").unwrap();
+        std::fs::write(
+            cwd.path().join(".nyq/settings.toml"),
+            "disabled_skills = [\"review\", \"pdf\"]\ndisabled_tools = [\"web_fetch\"]\n",
+        )
+        .unwrap();
+        let (s, _) = load_layered(home.path(), cwd.path());
+        assert_eq!(s.disabled_skills, ["pdf", "review"]);
+        assert_eq!(s.disabled_tools, ["bash", "web_fetch"]);
         *CURRENT.lock().unwrap() = None;
         *OVERRIDES.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn list_toggles_touch_only_the_users_entries() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("settings.toml"), "# mine\nsound = \"on\"\ndisabled_skills = [\"pdf\"]\ndisabled_tools = [\"bash\"]\n").unwrap();
+        let project: Map<String, Value> =
+            serde_json::from_value(serde_json::json!({"disabled_skills": ["review", "pdf"], "disabled_tools": ["web_fetch"]})).unwrap();
+        let layers = Overrides { project, workspace: Map::new() };
+        let s = Settings { disabled_skills: vec!["pdf".into(), "review".into()], ..Default::default() };
+        let (s, notice) = listed(home.path(), &layers, s, List::Skills, "lint", true).unwrap();
+        assert_eq!(s.disabled_skills, ["pdf", "lint", "review"]);
+        assert!(notice.is_none());
+        assert_eq!(user_file(home.path())["disabled_skills"], serde_json::json!(["pdf", "lint"]));
+        // The project lists `pdf` too, so it stays off, and says so.
+        let (s, notice) = listed(home.path(), &layers, s, List::Skills, "pdf", false).unwrap();
+        assert_eq!(s.disabled_skills, ["lint", "review", "pdf"]);
+        assert!(notice.unwrap().contains(".nyq/settings.toml"));
+        assert_eq!(user_file(home.path())["disabled_skills"], serde_json::json!(["lint"]));
+        let (s, notice) = listed(home.path(), &layers, s, List::Skills, "lint", false).unwrap();
+        assert_eq!(s.disabled_skills, ["review", "pdf"]);
+        assert!(notice.is_none());
+        let (s, _) = listed(home.path(), &layers, s, List::Tools, "bash", false).unwrap();
+        assert_eq!(s.disabled_tools, ["web_fetch"]);
+        // An emptied list is dropped from the file; comments stay.
+        let text = std::fs::read_to_string(home.path().join("settings.toml")).unwrap();
+        assert!(text.starts_with("# mine") && !text.contains("disabled") && !text.contains("review"), "{text}");
+        // A workspace override replaces the list outright.
+        let ws: Map<String, Value> = serde_json::from_value(serde_json::json!({"disabled_skills": ["x"]})).unwrap();
+        let layers = Overrides { project: Map::new(), workspace: ws };
+        let (s, notice) = listed(home.path(), &layers, Settings::default(), List::Skills, "x", false).unwrap();
+        assert_eq!(s.disabled_skills, ["x"]);
+        assert!(notice.unwrap().contains("workspaces in settings.toml"));
     }
 
     #[test]

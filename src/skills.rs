@@ -85,12 +85,21 @@ fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<Root> {
     roots
 }
 
-/// Discover skills for a session. `home` is the nyq profile dir (~/.nyq).
+/// Discover the skills a session offers: every skill but those named in
+/// the `disabled_skills` setting. `home` is the nyq profile dir (~/.nyq).
 pub fn discover(home: &Path, cwd: &Path) -> Vec<Skill> {
-    discover_report(home, cwd).0
+    let mut skills = discover_report(home, cwd).0;
+    skills.retain(|s| !is_disabled(s));
+    skills
 }
 
-/// [`discover`], plus problems with SKILL.md files (for `/skills`).
+/// Whether the `disabled_skills` setting turns `skill` off (by its id).
+pub fn is_disabled(skill: &Skill) -> bool {
+    crate::settings::current().disabled_skills.contains(&skill.id)
+}
+
+/// Every skill found, disabled ones included, plus problems with SKILL.md
+/// files (for `/skills`).
 pub fn discover_report(home: &Path, cwd: &Path) -> (Vec<Skill>, Vec<String>) {
     discover_in(&roots(home, dirs::home_dir().as_deref(), cwd))
 }
@@ -331,19 +340,6 @@ pub fn prompt_section(skills: &[Skill]) -> String {
         out.push_str(&format!("- ... and {} more\n", skills.len() - MAX_PROMPT_SKILLS));
     }
     crate::limits::clip("skill_catalog_bytes", &out)
-}
-
-/// Lines for a `/skills` listing.
-pub fn list_lines(skills: &[Skill]) -> Vec<String> {
-    if skills.is_empty() {
-        return vec!["No skills found (add <dir>/SKILL.md under .nyq/skills, ~/.nyq/skills, skills/, .agents/skills, .claude/skills, .claw/skills, ...).".into()];
-    }
-    let width = skills.iter().map(|s| s.id.chars().count()).max().unwrap_or(0);
-    skills
-        .iter()
-        .map(|s| format!("{:width$}  {:7}  {}", s.id, s.scope, short(&s.description, 100)))
-        .map(|l| l.trim_end().to_string())
-        .collect()
 }
 
 #[cfg(test)]
@@ -800,8 +796,6 @@ mod tests {
         assert!(p.contains("- s001\n"));
         assert!(p.contains("- s099: short") && !p.contains("s100"));
         assert!(p.contains("and 5 more"));
-        let lines = list_lines(&skills[2..3]);
-        assert_eq!(lines, ["s002  user     short"]);
     }
 
     #[tokio::test]
@@ -859,7 +853,6 @@ mod tests {
             ids,
             [("claw", ".claw/skills"), ("dup", ".nyq/skills"), ("dup@~/.claw/skills", "~/.claw/skills"), ("uclaw", "~/.claw/skills")]
         );
-        assert!(list_lines(&[])[0].contains(".claw/skills"));
     }
 
     #[test]

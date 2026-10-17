@@ -63,6 +63,7 @@ pub fn status(
         "max_agent_steps": crate::agent::step_limit().0, "trace": crate::trace::describe(),
         "system_prompt_files": crate::prompt::prompt_files(cwd, home),
         "disabled_tools": crate::settings::current().disabled_tools,
+        "disabled_skills": crate::settings::current().disabled_skills,
         "context_limits": crate::limits::report()})
 }
 pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
@@ -89,6 +90,7 @@ pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
             "trace",
             "system_prompt_files",
             "disabled_tools",
+            "disabled_skills",
         ] {
             let v = &value[key];
             lines.push(format!(

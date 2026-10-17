@@ -17,7 +17,7 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_NAME: usize = 64;
 /// How deep a source is searched for SKILL.md files.
 const MAX_DEPTH: usize = 4;
-pub const USAGE: &str = "Usage: /skills (menu) | /skills [list|install SOURCE [--project] [--skill NAME]|remove NAME|info NAME|create NAME [--project]|path]";
+pub const USAGE: &str = "Usage: /skills (menu) | /skills [list|install SOURCE [--project] [--skill NAME]|remove NAME|info NAME|enable NAME|disable NAME|copy NAME [--project] [--force]|create NAME [--project]|path]";
 
 /// Where managed skills live: the profile's or the project's skills directory.
 pub fn managed_dir(home: &Path, cwd: &Path, project: bool) -> PathBuf {
@@ -360,6 +360,11 @@ pub enum Command {
     Remove(String),
     Info(String),
     Create { name: String, project: bool },
+    /// Copy a skill from another tool's folder into nyq's (`--force` replaces).
+    Copy { name: String, project: bool, force: bool },
+    /// Turn a skill on or off (`disabled_skills`).
+    Enable(String),
+    Disable(String),
     Path,
     Usage,
 }
@@ -407,12 +412,13 @@ pub fn parse(args: &[&str]) -> Command {
     let pasted = from_pasted(args);
     let args = pasted.as_deref().unwrap_or(args);
     let project = args.contains(&"--project");
+    let force = args.contains(&"--force");
     let mut filter = None;
     let mut rest = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i] {
-            "--project" => {}
+            "--project" | "--force" => {}
             "--skill" => {
                 filter = args.get(i + 1).map(|s| s.to_string());
                 i += 1;
@@ -430,6 +436,9 @@ pub fn parse(args: &[&str]) -> Command {
         (Some("remove" | "rm" | "uninstall"), Some(name)) => Command::Remove(name),
         (Some("info" | "show"), Some(name)) => Command::Info(name),
         (Some("create" | "new"), Some(name)) => Command::Create { name, project },
+        (Some("copy" | "cp"), Some(name)) => Command::Copy { name, project, force },
+        (Some("enable" | "on"), Some(name)) => Command::Enable(name),
+        (Some("disable" | "off"), Some(name)) => Command::Disable(name),
         (Some("path"), _) if rest.is_empty() => Command::Path,
         _ => Command::Usage,
     }
@@ -442,8 +451,90 @@ fn reload(agent: &mut crate::agent::Agent, skills: &mut Vec<Skill>, home: &Path)
     skills::register(&mut agent.tools, skills.clone(), home, &agent.cwd);
 }
 
-/// `/skills ARGS` in the interactive session.
+/// Find a skill the way `/skills info` does: by id, then name, then name
+/// in any case.
+fn find<'a>(name: &str, skills: &'a [Skill]) -> Result<&'a Skill> {
+    skills
+        .iter()
+        .find(|s| s.id == name || s.name == name)
+        .or_else(|| skills.iter().find(|s| s.name.eq_ignore_ascii_case(name)))
+        .ok_or_else(|| anyhow!("Skill '{name}' not found."))
+}
+
+/// Copy `skill` (found in another tool's folder) into `dest`, one of nyq's
+/// skills directories, under its directory name. Something already there
+/// is only replaced with `force`. Returns the new directory.
+pub fn copy(skill: &Skill, dest: &Path, force: bool) -> Result<PathBuf> {
+    let dir_name = skill.dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let target = dest.join(&dir_name);
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(&skill.dir) == canon(&target) {
+        bail!("{} is already in {}.", skill.id, slash_path(dest));
+    }
+    if std::fs::symlink_metadata(&target).is_ok() && !force {
+        bail!("{} already exists; /skills copy {} --force replaces it.", slash_path(&target), skill.id);
+    }
+    install_from_dir(&skill.dir, &dir_name, None, dest)?;
+    Ok(target)
+}
+
+/// The `/skills` menu rows for every skill found (disabled ones too).
+pub fn menu_entries(all: &[Skill], home: &Path, cwd: &Path) -> Vec<crate::ui::skills_menu::Entry> {
+    all.iter()
+        .map(|skill| crate::ui::skills_menu::Entry {
+            group: skills::source(skill),
+            managed: managed(skill, home, cwd),
+            disabled: skills::is_disabled(skill),
+            files: skills::skill_files(&skill.dir, 0).1,
+            info: info(&skill.id, all, home, cwd).unwrap_or_default(),
+            skill: skill.clone(),
+        })
+        .collect()
+}
+
+/// Turn the skill `name` off (`off`) or back on through `disabled_skills`,
+/// and offer the model what is left. Returns what to tell the user.
+fn turn(agent: &mut crate::agent::Agent, skills: &mut Vec<Skill>, all: &[Skill], name: &str, off: bool) -> Result<String> {
+    let home = crate::config::home();
+    let skill = find(name, all)?;
+    let (_, notice) = crate::settings::set_listed(&home, crate::settings::List::Skills, &skill.id, off)?;
+    reload(agent, skills, &home);
+    Ok(match (off, notice) {
+        (_, Some(n)) => n,
+        (true, None) => format!("Turned off {}: the model and $ / completion no longer offer it.", skill.id),
+        (false, None) => format!("Turned on {}.", skill.id),
+    })
+}
+
+/// A result line: in the open `/skills` menu, else in the scrollback.
+fn say(tui: &crate::ui::tui::Tui, msg: &str) {
+    if !tui.screen().menu_notice(msg, false) {
+        crate::ui::info(msg);
+    }
+}
+
+/// `/skills ARGS` in the interactive session. With the menu open (it sent
+/// the command), the menu shows the result and refreshes.
 pub async fn command(
+    agent: &mut crate::agent::Agent,
+    tui: &crate::ui::tui::Tui,
+    skills: &mut Vec<Skill>,
+    args: &[&str],
+) -> Result<()> {
+    let result = run(agent, tui, skills, args).await;
+    if !tui.screen().skills_open() {
+        return result;
+    }
+    let home = crate::config::home();
+    let all = skills::discover_report(&home, &agent.cwd).0;
+    tui.screen().refresh_skills(menu_entries(&all, &home, &agent.cwd));
+    if let Err(e) = result {
+        tui.screen().menu_notice(&format!("{e:#}"), true);
+    }
+    Ok(())
+}
+
+async fn run(
     agent: &mut crate::agent::Agent,
     tui: &crate::ui::tui::Tui,
     skills: &mut Vec<Skill>,
@@ -452,21 +543,15 @@ pub async fn command(
     use crate::ui;
     let home = crate::config::home();
     let cwd = agent.cwd.clone();
+    // Every skill found, including turned-off ones (`skills` has only the rest).
+    let all = || skills::discover_report(&home, &cwd).0;
     match parse(args) {
-        Command::Menu => {
-            let entries = skills
-                .iter()
-                .map(|skill| crate::ui::skills_menu::Entry {
-                    group: skills::source(skill),
-                    managed: managed(skill, &home, &cwd),
-                    info: info(&skill.id, skills, &home, &cwd).unwrap_or_default(),
-                    skill: skill.clone(),
-                })
-                .collect();
-            tui.screen().open_skills(entries);
+        Command::Menu if ui::menus_available() => {
+            let targets = ui::skills_menu::Targets { user: managed_dir(&home, &cwd, false), project: managed_dir(&home, &cwd, true) };
+            tui.screen().open_skills(menu_entries(&all(), &home, &cwd), targets);
         }
-        Command::List => {
-            ui::list(&skills::list_lines(skills));
+        Command::Menu | Command::List => {
+            ui::list(&ui::skills_menu::plain_lines(&menu_entries(&all(), &home, &cwd)));
             let (_, problems) = skills::discover_report(&home, &cwd);
             if !problems.is_empty() {
                 ui::error(&format!("{} SKILL.md problem(s):", problems.len()));
@@ -479,17 +564,27 @@ pub async fn command(
             format!("project skills: {}", slash_path(&managed_dir(&home, &cwd, true))),
             format!("also read: {} (project) and ~/{} (user)", skills::PROJECT_ROOTS.iter().filter(|r| **r != ".nyq/skills").copied().collect::<Vec<_>>().join(", "), skills::USER_ROOTS.join(", ~/")),
         ]),
-        Command::Info(name) => ui::list(&info(&name, skills, &home, &cwd)?),
+        Command::Info(name) => ui::list(&info(&name, &all(), &home, &cwd)?),
         Command::Remove(name) => {
-            let msg = remove(&name, skills, &home, &cwd)?;
+            let msg = remove(&name, &all(), &home, &cwd)?;
             reload(agent, skills, &home);
-            ui::info(&msg);
+            say(tui, &msg);
         }
         Command::Create { name, project } => {
             let path = create(&name, &managed_dir(&home, &cwd, project))?;
             reload(agent, skills, &home);
-            ui::info(&format!("Created {}; edit it to describe and instruct the skill.", slash_path(&path)));
+            say(tui, &format!("Created {}; edit it to describe and instruct the skill.", slash_path(&path)));
         }
+        Command::Copy { name, project, force } => {
+            let all = all();
+            let skill = find(&name, &all)?;
+            let dest = managed_dir(&home, &cwd, project);
+            let target = copy(skill, &dest, force)?;
+            reload(agent, skills, &home);
+            say(tui, &format!("Copied {} to {}.", skill.id, slash_path(&target)));
+        }
+        Command::Enable(name) => say(tui, &turn(agent, skills, &all(), &name, false)?),
+        Command::Disable(name) => say(tui, &turn(agent, skills, &all(), &name, true)?),
         Command::Install { source, project, filter } => {
             let dest = managed_dir(&home, &cwd, project);
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -500,12 +595,12 @@ pub async fn command(
             };
             tui.screen().idle();
             let Some(result) = result else {
-                ui::info("Install cancelled.");
+                say(tui, "Install cancelled.");
                 return Ok(());
             };
             let names = result?;
             reload(agent, skills, &home);
-            ui::info(&format!("Installed {} into {}.", names.join(", "), slash_path(&dest)));
+            say(tui, &format!("Installed {} into {}.", names.join(", "), slash_path(&dest)));
         }
     }
     Ok(())
@@ -770,5 +865,58 @@ mod tests {
         assert!(create("my-skill", t.path()).is_err());
         assert!(create("../evil", t.path()).is_err());
         assert!(create(".hidden", t.path()).is_err());
+    }
+
+    #[test]
+    fn parses_copy_and_toggles() {
+        assert_eq!(parse(&["copy", "pdf"]), Command::Copy { name: "pdf".into(), project: false, force: false });
+        assert_eq!(parse(&["cp", "pdf", "--project", "--force"]), Command::Copy { name: "pdf".into(), project: true, force: true });
+        assert_eq!(parse(&["disable", "pdf"]), Command::Disable("pdf".into()));
+        assert_eq!(parse(&["enable", "review@.claude/skills"]), Command::Enable("review@.claude/skills".into()));
+        assert_eq!(parse(&["enable"]), Command::Usage);
+    }
+
+    #[test]
+    fn copies_another_tools_skill_into_nyq() {
+        let t = tempfile::tempdir().unwrap();
+        let (cwd, home) = (t.path().join("proj"), t.path().join("home"));
+        let src = cwd.join(".claude/skills/pdf");
+        write(&src.join("SKILL.md"), &md("pdf"));
+        write(&src.join("scripts/fill.py"), "print()\n");
+        write(&src.join(".git/HEAD"), "ref\n");
+        let skills = skills::discover_with(&home, None, &cwd);
+        let dest = managed_dir(&home, &cwd, false);
+        let target = copy(&skills[0], &dest, false).unwrap();
+        assert_eq!(target, dest.join("pdf"));
+        assert!(target.join("scripts/fill.py").is_file() && !target.join(".git").exists());
+        assert!(src.join("SKILL.md").is_file(), "the original stays");
+        // Something already there is only replaced with force.
+        write(&target.join("SKILL.md"), &md("pdf-old"));
+        let err = copy(&skills[0], &dest, false).unwrap_err().to_string();
+        assert!(err.contains("already exists") && err.contains("--force"), "{err}");
+        assert!(fs::read_to_string(target.join("SKILL.md")).unwrap().contains("pdf-old"));
+        copy(&skills[0], &dest, true).unwrap();
+        assert!(!fs::read_to_string(target.join("SKILL.md")).unwrap().contains("pdf-old"));
+        // A skill already in nyq's directory isn't copied onto itself.
+        let again = skills::discover_with(&home, None, &cwd);
+        let mine = again.iter().find(|s| s.location.contains("home")).unwrap();
+        assert!(copy(mine, &dest, true).unwrap_err().to_string().contains("already in"));
+    }
+
+    #[test]
+    fn menu_entries_mark_managed_and_count_files() {
+        let t = tempfile::tempdir().unwrap();
+        let (cwd, home) = (t.path().join("proj"), t.path().join("home"));
+        write(&cwd.join(".claude/skills/pdf/SKILL.md"), &md("pdf"));
+        write(&cwd.join(".claude/skills/pdf/a.md"), "a");
+        write(&cwd.join(".nyq/skills/lint/SKILL.md"), &md("lint"));
+        let all = skills::discover_with(&home, None, &cwd);
+        let entries = menu_entries(&all, &home, &cwd);
+        let e = |id: &str| entries.iter().find(|e| e.skill.id == id).unwrap();
+        assert!(e("lint").managed && !e("pdf").managed);
+        assert_eq!((e("pdf").files, e("lint").files), (1, 0));
+        assert_eq!(e("pdf").group, "Claude Code");
+        assert!(!e("pdf").disabled);
+        assert!(e("pdf").info[0].starts_with("pdf (project)"));
     }
 }
