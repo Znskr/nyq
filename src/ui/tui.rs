@@ -3787,7 +3787,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_read_like_fx() {
+    fn tool_rows_read_naturally() {
         assert_eq!(
             describe_tool("read_file", "src/main.rs"),
             ("Read".into(), "src/main.rs".into())
