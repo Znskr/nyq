@@ -211,6 +211,27 @@ mod tests {
     }
 
     #[test]
+    fn disabled_tools_are_neither_listed_nor_callable() {
+        let mut r = registry(2);
+        r.disable(&["read_file".into(), "mcp__gh__create_issue".into(), "mcp__gh__later".into()]);
+        // Also a tool that arrives after the setting was applied.
+        r.add(Box::new(Fake("mcp__gh__later".into(), "added later".into())));
+        assert_eq!(names(&r), ["mcp__gh__tool_0", "mcp__gh__tool_1"]);
+        assert!(r.get("read_file").is_none() && r.get("mcp__gh__later").is_none());
+        assert!(r.get("mcp__gh__tool_0").is_some());
+        assert_eq!(r.shared().len(), 2);
+
+        let unknown = crate::tools::unknown_tool_names(&[
+            "web_search".into(),
+            "skill".into(),
+            "mcp__any__tool".into(),
+            "ext__x".into(),
+            "websearch".into(),
+        ]);
+        assert_eq!(unknown, ["websearch"]);
+    }
+
+    #[test]
     fn many_tools_are_found_and_selected() {
         let mut r = registry(60);
         let n = names(&r);

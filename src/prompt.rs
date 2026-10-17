@@ -1,6 +1,6 @@
 //! The system prompt, plus any project instructions found in the workspace.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const BASE: &str = "\
 You are nyq, a coding agent running in the user's terminal. You help with \
@@ -13,6 +13,12 @@ over rewriting whole files.
 - Verify your work when practical (build, run tests) and report results honestly.
 - If a tool call is denied, do not retry it; ask the user how to proceed.
 - Format answers as GitHub-flavored markdown. Refer to code as path:line.";
+
+/// Replaces the built-in base prompt: `<home>/system.md`, or the project's
+/// `.nyq/system.md`, which wins.
+const SYSTEM_FILE: &str = "system.md";
+/// Added after the base prompt: the user's, then the project's.
+const APPEND_FILE: &str = "append-system.md";
 
 /// Files whose contents are appended as project instructions, in order.
 const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".nyq/instructions.md"];
@@ -39,15 +45,59 @@ fn sandbox_guidance(policy: &crate::sandbox::Policy) -> String {
 
 static BASE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Replace the built-in base prompt for this run (`ask --system`); tool,
-/// skill, project and environment context are still added.
+/// Replace the built-in base prompt for this run (`ask --system`), and the
+/// `system.md` / `append-system.md` files with it; tool, skill, project and
+/// environment context are still added.
 pub fn set_base(text: String) {
     let _ = BASE_OVERRIDE.set(text);
 }
 
-pub fn system(cwd: &Path, sandbox: &crate::sandbox::Policy) -> String {
-    let mut s = String::from(BASE_OVERRIDE.get().map_or(BASE, String::as_str));
+/// A prompt file's text when it is a regular file under `root` and not blank.
+fn read_prompt_file(root: &Path, path: &Path) -> Option<String> {
+    let text = crate::tools::read_rooted_text(root, path).ok()?;
+    let text = crate::limits::clip("project_instruction_file_bytes", text.trim());
+    (!text.is_empty()).then_some(text)
+}
+
+type PromptFile = (PathBuf, String);
+
+/// The active prompt files with their text: the `system.md` that replaces the
+/// base prompt (project over user), then the `append-system.md` files (user,
+/// then project).
+fn prompt_files_in(cwd: &Path, home: &Path) -> (Option<PromptFile>, Vec<PromptFile>) {
+    let project = cwd.join(".nyq");
+    let read = |root: &Path, path: PathBuf| read_prompt_file(root, &path).map(|text| (path, text));
+    let base = read(cwd, project.join(SYSTEM_FILE)).or_else(|| read(home, home.join(SYSTEM_FILE)));
+    let appends = [read(home, home.join(APPEND_FILE)), read(cwd, project.join(APPEND_FILE))];
+    (base, appends.into_iter().flatten().collect())
+}
+
+/// Paths of the active `system.md` / `append-system.md` files, for status.
+pub fn prompt_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+    let (base, appends) = prompt_files_in(cwd, home);
+    base.into_iter().chain(appends).map(|(path, _)| path).collect()
+}
+
+/// The base prompt (built in, from `system.md`, or `ask --system`), the
+/// sandbox guidance, then any `append-system.md` text.
+fn base_prompt(cwd: &Path, home: &Path, sandbox: &crate::sandbox::Policy) -> String {
+    let (base, appends) = match BASE_OVERRIDE.get() {
+        Some(text) => (Some(text.clone()), Vec::new()),
+        None => {
+            let (base, appends) = prompt_files_in(cwd, home);
+            (base.map(|(_, text)| text), appends)
+        }
+    };
+    let mut s = base.unwrap_or_else(|| BASE.to_string());
     s.push_str(&format!("\n- {}", sandbox_guidance(sandbox)));
+    for (_, text) in appends {
+        s.push_str(&format!("\n\n{text}"));
+    }
+    s
+}
+
+pub fn system(cwd: &Path, sandbox: &crate::sandbox::Policy) -> String {
+    let mut s = base_prompt(cwd, &crate::config::home(), sandbox);
     s.push_str(&format!(
         "\n\nEnvironment:\n- Working directory: {}\n- Platform: {}\n- Date: {}",
         cwd.display(),
@@ -166,6 +216,46 @@ mod tests {
             "{listed}"
         );
         assert!(listed.contains("Relative paths still resolve"), "{listed}");
+    }
+
+    #[test]
+    fn prompt_files_replace_and_extend_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(cwd.join(".nyq")).unwrap();
+        let policy = Policy::default();
+        let plain = base_prompt(&cwd, &home, &policy);
+        assert!(plain.starts_with("You are nyq"), "{plain}");
+        assert!(prompt_files(&cwd, &home).is_empty());
+
+        // A blank file changes nothing.
+        std::fs::write(home.join("system.md"), "  \n").unwrap();
+        assert_eq!(base_prompt(&cwd, &home, &policy), plain);
+
+        std::fs::write(home.join("system.md"), "User base.").unwrap();
+        std::fs::write(home.join("append-system.md"), "User extra.").unwrap();
+        let text = base_prompt(&cwd, &home, &policy);
+        assert!(text.starts_with("User base.\n- "), "{text}");
+        assert!(text.ends_with("\n\nUser extra."), "{text}");
+        assert!(!text.contains("You are nyq"), "{text}");
+
+        std::fs::write(cwd.join(".nyq/system.md"), "Project base.").unwrap();
+        std::fs::write(cwd.join(".nyq/append-system.md"), "Project extra.").unwrap();
+        let text = base_prompt(&cwd, &home, &policy);
+        assert!(text.starts_with("Project base."), "{text}");
+        assert!(!text.contains("User base."), "{text}");
+        let (user, project) = (text.find("User extra.").unwrap(), text.find("Project extra.").unwrap());
+        assert!(user < project, "{text}");
+        assert_eq!(
+            prompt_files(&cwd, &home),
+            vec![
+                cwd.join(".nyq/system.md"),
+                home.join("append-system.md"),
+                cwd.join(".nyq/append-system.md"),
+            ]
+        );
     }
 
     #[test]
