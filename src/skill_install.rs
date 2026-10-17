@@ -94,6 +94,10 @@ pub(crate) fn clone_url(location: &str) -> Option<String> {
     if location.contains("://") || location.starts_with("git@") {
         return Some(location.to_string());
     }
+    // `./x`, `../x`, `/x` and `~/x` are local paths, even when missing.
+    if location.starts_with(['.', '/', '~']) || Path::new(location).is_absolute() {
+        return None;
+    }
     let parts: Vec<&str> = location.split('/').collect();
     let ok = parts.len() == 2 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')));
     ok.then(|| format!("https://github.com/{location}.git"))
@@ -714,6 +718,10 @@ mod tests {
         assert!(parse_source("  ", None).is_err());
         assert_eq!(clone_url("o/r").as_deref(), Some("https://github.com/o/r.git"));
         assert_eq!(clone_url("not a repo"), None);
+        // Local-looking paths never become GitHub URLs, even when missing.
+        for local in ["./nope", "../x/y", "~/skills", "/tmp/x"] {
+            assert_eq!(clone_url(local), None, "{local}");
+        }
         assert_eq!(repo_name("https://github.com/o/agent-skills.git"), "agent-skills");
         assert_eq!(repo_name("git@github.com:o/r.git"), "r");
 
