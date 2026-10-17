@@ -17,7 +17,7 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_NAME: usize = 64;
 /// How deep a source is searched for SKILL.md files.
 const MAX_DEPTH: usize = 4;
-pub const USAGE: &str = "Usage: /skills [list|install SOURCE [--project] [--skill NAME]|remove NAME|info NAME|create NAME [--project]|path]";
+pub const USAGE: &str = "Usage: /skills (menu) | /skills [list|install SOURCE [--project] [--skill NAME]|remove NAME|info NAME|create NAME [--project]|path]";
 
 /// Where managed skills live: the profile's or the project's skills directory.
 pub fn managed_dir(home: &Path, cwd: &Path, project: bool) -> PathBuf {
@@ -40,11 +40,28 @@ struct Source {
     filter: Option<String>,
 }
 
+/// A skills.sh page (`[https://][www.]skills.sh/owner/repo[/skill][/]`) as
+/// `owner/repo[@skill]`; None for anything else.
+fn from_skills_sh(raw: &str) -> Option<Result<String>> {
+    let rest = raw.strip_prefix("https://").or_else(|| raw.strip_prefix("http://")).unwrap_or(raw);
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    let path = rest.strip_prefix("skills.sh/")?;
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    Some(match parts[..] {
+        [owner, repo] => Ok(format!("{owner}/{repo}")),
+        [owner, repo, skill] => Ok(format!("{owner}/{repo}@{skill}")),
+        _ => Err(anyhow!("unsupported skills.sh URL `{raw}` (expected skills.sh/OWNER/REPO[/SKILL])")),
+    })
+}
+
 fn parse_source(raw: &str, filter: Option<&str>) -> Result<Source> {
     let raw = raw.trim();
     if raw.is_empty() {
         bail!("missing skill source (a git URL, owner/repo, or a local path)");
     }
+    let mapped = from_skills_sh(raw).transpose()?;
+    let raw = mapped.as_deref().unwrap_or(raw);
     let mut location = raw.to_string();
     let mut inline = None;
     // owner/repo@skill (not for URLs or paths).
@@ -336,6 +353,8 @@ pub fn create(name: &str, dest: &Path) -> Result<PathBuf> {
 /// What `/skills ARGS` asks for.
 #[derive(Debug, PartialEq)]
 pub enum Command {
+    /// `/skills` alone: the interactive menu.
+    Menu,
     List,
     Install { source: String, project: bool, filter: Option<String> },
     Remove(String),
@@ -405,7 +424,8 @@ pub fn parse(args: &[&str]) -> Command {
     }
     let one = || (rest.len() == 1).then(|| rest[0].to_string());
     match (args.first().copied(), one()) {
-        (None | Some("list"), _) if rest.is_empty() => Command::List,
+        (None, _) if rest.is_empty() => Command::Menu,
+        (Some("list"), _) if rest.is_empty() => Command::List,
         (Some("install" | "add"), Some(source)) => Command::Install { source, project, filter },
         (Some("remove" | "rm" | "uninstall"), Some(name)) => Command::Remove(name),
         (Some("info" | "show"), Some(name)) => Command::Info(name),
@@ -433,6 +453,18 @@ pub async fn command(
     let home = crate::config::home();
     let cwd = agent.cwd.clone();
     match parse(args) {
+        Command::Menu => {
+            let entries = skills
+                .iter()
+                .map(|skill| crate::ui::skills_menu::Entry {
+                    group: skills::source(skill),
+                    managed: managed(skill, &home, &cwd),
+                    info: info(&skill.id, skills, &home, &cwd).unwrap_or_default(),
+                    skill: skill.clone(),
+                })
+                .collect();
+            tui.screen().open_skills(entries);
+        }
         Command::List => {
             ui::list(&skills::list_lines(skills));
             let (_, problems) = skills::discover_report(&home, &cwd);
@@ -445,7 +477,7 @@ pub async fn command(
         Command::Path => ui::list(&[
             format!("user skills: {}", slash_path(&managed_dir(&home, &cwd, false))),
             format!("project skills: {}", slash_path(&managed_dir(&home, &cwd, true))),
-            "also read: skills/, .agents/skills, .codex/skills, .claude/skills, .opencode/skills (project) and ~/.agents/skills, ~/.codex/skills, ~/.claude/skills, ~/.config/opencode/skills".into(),
+            format!("also read: {} (project) and ~/{} (user)", skills::PROJECT_ROOTS.iter().filter(|r| **r != ".nyq/skills").copied().collect::<Vec<_>>().join(", "), skills::USER_ROOTS.join(", ~/")),
         ]),
         Command::Info(name) => ui::list(&info(&name, skills, &home, &cwd)?),
         Command::Remove(name) => {
@@ -490,14 +522,14 @@ impl Tool for InstallSkill {
         ToolSpec {
             name: "install_skill".into(),
             description: "Install an Agent Skill (a directory with a SKILL.md) from a git URL, a GitHub `owner/repo` \
-                (optionally `owner/repo@skill`), or a local directory. Every skill found in the source is installed \
+                (optionally `owner/repo@skill`), a skills.sh URL (skills.sh/owner/repo[/skill]), or a local directory. Every skill found in the source is installed \
                 unless `skill` names one. Installs for the user by default; scope \"project\" installs into the \
                 project's .nyq/skills. The user must approve. Afterwards load it with the `skill` tool."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "git URL, owner/repo[@skill], or a local directory"},
+                    "source": {"type": "string", "description": "git URL, owner/repo[@skill], skills.sh URL, or a local directory"},
                     "skill": {"type": "string", "description": "Only install the skill with this name"},
                     "scope": {"type": "string", "enum": ["user", "project"], "description": "user (default) or project"}
                 },
@@ -575,6 +607,14 @@ mod tests {
         assert_eq!(parse_source("owner/repo@pdf", None).unwrap(), Source { location: "owner/repo".into(), filter: Some("pdf".into()) });
         assert_eq!(parse_source("git@github.com:o/r.git", None).unwrap().filter, None);
         assert_eq!(parse_source("./dir@x", None).unwrap().location, "./dir@x");
+        // skills.sh pages map to owner/repo[@skill].
+        for url in ["https://skills.sh/o/r/pdf", "skills.sh/o/r/pdf/", "http://www.skills.sh/o/r/pdf?x=1"] {
+            assert_eq!(parse_source(url, None).unwrap(), Source { location: "o/r".into(), filter: Some("pdf".into()) }, "{url}");
+        }
+        assert_eq!(parse_source("https://www.skills.sh/o/r/", None).unwrap(), Source { location: "o/r".into(), filter: None });
+        assert!(parse_source("skills.sh/o/r/pdf", Some("other")).is_err());
+        assert!(parse_source("https://skills.sh/o", None).is_err());
+        assert!(parse_source("skills.sh/a/b/c/d", None).is_err());
         assert!(parse_source("o/r@a", Some("b")).is_err());
         assert!(parse_source("  ", None).is_err());
         assert_eq!(clone_url("o/r").as_deref(), Some("https://github.com/o/r.git"));
@@ -582,7 +622,8 @@ mod tests {
         assert_eq!(repo_name("https://github.com/o/agent-skills.git"), "agent-skills");
         assert_eq!(repo_name("git@github.com:o/r.git"), "r");
 
-        assert_eq!(parse(&[]), Command::List);
+        assert_eq!(parse(&[]), Command::Menu);
+        assert_eq!(parse(&["list"]), Command::List);
         assert_eq!(
             parse(&["install", "o/r", "--project", "--skill", "pdf"]),
             Command::Install { source: "o/r".into(), project: true, filter: Some("pdf".into()) }
