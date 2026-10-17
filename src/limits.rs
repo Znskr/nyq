@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 pub const LIMITS: &[(&str, Option<usize>, &str)] = &[
     ("skill_description_bytes", Some(120), "each skill description in the system prompt"),
     ("skill_catalog_bytes", None, "the whole skill list in the system prompt"),
+    ("skill_file_bytes", None, "a whole SKILL.md or skill resource loaded by the `skill` tool"),
+    ("skill_chunk_bytes", Some(32 * 1024), "each part of a skill the `skill` tool returns (the rest via `offset`)"),
     ("mcp_description_bytes", None, "each MCP tool description"),
     ("mcp_content_block_bytes", Some(8 * 1024), "each text block of an MCP prompt or resource"),
     ("mcp_content_total_bytes", Some(32 * 1024), "a whole MCP prompt or resource"),

@@ -363,6 +363,8 @@ pub struct Registry {
     live: Option<LiveTools>,
     /// Tool changes from extensions (`crate::extensions`).
     extensions: Option<LiveTools>,
+    /// Installed skills, which `mcp_search_tools` also finds.
+    skills: Vec<crate::skills::Skill>,
 }
 
 impl Registry {
@@ -401,6 +403,11 @@ impl Registry {
                 patch(self);
             }
         }
+    }
+
+    /// The skills `mcp_search_tools` searches along with MCP tools.
+    pub fn set_skills(&mut self, skills: Vec<crate::skills::Skill>) {
+        self.skills = skills;
     }
 
     /// Instructions of connected MCP servers, by server name.
@@ -523,7 +530,8 @@ impl Registry {
         let args: Value = serde_json::from_str(arguments).unwrap_or_default();
         if name == mcp_search::SEARCH {
             return Some(
-                mcp_search::search(&mcp, &args, &self.mcp_notes()).map_or_else(ToolOutput::err, ToolOutput::ok),
+                mcp_search::search(&mcp, &self.skills, &args, &self.mcp_notes())
+                    .map_or_else(ToolOutput::err, ToolOutput::ok),
             );
         }
         let wanted = args
