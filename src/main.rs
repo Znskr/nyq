@@ -365,7 +365,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/model",
-        "switch model or provider (ctrl+l); /model ID|QUERY [effort] [fast|normal]",
+        "switch model or provider ({key}); /model ID|QUERY [effort] [fast|normal]",
     ),
     ("/compact", "summarize the conversation to free up context"),
     ("/copy", "copy the last answer to the clipboard"),
@@ -716,6 +716,13 @@ async fn run() -> Result<()> {
         && std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
     let ext_mode = if terminal { extensions::Mode::Tui } else { extensions::Mode::Print };
+    if terminal {
+        let (keys, key_warnings) = ui::keys::load(&home);
+        ui::keys::install(keys);
+        for w in &key_warnings {
+            ui::error(w);
+        }
+    }
     let (ext, ext_warnings) = extensions::Extensions::load(&home, &cwd, ext_mode);
     for w in &ext_warnings {
         ui::error(w);
@@ -820,7 +827,7 @@ async fn run() -> Result<()> {
     let commands: Vec<(String, String)> = COMMANDS
         .iter()
         .chain(commands::COMMANDS)
-        .map(|(c, d)| (c.to_string(), d.to_string()))
+        .map(|(c, d)| (c.to_string(), commands::describe(c, d)))
         .chain(templates.iter().map(|t| {
             (
                 format!("/{}", t.name),
@@ -1653,7 +1660,18 @@ async fn slash(
         "/exit" | "/quit" | "/q" => return Ok(false),
         "/help" | "/?" => {
             tui.screen().open_help();
-            ui::info("  !CMD run a shell command yourself (not sandboxed) · $skill or /skill sends a skill with your message\n  Enter while working steers · Alt+Enter queues a follow-up · Alt+Up edits the queue · Esc interrupts\n  Ctrl+O transcript · Ctrl+V paste an image · Ctrl+G reload into a ready upgrade · prompt templates: see /alias");
+            let k = ui::keys::current();
+            use ui::keys::KeyAction as K;
+            ui::info(&format!(
+                "  !CMD run a shell command yourself (not sandboxed) · $skill or /skill sends a skill with your message\n  {} while working steers · {} queues a follow-up · {} edits the queue · {} interrupts\n  {} transcript · {} paste an image · {} reload into a ready upgrade · /keys key bindings · prompt templates: see /alias",
+                k.title(K::Submit),
+                k.title(K::FollowUp),
+                k.title(K::Dequeue),
+                k.title(K::Interrupt),
+                k.title(K::ExpandTools),
+                k.title(K::PasteImage),
+                k.title(K::Reload),
+            ));
         }
         "/new" | "/clear" => {
             commands::fresh(agent, sessions_dir)?;

@@ -53,7 +53,7 @@ impl Category {
 /// and anything else unknown are extensions.
 pub fn category(cmd: &str) -> Category {
     match cmd {
-        "/help" | "/exit" | "/copy" | "/undo" | "/tools" | "/transcript" => Category::General,
+        "/help" | "/exit" | "/copy" | "/undo" | "/tools" | "/transcript" | "/keys" => Category::General,
         "/new" | "/clear" | "/reset" | "/continue" | "/rename" | "/resume" | "/sessions" | "/compact" => {
             Category::Session
         }
