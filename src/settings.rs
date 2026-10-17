@@ -207,6 +207,10 @@ pub struct Settings {
     /// Push the shell output on screen into the scrollback at start, so the
     /// session begins at the top of the screen.
     pub startup_scrollback: bool,
+    /// Tools never offered to the model: built-in names, `mcp__server__tool`
+    /// or `ext__…`. A project's list adds to the user's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
     /// Keys nyq doesn't manage here (`provider`, `models`, …), kept on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -238,6 +242,7 @@ impl Default for Settings {
             theme: "auto".into(),
             collapse_tool_calls: false,
             startup_scrollback: false,
+            disabled_tools: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -342,6 +347,8 @@ const PROJECT_KEYS: &[&str] = &[
     "statusline",
     "prompt_history",
     "slash_menu_categories",
+    // Only ever narrows what the model can do (merged with the user's list).
+    "disabled_tools",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -512,10 +519,17 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
             ignored.join(", ")
         ));
     }
+    // A project may disable more tools, never re-enable the user's.
+    if let (Some(Value::Array(mine)), Some(Value::Array(theirs))) =
+        (user.get("disabled_tools"), project.get_mut("disabled_tools"))
+    {
+        let extra: Vec<Value> = theirs.drain(..).filter(|n| !mine.contains(n)).collect();
+        *theirs = mine.iter().cloned().chain(extra).collect();
+    }
     let mut merged = user.clone();
     merge(&mut merged, &project);
     merge(&mut merged, &workspace);
-    let settings = serde_json::from_value(Value::Object(merged))
+    let settings: Settings = serde_json::from_value(Value::Object(merged))
         .or_else(|e| {
             warnings.push(format!("project or workspace settings: {e} (using your settings.json)"));
             // The layers are unusable: none of them may be reported as the
@@ -528,6 +542,10 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
             warnings.push(format!("settings.json: {e} (using default settings)"));
             Settings::default()
         });
+    let unknown = crate::tools::unknown_tool_names(&settings.disabled_tools);
+    if !unknown.is_empty() {
+        warnings.push(format!("disabled_tools: unknown tool {} (ignored)", unknown.join(", ")));
+    }
     *OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()) = Some(Overrides { project, workspace });
     (settings, warnings)
 }
@@ -993,6 +1011,21 @@ mod tests {
         let raw: Value =
             serde_json::from_slice(&std::fs::read(home.path().join("settings.json")).unwrap()).unwrap();
         assert_eq!(raw["sound"], "off");
+
+        // A project's disabled tools add to the user's; unknown names warn.
+        std::fs::write(home.path().join("settings.json"), r#"{"disabled_tools": ["web_search", "bash"]}"#).unwrap();
+        std::fs::write(
+            cwd.path().join(".nyq/settings.json"),
+            r#"{"disabled_tools": ["web_fetch", "bash", "mcp__gh__create_issue", "no_such_tool"]}"#,
+        )
+        .unwrap();
+        let (s, warnings) = load_layered(home.path(), cwd.path());
+        assert_eq!(
+            s.disabled_tools,
+            ["web_search", "bash", "web_fetch", "mcp__gh__create_issue", "no_such_tool"]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("unknown tool no_such_tool"), "{warnings:?}");
         *CURRENT.lock().unwrap() = None;
         *OVERRIDES.lock().unwrap() = None;
     }
