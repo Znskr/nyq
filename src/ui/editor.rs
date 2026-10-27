@@ -173,7 +173,12 @@ impl Editor {
         // Shift+movement extends the selection, so it moves like the plain key.
         let moving = matches!(
             key.code,
-            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
         );
         let selecting = shift && moving;
         let mut bound = key;
@@ -370,8 +375,16 @@ impl Editor {
 
     /// Insert an atomic token such as `[Image #1]`, spaced from its neighbours.
     pub fn insert_token(&mut self, token: &str) {
-        let lead = if self.before().is_some_and(|c| !c.is_whitespace()) { " " } else { "" };
-        let trail = if self.after().is_some_and(char::is_whitespace) { "" } else { " " };
+        let lead = if self.before().is_some_and(|c| !c.is_whitespace()) {
+            " "
+        } else {
+            ""
+        };
+        let trail = if self.after().is_some_and(char::is_whitespace) {
+            ""
+        } else {
+            " "
+        };
         self.paste(&format!("{lead}{token}{trail}"));
     }
 
@@ -379,7 +392,11 @@ impl Editor {
     pub fn remove_token(&mut self, token: &str) {
         let text = self.text();
         if text.contains(token) {
-            self.set_text(text.replace(&format!("{token} "), "").replace(token, "").trim_end());
+            self.set_text(
+                text.replace(&format!("{token} "), "")
+                    .replace(token, "")
+                    .trim_end(),
+            );
         }
     }
 
@@ -435,7 +452,8 @@ impl Editor {
         let width = width.max(1);
         self.width.set(width);
         let sel = self.selection();
-        let selected = |row: usize, i: usize| sel.is_some_and(|(a, b)| (row, i) >= a && (row, i) < b);
+        let selected =
+            |row: usize, i: usize| sel.is_some_and(|(a, b)| (row, i) >= a && (row, i) < b);
         let mut view = View {
             lines: Vec::new(),
             cursor_row: 0,
@@ -460,7 +478,11 @@ impl Editor {
                 }
                 if selected(row, i) != inverse {
                     inverse = !inverse;
-                    view.lines.last_mut().unwrap().push_str(if inverse { "\x1b[7m" } else { "\x1b[27m" });
+                    view.lines.last_mut().unwrap().push_str(if inverse {
+                        "\x1b[7m"
+                    } else {
+                        "\x1b[27m"
+                    });
                 }
                 view.lines.last_mut().unwrap().push(c);
                 col += w;
@@ -502,7 +524,10 @@ impl Editor {
             .enumerate()
             .filter_map(|(i, c)| {
                 let names = std::iter::once(c.0.as_str()).chain(crate::slash::aliases(&c.0));
-                names.filter_map(|n| crate::slash::rank(n, line)).min().map(|r| (r, i, c))
+                names
+                    .filter_map(|n| crate::slash::rank(n, line))
+                    .min()
+                    .map(|r| (r, i, c))
             })
             .collect();
         ranked.sort_by_key(|(r, i, _)| (*r, *i));
@@ -705,7 +730,10 @@ impl Editor {
         let segs = self.segments(self.row);
         let seg = segs.iter().rposition(|&s| s <= self.col).unwrap_or(0);
         let chars: Vec<char> = self.lines[self.row].chars().collect();
-        let x: usize = chars[segs[seg]..self.col].iter().map(|c| c.width().unwrap_or(0)).sum();
+        let x: usize = chars[segs[seg]..self.col]
+            .iter()
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
         // At the end of a full row the cursor shows on an extra row below it.
         let past_end = self.col == chars.len() && self.col > 0 && x >= self.width.get();
         let x = goal.unwrap_or(if past_end { 0 } else { x });
@@ -778,7 +806,10 @@ impl Editor {
         if self.col > 0 {
             self.remove((self.row, self.col - n), self.pos());
         } else if self.row > 0 {
-            self.remove((self.row - 1, self.lines[self.row - 1].chars().count()), self.pos());
+            self.remove(
+                (self.row - 1, self.lines[self.row - 1].chars().count()),
+                self.pos(),
+            );
         }
     }
     fn delete(&mut self) {
@@ -803,7 +834,10 @@ impl Editor {
             (&mut self.undo, &mut self.redo)
         };
         if let Some((lines, (row, col))) = from.pop() {
-            to.push((std::mem::replace(&mut self.lines, lines), (self.row, self.col)));
+            to.push((
+                std::mem::replace(&mut self.lines, lines),
+                (self.row, self.col),
+            ));
             (self.row, self.col) = (row, col);
             self.anchor = None;
         }
@@ -843,7 +877,12 @@ impl Editor {
         let step = self.keys.matches(KeyAction::HistorySearch, &key);
         let Some(search) = &mut self.search else {
             if step {
-                self.search = Some(Search { query: String::new(), at: None, draft: self.text(), failed: false });
+                self.search = Some(Search {
+                    query: String::new(),
+                    at: None,
+                    draft: self.text(),
+                    failed: false,
+                });
                 return Some(Action::None);
             }
             return None;
@@ -869,9 +908,17 @@ impl Editor {
                 return None;
             }
         };
-        let before = if older { search.at.unwrap_or(self.history.len()) } else { self.history.len() };
+        let before = if older {
+            search.at.unwrap_or(self.history.len())
+        } else {
+            self.history.len()
+        };
         let found = (!search.query.is_empty())
-            .then(|| self.history[..before].iter().rposition(|h| h.contains(&search.query)))
+            .then(|| {
+                self.history[..before]
+                    .iter()
+                    .rposition(|h| h.contains(&search.query))
+            })
             .flatten();
         search.failed = found.is_none() && !search.query.is_empty();
         if let Some(i) = found {
@@ -991,7 +1038,10 @@ mod tests {
     fn altgr_is_text_even_for_shortcut_letters() {
         let mut e = Editor::default();
         for c in "@\\{}[]|~€cdukjabfl".chars() {
-            assert_eq!(e.handle_key(KeyEvent::new(Char(c), M::CONTROL | M::ALT), false), Action::None);
+            assert_eq!(
+                e.handle_key(KeyEvent::new(Char(c), M::CONTROL | M::ALT), false),
+                Action::None
+            );
         }
         assert_eq!(e.text(), "@\\{}[]|~€cdukjabfl");
     }
@@ -1168,7 +1218,10 @@ mod tests {
 
     #[test]
     fn reverse_search_finds_older_matches() {
-        let mut e = Editor::new(vec!["cargo build".into(), "ls -la".into(), "cargo test".into()], Vec::new());
+        let mut e = Editor::new(
+            vec!["cargo build".into(), "ls -la".into(), "cargo test".into()],
+            Vec::new(),
+        );
         e.paste("draft");
         ctrl(&mut e, 'r');
         assert_eq!(e.search_status().unwrap(), "reverse search: ");
@@ -1179,7 +1232,10 @@ mod tests {
         ctrl(&mut e, 'r');
         assert_eq!(e.text(), "cargo build");
         plain(&mut e, Char('x'));
-        assert_eq!(e.search_status().unwrap(), "reverse search: cargox (no match)");
+        assert_eq!(
+            e.search_status().unwrap(),
+            "reverse search: cargox (no match)"
+        );
         assert_eq!(e.text(), "cargo build");
         plain(&mut e, Esc);
         assert_eq!((e.text().as_str(), e.search_status()), ("draft", None));
@@ -1241,7 +1297,12 @@ mod tests {
             ],
         );
         e.set_skills(vec![("pdf-tools".into(), "Work with PDFs\nmore".into())]);
-        let fills = |e: &Editor| e.suggestions().into_iter().map(|s| s.fill).collect::<Vec<_>>();
+        let fills = |e: &Editor| {
+            e.suggestions()
+                .into_iter()
+                .map(|s| s.fill)
+                .collect::<Vec<_>>()
+        };
         e.set_text("/model");
         assert_eq!(fills(&e), ["/model", "/models-x"]);
         e.set_text("/ode");
@@ -1250,7 +1311,10 @@ mod tests {
         assert_eq!(fills(&e), ["/usage"]);
         e.set_text("/pdf");
         let s = e.suggestions();
-        assert_eq!((s[0].label.as_str(), s[0].detail.as_str(), s[0].run), ("$pdf-tools", "Work with PDFs", false));
+        assert_eq!(
+            (s[0].label.as_str(), s[0].detail.as_str(), s[0].run),
+            ("$pdf-tools", "Work with PDFs", false)
+        );
         e.set_text("$p");
         assert_eq!(fills(&e), ["$pdf-tools"]);
         e.set_text("/permissions re");
@@ -1435,7 +1499,10 @@ mod tests {
         e.set_text("ab\ncd");
         plain(&mut e, Left);
         key(&mut e, Up, M::SHIFT);
-        assert_eq!(e.render(1).lines, ["a", "\x1b[7mb\x1b[27m", "\x1b[7mc\x1b[27m", "d"]);
+        assert_eq!(
+            e.render(1).lines,
+            ["a", "\x1b[7mb\x1b[27m", "\x1b[7mc\x1b[27m", "d"]
+        );
         plain(&mut e, Backspace);
         assert_eq!(e.text(), "ad");
         // Plain movement and Esc drop the selection; Shift+Up never recalls history.
@@ -1507,7 +1574,10 @@ mod tests {
         assert_eq!(e.text(), "");
         // Alt+Enter still queues a follow-up while busy.
         e.set_text("next");
-        assert_eq!(e.handle_key(KeyEvent::new(Enter, M::ALT), true), Action::FollowUp("next".into()));
+        assert_eq!(
+            e.handle_key(KeyEvent::new(Enter, M::ALT), true),
+            Action::FollowUp("next".into())
+        );
     }
 
     #[test]

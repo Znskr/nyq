@@ -24,7 +24,10 @@ pub struct Options {
 /// Reasoning items produced by the Anthropic Messages protocol carry a
 /// signature, not a Responses `encrypted_content`; never replay those here.
 pub(crate) fn is_anthropic_reasoning(id: &Option<String>) -> bool {
-    matches!(id.as_deref(), Some(super::anthropic::THINKING | super::anthropic::REDACTED))
+    matches!(
+        id.as_deref(),
+        Some(super::anthropic::THINKING | super::anthropic::REDACTED)
+    )
 }
 
 pub fn body(model: &str, effort: Option<&str>, req: Request<'_>, opts: Options) -> Value {
@@ -58,7 +61,8 @@ pub fn body(model: &str, effort: Option<&str>, req: Request<'_>, opts: Options) 
         body["text"] = json!({"verbosity":"low"});
     }
     if let Some(effort) = effort {
-        body["reasoning"] = json!({"effort":if effort == "minimal" { "low" } else { effort },"summary":"auto"});
+        body["reasoning"] =
+            json!({"effort":if effort == "minimal" { "low" } else { effort },"summary":"auto"});
     }
     body
 }
@@ -82,7 +86,12 @@ pub(crate) fn output_item(item: &Value) -> Option<Item> {
             id: item["id"].as_str().map(str::to_owned),
             summary: item["summary"]
                 .as_array()
-                .map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<String>())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part["text"].as_str())
+                        .collect::<String>()
+                })
                 .unwrap_or_default(),
             encrypted: item["encrypted_content"].as_str().map(str::to_owned),
         }),
@@ -92,7 +101,11 @@ pub(crate) fn output_item(item: &Value) -> Option<Item> {
 
 /// Read a Responses event stream into a [`Response`]. `label` names the
 /// backend in errors.
-pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSink<'_>) -> Result<Response> {
+pub async fn read_stream(
+    http: reqwest::Response,
+    label: &str,
+    on_event: EventSink<'_>,
+) -> Result<Response> {
     let mut events = sse::checked(http).await?.bytes_stream().eventsource();
     let mut items = BTreeMap::new();
     let mut response = Response::default();
@@ -106,7 +119,9 @@ pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSi
         let data: Value = serde_json::from_str(&event.data)?;
         let kind = data["type"].as_str().unwrap_or(&event.event);
         match kind {
-            "response.output_text.delta" | "response.refusal.delta" => on_event(StreamEvent::Text(sse::string(&data, "delta"))),
+            "response.output_text.delta" | "response.refusal.delta" => {
+                on_event(StreamEvent::Text(sse::string(&data, "delta")))
+            }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 on_event(StreamEvent::Reasoning(sse::string(&data, "delta")))
             }
@@ -118,17 +133,26 @@ pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSi
             }
             // Native web search runs server-side: show activity, but it
             // is not a tool call for us to run (and is never replayed).
-            "response.output_item.added" | "response.output_item.done" if data["item"]["type"] == "web_search_call" => {
+            "response.output_item.added" | "response.output_item.done"
+                if data["item"]["type"] == "web_search_call" =>
+            {
                 let item = &data["item"];
                 let id = sse::string(item, "id");
                 let has_query = item["action"]["query"].as_str().is_some();
-                if (kind == "response.output_item.added" || has_query) && searches.insert(id.clone()) {
-                    on_event(StreamEvent::ToolCallStart { id, name: "web_search".into() });
+                if (kind == "response.output_item.added" || has_query)
+                    && searches.insert(id.clone())
+                {
+                    on_event(StreamEvent::ToolCallStart {
+                        id,
+                        name: "web_search".into(),
+                    });
                 }
             }
             "response.output_item.done" => {
                 if let Some(item) = output_item(&data["item"]) {
-                    let index = data["output_index"].as_u64().context("output item missing output_index")?;
+                    let index = data["output_index"]
+                        .as_u64()
+                        .context("output item missing output_index")?;
                     items.insert(index, item);
                 }
             }
@@ -138,15 +162,21 @@ pub async fn read_stream(http: reqwest::Response, label: &str, on_event: EventSi
                     response.usage = Some(Usage {
                         input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                        cached_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
-                        reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
+                        cached_tokens: usage["input_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
+                        reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
                         ..Default::default()
                     });
                 }
                 completed = true;
                 break;
             }
-            "response.failed" | "error" | "response.incomplete" => anyhow::bail!("{}", sse::failure(&data)),
+            "response.failed" | "error" | "response.incomplete" => {
+                anyhow::bail!("{}", sse::failure(&data))
+            }
             _ => {}
         }
     }
@@ -241,25 +271,42 @@ mod tests {
         provider.set_effort(Some("high".into()));
         let items = [
             Item::user("hi"),
-            Item::Reasoning { id: Some(crate::provider::anthropic::THINKING.into()), summary: "x".into(), encrypted: Some("sig".into()) },
+            Item::Reasoning {
+                id: Some(crate::provider::anthropic::THINKING.into()),
+                summary: "x".into(),
+                encrypted: Some("sig".into()),
+            },
         ];
         let mut seen = Vec::new();
         let response = provider
-            .stream(Request { system: "sys", items: &items, tools: &[] }, &mut |e| seen.push(e))
+            .stream(
+                Request {
+                    system: "sys",
+                    items: &items,
+                    tools: &[],
+                },
+                &mut |e| seen.push(e),
+            )
             .await
             .unwrap();
         assert_eq!(
             response.items,
             vec![
                 Item::Assistant { text: "ok".into() },
-                Item::ToolCall { id: "c1".into(), name: "read_file".into(), arguments: "{\"path\":\"a\"}".into() }
+                Item::ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    arguments: "{\"path\":\"a\"}".into()
+                }
             ]
         );
         assert_eq!(seen[0], StreamEvent::Reasoning("hm".into()));
         let request = requests.recv().await.unwrap();
         let lower = request.to_lowercase();
         assert!(lower.starts_with("post /v1/responses "));
-        assert!(lower.contains("authorization: bearer k") && lower.contains("user-agent: nyq/test"));
+        assert!(
+            lower.contains("authorization: bearer k") && lower.contains("user-agent: nyq/test")
+        );
         let sent: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(sent["reasoning"]["effort"], "high");
         assert!(sent.get("text").is_none());

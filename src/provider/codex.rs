@@ -85,13 +85,24 @@ async fn latest_published() -> Option<String> {
     let cache = crate::config::home().join("codex-version");
     let fresh = std::fs::metadata(&cache)
         .and_then(|m| m.modified())
-        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < std::time::Duration::from_secs(86_400)));
-    let cached = || std::fs::read_to_string(&cache).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        .is_ok_and(|t| {
+            t.elapsed()
+                .is_ok_and(|age| age < std::time::Duration::from_secs(86_400))
+        });
+    let cached = || {
+        std::fs::read_to_string(&cache)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     if fresh {
         return cached();
     }
     let fetched = async {
-        let client = crate::http::builder().timeout(std::time::Duration::from_secs(3)).build().ok()?;
+        let client = crate::http::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .ok()?;
         let body: serde_json::Value = client
             .get("https://registry.npmjs.org/@openai/codex/latest")
             .header("User-Agent", concat!("nyq/", env!("CARGO_PKG_VERSION")))
@@ -115,7 +126,12 @@ async fn latest_published() -> Option<String> {
 }
 
 fn newest<'a>(baseline: &'a str, other: Option<&'a str>) -> &'a str {
-    let parse = |v: &str| -> Option<Vec<u64>> { v.trim_start_matches('v').split('.').map(|p| p.parse().ok()).collect() };
+    let parse = |v: &str| -> Option<Vec<u64>> {
+        v.trim_start_matches('v')
+            .split('.')
+            .map(|p| p.parse().ok())
+            .collect()
+    };
     match other {
         Some(o) if parse(o).zip(parse(baseline)).is_some_and(|(a, b)| a > b) => o,
         _ => baseline,
@@ -128,8 +144,7 @@ pub fn jwt_exp_ms(token: &str) -> Option<i64> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .ok()?;
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()?["exp"]
+    serde_json::from_slice::<Value>(&bytes).ok()?["exp"]
         .as_i64()
         .and_then(|s| s.checked_mul(1000))
 }
@@ -171,7 +186,10 @@ impl CodexProvider {
         }
         let url = match std::env::var("NYQ_CODEX_MODELS_URL") {
             Ok(url) => url,
-            Err(_) => format!("https://chatgpt.com/backend-api/codex/models?client_version={}", client_version().await),
+            Err(_) => format!(
+                "https://chatgpt.com/backend-api/codex/models?client_version={}",
+                client_version().await
+            ),
         };
         let send = |auth: Auth| {
             self.client
@@ -195,7 +213,12 @@ impl CodexProvider {
         super::remember_listing(
             "codex",
             catalog.models.iter().map(|m| m.slug.clone()).collect(),
-            catalog.models.iter().filter(|m| m.additional_speed_tiers.iter().any(|t| t == "fast")).map(|m| m.slug.clone()).collect(),
+            catalog
+                .models
+                .iter()
+                .filter(|m| m.additional_speed_tiers.iter().any(|t| t == "fast"))
+                .map(|m| m.slug.clone())
+                .collect(),
         );
         Ok(catalog
             .models
@@ -216,7 +239,10 @@ impl CodexProvider {
 
     fn body(&self, req: Request<'_>) -> Value {
         // Codex has native web search; it replaces our DuckDuckGo function tool.
-        let opts = responses::Options { native_web_search: true, low_verbosity: true };
+        let opts = responses::Options {
+            native_web_search: true,
+            low_verbosity: true,
+        };
         let mut body = responses::body(&self.model, self.effort.as_deref(), req, opts);
         // Codex exposes fast mode as the priority service tier.
         if self.fast && self.supports_fast() {
@@ -226,25 +252,30 @@ impl CodexProvider {
     }
 
     fn token_usable(auth: &Auth, rejected: Option<&str>) -> bool {
-        let expired = auth.expires_at_ms.saturating_sub(60_000) <= chrono::Utc::now().timestamp_millis();
+        let expired =
+            auth.expires_at_ms.saturating_sub(60_000) <= chrono::Utc::now().timestamp_millis();
         !expired && rejected != Some(auth.access_token.as_str())
     }
 
     async fn load_auth(&self) -> Result<Auth> {
-        let bytes = tokio::fs::read(&self.auth_path).await.context("reading Codex auth file")?;
+        let bytes = tokio::fs::read(&self.auth_path)
+            .await
+            .context("reading Codex auth file")?;
         Auth::parse(&bytes).context("parsing Codex auth file")
     }
 
     /// Pick up a token another fork or process already rotated into the auth file.
     async fn reread_usable(&self, previous: &Auth, rejected: Option<&str>) -> Option<Auth> {
         let fresh = self.load_auth().await.ok()?;
-        let changed = fresh.access_token != previous.access_token || fresh.refresh_token != previous.refresh_token;
+        let changed = fresh.access_token != previous.access_token
+            || fresh.refresh_token != previous.refresh_token;
         (changed && Self::token_usable(&fresh, rejected)).then_some(fresh)
     }
 
     async fn refresh(&self, auth: &Auth) -> Result<Auth> {
         let url = std::env::var("NYQ_CODEX_TOKEN_URL").unwrap_or_else(|_| {
-            let issuer = std::env::var("NYQ_CODEX_ISSUER").unwrap_or_else(|_| "https://auth.openai.com".into());
+            let issuer = std::env::var("NYQ_CODEX_ISSUER")
+                .unwrap_or_else(|_| "https://auth.openai.com".into());
             format!("{}/oauth/token", issuer.trim_end_matches('/'))
         });
         let result: Value = sse::checked(
@@ -269,9 +300,13 @@ impl CodexProvider {
         if let Some(token) = result["refresh_token"].as_str() {
             refreshed.refresh_token = token.to_owned();
         }
-        let seconds = result["expires_in"].as_i64().context("token response missing expires_in")?;
+        let seconds = result["expires_in"]
+            .as_i64()
+            .context("token response missing expires_in")?;
         anyhow::ensure!(seconds > 0, "token response has invalid expires_in");
-        refreshed.expires_at_ms = chrono::Utc::now().timestamp_millis().saturating_add(seconds.saturating_mul(1000));
+        refreshed.expires_at_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(seconds.saturating_mul(1000));
         self.save_auth(&refreshed)?;
         Ok(refreshed)
     }
@@ -354,7 +389,12 @@ impl CodexProvider {
 
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
-    fn endpoint(&self) -> Option<String> { Some(std::env::var("NYQ_CODEX_URL").unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".into())) }
+    fn endpoint(&self) -> Option<String> {
+        Some(
+            std::env::var("NYQ_CODEX_URL")
+                .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".into()),
+        )
+    }
 
     fn set_conversation(&mut self, id: &str) {
         self.session_id = id.to_string();
@@ -387,7 +427,9 @@ impl Provider for CodexProvider {
         self.effort = effort.filter(|e| e != "auto");
     }
     fn efforts(&self) -> Vec<String> {
-        ["low", "medium", "high", "xhigh"].map(String::from).to_vec()
+        ["low", "medium", "high", "xhigh"]
+            .map(String::from)
+            .to_vec()
     }
     fn fast(&self) -> bool {
         self.fast && self.supports_fast()
@@ -400,7 +442,10 @@ impl Provider for CodexProvider {
     }
     /// The first mini model in the live catalog (highest priority first).
     fn reviewer_model(&self) -> Option<String> {
-        super::listing("codex")?.models.into_iter().find(|m| m.contains("-mini"))
+        super::listing("codex")?
+            .models
+            .into_iter()
+            .find(|m| m.contains("-mini"))
     }
 
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
@@ -440,7 +485,12 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert_eq!(item, Item::Assistant { text: "Hello. I won't do that.".into() });
+        assert_eq!(
+            item,
+            Item::Assistant {
+                text: "Hello. I won't do that.".into()
+            }
+        );
         let text_field = output_item(&json!({
             "type": "message",
             "content": [{"type": "refusal", "text": "No."}]
@@ -586,13 +636,24 @@ mod tests {
     #[test]
     fn reviewer_is_a_listed_mini_model() {
         let provider = CodexProvider::new(PathBuf::new(), "big-review-test".into(), None);
-        crate::provider::remember_listing("codex", vec!["big-review-test".into(), "small-review-test-mini".into()], Vec::new());
-        assert_eq!(provider.reviewer_model().as_deref(), Some("small-review-test-mini"));
+        crate::provider::remember_listing(
+            "codex",
+            vec!["big-review-test".into(), "small-review-test-mini".into()],
+            Vec::new(),
+        );
+        assert_eq!(
+            provider.reviewer_model().as_deref(),
+            Some("small-review-test-mini")
+        );
     }
 
     #[test]
     fn fast_mode_requests_priority_tier() {
-        let empty = || Request { system: "", items: &[], tools: &[] };
+        let empty = || Request {
+            system: "",
+            items: &[],
+            tools: &[],
+        };
         let mut provider = CodexProvider::new(PathBuf::new(), "fast-capable-test".into(), None);
         provider.set_fast(true);
         // Unknown support: no tier is requested.
@@ -600,7 +661,11 @@ mod tests {
             assert!(provider.body(empty()).get("service_tier").is_none());
         }
         crate::provider::remember_listing("codex", Vec::new(), vec!["fast-capable-test".into()]);
-        assert!(crate::provider::listing("codex").is_some() && provider.supports_fast() && provider.fast());
+        assert!(
+            crate::provider::listing("codex").is_some()
+                && provider.supports_fast()
+                && provider.fast()
+        );
         assert_eq!(provider.body(empty())["service_tier"], "priority");
         assert!(provider.fork().fast());
         provider.set_fast(false);
@@ -716,10 +781,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = CodexProvider::new(auth_file(&dir, i64::MAX), "test".into(), None);
         let tools = vec![
-            ToolSpec { name: "web_search".into(), description: "ddg".into(), parameters: json!({"type":"object"}) },
-            ToolSpec { name: "web_fetch".into(), description: "fetch".into(), parameters: json!({"type":"object"}) },
+            ToolSpec {
+                name: "web_search".into(),
+                description: "ddg".into(),
+                parameters: json!({"type":"object"}),
+            },
+            ToolSpec {
+                name: "web_fetch".into(),
+                description: "fetch".into(),
+                parameters: json!({"type":"object"}),
+            },
         ];
-        let req = || Request { system: "", items: &[], tools: &tools };
+        let req = || Request {
+            system: "",
+            items: &[],
+            tools: &tools,
+        };
         let body = provider.body(req());
         assert_eq!(body["tools"][0], json!({"type":"web_search"}));
         assert_eq!(body["tools"][1]["name"], "web_fetch");
@@ -737,9 +814,20 @@ mod tests {
         let (url, mut requests, task) = server(vec![(200, events)]).await;
         Env::set("NYQ_CODEX_URL", &url);
         let mut received = Vec::new();
-        let response = provider.stream(req(), &mut |e| received.push(e)).await.unwrap();
-        assert_eq!(response.items, vec![Item::Assistant { text: "found it".into() }]);
-        let start = |id: &str| StreamEvent::ToolCallStart { id: id.into(), name: "web_search".into() };
+        let response = provider
+            .stream(req(), &mut |e| received.push(e))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.items,
+            vec![Item::Assistant {
+                text: "found it".into()
+            }]
+        );
+        let start = |id: &str| StreamEvent::ToolCallStart {
+            id: id.into(),
+            name: "web_search".into(),
+        };
         assert_eq!(received, vec![start("ws_1"), start("ws_2")]);
         let request = requests.recv().await.unwrap();
         assert!(request.contains(r#"{"type":"web_search"}"#));
@@ -887,7 +975,11 @@ mod tests {
     fn jwt(exp: &str) -> String {
         use base64::Engine;
         let enc = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes());
-        format!("{}.{}.x", enc(r#"{"alg":"none"}"#), enc(&format!(r#"{{"exp":{exp}}}"#)))
+        format!(
+            "{}.{}.x",
+            enc(r#"{"alg":"none"}"#),
+            enc(&format!(r#"{{"exp":{exp}}}"#))
+        )
     }
 
     #[test]
@@ -919,13 +1011,20 @@ mod tests {
         .await;
         Env::set("NYQ_CODEX_URL", &url);
         Env::set("NYQ_CODEX_TOKEN_URL", &token_url);
-        let req = || Request { system: "", items: &[], tools: &[] };
+        let req = || Request {
+            system: "",
+            items: &[],
+            tools: &[],
+        };
         child.stream(req(), &mut |_| {}).await.unwrap();
         parent.stream(req(), &mut |_| {}).await.unwrap();
         assert!(requests.recv().await.unwrap().contains("Bearer new"));
         assert!(requests.recv().await.unwrap().contains("Bearer new"));
         let token_request = token_requests.recv().await.unwrap();
-        assert!(token_request.contains("\"refresh_token\":\"refresh\""), "{token_request}");
+        assert!(
+            token_request.contains("\"refresh_token\":\"refresh\""),
+            "{token_request}"
+        );
         assert!(token_requests.try_recv().is_err());
         let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(saved["refresh_token"], "rotated");
@@ -960,4 +1059,3 @@ mod tests {
         assert_eq!(got.refresh_token, "fresh-refresh");
     }
 }
-

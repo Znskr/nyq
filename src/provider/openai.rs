@@ -55,7 +55,12 @@ impl OpenAiProvider {
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
-        Ok(self.list_models_detailed().await?.into_iter().map(|m| m.id).collect())
+        Ok(self
+            .list_models_detailed()
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect())
     }
 
     /// Models from `GET {base}/models`, without embedding/image/video models
@@ -88,8 +93,15 @@ impl OpenAiProvider {
         Ok(catalog
             .data
             .into_iter()
-            .filter(|m| m.kind.as_deref().is_none_or(|k| matches!(k, "language" | "chat" | "model")))
-            .map(|m| Listed { id: m.id, context_window: m.context_window })
+            .filter(|m| {
+                m.kind
+                    .as_deref()
+                    .is_none_or(|k| matches!(k, "language" | "chat" | "model"))
+            })
+            .map(|m| Listed {
+                id: m.id,
+                context_window: m.context_window,
+            })
             .collect())
     }
 
@@ -98,8 +110,13 @@ impl OpenAiProvider {
         let mut assistant: Option<Value> = None;
         for item in req.items {
             if let Item::Reasoning { summary, .. } = item {
-                if let Some(field) = self.reasoning_field.as_deref().filter(|_| !summary.is_empty()) {
-                    let message = assistant.get_or_insert_with(|| json!({"role":"assistant","content":null}));
+                if let Some(field) = self
+                    .reasoning_field
+                    .as_deref()
+                    .filter(|_| !summary.is_empty())
+                {
+                    let message =
+                        assistant.get_or_insert_with(|| json!({"role":"assistant","content":null}));
                     let mut text = message[field].as_str().unwrap_or_default().to_owned();
                     text.push_str(summary);
                     message[field] = json!(text);
@@ -176,9 +193,19 @@ struct Call {
 
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
-    fn endpoint(&self) -> Option<String> { Some(format!("{}/models", self.base_url.trim_end_matches('/'))) }
+    fn endpoint(&self) -> Option<String> {
+        Some(format!("{}/models", self.base_url.trim_end_matches('/')))
+    }
     fn pricing_provider(&self) -> &str {
-        if reqwest::Url::parse(&self.base_url).ok().and_then(|u| u.host_str().map(str::to_owned)).is_some_and(|h| h == "opencode.ai" || h.ends_with(".opencode.ai")) { "opencode" } else { self.name() }
+        if reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .is_some_and(|h| h == "opencode.ai" || h.ends_with(".opencode.ai"))
+        {
+            "opencode"
+        } else {
+            self.name()
+        }
     }
 
     fn fork(&self) -> Box<dyn Provider> {
@@ -259,7 +286,9 @@ impl Provider for OpenAiProvider {
                         completed = true;
                         response.truncated = true;
                     }
-                    Some(other) => anyhow::bail!("OpenAI stream stopped early: finish_reason {other}"),
+                    Some(other) => {
+                        anyhow::bail!("OpenAI stream stopped early: finish_reason {other}")
+                    }
                     None => anyhow::bail!("OpenAI stream stopped early: finish_reason {reason}"),
                 }
             }
@@ -331,7 +360,11 @@ impl Provider for OpenAiProvider {
                         name: String::new(),
                         arguments: String::new(),
                     });
-                    Call { id: "legacy-0".into(), position, ..Call::default() }
+                    Call {
+                        id: "legacy-0".into(),
+                        position,
+                        ..Call::default()
+                    }
                 });
                 if let Some(name) = function["name"].as_str() {
                     call.name.push_str(name);
@@ -340,7 +373,10 @@ impl Provider for OpenAiProvider {
                     call.arguments.push_str(args);
                 }
                 if !call.started && !call.name.is_empty() {
-                    on_event(StreamEvent::ToolCallStart { id: call.id.clone(), name: call.name.clone() });
+                    on_event(StreamEvent::ToolCallStart {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                    });
                     call.started = true;
                 }
             }
@@ -452,10 +488,22 @@ mod tests {
         let mut provider = OpenAiProvider::new("unused".into(), None, "test".into());
         let items = vec![
             Item::user("q"),
-            Item::Reasoning { id: None, summary: "plan".into(), encrypted: None },
-            Item::ToolCall { id: "a".into(), name: "one".into(), arguments: "{}".into() },
+            Item::Reasoning {
+                id: None,
+                summary: "plan".into(),
+                encrypted: None,
+            },
+            Item::ToolCall {
+                id: "a".into(),
+                name: "one".into(),
+                arguments: "{}".into(),
+            },
         ];
-        let req = || Request { system: "", items: &items, tools: &[] };
+        let req = || Request {
+            system: "",
+            items: &items,
+            tools: &[],
+        };
         let body = provider.body(req());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body["messages"][2].get("reasoning_content").is_none());
@@ -477,7 +525,16 @@ mod tests {
         let provider = OpenAiProvider::new(url, None, "a".into());
         assert_eq!(
             provider.list_models_detailed().await.unwrap(),
-            vec![Listed { id: "a".into(), context_window: Some(1000) }, Listed { id: "b".into(), context_window: None }]
+            vec![
+                Listed {
+                    id: "a".into(),
+                    context_window: Some(1000)
+                },
+                Listed {
+                    id: "b".into(),
+                    context_window: None
+                }
+            ]
         );
         task.await.unwrap();
     }
@@ -571,7 +628,16 @@ mod tests {
     async fn one_stream(body: String) -> anyhow::Result<Response> {
         let (url, _requests, task) = server(vec![(200, body)]).await;
         let provider = OpenAiProvider::new(url, None, "test".into());
-        let result = provider.stream(Request { system: "", items: &[], tools: &[] }, &mut |_| {}).await;
+        let result = provider
+            .stream(
+                Request {
+                    system: "",
+                    items: &[],
+                    tools: &[],
+                },
+                &mut |_| {},
+            )
+            .await;
         task.await.unwrap();
         result
     }
@@ -585,7 +651,9 @@ mod tests {
 
     #[tokio::test]
     async fn finish_reason_completes_without_done() {
-        let body = events(&[json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]})]);
+        let body = events(&[
+            json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}),
+        ]);
         let response = one_stream(body).await.unwrap();
         assert_eq!(response.items, vec![Item::Assistant { text: "hi".into() }]);
     }
@@ -593,7 +661,9 @@ mod tests {
     #[tokio::test]
     async fn incomplete_finish_reasons_are_errors() {
         for reason in ["length", "content_filter", "tool_calls", "function_call"] {
-            let body = events(&[json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason": reason}]})]);
+            let body = events(&[
+                json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason": reason}]}),
+            ]);
             let result = one_stream(body).await;
             if reason == "length" {
                 let response = result.expect("length");
@@ -617,10 +687,21 @@ mod tests {
         let response = one_stream(body).await.unwrap();
         assert_eq!(
             response.items,
-            vec![Item::ToolCall { id: "legacy-0".into(), name: "get_weather".into(), arguments: "{\"city\":\"Paris\"}".into() }]
+            vec![Item::ToolCall {
+                id: "legacy-0".into(),
+                name: "get_weather".into(),
+                arguments: "{\"city\":\"Paris\"}".into()
+            }]
         );
-        let body = events(&[json!({"choices":[{"index":0,"delta":{"refusal":"I can't help with that."},"finish_reason":"stop"}]})]);
+        let body = events(&[
+            json!({"choices":[{"index":0,"delta":{"refusal":"I can't help with that."},"finish_reason":"stop"}]}),
+        ]);
         let response = one_stream(body).await.unwrap();
-        assert_eq!(response.items, vec![Item::Assistant { text: "I can't help with that.".into() }]);
+        assert_eq!(
+            response.items,
+            vec![Item::Assistant {
+                text: "I can't help with that.".into()
+            }]
+        );
     }
 }

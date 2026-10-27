@@ -101,7 +101,11 @@ pub fn store_dir(session_path: &Path) -> PathBuf {
 
 /// Letters, digits, `-` and `_`; it is also the file name.
 pub fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= MAX_NAME && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !name.is_empty()
+        && name.len() <= MAX_NAME
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn path(dir: &Path, name: &str) -> PathBuf {
@@ -110,11 +114,15 @@ fn path(dir: &Path, name: &str) -> PathBuf {
 
 pub fn load(dir: &Path, name: &str) -> Result<Option<Record>> {
     if !valid_name(name) {
-        bail!("invalid subagent name `{name}` (use letters, digits, '-' and '_', at most {MAX_NAME})");
+        bail!(
+            "invalid subagent name `{name}` (use letters, digits, '-' and '_', at most {MAX_NAME})"
+        );
     }
     let p = path(dir, name);
     match std::fs::read(&p) {
-        Ok(data) => Ok(Some(serde_json::from_slice(&data).with_context(|| format!("reading {}", p.display()))?)),
+        Ok(data) => Ok(Some(
+            serde_json::from_slice(&data).with_context(|| format!("reading {}", p.display()))?,
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
     }
@@ -128,7 +136,9 @@ pub fn save(dir: &Path, record: &Record) -> Result<()> {
 
 /// Every saved subagent, oldest first.
 pub fn list(dir: &Path) -> Vec<Record> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut all: Vec<Record> = entries
         .flatten()
         .map(|e| e.path())
@@ -218,7 +228,16 @@ impl LiveGuard {
             return None;
         }
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        all.push(Live { id, key, label: label.into(), started: Instant::now(), calls: 0, last: String::new(), cancel, stopped: false });
+        all.push(Live {
+            id,
+            key,
+            label: label.into(),
+            started: Instant::now(),
+            calls: 0,
+            last: String::new(),
+            cancel,
+            stopped: false,
+        });
         Some(Self(id))
     }
 
@@ -251,8 +270,16 @@ pub fn live_lines() -> Vec<String> {
                 1 => "1 tool call".to_string(),
                 n => format!("{n} tool calls"),
             };
-            let last = if l.last.is_empty() { String::new() } else { format!(" · {}", l.last) };
-            format!("{} · {calls}{last} ({}s)", l.label, l.started.elapsed().as_secs())
+            let last = if l.last.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", l.last)
+            };
+            format!(
+                "{} · {calls}{last} ({}s)",
+                l.label,
+                l.started.elapsed().as_secs()
+            )
         })
         .collect()
 }
@@ -273,16 +300,26 @@ fn ago(t: DateTime<Utc>) -> String {
 
 fn flat(s: &str, max: usize) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() > max { format!("{}…", s.chars().take(max - 1).collect::<String>()) } else { s }
+    if s.chars().count() > max {
+        format!("{}…", s.chars().take(max - 1).collect::<String>())
+    } else {
+        s
+    }
 }
 
 pub fn list_lines(dir: &Path) -> Vec<String> {
     let all = list(dir);
     if all.is_empty() {
-        return vec!["No named subagents in this session (the model creates them with subagent `name`).".into()];
+        return vec![
+            "No named subagents in this session (the model creates them with subagent `name`)."
+                .into(),
+        ];
     }
     let w = all.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
-    let mut lines = vec![format!("{:w$}  {:7}  {:11}  {:>5}  {:>5}  {:8}  description", "name", "mode", "status", "turns", "tools", "updated")];
+    let mut lines = vec![format!(
+        "{:w$}  {:7}  {:11}  {:>5}  {:>5}  {:8}  description",
+        "name", "mode", "status", "turns", "tools", "updated"
+    )];
     for r in &all {
         lines.push(
             format!(
@@ -308,7 +345,12 @@ pub fn show_lines(dir: &Path, name: &str, max_items: usize) -> Result<Vec<String
         bail!("No subagent named `{name}` in this session.");
     };
     let mut lines = vec![
-        format!("{} · {} · {}", r.name, r.mode, r.effective_status(dir).label()),
+        format!(
+            "{} · {} · {}",
+            r.name,
+            r.mode,
+            r.effective_status(dir).label()
+        ),
         format!(
             "  {} turns · {} tool calls · ↑{} ↓{} tokens · created {} · updated {}",
             r.turns,
@@ -327,8 +369,12 @@ pub fn show_lines(dir: &Path, name: &str, max_items: usize) -> Result<Vec<String
         .iter()
         .filter_map(|i| match i {
             Item::User { text, .. } => Some(format!("  ▸ {}", flat(text, 160))),
-            Item::Assistant { text } if !text.trim().is_empty() => Some(format!("  ◂ {}", flat(text, 160))),
-            Item::ToolCall { name, arguments, .. } => Some(format!("    {name} {}", flat(arguments, 100))),
+            Item::Assistant { text } if !text.trim().is_empty() => {
+                Some(format!("  ◂ {}", flat(text, 160)))
+            }
+            Item::ToolCall {
+                name, arguments, ..
+            } => Some(format!("    {name} {}", flat(arguments, 100))),
             Item::Compaction { .. } => Some("  (earlier messages compacted)".into()),
             _ => None,
         })
@@ -336,7 +382,15 @@ pub fn show_lines(dir: &Path, name: &str, max_items: usize) -> Result<Vec<String
     if digest.len() > max_items {
         lines.push(format!("  … {} earlier entries", digest.len() - max_items));
     }
-    lines.extend(digest.into_iter().rev().take(max_items).collect::<Vec<_>>().into_iter().rev());
+    lines.extend(
+        digest
+            .into_iter()
+            .rev()
+            .take(max_items)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev(),
+    );
     Ok(lines)
 }
 
@@ -371,13 +425,21 @@ mod tests {
         assert!(command(Some(&session), &[]).unwrap()[0].starts_with("No named subagents"));
 
         let mut r = Record::new("scout", "explore", "find the parser");
-        r.items = vec![Item::user("look"), Item::Assistant { text: "found it".into() }];
+        r.items = vec![
+            Item::user("look"),
+            Item::Assistant {
+                text: "found it".into(),
+            },
+        ];
         r.turns = 1;
         save(&dir, &r).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("scout.json")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.join("scout.json"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         let back = load(&dir, "scout").unwrap().unwrap();
@@ -386,18 +448,31 @@ mod tests {
         assert!(load(&dir, "ghost").unwrap().is_none());
 
         let lines = command(Some(&session), &["list"]).unwrap();
-        assert!(lines[1].starts_with("scout") && lines[1].contains("idle"), "{lines:?}");
+        assert!(
+            lines[1].starts_with("scout") && lines[1].contains("idle"),
+            "{lines:?}"
+        );
         let lines = command(Some(&session), &["show", "scout"]).unwrap();
-        assert!(lines.iter().any(|l| l.contains("▸ look")) && lines.iter().any(|l| l.contains("◂ found it")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("▸ look"))
+                && lines.iter().any(|l| l.contains("◂ found it")),
+            "{lines:?}"
+        );
 
         // A `running` record from a dead process reads as interrupted.
         let mut stale = back.clone();
         stale.status = Status::Running;
         save(&dir, &stale).unwrap();
-        assert_eq!(load(&dir, "scout").unwrap().unwrap().effective_status(&dir), Status::Interrupted);
+        assert_eq!(
+            load(&dir, "scout").unwrap().unwrap().effective_status(&dir),
+            Status::Interrupted
+        );
 
         assert!(command(Some(&session), &["stop", "scout"]).unwrap()[0].starts_with("Stopped"));
-        assert_eq!(load(&dir, "scout").unwrap().unwrap().status, Status::Stopped);
+        assert_eq!(
+            load(&dir, "scout").unwrap().unwrap().status,
+            Status::Stopped
+        );
         assert!(command(Some(&session), &["stop", "ghost"]).is_err());
         command(Some(&session), &["delete", "scout"]).unwrap();
         assert!(list(&dir).is_empty());
@@ -412,7 +487,9 @@ mod tests {
         let guard = LiveGuard::start(Some(k.clone()), "w: task", cancel.clone()).unwrap();
         assert!(LiveGuard::start(Some(k.clone()), "again", CancellationToken::new()).is_none());
         guard.tool("read_file", "src/a.rs");
-        assert!(live_lines().iter().any(|l| l.starts_with("w: task · 1 tool call · read_file src/a.rs")));
+        assert!(live_lines()
+            .iter()
+            .any(|l| l.starts_with("w: task · 1 tool call · read_file src/a.rs")));
         assert!(cancel_live(&k));
         assert!(cancel.is_cancelled() && guard.stopped());
         drop(guard);

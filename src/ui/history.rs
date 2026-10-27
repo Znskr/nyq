@@ -24,9 +24,15 @@ fn parse(line: &str) -> Option<Record> {
         return None;
     }
     match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(serde_json::Value::String(text)) => Some(Record { text, cwd: String::new() }),
+        Ok(serde_json::Value::String(text)) => Some(Record {
+            text,
+            cwd: String::new(),
+        }),
         Ok(value @ serde_json::Value::Object(_)) => serde_json::from_value(value).ok(),
-        _ => Some(Record { text: line.to_string(), cwd: String::new() }),
+        _ => Some(Record {
+            text: line.to_string(),
+            cwd: String::new(),
+        }),
     }
 }
 
@@ -44,13 +50,20 @@ pub fn load(path: &Path, cwd: &str) -> Vec<String> {
         .filter(|r| !r.text.trim().is_empty() && seen.insert(r.text.as_str()))
         .collect();
     newest_first.sort_by_key(|r| r.cwd != cwd);
-    newest_first.into_iter().map(|r| r.text.clone()).rev().collect()
+    newest_first
+        .into_iter()
+        .map(|r| r.text.clone())
+        .rev()
+        .collect()
 }
 
 /// Append one prompt, compacting the file to the newest [`KEEP`] records
 /// once it holds more.
 pub fn append(path: &Path, text: &str, cwd: &str) -> std::io::Result<()> {
-    let mut line = serde_json::to_string(&Record { text: text.into(), cwd: cwd.into() })?;
+    let mut line = serde_json::to_string(&Record {
+        text: text.into(),
+        cwd: cwd.into(),
+    })?;
     line.push('\n');
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true).read(true);
@@ -83,7 +96,11 @@ fn write_locked(file: &mut File, line: &str) -> std::io::Result<()> {
     data.push_str(line);
     let count = data.lines().filter(|l| !l.trim().is_empty()).count();
     if readable && count > KEEP {
-        let kept: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).skip(count - KEEP).collect();
+        let kept: Vec<&str> = data
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .skip(count - KEEP)
+            .collect();
         // Rewrite through the locked handle (it appends, so cut first).
         file.set_len(0)?;
         file.write_all((kept.join("\n") + "\n").as_bytes())?;
@@ -109,7 +126,10 @@ mod tests {
             load(&path, "/here"),
             ["old one", "there", "plain", "here 1", "multi\nline"]
         );
-        assert_eq!(load(&path, "/there"), ["old one", "here 1", "multi\nline", "there", "plain"]);
+        assert_eq!(
+            load(&path, "/there"),
+            ["old one", "here 1", "multi\nline", "there", "plain"]
+        );
         assert!(load(&tmp.path().join("missing"), "/").is_empty());
     }
 

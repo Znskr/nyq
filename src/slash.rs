@@ -53,10 +53,11 @@ impl Category {
 /// and anything else unknown are extensions.
 pub fn category(cmd: &str) -> Category {
     match cmd {
-        "/help" | "/exit" | "/copy" | "/undo" | "/tools" | "/transcript" | "/keys" => Category::General,
-        "/new" | "/clear" | "/reset" | "/continue" | "/rename" | "/resume" | "/sessions" | "/compact" => {
-            Category::Session
+        "/help" | "/exit" | "/copy" | "/undo" | "/tools" | "/transcript" | "/keys" => {
+            Category::General
         }
+        "/new" | "/clear" | "/reset" | "/continue" | "/rename" | "/resume" | "/sessions"
+        | "/compact" => Category::Session,
         "/login" | "/logout" | "/setup" | "/usage" | "/stats" => Category::Account,
         "/model" | "/fast" => Category::Model,
         "/settings" | "/statusline" | "/sound" | "/notifications" => Category::Appearance,
@@ -79,12 +80,19 @@ pub const ALIASES: &[(&str, &str)] = &[
 ];
 
 pub fn aliases(cmd: &str) -> Vec<&'static str> {
-    ALIASES.iter().filter(|(_, c)| *c == cmd).map(|(a, _)| *a).collect()
+    ALIASES
+        .iter()
+        .filter(|(_, c)| *c == cmd)
+        .map(|(a, _)| *a)
+        .collect()
 }
 
 /// The command an alias stands for (or `cmd` itself).
 pub fn canonical(cmd: &str) -> &str {
-    ALIASES.iter().find(|(a, _)| *a == cmd).map_or(cmd, |(_, c)| c)
+    ALIASES
+        .iter()
+        .find(|(a, _)| *a == cmd)
+        .map_or(cmd, |(_, c)| c)
 }
 
 /// How well `query` (typed after `/`) matches `name`: 0 exact, 1 prefix,
@@ -119,7 +127,11 @@ const PERMISSIONS: &[ArgOption] = &[
     ("yolo", "never ask; deny rules still block", false),
     ("rules", "list rules and session grants", false),
     ("reload", "re-read permissions.json", false),
-    ("remember", "remember allow|deny TOOL ARGS-JSON for this session", true),
+    (
+        "remember",
+        "remember allow|deny TOOL ARGS-JSON for this session",
+        true,
+    ),
     ("revoke", "drop a remembered session rule: revoke ID", true),
     ("reset", "back to ask and forget session grants", false),
 ];
@@ -150,14 +162,22 @@ const WORKSPACE: &[ArgOption] = &[
 ];
 const ALLOWLIST: &[ArgOption] = &[
     ("view", "show trusted entries [effective|local|user]", false),
-    ("add", "trust a command, tool or URL: add KIND PATTERN", true),
+    (
+        "add",
+        "trust a command, tool or URL: add KIND PATTERN",
+        true,
+    ),
     ("remove", "remove N, or remove KIND PATTERN", true),
     ("reset", "forget entries [commands|tools|urls|all]", false),
     ("local", "this workspace only: local add|remove|reset", true),
     ("user", "every workspace: user add|remove|reset", true),
 ];
 const ALLOWLIST_SCOPED: &[ArgOption] = &[
-    ("add", "trust a command, tool or URL: add KIND PATTERN", true),
+    (
+        "add",
+        "trust a command, tool or URL: add KIND PATTERN",
+        true,
+    ),
     ("remove", "remove KIND PATTERN", true),
     ("reset", "forget entries [commands|tools|urls|all]", false),
 ];
@@ -183,22 +203,42 @@ const SKILLS: &[ArgOption] = &[
     ("remove", "remove an installed skill: remove NAME", true),
     ("info", "show a skill: info NAME", true),
     ("create", "create a skill: create NAME [--project]", true),
-    ("disable", "turn a skill off (disabled_skills): disable NAME", true),
+    (
+        "disable",
+        "turn a skill off (disabled_skills): disable NAME",
+        true,
+    ),
     ("enable", "turn a skill back on: enable NAME", true),
-    ("copy", "copy into nyq's skills: copy NAME [--project] [--force]", true),
+    (
+        "copy",
+        "copy into nyq's skills: copy NAME [--project] [--force]",
+        true,
+    ),
     ("path", "where skills are installed", false),
 ];
 const TOOLS: &[ArgOption] = &[
     ("list", "every tool with its state", false),
     ("info", "description and parameters: info NAME", true),
-    ("disable", "turn a tool off (disabled_tools): disable NAME", true),
+    (
+        "disable",
+        "turn a tool off (disabled_tools): disable NAME",
+        true,
+    ),
     ("enable", "turn a tool back on: enable NAME", true),
-    ("trust", "always allow it (permissions.json): trust NAME", true),
+    (
+        "trust",
+        "always allow it (permissions.json): trust NAME",
+        true,
+    ),
     ("untrust", "stop always allowing it: untrust NAME", true),
 ];
 const MCP: &[ArgOption] = &[
     ("list", "servers, state and tools", false),
-    ("add", "add NAME CMD [ARGS] or add --transport http NAME URL", true),
+    (
+        "add",
+        "add NAME CMD [ARGS] or add --transport http NAME URL",
+        true,
+    ),
     ("remove", "remove a profile server: remove NAME", true),
     ("reload", "re-read mcp.json and connect new servers", false),
     ("path", "the profile MCP config path", false),
@@ -207,7 +247,11 @@ const MCP: &[ArgOption] = &[
     ("login", "sign in to an HTTP server: login NAME", true),
     ("logout", "forget a sign-in: logout NAME", true),
     ("trust", "trust project servers", false),
-    ("resource", "browse resources: resource list|templates|read|complete", true),
+    (
+        "resource",
+        "browse resources: resource list|templates|read|complete",
+        true,
+    ),
     ("prompt", "browse prompts: prompt list|get|complete", true),
 ];
 const MCP_TRUST: &[ArgOption] = &[
@@ -234,7 +278,10 @@ const AGENTS: &[ArgOption] = &[
     ("stop", "stop NAME", true),
     ("delete", "delete NAME", true),
 ];
-const IMAGES: &[ArgOption] = &[("clear", "drop every pending image", false), ("remove", "remove N", true)];
+const IMAGES: &[ArgOption] = &[
+    ("clear", "drop every pending image", false),
+    ("remove", "remove N", true),
+];
 const BACKGROUND: &[ArgOption] = &[
     ("list", "background processes", false),
     ("logs", "head and tail of the output: logs ID|last", true),
@@ -248,7 +295,10 @@ const EXTENSIONS: &[ArgOption] = &[
     ("reload", "restart them and pick up new ones", false),
     ("trust", "trust the project's extensions", false),
 ];
-const MEMORY: &[ArgOption] = &[("list", "saved memories", false), ("remove", "forget one: remove N", true)];
+const MEMORY: &[ArgOption] = &[
+    ("list", "saved memories", false),
+    ("remove", "forget one: remove N", true),
+];
 const USAGE: &[ArgOption] = &[
     ("session", "this session", false),
     ("24h", "the last 24 hours", false),
@@ -268,7 +318,10 @@ const PROVIDERS: &[ArgOption] = &[
 pub fn arg_options(cmd: &str, prior: &[&str]) -> &'static [ArgOption] {
     match (canonical(cmd), prior) {
         ("/permissions", []) => PERMISSIONS,
-        ("/permissions", ["remember"]) => &[("allow", "allow this exact call", true), ("deny", "deny this exact call", true)],
+        ("/permissions", ["remember"]) => &[
+            ("allow", "allow this exact call", true),
+            ("deny", "deny this exact call", true),
+        ],
         ("/sound", []) => SOUND,
         ("/notifications", []) => NOTIFICATIONS,
         ("/statusline", _) => STATUSLINE,
@@ -305,7 +358,9 @@ pub fn arg_options(cmd: &str, prior: &[&str]) -> &'static [ArgOption] {
 /// `/usr/bin/foo crashes, why?` or `/tmp/x.log`.
 pub fn is_prompt(line: &str, known: impl Fn(&str) -> bool) -> bool {
     let line = line.trim();
-    let Some(rest) = line.strip_prefix('/') else { return false };
+    let Some(rest) = line.strip_prefix('/') else {
+        return false;
+    };
     let word = rest.split_whitespace().next().unwrap_or("");
     if word.is_empty() || known(&format!("/{word}")) {
         return false;
@@ -343,11 +398,22 @@ mod tests {
 
     #[test]
     fn argument_options_follow_the_words_typed() {
-        let names = |cmd: &str, prior: &[&str]| arg_options(cmd, prior).iter().map(|o| o.0).collect::<Vec<_>>();
+        let names = |cmd: &str, prior: &[&str]| {
+            arg_options(cmd, prior)
+                .iter()
+                .map(|o| o.0)
+                .collect::<Vec<_>>()
+        };
         assert!(names("/permissions", &[]).contains(&"reset"));
         assert_eq!(names("/allowlist", &["local"]), ["add", "remove", "reset"]);
-        assert_eq!(names("/allowlist", &["user", "add"]), ["command", "tool", "url"]);
-        assert_eq!(names("/mcp", &["resource"]), ["list", "templates", "read", "complete"]);
+        assert_eq!(
+            names("/allowlist", &["user", "add"]),
+            ["command", "tool", "url"]
+        );
+        assert_eq!(
+            names("/mcp", &["resource"]),
+            ["list", "templates", "read", "complete"]
+        );
         assert_eq!(names("/cost", &[]), ["session", "24h", "7d", "30d"]);
         assert!(names("/permissions", &["ask"]).is_empty());
         assert!(names("/nope", &[]).is_empty());

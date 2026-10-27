@@ -13,6 +13,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Runs on a hosted runner: formatting is cheap and needs no build cache.
+  fmt:
+    name: format
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --check
+
   # Runs on the dedicated AWS Lightsail runner.
   linux:
     name: test (AWS linux)

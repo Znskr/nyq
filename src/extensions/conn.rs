@@ -19,7 +19,8 @@ use super::protocol::Manifest;
 const GRACE: Duration = Duration::from_secs(2);
 
 /// Answers a request or notification the extension sent: `(method, params)`.
-pub type Handler = Arc<dyn Fn(String, Value) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
+pub type Handler =
+    Arc<dyn Fn(String, Value) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
@@ -43,7 +44,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// `command[0]` relative to the extension's directory when it is a path
 /// (`./bin/ext`), else looked up on PATH.
 fn program(dir: &Path, cmd: &str) -> std::path::PathBuf {
-    if cmd.starts_with("./") || cmd.starts_with("../") || (cmd.contains('/') && !Path::new(cmd).is_absolute()) {
+    if cmd.starts_with("./")
+        || cmd.starts_with("../")
+        || (cmd.contains('/') && !Path::new(cmd).is_absolute())
+    {
         dir.join(cmd)
     } else {
         cmd.into()
@@ -63,7 +67,10 @@ impl Conn {
         if let Some(parent) = log.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let stderr = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)?;
         let mut cmd = tokio::process::Command::new(program(dir, &manifest.command[0]));
         cmd.args(&manifest.command[1..])
             .current_dir(dir)
@@ -73,15 +80,17 @@ impl Conn {
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("could not start `{}`: {e}", manifest.command.join(" ")))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("could not start `{}`: {e}", manifest.command.join(" "))
+        })?;
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             while let Some(line) = rx.recv().await {
-                if stdin.write_all(line.as_bytes()).await.is_err() || stdin.write_all(b"\n").await.is_err() {
+                if stdin.write_all(line.as_bytes()).await.is_err()
+                    || stdin.write_all(b"\n").await.is_err()
+                {
                     break;
                 }
                 let _ = stdin.flush().await;
@@ -95,17 +104,28 @@ impl Conn {
         let reader = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
                 if let Some(method) = msg.get("method").and_then(Value::as_str) {
-                    let fut = handler(method.to_string(), msg.get("params").cloned().unwrap_or(Value::Null));
+                    let fut = handler(
+                        method.to_string(),
+                        msg.get("params").cloned().unwrap_or(Value::Null),
+                    );
                     let (id, replies) = (msg.get("id").cloned(), replies.clone());
                     tokio::spawn(async move {
                         let result = fut.await;
-                        let (Some(id), Some(tx)) = (id, replies.upgrade()) else { return };
+                        let (Some(id), Some(tx)) = (id, replies.upgrade()) else {
+                            return;
+                        };
                         let reply = match result {
                             Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
                             Err(e) => {
-                                let code = if e.starts_with("unknown method") { -32601 } else { -32000 };
+                                let code = if e.starts_with("unknown method") {
+                                    -32601
+                                } else {
+                                    -32000
+                                };
                                 json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": e}})
                             }
                         };
@@ -114,7 +134,11 @@ impl Conn {
                 } else if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                     if let Some(waiter) = lock(&reader_pending).remove(&id) {
                         let result = match msg.get("error") {
-                            Some(e) => Err(e.get("message").and_then(Value::as_str).unwrap_or("error").to_string()),
+                            Some(e) => Err(e
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("error")
+                                .to_string()),
                             None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                         };
                         let _ = waiter.send(result);
@@ -162,15 +186,23 @@ impl Conn {
 
     fn send(&self, msg: Value) -> Result<(), String> {
         let tx = lock(&self.tx).clone().ok_or("the extension is closing")?;
-        tx.send(msg.to_string()).map_err(|_| "the extension is not running".to_string())
+        tx.send(msg.to_string())
+            .map_err(|_| "the extension is not running".to_string())
     }
 
     /// Send a request and wait up to `timeout` for its answer.
-    pub async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock(&self.pending).insert(id, tx);
-        if let Err(e) = self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})) {
+        if let Err(e) =
+            self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+        {
             lock(&self.pending).remove(&id);
             return Err(e);
         }

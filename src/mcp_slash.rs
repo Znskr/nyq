@@ -12,8 +12,16 @@ use crate::{config, mcp_cli, mcp_features, tools};
 
 /// Whether `cfg` connects without being asked: profile servers, and project
 /// servers the user trusted (unless a profile server has the same name).
-fn starts(servers: &[ServerConfig], trusted: &std::collections::HashSet<String>, cfg: &ServerConfig) -> bool {
-    let profile = |name: &str| servers.iter().any(|s| s.scope == Scope::Profile && s.name == name);
+fn starts(
+    servers: &[ServerConfig],
+    trusted: &std::collections::HashSet<String>,
+    cfg: &ServerConfig,
+) -> bool {
+    let profile = |name: &str| {
+        servers
+            .iter()
+            .any(|s| s.scope == Scope::Profile && s.name == name)
+    };
     cfg.scope == Scope::Profile || (trusted.contains(&cfg.name) && !profile(&cfg.name))
 }
 
@@ -54,7 +62,11 @@ pub async fn connect_profile_servers(
     }
     mcp.start_background(later, !quiet);
     if !quiet {
-        let project: Vec<_> = servers.iter().filter(|s| !starts(servers, &trusted, s)).map(|s| s.name.as_str()).collect();
+        let project: Vec<_> = servers
+            .iter()
+            .filter(|s| !starts(servers, &trusted, s))
+            .map(|s| s.name.as_str())
+            .collect();
         if !project.is_empty() {
             ui::info(&format!(
                 "Project MCP servers in .mcp.json: {} (connect with /mcp connect NAME, or trust with /mcp trust approve NAME)",
@@ -78,7 +90,11 @@ fn drop_server_tools(agent: &mut Agent, mcp: &McpManager, name: &str) {
     agent.tools.remove_prefix(&mcp::tool_prefix(name));
 }
 
-fn install_mcp_tools(agent: &mut Agent, name: &str, tools: Vec<Box<dyn tools::Tool>>) -> Result<()> {
+fn install_mcp_tools(
+    agent: &mut Agent,
+    name: &str,
+    tools: Vec<Box<dyn tools::Tool>>,
+) -> Result<()> {
     let mut added = Vec::new();
     for tool in tools {
         let n = tool.spec().name.clone();
@@ -114,7 +130,12 @@ pub async fn connect(mcp: &mut McpManager, agent: &mut Agent, cfg: &ServerConfig
 /// changed secret counts as a change).
 fn fingerprint(cfg: &ServerConfig) -> String {
     let transport = match &cfg.transport {
-        Transport::Stdio { command, args, env, cwd } => format!("stdio {command:?} {args:?} {env:?} {cwd:?}"),
+        Transport::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => format!("stdio {command:?} {args:?} {env:?} {cwd:?}"),
         Transport::Http { url, headers } => format!("http {url} {headers:?}"),
         Transport::Sse { url, headers } => format!("sse {url} {headers:?}"),
     };
@@ -166,7 +187,10 @@ pub async fn reload(mcp: &mut McpManager, agent: &mut Agent, servers: &mut Vec<S
 }
 
 fn find<'a>(servers: &'a [ServerConfig], name: &str) -> Result<&'a ServerConfig> {
-    servers.iter().find(|s| s.name == name).with_context(|| format!("no MCP server named `{name}`"))
+    servers
+        .iter()
+        .find(|s| s.name == name)
+        .with_context(|| format!("no MCP server named `{name}`"))
 }
 
 /// `/mcp add [--transport stdio|http] [--force] NAME COMMAND [ARGS…] | URL`.
@@ -190,13 +214,18 @@ fn parse_add(args: &[&str]) -> Result<(String, serde_json::Value, bool)> {
         }
         i += 1;
     }
-    let [name, target, rest @ ..] = &args[i..] else { bail!(USAGE) };
+    let [name, target, rest @ ..] = &args[i..] else {
+        bail!(USAGE)
+    };
     let url = http || target.starts_with("http://") || target.starts_with("https://");
     let entry = if url {
         anyhow::ensure!(rest.is_empty(), "an HTTP server takes only a URL; {USAGE}");
         mcp_cli::build_entry(Some(target), &[], None, &[], None, &[])?
     } else {
-        let command: Vec<String> = std::iter::once(*target).chain(rest.iter().copied()).map(String::from).collect();
+        let command: Vec<String> = std::iter::once(*target)
+            .chain(rest.iter().copied())
+            .map(String::from)
+            .collect();
         mcp_cli::build_entry(None, &[], None, &[], None, &command)?
     };
     Ok((name.to_string(), entry, force))
@@ -205,15 +234,23 @@ fn parse_add(args: &[&str]) -> Result<(String, serde_json::Value, bool)> {
 /// Lines for bare `/mcp` and `/mcp list`: each server's state and tools.
 fn list_lines(agent: &Agent, mcp: &McpManager, servers: &[ServerConfig]) -> Vec<String> {
     if servers.is_empty() {
-        return vec!["No MCP servers configured (/mcp add NAME COMMAND, or edit mcp.json or .mcp.json).".into()];
+        return vec![
+            "No MCP servers configured (/mcp add NAME COMMAND, or edit mcp.json or .mcp.json)."
+                .into(),
+        ];
     }
     let connected = mcp.connected();
     let mut lines = Vec::new();
     for s in servers {
-        let scope = if s.scope == Scope::Project { "project" } else { "profile" };
+        let scope = if s.scope == Scope::Project {
+            "project"
+        } else {
+            "profile"
+        };
         let state = match connected.iter().find(|(n, _)| n == &s.name) {
             Some((_, n)) => {
-                let (action, specific) = agent.permissions.server_default(&mcp::tool_prefix(&s.name));
+                let (action, specific) =
+                    agent.permissions.server_default(&mcp::tool_prefix(&s.name));
                 let more = if specific { " + tool rules" } else { "" };
                 format!("connected · {n} tools · {}{more}", action.as_str())
             }
@@ -321,8 +358,18 @@ mod tests {
     fn add_arguments_make_stdio_and_http_entries() {
         let (name, entry, force) = parse_add(&["fs", "npx", "-y", "server"]).unwrap();
         assert_eq!((name.as_str(), force), ("fs", false));
-        assert_eq!(entry, serde_json::json!({"command": "npx", "args": ["-y", "server"]}));
-        let (_, entry, force) = parse_add(&["--force", "--transport", "http", "wiki", "https://x.dev/mcp"]).unwrap();
+        assert_eq!(
+            entry,
+            serde_json::json!({"command": "npx", "args": ["-y", "server"]})
+        );
+        let (_, entry, force) = parse_add(&[
+            "--force",
+            "--transport",
+            "http",
+            "wiki",
+            "https://x.dev/mcp",
+        ])
+        .unwrap();
         assert!(force);
         assert_eq!(entry, serde_json::json!({"url": "https://x.dev/mcp"}));
         let (_, entry, _) = parse_add(&["wiki", "http://localhost:3000/mcp"]).unwrap();

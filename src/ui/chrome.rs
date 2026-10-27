@@ -50,7 +50,10 @@ pub fn fancy() -> bool {
 
 /// Apply the `ui_style` setting: `fancy`, else the classic look.
 pub fn set_style(style: &str) {
-    FANCY.store(style.trim().eq_ignore_ascii_case("fancy"), Ordering::Relaxed);
+    FANCY.store(
+        style.trim().eq_ignore_ascii_case("fancy"),
+        Ordering::Relaxed,
+    );
 }
 
 /// Render this test thread in the fancy or the classic look.
@@ -85,7 +88,9 @@ fn ascii_char(c: char) -> char {
         '─' | '━' | '╌' | '–' | '—' => '-',
         '│' | '┃' | '├' | '▌' | '▍' | '▎' | '▏' => '|',
         '└' => '`',
-        '╭' | '╮' | '╰' | '╯' | '┼' | '┬' | '┴' | '┤' | '┌' | '┐' | '┘' => '+',
+        '╭' | '╮' | '╰' | '╯' | '┼' | '┬' | '┴' | '┤' | '┌' | '┐' | '┘' => {
+            '+'
+        }
         '●' | '•' | '◆' | '◇' => '*',
         '·' => '-',
         '…' | '⋯' => '~',
@@ -191,10 +196,16 @@ pub fn tips(keys: &Keymap) -> Vec<(String, &'static str)> {
         (key(KeyAction::ModelMenu), "switches models"),
         (key(KeyAction::CycleEffort), "cycles the reasoning effort"),
         (Some("@".into()), "mentions a file, and $ runs a skill"),
-        (key(KeyAction::FollowUp), "queues a follow-up while nyq works"),
+        (
+            key(KeyAction::FollowUp),
+            "queues a follow-up while nyq works",
+        ),
         (Some("!".into()), "runs a shell command, like !git status"),
         (key(KeyAction::HistorySearch), "searches earlier prompts"),
-        (key(KeyAction::PasteImage), "pastes an image from the clipboard"),
+        (
+            key(KeyAction::PasteImage),
+            "pastes an image from the clipboard",
+        ),
     ]
     .into_iter()
     .filter_map(|(k, text)| Some((k?, text)))
@@ -209,7 +220,11 @@ pub fn banner(version: &str, f: &Footer, keys: &Keymap, width: usize, tip: usize
         return vec![classic_banner(version, keys)];
     }
     let version = format!("v{}", sanitize_text(version));
-    let mut facts: Vec<String> = [&f.model, &f.provider].iter().filter(|s| !s.is_empty()).map(|s| sanitize_text(s)).collect();
+    let mut facts: Vec<String> = [&f.model, &f.provider]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| sanitize_text(s))
+        .collect();
     if !f.cwd.is_empty() {
         facts.push(sanitize_text(&tilde(&f.cwd)));
     }
@@ -220,18 +235,37 @@ pub fn banner(version: &str, f: &Footer, keys: &Keymap, width: usize, tip: usize
     if wide && !theme::ascii() {
         // The text starts two columns right of the logo.
         let room = width.saturating_sub(LOGO[0].chars().count() + 2);
-        rows.push(format!("{}  {name} {}", gradient(LOGO[0]), paint(fg(GRAY), &truncate(&version, room.saturating_sub(4)))));
-        rows.push(format!("{}  {}", gradient(LOGO[1]), paint(fg(GRAY), &truncate(&facts, room))));
+        rows.push(format!(
+            "{}  {name} {}",
+            gradient(LOGO[0]),
+            paint(fg(GRAY), &truncate(&version, room.saturating_sub(4)))
+        ));
+        rows.push(format!(
+            "{}  {}",
+            gradient(LOGO[1]),
+            paint(fg(GRAY), &truncate(&facts, room))
+        ));
     } else {
         let lead = format!("{} ", paint(fg(ACCENT), "◆"));
-        let rest = if facts.is_empty() { version } else { format!("{version} · {facts}") };
+        let rest = if facts.is_empty() {
+            version
+        } else {
+            format!("{version} · {facts}")
+        };
         let room = width.saturating_sub(6).max(1);
-        rows.push(format!("{lead}{name} {}", paint(fg(GRAY), &truncate(&rest, room))));
+        rows.push(format!(
+            "{lead}{name} {}",
+            paint(fg(GRAY), &truncate(&rest, room))
+        ));
     }
     let tips = tips(keys);
     if wide && !tips.is_empty() {
         let (key, text) = &tips[tip % tips.len()];
-        let indent = if theme::ascii() { 2 } else { LOGO[0].chars().count() + 2 };
+        let indent = if theme::ascii() {
+            2
+        } else {
+            LOGO[0].chars().count() + 2
+        };
         let room = width.saturating_sub(indent + 5 + key.chars().count());
         rows.push(format!(
             "{}{} {} {}",
@@ -289,16 +323,35 @@ pub fn placeholder(busy: bool, keys: &Keymap) -> String {
 /// mark, accented while nyq waits for input and dimmed while it works. An
 /// empty input shows `placeholder`. Returns the rows and where the first
 /// text row and column are.
-pub fn input_box(lines: &[String], placeholder: Option<&str>, width: usize, busy: bool) -> (Vec<String>, usize, usize) {
-    let (border, prompt) = if busy { (fg(FAINT), fg(GRAY)) } else { (fg(GRAY), fg(ACCENT).bold()) };
+pub fn input_box(
+    lines: &[String],
+    placeholder: Option<&str>,
+    width: usize,
+    busy: bool,
+) -> (Vec<String>, usize, usize) {
+    let (border, prompt) = if busy {
+        (fg(FAINT), fg(GRAY))
+    } else {
+        (fg(GRAY), fg(ACCENT).bold())
+    };
     let inner = input_width(width);
     let text = |i: usize, l: &String| match placeholder {
         Some(p) if i == 0 && l.is_empty() => paint(fg(FAINT).italic(), &truncate(p, inner)),
         _ => l.clone(),
     };
-    let lead = |i: usize| if i == 0 { paint(prompt, if theme::ascii() { ">" } else { "›" }) } else { " ".into() };
+    let lead = |i: usize| {
+        if i == 0 {
+            paint(prompt, if theme::ascii() { ">" } else { "›" })
+        } else {
+            " ".into()
+        }
+    };
     if !boxed(width) {
-        let rows = lines.iter().enumerate().map(|(i, l)| format!("{} {}", lead(i), text(i, l))).collect();
+        let rows = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{} {}", lead(i), text(i, l)))
+            .collect();
         return (rows, 0, 2);
     }
     let edge = "─".repeat(width - 2);
@@ -306,7 +359,12 @@ pub fn input_box(lines: &[String], placeholder: Option<&str>, width: usize, busy
     for (i, l) in lines.iter().enumerate() {
         let t = text(i, l);
         let pad = " ".repeat(inner.saturating_sub(visible_width(&t)));
-        rows.push(format!("{} {} {t}{pad} {}", paint(border, "│"), lead(i), paint(border, "│")));
+        rows.push(format!(
+            "{} {} {t}{pad} {}",
+            paint(border, "│"),
+            lead(i),
+            paint(border, "│")
+        ));
     }
     rows.push(paint(border, &format!("╰{edge}╯")));
     (rows, 1, 4)
@@ -315,8 +373,16 @@ pub fn input_box(lines: &[String], placeholder: Option<&str>, width: usize, busy
 /// A context gauge: five cells filled by `used` (0 to 1).
 fn meter(used: f64, color: Color) -> String {
     let filled = ((used * 5.0).round() as usize).clamp(usize::from(used > 0.0), 5);
-    let (on, off) = if theme::ascii() { ("#", "-") } else { ("▰", "▱") };
-    format!("{}{}", paint(fg(color), &on.repeat(filled)), paint(fg(FAINT), &off.repeat(5 - filled)))
+    let (on, off) = if theme::ascii() {
+        ("#", "-")
+    } else {
+        ("▰", "▱")
+    };
+    format!(
+        "{}{}",
+        paint(fg(color), &on.repeat(filled)),
+        paint(fg(FAINT), &off.repeat(5 - filled))
+    )
 }
 
 /// One right-hand segment, colored by what it says.
@@ -342,9 +408,18 @@ fn segment(kind: Kind, text: &str) -> String {
             };
             paint(fg(color), &text)
         }
-        Kind::Sandbox => paint(fg(if text.starts_with("no sandbox") { YELLOW } else { GRAY }), &text),
+        Kind::Sandbox => paint(
+            fg(if text.starts_with("no sandbox") {
+                YELLOW
+            } else {
+                GRAY
+            }),
+            &text,
+        ),
         Kind::Branch => match text.split_once(' ').filter(|_| !theme::ascii()) {
-            Some((glyph, name)) => format!("{} {}", paint(fg(MAGENTA), glyph), paint(fg(GRAY), name)),
+            Some((glyph, name)) => {
+                format!("{} {}", paint(fg(MAGENTA), glyph), paint(fg(GRAY), name))
+            }
             None => paint(fg(GRAY), &text),
         },
         Kind::Title => paint(fg(GRAY), &text),
@@ -376,7 +451,12 @@ pub fn status_line(f: &Footer, width: usize, upgrade: &str) -> String {
             let mut parts = text.split(" · ");
             let effort = parts.next().unwrap_or_default();
             let model = parts.next().unwrap_or_default();
-            let mut out = format!("{}{}{}", paint(fg(MAGENTA), effort), sep(), paint(fg(MID), &sanitize_text(model)));
+            let mut out = format!(
+                "{}{}{}",
+                paint(fg(MAGENTA), effort),
+                sep(),
+                paint(fg(MID), &sanitize_text(model))
+            );
             for p in parts {
                 out.push_str(&sep());
                 out.push_str(&paint(fg(YELLOW), p));
@@ -388,21 +468,38 @@ pub fn status_line(f: &Footer, width: usize, upgrade: &str) -> String {
     if visible_width(&left) > width {
         return clip_width(&left, width);
     }
-    let room = if left.is_empty() { width } else { width.saturating_sub(visible_width(&left) + 4) };
+    let room = if left.is_empty() {
+        width
+    } else {
+        width.saturating_sub(visible_width(&left) + 4)
+    };
     let upgrade = if upgrade.is_empty() {
         String::new()
     } else {
-        let color = if upgrade.starts_with("upgrading") { GRAY } else { YELLOW };
+        let color = if upgrade.starts_with("upgrading") {
+            GRAY
+        } else {
+            YELLOW
+        };
         paint(fg(color), &truncate(upgrade, room))
     };
     let mut segs = statusline::segments(f, width);
     let joined = |segs: &[(Kind, String)]| {
-        let parts = std::iter::once(upgrade.clone()).filter(|u| !u.is_empty()).chain(segs.iter().map(|(k, t)| segment(*k, t)));
+        let parts = std::iter::once(upgrade.clone())
+            .filter(|u| !u.is_empty())
+            .chain(segs.iter().map(|(k, t)| segment(*k, t)));
         parts.collect::<Vec<_>>().join(&sep())
     };
     let mut right = joined(&segs);
     while visible_width(&right) > room {
-        let Some(i) = segs.iter().enumerate().min_by_key(|(_, (k, _))| drop_rank(*k)).map(|(i, _)| i) else { break };
+        let Some(i) = segs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (k, _))| drop_rank(*k))
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
         segs.remove(i);
         right = joined(&segs);
     }
@@ -423,13 +520,36 @@ pub fn status_line(f: &Footer, width: usize, upgrade: &str) -> String {
 /// The working line: spinner and `label` (painted), then `facts` (time,
 /// tokens, tool tally) and a glimpse of the reasoning (`detail`), with the
 /// interrupt key on the right when there is room.
-pub fn working_line(label: &str, facts: &[String], detail: &str, interrupt: Option<&str>, frame: usize, width: usize) -> String {
-    let hint = interrupt.map(|k| format!("{}{}", paint(fg(GRAY), k), paint(fg(FAINT), " to interrupt"))).unwrap_or_default();
+pub fn working_line(
+    label: &str,
+    facts: &[String],
+    detail: &str,
+    interrupt: Option<&str>,
+    frame: usize,
+    width: usize,
+) -> String {
+    let hint = interrupt
+        .map(|k| {
+            format!(
+                "{}{}",
+                paint(fg(GRAY), k),
+                paint(fg(FAINT), " to interrupt")
+            )
+        })
+        .unwrap_or_default();
     let mut line = format!("{} {label}", paint(fg(ACCENT), spinner(frame)));
     let facts = facts.join(" · ");
     let room = |line: &str, reserve: usize| width.saturating_sub(visible_width(line) + reserve);
-    let reserve = if hint.is_empty() { 0 } else { visible_width(&hint) + 2 };
-    let reserve = if room(&line, reserve) < 8 + facts.chars().count().min(12) { 0 } else { reserve };
+    let reserve = if hint.is_empty() {
+        0
+    } else {
+        visible_width(&hint) + 2
+    };
+    let reserve = if room(&line, reserve) < 8 + facts.chars().count().min(12) {
+        0
+    } else {
+        reserve
+    };
     if !facts.is_empty() {
         let facts = truncate(&facts, room(&line, reserve + 3));
         line.push_str(&sep());
@@ -453,10 +573,20 @@ pub fn fence_open(lang: &str) -> String {
     let lang = if lang.is_empty() { "code" } else { lang };
     if !fancy() {
         let rule = "─".repeat((RULE - 2).saturating_sub(lang.chars().count()));
-        return format!("{} {} {}", paint(fg(FAINT), "─"), paint(fg(GRAY), lang), paint(fg(FAINT), &rule));
+        return format!(
+            "{} {} {}",
+            paint(fg(FAINT), "─"),
+            paint(fg(GRAY), lang),
+            paint(fg(FAINT), &rule)
+        );
     }
     let rule = "─".repeat(RULE.saturating_sub(lang.chars().count() + 4).max(1));
-    format!("{}{} {}", paint(fg(FAINT), "╭─ "), paint(fg(GRAY).italic(), lang), paint(fg(FAINT), &rule))
+    format!(
+        "{}{} {}",
+        paint(fg(FAINT), "╭─ "),
+        paint(fg(GRAY).italic(), lang),
+        paint(fg(FAINT), &rule)
+    )
 }
 
 /// The row closing a fenced code block.
@@ -491,7 +621,9 @@ mod tests {
     fn has_color(s: &str) -> bool {
         s.split("\x1b[").skip(1).any(|esc| {
             let params = esc.split('m').next().unwrap_or("");
-            params.split(';').any(|p| matches!(p.parse::<u8>(), Ok(30..=49 | 90..=107)))
+            params
+                .split(';')
+                .any(|p| matches!(p.parse::<u8>(), Ok(30..=49 | 90..=107)))
         })
     }
 
@@ -503,15 +635,26 @@ mod tests {
         let plain: Vec<String> = rows.iter().map(|r| strip_ansi(r)).collect();
         assert_eq!(plain.len(), 3, "{plain:?}");
         assert_eq!(plain[0], format!("{}  nyq v0.5", LOGO[0]));
-        assert_eq!(plain[1], format!("{}  gpt-6-sol · openai · /work/nyq", LOGO[1]));
+        assert_eq!(
+            plain[1],
+            format!("{}  gpt-6-sol · openai · /work/nyq", LOGO[1])
+        );
         let (key, text) = &tips(&keys)[1];
         assert_eq!(plain[2], format!("{}tip {key} {text}", " ".repeat(13)));
-        assert!(rows[0].contains("\x1b[38;2;"), "a truecolor gradient: {:?}", rows[0]);
+        assert!(
+            rows[0].contains("\x1b[38;2;"),
+            "a truecolor gradient: {:?}",
+            rows[0]
+        );
         assert!(rows.iter().all(|r| visible_width(r) <= 110));
         // Without truecolor the logo is one accent color.
         theme::test_mode(false, false, false);
         let rows = banner("0.5", &footer(), &keys, 110, 0);
-        assert!(!rows[0].contains("\x1b[38;2;") && rows[0].contains("\x1b[38;5;"), "{:?}", rows[0]);
+        assert!(
+            !rows[0].contains("\x1b[38;2;") && rows[0].contains("\x1b[38;5;"),
+            "{:?}",
+            rows[0]
+        );
     }
 
     #[test]
@@ -522,7 +665,9 @@ mod tests {
         let plain = strip_ansi(&rows[0]);
         assert!(plain.starts_with("◆ nyq v0.5 · gpt-6-sol"), "{plain}");
         assert!(visible_width(&rows[0]) <= 50, "{plain}");
-        assert!(banner("0.5", &Footer::default(), &Keymap::default(), 8, 0).iter().all(|r| visible_width(r) <= 8));
+        assert!(banner("0.5", &Footer::default(), &Keymap::default(), 8, 0)
+            .iter()
+            .all(|r| visible_width(r) <= 8));
     }
 
     #[test]
@@ -530,8 +675,15 @@ mod tests {
         let (keys, warnings) = Keymap::parse("expand_tools = \"alt+t\"\nmodel_menu = []");
         assert!(warnings.is_empty(), "{warnings:?}");
         let tips = tips(&keys);
-        assert!(tips.iter().any(|(k, t)| k == "alt+t" && t.contains("transcript")), "{tips:?}");
-        assert!(!tips.iter().any(|(_, t)| t.contains("switches models")), "unbound keys drop their tip");
+        assert!(
+            tips.iter()
+                .any(|(k, t)| k == "alt+t" && t.contains("transcript")),
+            "{tips:?}"
+        );
+        assert!(
+            !tips.iter().any(|(_, t)| t.contains("switches models")),
+            "unbound keys drop their tip"
+        );
     }
 
     #[test]
@@ -541,16 +693,32 @@ mod tests {
         assert_eq!(rows.len(), 2, "no logo, but a tip: {rows:?}");
         let folded: Vec<String> = rows.iter().map(|r| strip_ansi(&fold(r))).collect();
         assert!(folded.iter().all(|r| r.is_ascii()), "{folded:?}");
-        assert!(folded[0].starts_with("* nyq v0.5 - gpt-6-sol"), "{folded:?}");
+        assert!(
+            folded[0].starts_with("* nyq v0.5 - gpt-6-sol"),
+            "{folded:?}"
+        );
         let (rows, _, _) = input_box(&[String::new()], Some("Ask"), 30, false);
         let rows: Vec<String> = rows.iter().map(|r| strip_ansi(&fold(r))).collect();
-        assert_eq!(rows, [format!("+{}+", "-".repeat(28)), format!("| > Ask{}|", " ".repeat(22)), format!("+{}+", "-".repeat(28))]);
+        assert_eq!(
+            rows,
+            [
+                format!("+{}+", "-".repeat(28)),
+                format!("| > Ask{}|", " ".repeat(22)),
+                format!("+{}+", "-".repeat(28))
+            ]
+        );
         let line = strip_ansi(&fold(&status_line(&footer(), 100, "")));
-        assert!(line.is_ascii() && line.contains("git:main") && line.contains("####- 75% of 200k"), "{line}");
+        assert!(
+            line.is_ascii() && line.contains("git:main") && line.contains("####- 75% of 200k"),
+            "{line}"
+        );
         assert_eq!(spinner(5), "/");
         assert_eq!(strip_ansi(&mark(Mark::Ok, 0)), "+");
         assert_eq!(fold("├ Read a…"), "| Read a~");
-        assert_eq!(visible_width(&fold("╭─ rust ⋯ ✓ ✗ ⎇ ▰▱")), visible_width("╭─ rust ⋯ ✓ ✗ ⎇ ▰▱"));
+        assert_eq!(
+            visible_width(&fold("╭─ rust ⋯ ✓ ✗ ⎇ ▰▱")),
+            visible_width("╭─ rust ⋯ ✓ ✗ ⎇ ▰▱")
+        );
         theme::test_mode(false, false, true);
         assert_eq!(fold("├ ✓"), "├ ✓", "UTF-8 locales keep their glyphs");
     }
@@ -562,7 +730,14 @@ mod tests {
         let mut rows = banner("0.5", &footer(), &keys, 110, 0);
         rows.extend(input_box(&["hi".into()], None, 40, false).0);
         rows.push(status_line(&footer(), 120, "update ready"));
-        rows.push(working_line("Working", &["3s".into()], "", Some("esc"), 0, 80));
+        rows.push(working_line(
+            "Working",
+            &["3s".into()],
+            "",
+            Some("esc"),
+            0,
+            80,
+        ));
         rows.push(mark(Mark::Failed, 0) + &note("+3 / -1") + &fence_open("rust"));
         for r in &rows {
             assert!(!has_color(r), "{r:?}");
@@ -575,14 +750,22 @@ mod tests {
     #[test]
     fn input_box_frames_text_and_placeholder() {
         theme::test_mode(false, false, true);
-        let (rows, row, col) = input_box(&[String::new()], Some("Ask anything · / for commands"), 24, false);
+        let (rows, row, col) = input_box(
+            &[String::new()],
+            Some("Ask anything · / for commands"),
+            24,
+            false,
+        );
         let plain: Vec<String> = rows.iter().map(|r| strip_ansi(r)).collect();
         assert_eq!(plain[1], "│ › Ask anything · / … │");
         assert_eq!((row, col, input_width(24)), (1, 4, 18));
         assert!(rows.iter().all(|r| visible_width(r) == 24), "{plain:?}");
         let (rows, _, _) = input_box(&["one".into(), "two".into()], Some("unused"), 20, true);
         let plain: Vec<String> = rows.iter().map(|r| strip_ansi(r)).collect();
-        assert_eq!(plain[1..3], ["│ › one            │", "│   two            │"]);
+        assert_eq!(
+            plain[1..3],
+            ["│ › one            │", "│   two            │"]
+        );
         // Narrow terminals get the prompt mark alone.
         let (rows, row, col) = input_box(&["x".into()], None, 10, false);
         assert_eq!((strip_ansi(&rows[0]), row, col), ("› x".into(), 0, 2));
@@ -601,7 +784,10 @@ mod tests {
         // Narrower: the title and token counts go first, the mode stays.
         let line = strip_ansi(&status_line(&f, 80, ""));
         assert!(visible_width(&line) <= 80, "{line}");
-        assert!(!line.contains("Fix the") && !line.contains("↑1.2k") && line.contains("auto"), "{line}");
+        assert!(
+            !line.contains("Fix the") && !line.contains("↑1.2k") && line.contains("auto"),
+            "{line}"
+        );
         let line = strip_ansi(&status_line(&f, 30, "update ready"));
         assert!(visible_width(&line) <= 30, "{line}");
         // Context fullness picks the gauge color.
@@ -617,9 +803,22 @@ mod tests {
         let facts = ["12s".to_string(), "↑1.5k ↓20".into(), "2 read".into()];
         let line = working_line("Working", &facts, "", Some("esc"), 3, 80);
         let plain = strip_ansi(&line);
-        assert!(plain.starts_with("⠸ Working · 12s · ↑1.5k ↓20 · 2 read"), "{plain}");
-        assert!(plain.ends_with("esc to interrupt") && visible_width(&line) == 80, "{plain}");
-        let narrow = working_line("Thinking", &facts, "about the parser", Some("ctrl+c"), 0, 30);
+        assert!(
+            plain.starts_with("⠸ Working · 12s · ↑1.5k ↓20 · 2 read"),
+            "{plain}"
+        );
+        assert!(
+            plain.ends_with("esc to interrupt") && visible_width(&line) == 80,
+            "{plain}"
+        );
+        let narrow = working_line(
+            "Thinking",
+            &facts,
+            "about the parser",
+            Some("ctrl+c"),
+            0,
+            30,
+        );
         assert!(visible_width(&narrow) <= 30, "{}", strip_ansi(&narrow));
         assert!(!strip_ansi(&working_line("Working", &[], "", None, 0, 40)).contains("interrupt"));
     }
@@ -634,7 +833,10 @@ mod tests {
         assert_eq!(strip_ansi(&note("+3 / -1")), "+3 -1");
         assert!(note("+3 / -1").contains(&fg(GREEN).paint("+3").to_string()));
         assert_eq!(strip_ansi(&note("12 lines")), "12 lines");
-        assert_eq!(strip_ansi(&fence_open("rust")), format!("╭─ rust {}", "─".repeat(RULE - 8)));
+        assert_eq!(
+            strip_ansi(&fence_open("rust")),
+            format!("╭─ rust {}", "─".repeat(RULE - 8))
+        );
         assert_eq!(strip_ansi(&fence_open("")).chars().count(), RULE);
         assert_eq!(strip_ansi(&fence_close()).chars().count(), RULE);
     }

@@ -149,7 +149,9 @@ fn load(home: &Path) -> Stored {
     let Ok(bytes) = std::fs::read(&path) else {
         return Stored::Unusable;
     };
-    parse_session(&bytes).map(Stored::Ready).unwrap_or(Stored::Unusable)
+    parse_session(&bytes)
+        .map(Stored::Ready)
+        .unwrap_or(Stored::Unusable)
 }
 
 fn parse_session(bytes: &[u8]) -> Result<Session> {
@@ -158,10 +160,15 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
     let session = Session {
         access_token: required_string(&value, "access_token")?,
         refresh_token: required_string(&value, "refresh_token")?,
-        expires_at_ms: value["expires_at_ms"].as_i64().context("invalid Grok sign-in")?,
+        expires_at_ms: value["expires_at_ms"]
+            .as_i64()
+            .context("invalid Grok sign-in")?,
         account_id: required_string(&value, "account_id")?,
     };
-    anyhow::ensure!(valid_account_id(&session.account_id), "invalid Grok sign-in");
+    anyhow::ensure!(
+        valid_account_id(&session.account_id),
+        "invalid Grok sign-in"
+    );
     Ok(session)
 }
 
@@ -174,7 +181,10 @@ fn required_string(value: &Value, key: &str) -> Result<String> {
 }
 
 fn encode_session(session: &Session) -> Result<Vec<u8>> {
-    anyhow::ensure!(valid_account_id(&session.account_id), "invalid Grok sign-in");
+    anyhow::ensure!(
+        valid_account_id(&session.account_id),
+        "invalid Grok sign-in"
+    );
     let mut bytes = serde_json::to_vec(&json!({
         "version": 1,
         "access_token": session.access_token,
@@ -208,7 +218,11 @@ fn loopback_http(url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(url) else {
         return false;
     };
-    if !url.scheme().eq_ignore_ascii_case("http") || !url.username().is_empty() || url.password().is_some() || url.port().is_none() {
+    if !url.scheme().eq_ignore_ascii_case("http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_none()
+    {
         return false;
     }
     matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
@@ -327,7 +341,8 @@ fn parse_callback(target: &str, expected_state: &str) -> Callback {
             None => Callback::Unrelated,
         };
     }
-    let (Some(code), Some(state)) = (query_param(query, "code"), query_param(query, "state")) else {
+    let (Some(code), Some(state)) = (query_param(query, "code"), query_param(query, "state"))
+    else {
         return Callback::Unrelated;
     };
     if state != expected_state {
@@ -340,7 +355,9 @@ fn parse_callback(target: &str, expected_state: &str) -> Callback {
 fn accept_manual(raw: &str) -> Result<String> {
     let code = raw.trim();
     anyhow::ensure!(
-        !code.is_empty() && code.len() <= MAX_CODE_BYTES && code.bytes().all(|b| (0x21..=0x7e).contains(&b)),
+        !code.is_empty()
+            && code.len() <= MAX_CODE_BYTES
+            && code.bytes().all(|b| (0x21..=0x7e).contains(&b)),
         "invalid Grok authorization code"
     );
     Ok(code.to_owned())
@@ -366,14 +383,23 @@ p{{margin:0;font-size:.875rem;opacity:.62}}\
 fn header_value<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
     raw.split("\r\n").find_map(|line| {
         let (key, value) = line.split_once(':')?;
-        key.eq_ignore_ascii_case(name).then(|| value.trim()).filter(|v| !v.is_empty())
+        key.eq_ignore_ascii_case(name)
+            .then(|| value.trim())
+            .filter(|v| !v.is_empty())
     })
 }
 
-async fn write_response(socket: &mut tokio::net::TcpStream, status: &str, cors: Option<&str>, body: &str) {
+async fn write_response(
+    socket: &mut tokio::net::TcpStream,
+    status: &str,
+    cors: Option<&str>,
+    body: &str,
+) {
     let mut head = format!("HTTP/1.1 {status}\r\n");
     if let Some(origin) = cors {
-        head.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"));
+        head.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"
+        ));
     }
     head.push_str(&format!(
         "Content-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -394,11 +420,17 @@ Content-Length: 0\r\nConnection: close\r\n\r\n"
     let _ = tokio::time::timeout(Duration::from_secs(5), socket.write_all(body.as_bytes())).await;
 }
 
-async fn read_headers(socket: &mut tokio::net::TcpStream, deadline: tokio::time::Instant) -> Option<Vec<u8>> {
+async fn read_headers(
+    socket: &mut tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 1024];
     let first = deadline.min(tokio::time::Instant::now() + Duration::from_millis(250));
-    let n = tokio::time::timeout_at(first, socket.read(&mut buf)).await.ok()?.ok()?;
+    let n = tokio::time::timeout_at(first, socket.read(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
     if n == 0 {
         return None;
     }
@@ -407,7 +439,10 @@ async fn read_headers(socket: &mut tokio::net::TcpStream, deadline: tokio::time:
         if bytes.len() > 16 * 1024 || tokio::time::Instant::now() >= deadline {
             return None;
         }
-        let n = tokio::time::timeout_at(deadline, socket.read(&mut buf)).await.ok()?.ok()?;
+        let n = tokio::time::timeout_at(deadline, socket.read(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
         if n == 0 {
             return None;
         }
@@ -416,7 +451,11 @@ async fn read_headers(socket: &mut tokio::net::TcpStream, deadline: tokio::time:
     Some(bytes)
 }
 
-async fn handle_connection(socket: &mut tokio::net::TcpStream, state: &str, deadline: tokio::time::Instant) -> Result<Step> {
+async fn handle_connection(
+    socket: &mut tokio::net::TcpStream,
+    state: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Step> {
     let Some(bytes) = read_headers(socket, deadline).await else {
         return Ok(Step::Continue);
     };
@@ -432,12 +471,24 @@ async fn handle_connection(socket: &mut tokio::net::TcpStream, state: &str, dead
         if cors.is_some() && requested.is_some_and(|m| m.eq_ignore_ascii_case("GET")) && callback {
             write_preflight(socket).await;
         } else {
-            write_response(socket, "404 Not Found", None, "<!doctype html><title>Not found</title>Not found.").await;
+            write_response(
+                socket,
+                "404 Not Found",
+                None,
+                "<!doctype html><title>Not found</title>Not found.",
+            )
+            .await;
         }
         return Ok(Step::Continue);
     }
     if !method.eq_ignore_ascii_case("GET") || (origin.is_some() && cors.is_none()) {
-        write_response(socket, "404 Not Found", None, "<!doctype html><title>Not found</title>Not found.").await;
+        write_response(
+            socket,
+            "404 Not Found",
+            None,
+            "<!doctype html><title>Not found</title>Not found.",
+        )
+        .await;
         return Ok(Step::Continue);
     }
     let cors = cors.map(|_| CORS_ORIGIN);
@@ -447,21 +498,42 @@ async fn handle_connection(socket: &mut tokio::net::TcpStream, state: &str, dead
                 socket,
                 "200 OK",
                 cors,
-                &callback_page("Authorization complete", "Returning you to nyq. You can close this tab."),
+                &callback_page(
+                    "Authorization complete",
+                    "Returning you to nyq. You can close this tab.",
+                ),
             )
             .await;
             Ok(Step::Code(code))
         }
         Callback::Unrelated => {
-            write_response(socket, "404 Not Found", cors, "<!doctype html><title>Not found</title>Not found.").await;
+            write_response(
+                socket,
+                "404 Not Found",
+                cors,
+                "<!doctype html><title>Not found</title>Not found.",
+            )
+            .await;
             Ok(Step::Continue)
         }
         Callback::StateMismatch => {
-            write_response(socket, "400 Bad Request", cors, &callback_page("Authorization failed", "Return to nyq for details.")).await;
+            write_response(
+                socket,
+                "400 Bad Request",
+                cors,
+                &callback_page("Authorization failed", "Return to nyq for details."),
+            )
+            .await;
             bail!("Grok sign-in state mismatch")
         }
         Callback::Denied => {
-            write_response(socket, "400 Bad Request", cors, &callback_page("Authorization failed", "Return to nyq for details.")).await;
+            write_response(
+                socket,
+                "400 Bad Request",
+                cors,
+                &callback_page("Authorization failed", "Return to nyq for details."),
+            )
+            .await;
             bail!("Grok sign-in was denied or failed")
         }
     }
@@ -484,22 +556,35 @@ async fn post_form(client: &reqwest::Client, url: &str, body: String) -> Result<
         .context("Grok token request")?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
-    anyhow::ensure!(status.is_success(), "Grok token request failed (HTTP {status})");
+    anyhow::ensure!(
+        status.is_success(),
+        "Grok token request failed (HTTP {status})"
+    );
     serde_json::from_str(&text).context("invalid Grok token response")
 }
 
 fn token_parts(value: &Value, require_refresh: bool) -> Result<(String, Option<String>, i64)> {
-    let access = value["access_token"].as_str().filter(|s| !s.is_empty()).context("invalid Grok token response")?.to_owned();
+    let access = value["access_token"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .context("invalid Grok token response")?
+        .to_owned();
     let refresh = match value.get("refresh_token") {
         Some(Value::String(token)) if !token.is_empty() => Some(token.clone()),
         None if !require_refresh => None,
         _ => bail!("invalid Grok token response"),
     };
-    let expires_in = value["expires_in"].as_i64().filter(|n| *n > 0).context("invalid Grok token response")?;
+    let expires_in = value["expires_in"]
+        .as_i64()
+        .filter(|n| *n > 0)
+        .context("invalid Grok token response")?;
     Ok((access, refresh, expires_in))
 }
 
-async fn fetch_account(client: &reqwest::Client, access_token: &str) -> Result<(String, Option<String>)> {
+async fn fetch_account(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<(String, Option<String>)> {
     let url = configured_url(USERINFO_URL_ENV, USERINFO_URL)?;
     let response = client
         .get(url)
@@ -509,13 +594,28 @@ async fn fetch_account(client: &reqwest::Client, access_token: &str) -> Result<(
         .await
         .context("Grok account lookup")?;
     let status = response.status();
-    anyhow::ensure!(status.is_success(), "Grok account lookup failed (HTTP {status})");
-    let value: Value = response.json().await.context("invalid Grok account response")?;
-    let account_id = value["sub"].as_str().filter(|id| valid_account_id(id)).context("invalid Grok account response")?.to_owned();
+    anyhow::ensure!(
+        status.is_success(),
+        "Grok account lookup failed (HTTP {status})"
+    );
+    let value: Value = response
+        .json()
+        .await
+        .context("invalid Grok account response")?;
+    let account_id = value["sub"]
+        .as_str()
+        .filter(|id| valid_account_id(id))
+        .context("invalid Grok account response")?
+        .to_owned();
     Ok((account_id, display_email(&value).map(str::to_owned)))
 }
 
-async fn exchange_code(client: &reqwest::Client, code: &str, verifier: &str, redirect: &str) -> Result<(Session, Option<String>)> {
+async fn exchange_code(
+    client: &reqwest::Client,
+    code: &str,
+    verifier: &str,
+    redirect: &str,
+) -> Result<(Session, Option<String>)> {
     let url = configured_url(TOKEN_URL_ENV, TOKEN_URL)?;
     let body = form(&[
         ("grant_type", "authorization_code"),
@@ -530,7 +630,9 @@ async fn exchange_code(client: &reqwest::Client, code: &str, verifier: &str, red
     let session = Session {
         access_token,
         refresh_token: refresh_token.context("invalid Grok token response")?,
-        expires_at_ms: chrono::Utc::now().timestamp_millis().saturating_add(expires_in.saturating_mul(1000)),
+        expires_at_ms: chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(expires_in.saturating_mul(1000)),
         account_id,
     };
     Ok((session, email))
@@ -548,11 +650,16 @@ async fn refresh_session(client: &reqwest::Client, session: &Session) -> Result<
         .context("refreshing the Grok sign-in failed; run `nyq login grok` if it keeps failing")?;
     let (access_token, refresh_token, expires_in) = token_parts(&value, false)?;
     let (account_id, _) = fetch_account(client, &access_token).await?;
-    anyhow::ensure!(account_id == session.account_id, "Grok account changed during refresh");
+    anyhow::ensure!(
+        account_id == session.account_id,
+        "Grok account changed during refresh"
+    );
     Ok(Session {
         access_token,
         refresh_token: refresh_token.unwrap_or_else(|| session.refresh_token.clone()),
-        expires_at_ms: chrono::Utc::now().timestamp_millis().saturating_add(expires_in.saturating_mul(1000)),
+        expires_at_ms: chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(expires_in.saturating_mul(1000)),
         account_id,
     })
 }
@@ -626,7 +733,13 @@ pub async fn login(
     }
 }
 
-async fn finish(home: &Path, client: &reqwest::Client, code: &str, verifier: &str, redirect: &str) -> Result<String> {
+async fn finish(
+    home: &Path,
+    client: &reqwest::Client,
+    code: &str,
+    verifier: &str,
+    redirect: &str,
+) -> Result<String> {
     let (session, email) = exchange_code(client, code, verifier, redirect).await?;
     save_session(home, &session)?;
     Ok(signed_in_message(email.as_deref()))
@@ -723,13 +836,19 @@ fn read_stdin_chunk(buf: &mut Vec<u8>, closed: &mut bool) -> Result<Option<Strin
         let chunk = &tmp[..n as usize];
         if let Some(i) = chunk.iter().position(|b| *b == b'\n') {
             buf.extend_from_slice(&chunk[..i]);
-            anyhow::ensure!(buf.len() <= MAX_CODE_BYTES, "Grok authorization code is too long");
+            anyhow::ensure!(
+                buf.len() <= MAX_CODE_BYTES,
+                "Grok authorization code is too long"
+            );
             let line = String::from_utf8_lossy(buf).into_owned();
             buf.clear();
             *closed = true;
             return Ok(Some(line));
         }
-        anyhow::ensure!(buf.len() + chunk.len() <= MAX_CODE_BYTES, "Grok authorization code is too long");
+        anyhow::ensure!(
+            buf.len() + chunk.len() <= MAX_CODE_BYTES,
+            "Grok authorization code is too long"
+        );
         buf.extend_from_slice(chunk);
         if (n as usize) < tmp.len() {
             return Ok(None);
@@ -844,7 +963,10 @@ impl GrokProvider {
     }
 
     async fn fetch(&self, session: &Session, url: &str, with_account: bool) -> Result<Fetched> {
-        anyhow::ensure!(valid_account_id(&session.account_id), "invalid Grok account");
+        anyhow::ensure!(
+            valid_account_id(&session.account_id),
+            "invalid Grok account"
+        );
         let mut request = self
             .client
             .get(url)
@@ -853,7 +975,9 @@ impl GrokProvider {
             .header("accept", "application/json")
             .header("user-agent", crate::config::USER_AGENT);
         if with_account {
-            request = request.header("X-XAI-Token-Auth", TOKEN_AUTH).header("x-userid", &session.account_id);
+            request = request
+                .header("X-XAI-Token-Auth", TOKEN_AUTH)
+                .header("x-userid", &session.account_id);
         }
         let response = request.send().await.context("listing Grok models")?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -861,9 +985,17 @@ impl GrokProvider {
         }
         let status = response.status();
         let bytes = response.bytes().await.context("listing Grok models")?;
-        anyhow::ensure!(bytes.len() <= MAX_CATALOG_BYTES, "Grok model catalog is too large");
-        anyhow::ensure!(status.is_success(), "Grok model list failed (HTTP {status})");
-        Ok(Fetched::Ok(String::from_utf8(bytes.to_vec()).context("invalid Grok model catalog")?))
+        anyhow::ensure!(
+            bytes.len() <= MAX_CATALOG_BYTES,
+            "Grok model catalog is too large"
+        );
+        anyhow::ensure!(
+            status.is_success(),
+            "Grok model list failed (HTTP {status})"
+        );
+        Ok(Fetched::Ok(
+            String::from_utf8(bytes.to_vec()).context("invalid Grok model catalog")?,
+        ))
     }
 
     fn request_body(&self, req: Request<'_>) -> Value {
@@ -873,7 +1005,10 @@ impl GrokProvider {
             &self.model,
             self.effort.as_deref(),
             req,
-            responses::Options { native_web_search: false, low_verbosity: true },
+            responses::Options {
+                native_web_search: false,
+                low_verbosity: true,
+            },
         );
         if empty_system {
             body["instructions"] = json!("You are a helpful assistant.");
@@ -897,7 +1032,8 @@ impl GrokProvider {
             return Ok(current);
         }
         if let Stored::Ready(fresh) = load(&self.home) {
-            let changed = fresh.access_token != current.access_token || fresh.refresh_token != current.refresh_token;
+            let changed = fresh.access_token != current.access_token
+                || fresh.refresh_token != current.refresh_token;
             if changed && token_usable(&fresh, rejected, now) {
                 *cached = Some(fresh.clone());
                 return Ok(fresh);
@@ -913,12 +1049,18 @@ impl GrokProvider {
         match load(&self.home) {
             Stored::Ready(session) => Ok(session),
             Stored::Missing => bail!("Grok subscription needs a sign-in: run `nyq login grok`"),
-            Stored::Unusable => bail!("Grok sign-in file is unusable (expected a private {}); run `nyq login grok`", AUTH_FILE),
+            Stored::Unusable => bail!(
+                "Grok sign-in file is unusable (expected a private {}); run `nyq login grok`",
+                AUTH_FILE
+            ),
         }
     }
 
     async fn send(&self, url: &str, body: &Value, session: &Session) -> Result<reqwest::Response> {
-        anyhow::ensure!(valid_account_id(&session.account_id), "invalid Grok account");
+        anyhow::ensure!(
+            valid_account_id(&session.account_id),
+            "invalid Grok account"
+        );
         let mut request = self
             .client
             .post(url)
@@ -959,11 +1101,20 @@ struct ListedModel {
 }
 
 fn parse_catalog(subscription: &str, modalities: &str) -> Result<Vec<ListedModel>> {
-    let subscription: Value = serde_json::from_str(subscription).context("invalid Grok model catalog")?;
-    let modalities: Value = serde_json::from_str(modalities).context("invalid Grok model catalog")?;
-    let data = subscription["data"].as_array().context("invalid Grok model catalog")?;
-    let modality_models = modalities["models"].as_array().context("invalid Grok model catalog")?;
-    anyhow::ensure!(data.len() <= MAX_MODELS && modality_models.len() <= MAX_MODELS, "invalid Grok model catalog");
+    let subscription: Value =
+        serde_json::from_str(subscription).context("invalid Grok model catalog")?;
+    let modalities: Value =
+        serde_json::from_str(modalities).context("invalid Grok model catalog")?;
+    let data = subscription["data"]
+        .as_array()
+        .context("invalid Grok model catalog")?;
+    let modality_models = modalities["models"]
+        .as_array()
+        .context("invalid Grok model catalog")?;
+    anyhow::ensure!(
+        data.len() <= MAX_MODELS && modality_models.len() <= MAX_MODELS,
+        "invalid Grok model catalog"
+    );
     let mut listed = Vec::new();
     for value in data {
         let object = value.as_object().context("invalid Grok model catalog")?;
@@ -977,9 +1128,15 @@ fn parse_catalog(subscription: &str, modalities: &str) -> Result<Vec<ListedModel
         if !string_array_contains(modality, "output_modalities", "text")? {
             continue;
         }
-        let supports = object.get("supports_reasoning_effort").and_then(Value::as_bool).context("invalid Grok model catalog")?;
+        let supports = object
+            .get("supports_reasoning_effort")
+            .and_then(Value::as_bool)
+            .context("invalid Grok model catalog")?;
         let efforts = reasoning_efforts(object.get("reasoning_efforts"))?;
-        anyhow::ensure!(supports == !efforts.is_empty(), "invalid Grok model catalog");
+        anyhow::ensure!(
+            supports == !efforts.is_empty(),
+            "invalid Grok model catalog"
+        );
         listed.push(ListedModel {
             id: id.to_owned(),
             context_window: positive_u32(object.get("context_window"))?,
@@ -992,7 +1149,11 @@ fn parse_catalog(subscription: &str, modalities: &str) -> Result<Vec<ListedModel
 }
 
 fn required_field<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str> {
-    object.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).context("invalid Grok model catalog")
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .context("invalid Grok model catalog")
 }
 
 fn find_modality<'a>(models: &'a [Value], id: &str) -> Result<&'a serde_json::Map<String, Value>> {
@@ -1007,8 +1168,15 @@ fn find_modality<'a>(models: &'a [Value], id: &str) -> Result<&'a serde_json::Ma
     bail!("invalid Grok model catalog")
 }
 
-fn string_array_contains(object: &serde_json::Map<String, Value>, key: &str, expected: &str) -> Result<bool> {
-    let items = object.get(key).and_then(Value::as_array).context("invalid Grok model catalog")?;
+fn string_array_contains(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    expected: &str,
+) -> Result<bool> {
+    let items = object
+        .get(key)
+        .and_then(Value::as_array)
+        .context("invalid Grok model catalog")?;
     anyhow::ensure!(items.len() <= 32, "invalid Grok model catalog");
     let mut found = false;
     for item in items {
@@ -1019,13 +1187,22 @@ fn string_array_contains(object: &serde_json::Map<String, Value>, key: &str, exp
 }
 
 fn reasoning_efforts(value: Option<&Value>) -> Result<Vec<String>> {
-    let items = value.and_then(Value::as_array).context("invalid Grok model catalog")?;
+    let items = value
+        .and_then(Value::as_array)
+        .context("invalid Grok model catalog")?;
     anyhow::ensure!(items.len() <= 16, "invalid Grok model catalog");
     let mut efforts = Vec::new();
     for item in items {
-        let raw = item.as_object().and_then(|o| o.get("value")).and_then(Value::as_str).context("invalid Grok model catalog")?;
+        let raw = item
+            .as_object()
+            .and_then(|o| o.get("value"))
+            .and_then(Value::as_str)
+            .context("invalid Grok model catalog")?;
         let effort = parse_effort(raw)?;
-        anyhow::ensure!(!efforts.iter().any(|existing| existing == &effort), "invalid Grok model catalog");
+        anyhow::ensure!(
+            !efforts.iter().any(|existing| existing == &effort),
+            "invalid Grok model catalog"
+        );
         efforts.push(effort);
     }
     Ok(efforts)
@@ -1038,7 +1215,9 @@ fn parse_effort(raw: &str) -> Result<String> {
             && !raw.eq_ignore_ascii_case("default")
             && !raw.is_empty()
             && raw.len() <= 64
-            && raw.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+            && raw
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
         "invalid Grok model catalog"
     );
     Ok(raw.to_owned())
@@ -1142,7 +1321,10 @@ mod tests {
                 "NYQ_PROVIDER",
                 "NYQ_BASE_URL",
             ];
-            let saved = keys.iter().map(|key| (*key, std::env::var_os(key))).collect();
+            let saved = keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
             for key in keys {
                 std::env::remove_var(key);
             }
@@ -1193,7 +1375,9 @@ mod tests {
         assert!(!valid_account_id(&"a".repeat(MAX_ACCOUNT_ID + 1)));
         let dir = tempfile::tempdir().unwrap();
         save_session(dir.path(), &sample(1234)).unwrap();
-        let Stored::Ready(loaded) = load(dir.path()) else { panic!("missing session") };
+        let Stored::Ready(loaded) = load(dir.path()) else {
+            panic!("missing session")
+        };
         assert_eq!(loaded.access_token, "access");
         assert_eq!(loaded.refresh_token, "refresh");
         assert_eq!(loaded.account_id, "acct_test");
@@ -1203,8 +1387,19 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(auth_path(dir.path())).unwrap().permissions().mode() & 0o777, 0o600);
-            std::fs::set_permissions(auth_path(dir.path()), std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                std::fs::metadata(auth_path(dir.path()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(
+                auth_path(dir.path()),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
             assert!(matches!(load(dir.path()), Stored::Unusable));
             assert!(!has_session(dir.path()));
         }
@@ -1221,7 +1416,12 @@ mod tests {
         assert!(!loopback_http("http://example.com:1234/token"));
         assert!(!loopback_http("http://127.0.0.1/token"));
         assert!(!loopback_http("http://user@127.0.0.1:1234/token"));
-        let url = authorization_url(ISSUER, "http://127.0.0.1:1455/callback", "challenge-value", "state-value");
+        let url = authorization_url(
+            ISSUER,
+            "http://127.0.0.1:1455/callback",
+            "challenge-value",
+            "state-value",
+        );
         assert!(url.starts_with("https://auth.x.ai/oauth2/authorize?"));
         assert!(!url.contains(' '));
         assert!(url.contains("%20"));
@@ -1238,19 +1438,45 @@ mod tests {
         assert_eq!(pairs["referrer"], PROXY_CLIENT_NAME);
         assert!(!PROXY_CLIENT_NAME.is_empty());
         let _env = TestEnv::new();
-        assert_eq!(configured_url(RESPONSES_URL_ENV, RESPONSES_URL).unwrap(), RESPONSES_URL);
-        assert_eq!(configured_url(MODELS_URL_ENV, MODELS_URL).unwrap(), MODELS_URL);
-        assert_eq!(configured_url(MODALITIES_URL_ENV, MODALITIES_URL).unwrap(), MODALITIES_URL);
+        assert_eq!(
+            configured_url(RESPONSES_URL_ENV, RESPONSES_URL).unwrap(),
+            RESPONSES_URL
+        );
+        assert_eq!(
+            configured_url(MODELS_URL_ENV, MODELS_URL).unwrap(),
+            MODELS_URL
+        );
+        assert_eq!(
+            configured_url(MODALITIES_URL_ENV, MODALITIES_URL).unwrap(),
+            MODALITIES_URL
+        );
     }
 
     #[test]
     fn callback_and_manual_code_rules() {
-        assert!(matches!(parse_callback("/callback?code=auth%20code&state=expected", "expected"), Callback::Code(code) if code == "auth code"));
-        assert!(matches!(parse_callback("/callback?code=auth&state=other", "expected"), Callback::StateMismatch));
-        assert!(matches!(parse_callback("/callback?error=access_denied&state=expected", "expected"), Callback::Denied));
-        assert!(matches!(parse_callback("/callback?error=access_denied&state=other", "expected"), Callback::StateMismatch));
-        assert!(matches!(parse_callback("/other?code=auth&state=expected", "expected"), Callback::Unrelated));
-        assert!(matches!(parse_callback("/callback?code=auth&state=expected#x", "expected"), Callback::Unrelated));
+        assert!(
+            matches!(parse_callback("/callback?code=auth%20code&state=expected", "expected"), Callback::Code(code) if code == "auth code")
+        );
+        assert!(matches!(
+            parse_callback("/callback?code=auth&state=other", "expected"),
+            Callback::StateMismatch
+        ));
+        assert!(matches!(
+            parse_callback("/callback?error=access_denied&state=expected", "expected"),
+            Callback::Denied
+        ));
+        assert!(matches!(
+            parse_callback("/callback?error=access_denied&state=other", "expected"),
+            Callback::StateMismatch
+        ));
+        assert!(matches!(
+            parse_callback("/other?code=auth&state=expected", "expected"),
+            Callback::Unrelated
+        ));
+        assert!(matches!(
+            parse_callback("/callback?code=auth&state=expected#x", "expected"),
+            Callback::Unrelated
+        ));
         assert_eq!(accept_manual("  code-1 \n").unwrap(), "code-1");
         assert!(accept_manual("").is_err());
         assert!(accept_manual("has space").is_err());
@@ -1295,7 +1521,12 @@ mod tests {
         let exact_modalities = format!(
             r#"{{"models":[{{"id":"{exact_id}","input_modalities":["text"],"output_modalities":["text"]}}]}}"#
         );
-        assert_eq!(parse_catalog(&exact, &exact_modalities).unwrap()[0].id.len(), MAX_MODEL_ID);
+        assert_eq!(
+            parse_catalog(&exact, &exact_modalities).unwrap()[0]
+                .id
+                .len(),
+            MAX_MODEL_ID
+        );
         let long_id = "g".repeat(MAX_MODEL_ID + 1);
         let long = format!(
             r#"{{"data":[{{"model":"{long_id}","api_backend":"responses","context_window":1000,"supports_reasoning_effort":false,"reasoning_efforts":[]}}]}}"#
@@ -1310,17 +1541,26 @@ mod tests {
 
     #[test]
     fn review_body_requires_the_decision_tool() {
-        let provider = GrokProvider::new(PathBuf::from("."), "grok-4.20".into(), Some("high".into()));
+        let provider =
+            GrokProvider::new(PathBuf::from("."), "grok-4.20".into(), Some("high".into()));
         let spec = crate::classifier::tool_spec();
         let items = [crate::types::Item::user("Review the pending action.")];
-        let body = provider.request_body(Request { system: "Be concise.", items: &items, tools: &[spec] });
+        let body = provider.request_body(Request {
+            system: "Be concise.",
+            items: &items,
+            tools: &[spec],
+        });
         assert_eq!(body["model"], "grok-4.20");
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["max_output_tokens"], 2048);
         assert_eq!(body["reasoning"]["effort"], "high");
         assert!(body.get("service_tier").is_none());
         assert_eq!(body["instructions"], "Be concise.");
-        let empty = provider.request_body(Request { system: "", items: &[], tools: &[] });
+        let empty = provider.request_body(Request {
+            system: "",
+            items: &[],
+            tools: &[],
+        });
         assert_eq!(empty["instructions"], "You are a helpful assistant.");
         assert_eq!(empty["tool_choice"], "auto");
         assert!(empty.get("service_tier").is_none());
@@ -1348,14 +1588,19 @@ mod tests {
             |_| {},
             move |url| {
                 let url = reqwest::Url::parse(url).unwrap();
-                let pairs: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+                let pairs: std::collections::BTreeMap<_, _> =
+                    url.query_pairs().into_owned().collect();
                 *challenge2.lock().unwrap() = pairs["code_challenge"].clone();
                 let redirect = pairs["redirect_uri"].clone();
                 let state = pairs["state"].clone();
                 let origin = redirect.trim_end_matches("/callback").to_owned();
                 let handle = tokio::spawn(async move {
                     let client = crate::http::client();
-                    let favicon = client.get(format!("{origin}/favicon.ico")).send().await.unwrap();
+                    let favicon = client
+                        .get(format!("{origin}/favicon.ico"))
+                        .send()
+                        .await
+                        .unwrap();
                     assert_eq!(favicon.status(), 404);
                     let preflight = client
                         .request(reqwest::Method::OPTIONS, format!("{origin}/callback"))
@@ -1367,10 +1612,21 @@ mod tests {
                         .unwrap();
                     assert_eq!(preflight.status(), 204);
                     let headers = preflight.headers().clone();
-                    assert_eq!(headers.get("access-control-allow-origin").unwrap(), CORS_ORIGIN);
-                    assert_eq!(headers.get("access-control-allow-private-network").unwrap(), "true");
+                    assert_eq!(
+                        headers.get("access-control-allow-origin").unwrap(),
+                        CORS_ORIGIN
+                    );
+                    assert_eq!(
+                        headers.get("access-control-allow-private-network").unwrap(),
+                        "true"
+                    );
                     let callback = format!("{redirect}?code=auth-code&state={state}");
-                    let response = client.get(callback).header("origin", CORS_ORIGIN).send().await.unwrap();
+                    let response = client
+                        .get(callback)
+                        .header("origin", CORS_ORIGIN)
+                        .send()
+                        .await
+                        .unwrap();
                     assert_eq!(response.status(), 200);
                     let html = response.text().await.unwrap();
                     assert!(html.contains("<h1>Authorization complete</h1>"));
@@ -1388,19 +1644,29 @@ mod tests {
         let token = requests.recv().await.unwrap();
         let userinfo = requests.recv().await.unwrap();
         task.await.unwrap();
-        let form = reqwest::Url::parse(&format!("http://localhost/?{}", token.split("\r\n\r\n").nth(1).unwrap())).unwrap();
+        let form = reqwest::Url::parse(&format!(
+            "http://localhost/?{}",
+            token.split("\r\n\r\n").nth(1).unwrap()
+        ))
+        .unwrap();
         let fields: std::collections::BTreeMap<_, _> = form.query_pairs().into_owned().collect();
         assert_eq!(fields["grant_type"], "authorization_code");
         assert_eq!(fields["client_id"], CLIENT_ID);
         assert_eq!(fields["code"], "auth-code");
         assert!(fields["redirect_uri"].starts_with("http://127.0.0.1:"));
         assert!(fields["redirect_uri"].ends_with("/callback"));
-        assert_eq!(*challenge.lock().unwrap(), pkce_challenge(&fields["code_verifier"]));
-        assert!(token.to_ascii_lowercase().contains("application/x-www-form-urlencoded"));
+        assert_eq!(
+            *challenge.lock().unwrap(),
+            pkce_challenge(&fields["code_verifier"])
+        );
+        assert!(token
+            .to_ascii_lowercase()
+            .contains("application/x-www-form-urlencoded"));
         let userinfo = userinfo.to_ascii_lowercase();
         assert!(userinfo.starts_with("get /oauth2/userinfo "));
         assert!(userinfo.contains(&format!("authorization: bearer {access}")));
-        let saved: Value = serde_json::from_slice(&std::fs::read(auth_path(dir.path())).unwrap()).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(auth_path(dir.path())).unwrap()).unwrap();
         assert_eq!(saved["version"], 1);
         assert_eq!(saved["access_token"], access);
         assert_eq!(saved["refresh_token"], "refresh-token");
@@ -1412,7 +1678,10 @@ mod tests {
     async fn pasted_code_skips_the_browser_and_mismatch_fails() {
         let mut env = TestEnv::new();
         let (base, mut requests, task) = server(vec![
-            (200, json!({"access_token": "a", "refresh_token": "r", "expires_in": 10}).to_string()),
+            (
+                200,
+                json!({"access_token": "a", "refresh_token": "r", "expires_in": 10}).to_string(),
+            ),
             (200, json!({"sub": "acct_paste"}).to_string()),
         ])
         .await;
@@ -1445,12 +1714,19 @@ mod tests {
             |_| {},
             move |url| {
                 let url = reqwest::Url::parse(url).unwrap();
-                let pairs: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+                let pairs: std::collections::BTreeMap<_, _> =
+                    url.query_pairs().into_owned().collect();
                 let redirect = pairs["redirect_uri"].clone();
                 let handle = tokio::spawn(async move {
-                    let response = reqwest::get(format!("{redirect}?code=x&state=nope")).await.unwrap();
+                    let response = reqwest::get(format!("{redirect}?code=x&state=nope"))
+                        .await
+                        .unwrap();
                     assert_eq!(response.status(), 400);
-                    assert!(response.text().await.unwrap().contains("Authorization failed"));
+                    assert!(response
+                        .text()
+                        .await
+                        .unwrap()
+                        .contains("Authorization failed"));
                 });
                 *slot2.lock().unwrap() = Some(handle);
             },
@@ -1465,10 +1741,14 @@ mod tests {
     #[tokio::test]
     async fn logout_revokes_then_deletes() {
         let mut env = TestEnv::new();
-        let (base, mut requests, task) = server(vec![(200, String::new()), (500, "no".into())]).await;
+        let (base, mut requests, task) =
+            server(vec![(200, String::new()), (500, "no".into())]).await;
         env.set(REVOKE_URL_ENV, &format!("{base}/revoke"));
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(logout(dir.path()).await.unwrap(), "No Grok sign-in stored by nyq.");
+        assert_eq!(
+            logout(dir.path()).await.unwrap(),
+            "No Grok sign-in stored by nyq."
+        );
         save_session(dir.path(), &sample(1234)).unwrap();
         assert_eq!(logout(dir.path()).await.unwrap(), "Signed out of Grok.");
         let request = requests.recv().await.unwrap();
@@ -1492,7 +1772,10 @@ mod tests {
         ]);
         let (base, mut requests, task) = server(vec![
             (401, String::new()),
-            (200, json!({"access_token": "new-access", "expires_in": 3600}).to_string()),
+            (
+                200,
+                json!({"access_token": "new-access", "expires_in": 3600}).to_string(),
+            ),
             (200, json!({"sub": "acct_test"}).to_string()),
             (200, sse_body),
         ])
@@ -1505,25 +1788,49 @@ mod tests {
         session.access_token = "old-access".into();
         session.refresh_token = "keep-refresh".into();
         save_session(dir.path(), &session).unwrap();
-        let mut provider = GrokProvider::new(dir.path().to_path_buf(), "grok-4".into(), Some("medium".into()));
+        let mut provider = GrokProvider::new(
+            dir.path().to_path_buf(),
+            "grok-4".into(),
+            Some("medium".into()),
+        );
         provider.set_conversation("conv-1");
-        let response = provider.stream(Request { system: "sys", items: &[], tools: &[] }, &mut |_| {}).await.unwrap();
-        assert_eq!(response.items, vec![crate::types::Item::Assistant { text: "hi".into() }]);
+        let response = provider
+            .stream(
+                Request {
+                    system: "sys",
+                    items: &[],
+                    tools: &[],
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.items,
+            vec![crate::types::Item::Assistant { text: "hi".into() }]
+        );
         let denied = requests.recv().await.unwrap();
         let refresh = requests.recv().await.unwrap();
         let _userinfo = requests.recv().await.unwrap();
         let ok = requests.recv().await.unwrap();
         task.await.unwrap();
-        assert!(denied.to_ascii_lowercase().starts_with("post /v1/responses "));
+        assert!(denied
+            .to_ascii_lowercase()
+            .starts_with("post /v1/responses "));
         assert!(refresh.contains("grant_type=refresh_token"));
         assert!(refresh.contains("refresh_token=keep-refresh"));
-        assert!(refresh.to_ascii_lowercase().contains("application/x-www-form-urlencoded"));
+        assert!(refresh
+            .to_ascii_lowercase()
+            .contains("application/x-www-form-urlencoded"));
         let ok_l = ok.to_ascii_lowercase();
         assert!(ok_l.contains("authorization: bearer new-access"));
         assert!(ok_l.contains("x-xai-token-auth: xai-grok-cli"));
         assert!(ok_l.contains("x-authenticateresponse: authenticate-response"));
         assert!(ok_l.contains("x-grok-client-version: 1.0.6"));
-        assert!(ok_l.contains(&format!("x-grok-client-identifier: {}", PROXY_CLIENT_NAME.to_ascii_lowercase())));
+        assert!(ok_l.contains(&format!(
+            "x-grok-client-identifier: {}",
+            PROXY_CLIENT_NAME.to_ascii_lowercase()
+        )));
         assert!(ok_l.contains("x-grok-model-override: grok-4"));
         assert!(ok_l.contains("x-grok-user-id: acct_test"));
         assert!(ok_l.contains("x-grok-conv-id: conv-1"));
@@ -1531,7 +1838,8 @@ mod tests {
         assert_eq!(sent["model"], "grok-4");
         assert_eq!(sent["reasoning"]["effort"], "medium");
         assert!(sent.get("service_tier").is_none());
-        let saved: Value = serde_json::from_slice(&std::fs::read(auth_path(dir.path())).unwrap()).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(auth_path(dir.path())).unwrap()).unwrap();
         assert_eq!(saved["access_token"], "new-access");
         assert_eq!(saved["refresh_token"], "keep-refresh");
         assert_eq!(saved["account_id"], "acct_test");
@@ -1554,14 +1862,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         save_session(dir.path(), &sample(0)).unwrap();
         let provider = GrokProvider::new(dir.path().to_path_buf(), DEFAULT_MODEL.into(), None);
-        let err = provider.stream(Request { system: "s", items: &[], tools: &[] }, &mut |_| {}).await.unwrap_err();
+        let err = provider
+            .stream(
+                Request {
+                    system: "s",
+                    items: &[],
+                    tools: &[],
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("account changed"));
-        let saved: Value = serde_json::from_slice(&std::fs::read(auth_path(dir.path())).unwrap()).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(auth_path(dir.path())).unwrap()).unwrap();
         assert_eq!(saved["access_token"], "access");
         let _ = requests.recv().await;
         let _ = requests.recv().await;
 
-        save_session(dir.path(), &sample(chrono::Utc::now().timestamp_millis() + 3_600_000)).unwrap();
+        save_session(
+            dir.path(),
+            &sample(chrono::Utc::now().timestamp_millis() + 3_600_000),
+        )
+        .unwrap();
         let provider = GrokProvider::new(dir.path().to_path_buf(), DEFAULT_MODEL.into(), None);
         let choice = provider.list_models().await.unwrap();
         assert_eq!(choice.len(), 1);
@@ -1594,8 +1917,21 @@ mod tests {
             Some("low".into()),
         )
         .unwrap();
-        assert_eq!((built.name(), built.model(), built.effort(), built.context_window()), ("grok", "current-a", Some("low"), Some(500_123)));
+        assert_eq!(
+            (
+                built.name(),
+                built.model(),
+                built.effort(),
+                built.context_window()
+            ),
+            ("grok", "current-a", Some("low"), Some(500_123))
+        );
         assert_eq!(built.efforts(), ["high".to_string(), "low".to_string()]);
-        assert_eq!(crate::config::provider(dir.path(), Some("grok"), None).unwrap().model(), DEFAULT_MODEL);
+        assert_eq!(
+            crate::config::provider(dir.path(), Some("grok"), None)
+                .unwrap()
+                .model(),
+            DEFAULT_MODEL
+        );
     }
 }

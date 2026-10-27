@@ -182,7 +182,10 @@ mod tests {
             redact("clone https://x-access-token:hunter2@github.com/o/r.git"),
             "clone https://[redacted]@github.com/o/r.git"
         );
-        assert_eq!(redact("https://example.com:8443/v1"), "https://example.com:8443/v1");
+        assert_eq!(
+            redact("https://example.com:8443/v1"),
+            "https://example.com:8443/v1"
+        );
     }
 
     #[test]

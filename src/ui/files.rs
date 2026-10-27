@@ -38,7 +38,11 @@ fn score(path: &str, query: &str) -> Option<i64> {
             want.next();
             score += 1
                 + if prev_hit { 5 } else { 0 }
-                + if matches!(prev, '/' | '_' | '-' | '.' | ' ') { 3 } else { 0 }
+                + if matches!(prev, '/' | '_' | '-' | '.' | ' ') {
+                    3
+                } else {
+                    0
+                }
                 + if i >= name_start { 2 } else { 0 };
         }
         prev_hit = hit;
@@ -53,8 +57,15 @@ pub fn matches(files: &[String], query: &str, limit: usize) -> Vec<String> {
         .iter()
         .filter_map(|f| score(f, query).map(|s| (s, f)))
         .collect();
-    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(b.1)));
-    hits.into_iter().take(limit).map(|(_, f)| f.clone()).collect()
+    hits.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.len().cmp(&b.1.len()))
+            .then(a.1.cmp(b.1))
+    });
+    hits.into_iter()
+        .take(limit)
+        .map(|(_, f)| f.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -65,7 +76,14 @@ mod tests {
     fn indexes_and_ranks_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        for f in ["src/main.rs", "src/ui/editor.rs", "README.md", ".git/config", "target/x.rs", ".gitignore"] {
+        for f in [
+            "src/main.rs",
+            "src/ui/editor.rs",
+            "README.md",
+            ".git/config",
+            "target/x.rs",
+            ".gitignore",
+        ] {
             std::fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
             std::fs::write(root.join(f), "").unwrap();
         }
@@ -73,7 +91,10 @@ mod tests {
         // Ignore files apply inside a git repository.
         std::fs::create_dir_all(root.join(".git/info")).unwrap();
         let files = index(root);
-        assert_eq!(files, [".gitignore", "README.md", "src/main.rs", "src/ui/editor.rs"]);
+        assert_eq!(
+            files,
+            [".gitignore", "README.md", "src/main.rs", "src/ui/editor.rs"]
+        );
         assert_eq!(matches(&files, "edit", 8), ["src/ui/editor.rs"]);
         assert_eq!(matches(&files, "MAIN", 8), ["src/main.rs"]);
         assert_eq!(matches(&files, "sr", 8)[0], "src/main.rs");

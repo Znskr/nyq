@@ -45,7 +45,12 @@ pub const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1";
 pub const ANTHROPIC_AUTH_TOKEN: &str = "ANTHROPIC_AUTH_TOKEN";
 
 impl Service {
-    pub const ALL: [Service; 4] = [Service::OpencodeGo, Service::Opencode, Service::Xai, Service::Anthropic];
+    pub const ALL: [Service; 4] = [
+        Service::OpencodeGo,
+        Service::Opencode,
+        Service::Xai,
+        Service::Anthropic,
+    ];
 
     /// Provider id, as used by `--provider`, the switcher tab and models.dev.
     pub fn id(self) -> &'static str {
@@ -92,7 +97,9 @@ impl Service {
             Service::OpencodeGo => "glm-5.3".into(),
             Service::Opencode => "claude-sonnet-5-5".into(),
             Service::Xai => "grok-4.7".into(),
-            Service::Anthropic => env("ANTHROPIC_MODEL").unwrap_or_else(|| "claude-opus-5-5".into()),
+            Service::Anthropic => {
+                env("ANTHROPIC_MODEL").unwrap_or_else(|| "claude-opus-5-5".into())
+            }
         }
     }
 
@@ -121,7 +128,10 @@ impl Service {
             return self.id();
         }
         let base = self.base_url();
-        let host = reqwest::Url::parse(&base).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
+        let host = reqwest::Url::parse(&base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
         let is = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
         if is("deepseek.com") {
             "deepseek"
@@ -144,7 +154,10 @@ impl Service {
 }
 
 fn env(var: &str) -> Option<String> {
-    std::env::var(var).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
 }
 
 /// A Messages API base ending in `/v1`: SDK-style bases
@@ -152,7 +165,10 @@ fn env(var: &str) -> Option<String> {
 /// `…/v1/messages` loses the endpoint.
 pub fn anthropic_base(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
-    let url = url.strip_suffix("/messages").unwrap_or(url).trim_end_matches('/');
+    let url = url
+        .strip_suffix("/messages")
+        .unwrap_or(url)
+        .trim_end_matches('/');
     if url.ends_with("/v1") {
         url.to_owned()
     } else {
@@ -180,7 +196,11 @@ fn opencode_auth_files() -> Vec<PathBuf> {
 
 fn read_key(path: &Path, id: &str) -> Option<String> {
     let v: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    v[id]["key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned)
+    v[id]["key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned)
 }
 
 /// The API key for `service`, or None when it is not configured.
@@ -194,7 +214,10 @@ pub fn api_key(home: &Path, service: Service) -> Option<String> {
         }
     }
     if service.is_opencode() {
-        if let Some(key) = opencode_auth_files().iter().find_map(|f| read_key(f, service.id())) {
+        if let Some(key) = opencode_auth_files()
+            .iter()
+            .find_map(|f| read_key(f, service.id()))
+        {
             return Some(key);
         }
     }
@@ -210,7 +233,11 @@ pub fn key_source(home: &Path, service: Service) -> Option<String> {
     if bearer(service) {
         return Some(ANTHROPIC_AUTH_TOKEN.into());
     }
-    if service.is_opencode() && opencode_auth_files().iter().any(|f| read_key(f, service.id()).is_some()) {
+    if service.is_opencode()
+        && opencode_auth_files()
+            .iter()
+            .any(|f| read_key(f, service.id()).is_some())
+    {
         return Some("OpenCode CLI login".into());
     }
     read_key(&own_auth(home), service.id()).map(|_| "stored by nyq".into())
@@ -219,7 +246,9 @@ pub fn key_source(home: &Path, service: Service) -> Option<String> {
 /// Whether [`api_key`] is a bearer token (`ANTHROPIC_AUTH_TOKEN`, used when
 /// `ANTHROPIC_API_KEY` is unset) rather than an `x-api-key` key.
 pub fn bearer(service: Service) -> bool {
-    service == Service::Anthropic && env(service.key_env()).is_none() && env(ANTHROPIC_AUTH_TOKEN).is_some()
+    service == Service::Anthropic
+        && env(service.key_env()).is_none()
+        && env(ANTHROPIC_AUTH_TOKEN).is_some()
 }
 
 pub(crate) fn read_own(home: &Path) -> Result<serde_json::Map<String, Value>> {
@@ -257,7 +286,9 @@ pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck 
         .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
         .timeout(std::time::Duration::from_secs(10));
     let request = match service {
-        Service::Anthropic => request.header("x-api-key", key.trim()).header("anthropic-version", anthropic::VERSION),
+        Service::Anthropic => request
+            .header("x-api-key", key.trim())
+            .header("anthropic-version", anthropic::VERSION),
         _ => request.bearer_auth(key.trim()),
     };
     let response = match request.send().await {
@@ -300,7 +331,14 @@ pub struct HostedProvider {
 }
 
 impl HostedProvider {
-    pub fn new(service: Service, base_url: String, api_key: String, model: String, effort: Option<String>, models: Arc<Models>) -> Self {
+    pub fn new(
+        service: Service,
+        base_url: String,
+        api_key: String,
+        model: String,
+        effort: Option<String>,
+        models: Arc<Models>,
+    ) -> Self {
         Self {
             service,
             base_url,
@@ -315,7 +353,12 @@ impl HostedProvider {
     }
 
     /// Build from the environment and profile: key, base URL, models.dev data.
-    pub fn configured(home: &Path, service: Service, model: String, effort: Option<String>) -> Result<Self> {
+    pub fn configured(
+        home: &Path,
+        service: Service,
+        model: String,
+        effort: Option<String>,
+    ) -> Result<Self> {
         let key = api_key(home, service).with_context(|| match service {
             Service::Anthropic => format!(
                 "the Anthropic API needs an API key: set ANTHROPIC_API_KEY (or {ANTHROPIC_AUTH_TOKEN} for a bearer token) or run `nyq login anthropic`"
@@ -324,7 +367,14 @@ impl HostedProvider {
         })?;
         let catalog = service.catalog_id();
         let models = crate::catalog::load(home, catalog);
-        let mut provider = Self::new(service, service.base_url(), key, model, effort, Arc::new(models));
+        let mut provider = Self::new(
+            service,
+            service.base_url(),
+            key,
+            model,
+            effort,
+            Arc::new(models),
+        );
         provider.bearer = bearer(service);
         provider.catalog = catalog.into();
         Ok(provider)
@@ -336,7 +386,9 @@ impl HostedProvider {
 
     /// What the Models API said about the current model (Anthropic only).
     fn info(&self) -> Option<anthropic::ModelInfo> {
-        (self.service == Service::Anthropic).then(|| anthropic::known(&self.base_url, &self.model).flatten()).flatten()
+        (self.service == Service::Anthropic)
+            .then(|| anthropic::known(&self.base_url, &self.model).flatten())
+            .flatten()
     }
 
     pub fn protocol(&self) -> Protocol {
@@ -344,16 +396,21 @@ impl HostedProvider {
             Service::Xai => Protocol::Responses,
             Service::Anthropic => Protocol::Anthropic,
             // A missing catalog used to force chat completions for every model.
-            Service::OpencodeGo | Service::Opencode => {
-                self.meta().map_or_else(|| infer_protocol(&self.model), ModelMeta::protocol)
-            }
+            Service::OpencodeGo | Service::Opencode => self
+                .meta()
+                .map_or_else(|| infer_protocol(&self.model), ModelMeta::protocol),
         }
     }
 
     fn headers(&self) -> Vec<(String, String)> {
-        let mut headers = vec![("User-Agent".to_string(), crate::config::USER_AGENT.to_string())];
+        let mut headers = vec![(
+            "User-Agent".to_string(),
+            crate::config::USER_AGENT.to_string(),
+        )];
         match self.service {
-            Service::OpencodeGo | Service::Opencode => headers.push(("x-opencode-session".into(), self.session.clone())),
+            Service::OpencodeGo | Service::Opencode => {
+                headers.push(("x-opencode-session".into(), self.session.clone()))
+            }
             // Routes a conversation to the same cache.
             Service::Xai => headers.push(("x-grok-conv-id".into(), self.session.clone())),
             Service::Anthropic => {}
@@ -366,7 +423,12 @@ impl HostedProvider {
             effort: self.effort.clone(),
             headers: self.headers(),
             reasoning_field: self.meta().and_then(|m| m.interleaved.clone()),
-            ..OpenAiProvider::with_label(self.service.id().into(), self.base_url.clone(), Some(self.api_key.clone()), self.model.clone())
+            ..OpenAiProvider::with_label(
+                self.service.id().into(),
+                self.base_url.clone(),
+                Some(self.api_key.clone()),
+                self.model.clone(),
+            )
         }
     }
 
@@ -377,15 +439,24 @@ impl HostedProvider {
         if self.service == Service::Anthropic {
             return self.list_anthropic().await;
         }
-        let listed = tokio::time::timeout(std::time::Duration::from_secs(6), self.chat().list_models_detailed())
-            .await
-            .context("timed out listing models")??;
-        super::remember_listing(self.service.id(), listed.iter().map(|m| m.id.clone()).collect(), Vec::new());
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            self.chat().list_models_detailed(),
+        )
+        .await
+        .context("timed out listing models")??;
+        super::remember_listing(
+            self.service.id(),
+            listed.iter().map(|m| m.id.clone()).collect(),
+            Vec::new(),
+        );
         Ok(listed
             .into_iter()
             .filter_map(|m| {
                 let meta = self.models.get(&m.id);
-                if meta.is_some_and(|meta| !meta.text_output || meta.npm.as_deref() == Some("@ai-sdk/google")) {
+                if meta.is_some_and(|meta| {
+                    !meta.text_output || meta.npm.as_deref() == Some("@ai-sdk/google")
+                }) {
                     return None;
                 }
                 Some(ModelChoice {
@@ -409,7 +480,11 @@ impl HostedProvider {
             ModelChoice {
                 provider: self.service.id().into(),
                 context_window: context.or(meta.and_then(|m| m.context)),
-                efforts: if efforts.is_empty() { self.efforts_for(&id, None) } else { efforts },
+                efforts: if efforts.is_empty() {
+                    self.efforts_for(&id, None)
+                } else {
+                    efforts
+                },
                 price: meta.and_then(ModelMeta::price),
                 model: id,
             }
@@ -422,15 +497,25 @@ impl HostedProvider {
         .context("timed out listing models");
         let error = match listed {
             Ok(Ok(models)) if !models.is_empty() => {
-                super::remember_listing(self.service.id(), models.iter().map(|m| m.id.clone()).collect(), Vec::new());
-                return Ok(models.into_iter().map(|m| choice(m.id, m.context, m.efforts)).collect());
+                super::remember_listing(
+                    self.service.id(),
+                    models.iter().map(|m| m.id.clone()).collect(),
+                    Vec::new(),
+                );
+                return Ok(models
+                    .into_iter()
+                    .map(|m| choice(m.id, m.context, m.efforts))
+                    .collect());
             }
             Ok(Ok(_)) => anyhow::anyhow!("the endpoint lists no models"),
             Ok(Err(e)) => e,
             Err(e) => e,
         };
         // A refused key is not something the catalog can paper over.
-        if error.chain().any(|c| c.downcast_ref::<super::sse::HttpError>().is_some_and(|e| matches!(e.status, 401 | 403))) {
+        if error.chain().any(|c| {
+            c.downcast_ref::<super::sse::HttpError>()
+                .is_some_and(|e| matches!(e.status, 401 | 403))
+        }) {
             return Err(error);
         }
         let mut ids: Vec<String> = self
@@ -443,30 +528,61 @@ impl HostedProvider {
         if !ids.contains(&self.model) {
             ids.insert(0, self.model.clone());
         }
-        Ok(ids.into_iter().map(|id| choice(id, None, Vec::new())).collect())
+        Ok(ids
+            .into_iter()
+            .map(|id| choice(id, None, Vec::new()))
+            .collect())
     }
 
     /// Efforts for `id`: the Models API's, else the catalog's, else the
     /// defaults for how the model thinks.
     fn efforts_for(&self, id: &str, info: Option<&anthropic::ModelInfo>) -> Vec<String> {
-        if let Some(info) = info.filter(|i| i.thinking != anthropic::Thinking::Unknown || !i.efforts.is_empty()) {
+        if let Some(info) =
+            info.filter(|i| i.thinking != anthropic::Thinking::Unknown || !i.efforts.is_empty())
+        {
             return info.efforts.clone();
         }
-        match self.models.get(id).map(|m| m.efforts.clone()).filter(|e| !e.is_empty()) {
+        match self
+            .models
+            .get(id)
+            .map(|m| m.efforts.clone())
+            .filter(|e| !e.is_empty())
+        {
             Some(efforts) => efforts,
             None => anthropic::default_efforts(id),
         }
     }
 
-    async fn stream_anthropic(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
-        let info = anthropic::describe(&self.base_url, Some(&self.api_key), self.bearer, &self.model).await;
-        let mut provider = AnthropicProvider::new(self.service.id().into(), self.base_url.clone(), Some(self.api_key.clone()), self.model.clone());
+    async fn stream_anthropic(
+        &self,
+        req: Request<'_>,
+        on_event: EventSink<'_>,
+    ) -> Result<Response> {
+        let info = anthropic::describe(
+            &self.base_url,
+            Some(&self.api_key),
+            self.bearer,
+            &self.model,
+        )
+        .await;
+        let mut provider = AnthropicProvider::new(
+            self.service.id().into(),
+            self.base_url.clone(),
+            Some(self.api_key.clone()),
+            self.model.clone(),
+        );
         provider.bearer = self.bearer;
         provider.effort = self.effort.clone();
         provider.headers = self.headers();
         provider.think_by_default = true;
-        provider.thinking = info.as_ref().map_or(anthropic::Thinking::Unknown, |i| i.thinking);
-        if let Some(output) = info.as_ref().and_then(|i| i.max_output).or_else(|| self.meta().and_then(|m| m.output)) {
+        provider.thinking = info
+            .as_ref()
+            .map_or(anthropic::Thinking::Unknown, |i| i.thinking);
+        if let Some(output) = info
+            .as_ref()
+            .and_then(|i| i.max_output)
+            .or_else(|| self.meta().and_then(|m| m.output))
+        {
             provider.max_tokens = output.clamp(1_024, 64_000);
         }
         provider.stream(req, on_event).await
@@ -515,13 +631,22 @@ impl Provider for HostedProvider {
         self.meta().map(|m| m.efforts.clone()).unwrap_or_default()
     }
     fn context_window(&self) -> Option<u64> {
-        self.info().and_then(|i| i.context).or_else(|| self.meta().and_then(|m| m.context))
+        self.info()
+            .and_then(|i| i.context)
+            .or_else(|| self.meta().and_then(|m| m.context))
     }
     fn set_conversation(&mut self, id: &str) {
         self.session = id.to_string();
     }
     fn fork(&self) -> Box<dyn Provider> {
-        let mut fork = Self::new(self.service, self.base_url.clone(), self.api_key.clone(), self.model.clone(), self.effort.clone(), Arc::clone(&self.models));
+        let mut fork = Self::new(
+            self.service,
+            self.base_url.clone(),
+            self.api_key.clone(),
+            self.model.clone(),
+            self.effort.clone(),
+            Arc::clone(&self.models),
+        );
         fork.session = uuid::Uuid::new_v4().to_string();
         fork.bearer = self.bearer;
         fork.catalog = self.catalog.clone();
@@ -546,7 +671,12 @@ impl Provider for HostedProvider {
                 provider.send(req, on_event).await
             }
             Protocol::Anthropic => {
-                let mut provider = AnthropicProvider::new(label, self.base_url.clone(), Some(self.api_key.clone()), self.model.clone());
+                let mut provider = AnthropicProvider::new(
+                    label,
+                    self.base_url.clone(),
+                    Some(self.api_key.clone()),
+                    self.model.clone(),
+                );
                 provider.effort = self.effort.clone();
                 provider.headers = self.headers();
                 if let Some(output) = self.meta().and_then(|m| m.output) {
@@ -569,18 +699,50 @@ mod tests {
     };
 
     fn models() -> Arc<Models> {
-        let meta = |npm: Option<&str>| ModelMeta { npm: npm.map(str::to_owned), text_output: true, ..ModelMeta::default() };
+        let meta = |npm: Option<&str>| ModelMeta {
+            npm: npm.map(str::to_owned),
+            text_output: true,
+            ..ModelMeta::default()
+        };
         let mut models = Models::new();
-        models.insert("glm".into(), ModelMeta { interleaved: Some("reasoning_content".into()), efforts: vec!["low".into(), "high".into()], context: Some(1000), cost: Some((1.0, 2.0)), ..meta(None) });
+        models.insert(
+            "glm".into(),
+            ModelMeta {
+                interleaved: Some("reasoning_content".into()),
+                efforts: vec!["low".into(), "high".into()],
+                context: Some(1000),
+                cost: Some((1.0, 2.0)),
+                ..meta(None)
+            },
+        );
         models.insert("grok".into(), meta(Some("@ai-sdk/openai")));
-        models.insert("claude".into(), ModelMeta { output: Some(128_000), ..meta(Some("@ai-sdk/anthropic")) });
+        models.insert(
+            "claude".into(),
+            ModelMeta {
+                output: Some(128_000),
+                ..meta(Some("@ai-sdk/anthropic"))
+            },
+        );
         models.insert("gemini".into(), meta(Some("@ai-sdk/google")));
-        models.insert("imagine".into(), ModelMeta { text_output: false, ..meta(None) });
+        models.insert(
+            "imagine".into(),
+            ModelMeta {
+                text_output: false,
+                ..meta(None)
+            },
+        );
         Arc::new(models)
     }
 
     fn provider(service: Service, url: &str, model: &str) -> HostedProvider {
-        HostedProvider::new(service, url.into(), "sk-test".into(), model.into(), None, models())
+        HostedProvider::new(
+            service,
+            url.into(),
+            "sk-test".into(),
+            model.into(),
+            None,
+            models(),
+        )
     }
 
     fn body_of(request: &str) -> Value {
@@ -595,7 +757,15 @@ mod tests {
         assert_eq!(p(Service::Opencode, "claude"), Protocol::Anthropic);
         assert_eq!(p(Service::Opencode, "unknown"), Protocol::Chat);
         let bare = |model: &str| {
-            HostedProvider::new(Service::Opencode, "http://unused".into(), "k".into(), model.into(), None, Arc::new(Models::new())).protocol()
+            HostedProvider::new(
+                Service::Opencode,
+                "http://unused".into(),
+                "k".into(),
+                model.into(),
+                None,
+                Arc::new(Models::new()),
+            )
+            .protocol()
         };
         assert_eq!(bare("claude-sonnet-4"), Protocol::Anthropic);
         assert_eq!(bare("Claude-Opus"), Protocol::Anthropic);
@@ -614,7 +784,9 @@ mod tests {
 
     #[tokio::test]
     async fn each_protocol_sends_session_and_user_agent() {
-        let chat = events(&[json!({"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":"stop"}]})]);
+        let chat = events(&[
+            json!({"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":"stop"}]}),
+        ]);
         let responses = events(&[
             json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"b"}]}}),
             json!({"type":"response.completed","response":{}}),
@@ -623,24 +795,54 @@ mod tests {
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"c"}}),
             json!({"type":"message_stop"}),
         ]);
-        let (url, mut requests, task) = server(vec![(200, chat), (200, responses), (200, messages)]).await;
+        let (url, mut requests, task) =
+            server(vec![(200, chat), (200, responses), (200, messages)]).await;
         let base = format!("{url}/zen/go/v1");
         let mut p = provider(Service::OpencodeGo, &base, "glm");
         p.set_conversation("conv-1");
         p.set_effort(Some("high".into()));
-        let items = [Item::user("hi"), Item::Reasoning { id: None, summary: "r".into(), encrypted: None }, Item::Assistant { text: "x".into() }, Item::user("again")];
+        let items = [
+            Item::user("hi"),
+            Item::Reasoning {
+                id: None,
+                summary: "r".into(),
+                encrypted: None,
+            },
+            Item::Assistant { text: "x".into() },
+            Item::user("again"),
+        ];
         let mut texts = Vec::new();
         for model in ["glm", "grok", "claude"] {
             p.set_model(model.into());
-            let r = p.stream(Request { system: "s", items: &items, tools: &[] }, &mut |_| {}).await.unwrap();
+            let r = p
+                .stream(
+                    Request {
+                        system: "s",
+                        items: &items,
+                        tools: &[],
+                    },
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
             texts.push(r.items);
         }
-        assert_eq!(texts, ["a", "b", "c"].map(|t| vec![Item::Assistant { text: t.into() }]));
+        assert_eq!(
+            texts,
+            ["a", "b", "c"].map(|t| vec![Item::Assistant { text: t.into() }])
+        );
         let version = format!("user-agent: nyq/{}", env!("CARGO_PKG_VERSION"));
-        for (path, auth) in [("/chat/completions", "authorization: bearer sk-test"), ("/responses", "authorization: bearer sk-test"), ("/messages", "x-api-key: sk-test")] {
+        for (path, auth) in [
+            ("/chat/completions", "authorization: bearer sk-test"),
+            ("/responses", "authorization: bearer sk-test"),
+            ("/messages", "x-api-key: sk-test"),
+        ] {
             let request = requests.recv().await.unwrap();
             let lower = request.to_lowercase();
-            assert!(lower.starts_with(&format!("post /zen/go/v1{path} ")), "{lower}");
+            assert!(
+                lower.starts_with(&format!("post /zen/go/v1{path} ")),
+                "{lower}"
+            );
             for header in [auth, "x-opencode-session: conv-1", &version] {
                 assert!(lower.contains(header), "{path}: {header}");
             }
@@ -660,7 +862,10 @@ mod tests {
         task.await.unwrap();
         // Forks get their own conversation id.
         let fork = p.fork();
-        assert_eq!((fork.name(), fork.model(), fork.effort()), ("opencode-go", "claude", Some("high")));
+        assert_eq!(
+            (fork.name(), fork.model(), fork.effort()),
+            ("opencode-go", "claude", Some("high"))
+        );
     }
 
     #[tokio::test]
@@ -669,7 +874,16 @@ mod tests {
         let (url, mut requests, task) = server(vec![(200, responses)]).await;
         let mut xai = provider(Service::Xai, &url, "grok-x");
         xai.set_conversation("c");
-        xai.stream(Request { system: "", items: &[], tools: &[] }, &mut |_| {}).await.unwrap();
+        xai.stream(
+            Request {
+                system: "",
+                items: &[],
+                tools: &[],
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
         let first = requests.recv().await.unwrap();
         assert!(first.starts_with("POST /responses "));
         assert!(first.to_lowercase().contains("x-grok-conv-id: c"));
@@ -680,17 +894,27 @@ mod tests {
     async fn listing_uses_metadata() {
         let (url, mut requests, task) = server(vec![(
             200,
-            json!({"data":[{"id":"glm"},{"id":"imagine"},{"id":"gemini"},{"id":"fresh"}]}).to_string(),
+            json!({"data":[{"id":"glm"},{"id":"imagine"},{"id":"gemini"},{"id":"fresh"}]})
+                .to_string(),
         )])
         .await;
-        let models = provider(Service::OpencodeGo, &url, "glm").list_models().await.unwrap();
-        assert_eq!(models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), ["glm", "fresh"]);
+        let models = provider(Service::OpencodeGo, &url, "glm")
+            .list_models()
+            .await
+            .unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
+            ["glm", "fresh"]
+        );
         assert_eq!(models[0].efforts, ["low", "high"]);
         assert_eq!(models[0].context_window, Some(1000));
         assert_eq!(models[0].price.as_deref(), Some("$1/$2 per 1M"));
         assert_eq!(models[1].provider, "opencode-go");
         let request = requests.recv().await.unwrap().to_lowercase();
-        assert!(request.starts_with("get /models ") && request.contains("authorization: bearer sk-test"));
+        assert!(
+            request.starts_with("get /models ")
+                && request.contains("authorization: bearer sk-test")
+        );
         task.await.unwrap();
     }
 
@@ -710,12 +934,22 @@ mod tests {
         // nyq's own login.
         save_key(home, Service::OpencodeGo, " own-go \n").unwrap();
         save_key(home, Service::Xai, "own-xai").unwrap();
-        assert_eq!(api_key(home, Service::OpencodeGo).as_deref(), Some("own-go"));
+        assert_eq!(
+            api_key(home, Service::OpencodeGo).as_deref(),
+            Some("own-go")
+        );
         assert_eq!(api_key(home, Service::Opencode), None);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(home.join("auth.json")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(home.join("auth.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
         // The OpenCode CLI's login wins over nyq's, per service id. (Found via
         // HOME, which Windows does not use to locate the home directory.)
@@ -724,26 +958,42 @@ mod tests {
             let cli = user.path().join(".local/share/opencode");
             std::fs::create_dir_all(&cli).unwrap();
             std::fs::write(cli.join("auth.json"), r#"{"opencode-go":{"type":"api","key":"cli-go"},"opencode":{"type":"api","key":"cli-zen"}}"#).unwrap();
-            assert_eq!(api_key(home, Service::OpencodeGo).as_deref(), Some("cli-go"));
+            assert_eq!(
+                api_key(home, Service::OpencodeGo).as_deref(),
+                Some("cli-go")
+            );
             assert_eq!(api_key(home, Service::Opencode).as_deref(), Some("cli-zen"));
         }
         // XDG_DATA_HOME is checked first.
         let xdg = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(xdg.path().join("opencode")).unwrap();
-        std::fs::write(xdg.path().join("opencode/auth.json"), r#"{"opencode-go":{"key":"xdg-go"}}"#).unwrap();
+        std::fs::write(
+            xdg.path().join("opencode/auth.json"),
+            r#"{"opencode-go":{"key":"xdg-go"}}"#,
+        )
+        .unwrap();
         std::env::set_var("XDG_DATA_HOME", xdg.path());
-        assert_eq!(api_key(home, Service::OpencodeGo).as_deref(), Some("xdg-go"));
+        assert_eq!(
+            api_key(home, Service::OpencodeGo).as_deref(),
+            Some("xdg-go")
+        );
         // xAI never reads the OpenCode file; the environment wins everywhere.
         assert_eq!(api_key(home, Service::Xai).as_deref(), Some("own-xai"));
         std::env::set_var("OPENCODE_API_KEY", "env-key");
         std::env::set_var("XAI_API_KEY", "env-xai");
-        assert_eq!(api_key(home, Service::OpencodeGo).as_deref(), Some("env-key"));
+        assert_eq!(
+            api_key(home, Service::OpencodeGo).as_deref(),
+            Some("env-key")
+        );
         assert_eq!(api_key(home, Service::Xai).as_deref(), Some("env-xai"));
         std::env::remove_var("XAI_API_KEY");
         assert!(remove_key(home, Service::Xai).unwrap());
         assert!(!remove_key(home, Service::Xai).unwrap());
         assert_eq!(api_key(home, Service::Xai), None);
-        assert_eq!(read_key(&home.join("auth.json"), "opencode-go").as_deref(), Some("own-go"));
+        assert_eq!(
+            read_key(&home.join("auth.json"), "opencode-go").as_deref(),
+            Some("own-go")
+        );
         assert!(save_key(home, Service::Xai, "  ").is_err());
         for (k, v) in saved {
             match v {
@@ -764,11 +1014,17 @@ mod tests {
     ];
 
     /// Clears the Anthropic variables for a test; restores them on drop.
-    struct AnthropicEnv(Vec<(&'static str, Option<std::ffi::OsString>)>, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    struct AnthropicEnv(
+        Vec<(&'static str, Option<std::ffi::OsString>)>,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
     impl AnthropicEnv {
         fn new() -> Self {
             let lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
-            let saved = ANTHROPIC_VARS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+            let saved = ANTHROPIC_VARS
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
             for k in ANTHROPIC_VARS {
                 std::env::remove_var(k);
             }
@@ -791,19 +1047,46 @@ mod tests {
         let _env = AnthropicEnv::new();
         let user = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", user.path());
-        assert_eq!(anthropic_base("https://api.deepseek.com/anthropic"), "https://api.deepseek.com/anthropic/v1");
+        assert_eq!(
+            anthropic_base("https://api.deepseek.com/anthropic"),
+            "https://api.deepseek.com/anthropic/v1"
+        );
         assert_eq!(anthropic_base("https://api.anthropic.com/"), ANTHROPIC_URL);
-        assert_eq!(anthropic_base("http://localhost:4000/v1/messages"), "http://localhost:4000/v1");
+        assert_eq!(
+            anthropic_base("http://localhost:4000/v1/messages"),
+            "http://localhost:4000/v1"
+        );
         assert_eq!(Service::parse("Claude"), Some(Service::Anthropic));
         let a = Service::Anthropic;
-        assert_eq!((a.base_url().as_str(), a.catalog_id(), a.default_model().as_str()), (ANTHROPIC_URL, "anthropic", "claude-opus-5-5"));
+        assert_eq!(
+            (
+                a.base_url().as_str(),
+                a.catalog_id(),
+                a.default_model().as_str()
+            ),
+            (ANTHROPIC_URL, "anthropic", "claude-opus-5-5")
+        );
         std::env::set_var("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic");
         std::env::set_var("ANTHROPIC_MODEL", "deepseek-v4");
-        assert_eq!((a.base_url().as_str(), a.catalog_id(), a.default_model().as_str()), ("https://api.deepseek.com/anthropic/v1", "deepseek", "deepseek-v4"));
+        assert_eq!(
+            (
+                a.base_url().as_str(),
+                a.catalog_id(),
+                a.default_model().as_str()
+            ),
+            (
+                "https://api.deepseek.com/anthropic/v1",
+                "deepseek",
+                "deepseek-v4"
+            )
+        );
         std::env::set_var("ANTHROPIC_BASE_URL", "https://api.moonshot.ai/anthropic");
         assert_eq!(a.catalog_id(), "moonshotai");
         std::env::set_var("NYQ_ANTHROPIC_BASE_URL", "http://127.0.0.1:4000");
-        assert_eq!((a.base_url().as_str(), a.catalog_id()), ("http://127.0.0.1:4000/v1", "anthropic"));
+        assert_eq!(
+            (a.base_url().as_str(), a.catalog_id()),
+            ("http://127.0.0.1:4000/v1", "anthropic")
+        );
 
         // nyq's stored key < ANTHROPIC_AUTH_TOKEN (bearer) < ANTHROPIC_API_KEY.
         let home = tempfile::tempdir().unwrap();
@@ -814,18 +1097,34 @@ mod tests {
         assert_eq!(key_source(home, a).as_deref(), Some("stored by nyq"));
         assert!(!bearer(a));
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "gateway-token");
-        assert_eq!((api_key(home, a).as_deref(), bearer(a)), (Some("gateway-token"), true));
+        assert_eq!(
+            (api_key(home, a).as_deref(), bearer(a)),
+            (Some("gateway-token"), true)
+        );
         assert_eq!(key_source(home, a).as_deref(), Some("ANTHROPIC_AUTH_TOKEN"));
         let configured = HostedProvider::configured(home, a, "m".into(), None).unwrap();
-        assert!(configured.bearer && configured.endpoint().as_deref() == Some("http://127.0.0.1:4000/v1"));
+        assert!(
+            configured.bearer
+                && configured.endpoint().as_deref() == Some("http://127.0.0.1:4000/v1")
+        );
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env");
-        assert_eq!((api_key(home, a).as_deref(), bearer(a)), (Some("sk-ant-env"), false));
+        assert_eq!(
+            (api_key(home, a).as_deref(), bearer(a)),
+            (Some("sk-ant-env"), false)
+        );
         assert_eq!(key_source(home, a).as_deref(), Some("ANTHROPIC_API_KEY"));
         assert!(!bearer(Service::Xai));
     }
 
     fn anthropic(url: &str, model: &str, models: Models) -> HostedProvider {
-        HostedProvider::new(Service::Anthropic, format!("{url}/v1"), "sk-ant".into(), model.into(), None, Arc::new(models))
+        HostedProvider::new(
+            Service::Anthropic,
+            format!("{url}/v1"),
+            "sk-ant".into(),
+            model.into(),
+            None,
+            Arc::new(models),
+        )
     }
 
     #[tokio::test]
@@ -842,18 +1141,48 @@ mod tests {
                 json!({"type":"message_stop"}),
             ])
         };
-        let (url, mut requests, task) = server(vec![(200, info.to_string()), (200, reply()), (200, reply())]).await;
+        let (url, mut requests, task) = server(vec![
+            (200, info.to_string()),
+            (200, reply()),
+            (200, reply()),
+        ])
+        .await;
         let mut p = anthropic(&url, "claude-opus-x", Models::new());
         p.set_effort(Some("xhigh".into()));
-        let tools = [crate::types::ToolSpec { name: "read_file".into(), description: "d".into(), parameters: json!({"type":"object"}) }];
+        let tools = [crate::types::ToolSpec {
+            name: "read_file".into(),
+            description: "d".into(),
+            parameters: json!({"type":"object"}),
+        }];
         for _ in 0..2 {
-            let r = p.stream(Request { system: "sys", items: &[Item::user("hi")], tools: &tools }, &mut |_| {}).await.unwrap();
+            let r = p
+                .stream(
+                    Request {
+                        system: "sys",
+                        items: &[Item::user("hi")],
+                        tools: &tools,
+                    },
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
             assert_eq!(r.items, vec![Item::Assistant { text: "hi".into() }]);
             let usage = r.usage.unwrap();
-            assert_eq!((usage.input_tokens, usage.cached_tokens, usage.cache_write_tokens, usage.output_tokens), (2103, 2000, 100, 5));
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.cached_tokens,
+                    usage.cache_write_tokens,
+                    usage.output_tokens
+                ),
+                (2103, 2000, 100, 5)
+            );
         }
         let lookup = requests.recv().await.unwrap().to_lowercase();
-        assert!(lookup.starts_with("get /v1/models/claude-opus-x "), "{lookup}");
+        assert!(
+            lookup.starts_with("get /v1/models/claude-opus-x "),
+            "{lookup}"
+        );
         for header in ["x-api-key: sk-ant", "anthropic-version: 2023-06-01"] {
             assert!(lookup.contains(header), "{header}");
         }
@@ -861,40 +1190,93 @@ mod tests {
         for _ in 0..2 {
             let request = requests.recv().await.unwrap();
             let lower = request.to_lowercase();
-            assert!(lower.starts_with("post /v1/messages ") && lower.contains("x-api-key: sk-ant") && !lower.contains("authorization"), "{lower}");
-            assert!(lower.contains("anthropic-version: 2023-06-01") && lower.contains("user-agent: nyq/"));
+            assert!(
+                lower.starts_with("post /v1/messages ")
+                    && lower.contains("x-api-key: sk-ant")
+                    && !lower.contains("authorization"),
+                "{lower}"
+            );
+            assert!(
+                lower.contains("anthropic-version: 2023-06-01")
+                    && lower.contains("user-agent: nyq/")
+            );
             let body = body_of(&request);
-            assert_eq!(body["thinking"], json!({"type":"adaptive","display":"summarized"}));
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"adaptive","display":"summarized"})
+            );
             assert_eq!(body["output_config"]["effort"], "xhigh");
             assert_eq!(body["max_tokens"], 64_000);
             assert_eq!(body["stream"], true);
             assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
-            assert_eq!(body["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+            assert_eq!(
+                body["messages"][0]["content"][0]["cache_control"]["type"],
+                "ephemeral"
+            );
             assert_eq!(body["tools"][0]["name"], "read_file");
         }
         task.await.unwrap();
         assert_eq!(p.efforts(), ["low", "medium", "high", "xhigh", "max"]);
         assert_eq!(p.context_window(), Some(1_000_000));
-        assert_eq!((p.name(), p.pricing_provider(), p.protocol()), ("anthropic", "anthropic", Protocol::Anthropic));
+        assert_eq!(
+            (p.name(), p.pricing_provider(), p.protocol()),
+            ("anthropic", "anthropic", Protocol::Anthropic)
+        );
     }
 
     #[tokio::test]
     async fn compatible_endpoint_without_model_details() {
         let reply = events(&[json!({"type":"message_stop"})]);
-        let (url, mut requests, task) = server(vec![(404, r#"{"error":{"type":"not_found_error","message":"no"}}"#.into()), (200, reply.clone()), (200, reply)]).await;
+        let (url, mut requests, task) = server(vec![
+            (
+                404,
+                r#"{"error":{"type":"not_found_error","message":"no"}}"#.into(),
+            ),
+            (200, reply.clone()),
+            (200, reply),
+        ])
+        .await;
         let mut p = anthropic(&url, "deepseek-v4", Models::new());
         p.bearer = true;
         p.set_effort(Some("high".into()));
-        p.stream(Request { system: "", items: &[Item::user("hi")], tools: &[] }, &mut |_| {}).await.unwrap();
+        p.stream(
+            Request {
+                system: "",
+                items: &[Item::user("hi")],
+                tools: &[],
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
         p.set_effort(None);
-        p.stream(Request { system: "", items: &[Item::user("hi")], tools: &[] }, &mut |_| {}).await.unwrap();
+        p.stream(
+            Request {
+                system: "",
+                items: &[Item::user("hi")],
+                tools: &[],
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
         let _lookup = requests.recv().await.unwrap();
         let first = requests.recv().await.unwrap();
-        assert!(first.to_lowercase().contains("authorization: bearer sk-ant") && !first.to_lowercase().contains("x-api-key"));
+        assert!(
+            first
+                .to_lowercase()
+                .contains("authorization: bearer sk-ant")
+                && !first.to_lowercase().contains("x-api-key")
+        );
         // Not Claude: a thinking budget under the default output cap.
-        assert_eq!(body_of(&first)["thinking"], json!({"type":"enabled","budget_tokens":16384}));
+        assert_eq!(
+            body_of(&first)["thinking"],
+            json!({"type":"enabled","budget_tokens":16384})
+        );
         // Without an effort, a budget model is not asked to think.
-        assert!(body_of(&requests.recv().await.unwrap()).get("thinking").is_none());
+        assert!(body_of(&requests.recv().await.unwrap())
+            .get("thinking")
+            .is_none());
         task.await.unwrap();
         assert_eq!(p.efforts(), ["low", "medium", "high"]);
     }
@@ -911,22 +1293,58 @@ mod tests {
         ])
         .await;
         let mut catalog = Models::new();
-        catalog.insert("kimi-k3".into(), ModelMeta { text_output: true, context: Some(256_000), cost: Some((0.6, 2.5)), ..ModelMeta::default() });
-        catalog.insert("painter".into(), ModelMeta { text_output: false, ..ModelMeta::default() });
+        catalog.insert(
+            "kimi-k3".into(),
+            ModelMeta {
+                text_output: true,
+                context: Some(256_000),
+                cost: Some((0.6, 2.5)),
+                ..ModelMeta::default()
+            },
+        );
+        catalog.insert(
+            "painter".into(),
+            ModelMeta {
+                text_output: false,
+                ..ModelMeta::default()
+            },
+        );
         let p = anthropic(&url, "kimi-k3", catalog);
         let listed = p.list_models().await.unwrap();
-        assert_eq!(listed.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), ["claude-opus-x", "kimi-k3"]);
-        assert_eq!((listed[0].efforts.clone(), listed[0].context_window), (vec!["low".to_string(), "high".into()], Some(1_000_000)));
+        assert_eq!(
+            listed.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
+            ["claude-opus-x", "kimi-k3"]
+        );
+        assert_eq!(
+            (listed[0].efforts.clone(), listed[0].context_window),
+            (vec!["low".to_string(), "high".into()], Some(1_000_000))
+        );
         // Ids alone: the catalog fills in context and price.
-        assert_eq!((listed[1].context_window, listed[1].price.as_deref()), (Some(256_000), Some("$0.6/$2.5 per 1M")));
+        assert_eq!(
+            (listed[1].context_window, listed[1].price.as_deref()),
+            (Some(256_000), Some("$0.6/$2.5 per 1M"))
+        );
         assert_eq!(listed[1].efforts, ["low", "medium", "high"]);
         assert!(listed.iter().all(|m| m.provider == "anthropic"));
         let first = requests.recv().await.unwrap().to_lowercase();
-        assert!(first.starts_with("get /v1/models?limit=1000 ") && first.contains("x-api-key: sk-ant"), "{first}");
-        assert!(requests.recv().await.unwrap().starts_with("GET /v1/models?limit=1000&after_id=claude-opus-x "));
+        assert!(
+            first.starts_with("get /v1/models?limit=1000 ") && first.contains("x-api-key: sk-ant"),
+            "{first}"
+        );
+        assert!(requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /v1/models?limit=1000&after_id=claude-opus-x "));
         // No Models API: the catalog's text models plus the current one.
         let fallback = p.list_models().await.unwrap();
-        assert_eq!(fallback.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), ["kimi-k3"]);
+        assert_eq!(
+            fallback
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>(),
+            ["kimi-k3"]
+        );
         // A refused key is reported, not hidden behind the catalog.
         let err = p.list_models().await.unwrap_err();
         assert!(format!("{err:#}").contains("invalid x-api-key"), "{err:#}");

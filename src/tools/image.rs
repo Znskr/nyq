@@ -22,15 +22,18 @@ pub(crate) const VISION: &str = "vision";
 /// Whether the catalog says `model` cannot read images (unknown models are
 /// assumed to). Looked up once per model.
 pub(crate) fn text_only(provider: &str, model: &str) -> bool {
-    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(String, String), bool>>> =
-        std::sync::LazyLock::new(Default::default);
+    static SEEN: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<(String, String), bool>>,
+    > = std::sync::LazyLock::new(Default::default);
     let key = (provider.to_string(), model.to_string());
     if let Some(known) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return *known;
     }
     let text_only = crate::catalog::lookup(&crate::config::home(), provider, model)
         .is_some_and(|meta| meta.image_input == Some(false));
-    SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(key, text_only);
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, text_only);
     text_only
 }
 
@@ -44,8 +47,11 @@ pub(crate) fn park_images(home: &Path, session_key: &str, images: &[Image]) -> S
     let mut paths = Vec::new();
     for image in images {
         let ext = image.media_type.rsplit('/').next().unwrap_or("png");
-        let path = attachments(home, session_key).join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()));
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) else { continue };
+        let path =
+            attachments(home, session_key).join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()));
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) else {
+            continue;
+        };
         if crate::session::write_private(&path, &bytes).is_ok() {
             paths.push(super::slash_path(&path));
         }
@@ -73,7 +79,8 @@ impl Vision {
     /// Images in this session's attachment store are always readable.
     fn parked(raw: &str) -> bool {
         let artifacts = crate::config::home().join("artifacts");
-        let (Ok(root), Ok(path)) = (std::fs::canonicalize(artifacts), std::fs::canonicalize(raw)) else {
+        let (Ok(root), Ok(path)) = (std::fs::canonicalize(artifacts), std::fs::canonicalize(raw))
+        else {
             return false;
         };
         path.starts_with(root) && path.parent().is_some_and(|p| p.ends_with("images"))
@@ -108,13 +115,17 @@ impl Tool for Vision {
         args["paths"].as_array().is_some_and(|paths| {
             paths.iter().filter_map(Value::as_str).any(|raw| {
                 let path = resolve(cwd, raw);
-                !Self::parked(&path.to_string_lossy()) && !crate::agent::inside(cwd, &path.to_string_lossy())
+                !Self::parked(&path.to_string_lossy())
+                    && !crate::agent::inside(cwd, &path.to_string_lossy())
             })
         })
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
-        let paths: Vec<&str> = args["paths"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let paths: Vec<&str> = args["paths"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
         let Some(question) = args["question"].as_str().filter(|q| !q.trim().is_empty()) else {
             return ToolOutput::err("vision: missing `question`");
         };
@@ -137,7 +148,11 @@ impl Tool for Vision {
         let Some(parent) = &ctx.provider else {
             return ToolOutput::err("vision: no model provider in this context");
         };
-        let Some(model) = crate::catalog::vision_model(&crate::config::home(), parent.pricing_provider(), parent.model()) else {
+        let Some(model) = crate::catalog::vision_model(
+            &crate::config::home(),
+            parent.pricing_provider(),
+            parent.model(),
+        ) else {
             return ToolOutput::err(
                 "vision: no vision-capable model is known for this provider. Set NYQ_VISION_MODEL to one, or ask the user to describe the image.",
             );
@@ -145,8 +160,15 @@ impl Tool for Vision {
         let mut provider = parent.fork();
         provider.set_model(model.clone());
         provider.set_effort(None);
-        let items = [Item::User { text: question.to_string(), images }];
-        let req = crate::types::Request { system: VISION_SYSTEM, items: &items, tools: &[] };
+        let items = [Item::User {
+            text: question.to_string(),
+            images,
+        }];
+        let req = crate::types::Request {
+            system: VISION_SYSTEM,
+            items: &items,
+            tools: &[],
+        };
         let mut ignore = |_: crate::types::StreamEvent| {};
         let response = tokio::select! {
             r = provider.stream(req, &mut ignore) => r,
@@ -195,18 +217,29 @@ pub(crate) fn image_from_bytes(bytes: &[u8], claimed: &str) -> Result<Image> {
     if !claimed.eq_ignore_ascii_case(detected) {
         bail!("mime type {claimed} does not match the image bytes ({detected})");
     }
-    Ok(Image { media_type: detected.into(), data: base64::engine::general_purpose::STANDARD.encode(bytes) })
+    Ok(Image {
+        media_type: detected.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }
 
 pub fn load(path: &Path) -> Result<Image> {
-    let bytes = super::safeio::read_capped(path, MAX_BYTES).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = super::safeio::read_capped(path, MAX_BYTES)
+        .with_context(|| format!("reading {}", path.display()))?;
     if bytes.len() as u64 > MAX_BYTES {
-        bail!("{} is {} MB; images are limited to 20 MB", path.display(), (bytes.len() as u64) / (1024 * 1024));
+        bail!(
+            "{} is {} MB; images are limited to 20 MB",
+            path.display(),
+            (bytes.len() as u64) / (1024 * 1024)
+        );
     }
     let Some(media_type) = media_type(&bytes) else {
         bail!("{} is not a PNG, JPEG, GIF or WebP image", path.display());
     };
-    Ok(Image { media_type: media_type.into(), data: base64::engine::general_purpose::STANDARD.encode(&bytes) })
+    Ok(Image {
+        media_type: media_type.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    })
 }
 
 fn resolve(cwd: &Path, raw: &str) -> PathBuf {
@@ -227,7 +260,9 @@ pub fn user_message(text: &str, cwd: &Path) -> Result<(Item, Vec<String>)> {
     let mut attached = Vec::new();
     for token in text.split_whitespace() {
         let explicit = token.starts_with('@');
-        let raw = token.trim_start_matches('@').trim_matches(|c| c == '\'' || c == '"');
+        let raw = token
+            .trim_start_matches('@')
+            .trim_matches(|c| c == '\'' || c == '"');
         let is_image = Path::new(raw)
             .extension()
             .and_then(|e| e.to_str())
@@ -242,7 +277,13 @@ pub fn user_message(text: &str, cwd: &Path) -> Result<(Item, Vec<String>)> {
         images.push(load(&path)?);
         attached.push(raw.to_string());
     }
-    Ok((Item::User { text: text.to_string(), images }, attached))
+    Ok((
+        Item::User {
+            text: text.to_string(),
+            images,
+        },
+        attached,
+    ))
 }
 
 /// Like [`user_message`], but a failed `@image` keeps the text. The third
@@ -275,7 +316,9 @@ impl Tool for ViewImage {
     }
 
     fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
-        args["path"].as_str().is_some_and(|raw| !crate::agent::inside(cwd, &resolve(cwd, raw).to_string_lossy()))
+        args["path"]
+            .as_str()
+            .is_some_and(|raw| !crate::agent::inside(cwd, &resolve(cwd, raw).to_string_lossy()))
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
@@ -287,7 +330,10 @@ impl Tool for ViewImage {
             return ToolOutput::err(format!("view_image: {msg}"));
         }
         match load(&path) {
-            Ok(image) => ToolOutput { images: vec![image], ..ToolOutput::ok(format!("Loaded {raw}; the image follows.")) },
+            Ok(image) => ToolOutput {
+                images: vec![image],
+                ..ToolOutput::ok(format!("Loaded {raw}; the image follows."))
+            },
             Err(e) => ToolOutput::err(format!("view_image: {e:#}")),
         }
     }
@@ -313,13 +359,21 @@ mod tests {
     fn attaches_explicit_and_existing_paths() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("shot.png"), PNG).unwrap();
-        let (item, attached) = user_message("what is in @shot.png and shot.png? not missing.png", dir.path()).unwrap();
+        let (item, attached) = user_message(
+            "what is in @shot.png and shot.png? not missing.png",
+            dir.path(),
+        )
+        .unwrap();
         assert_eq!(attached, vec!["shot.png"]);
-        let Item::User { images, text } = item else { panic!() };
+        let Item::User { images, text } = item else {
+            panic!()
+        };
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].media_type, "image/png");
         assert!(text.contains("@shot.png"));
-        assert!(images[0].data_url().starts_with("data:image/png;base64,iVBOR"));
+        assert!(images[0]
+            .data_url()
+            .starts_with("data:image/png;base64,iVBOR"));
         let (_, attached, warning) = user_turn("see @shot.png", dir.path());
         assert!(warning.is_none() && attached == vec!["shot.png"]);
     }
@@ -330,9 +384,14 @@ mod tests {
         assert!(user_message("see @nope.png", dir.path()).is_err());
         std::fs::write(dir.path().join("fake.jpg"), b"text").unwrap();
         assert!(user_message("see @fake.jpg", dir.path()).is_err());
-        assert!(user_message("plain text only", dir.path()).unwrap().1.is_empty());
+        assert!(user_message("plain text only", dir.path())
+            .unwrap()
+            .1
+            .is_empty());
         let (item, attached, warning) = user_turn("long note @nope.png", dir.path());
-        let Item::User { text, images } = item else { panic!() };
+        let Item::User { text, images } = item else {
+            panic!()
+        };
         assert_eq!(text, "long note @nope.png");
         assert!(images.is_empty() && attached.is_empty());
         assert!(warning.unwrap().contains("nope.png"));
@@ -364,30 +423,56 @@ mod tests {
             fn fork(&self) -> Box<dyn Provider> {
                 Box::new(self.clone())
             }
-            async fn stream(&self, req: crate::types::Request<'_>, _: EventSink<'_>) -> anyhow::Result<crate::types::Response> {
-                let Item::User { text, images } = &req.items[0] else { panic!() };
+            async fn stream(
+                &self,
+                req: crate::types::Request<'_>,
+                _: EventSink<'_>,
+            ) -> anyhow::Result<crate::types::Response> {
+                let Item::User { text, images } = &req.items[0] else {
+                    panic!()
+                };
                 self.0.lock().unwrap().push((text.clone(), images.len()));
                 Ok(crate::types::Response {
-                    items: vec![Item::Assistant { text: "A red error banner reading \"boom\".".into() }],
+                    items: vec![Item::Assistant {
+                        text: "A red error banner reading \"boom\".".into(),
+                    }],
                     ..Default::default()
                 })
             }
         }
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let old = std::env::var_os("NYQ_VISION_MODEL");
         std::env::set_var("NYQ_VISION_MODEL", "seeing-model");
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), PNG).unwrap();
         let seen = Seen::default();
-        let ctx = ToolCtx { cwd: dir.path().into(), provider: Some(Arc::new(seen.clone())), ..Default::default() };
-        let out = Vision.run(json!({"paths": ["a.png"], "question": "What does it say?"}), &ctx).await;
+        let ctx = ToolCtx {
+            cwd: dir.path().into(),
+            provider: Some(Arc::new(seen.clone())),
+            ..Default::default()
+        };
+        let out = Vision
+            .run(
+                json!({"paths": ["a.png"], "question": "What does it say?"}),
+                &ctx,
+            )
+            .await;
         match old {
             Some(v) => std::env::set_var("NYQ_VISION_MODEL", v),
             None => std::env::remove_var("NYQ_VISION_MODEL"),
         }
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("seeing-model") && out.content.contains("boom"), "{}", out.content);
-        assert_eq!(*seen.0.lock().unwrap(), vec![("What does it say?".to_string(), 1)]);
+        assert!(
+            out.content.contains("seeing-model") && out.content.contains("boom"),
+            "{}",
+            out.content
+        );
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec![("What does it say?".to_string(), 1)]
+        );
         assert_eq!(*seen.1.lock().unwrap(), "seeing-model");
         assert!(!Vision.needs_approval_for(&json!({"paths": ["a.png"]}), dir.path()));
         assert!(Vision.needs_approval_for(&json!({"paths": ["/etc/x.png"]}), dir.path()));
@@ -395,7 +480,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let image = load(&dir.path().join("a.png")).unwrap();
         let note = park_images(home.path(), "s1", &[image]);
-        let path = note.split("attached: ").nth(1).unwrap().split(". The").next().unwrap();
+        let path = note
+            .split("attached: ")
+            .nth(1)
+            .unwrap()
+            .split(". The")
+            .next()
+            .unwrap();
         assert_eq!(std::fs::read(path).unwrap(), PNG);
         assert!(note.contains("call vision"), "{note}");
     }
@@ -404,7 +495,10 @@ mod tests {
     async fn view_image_returns_image() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), PNG).unwrap();
-        let ctx = ToolCtx { cwd: dir.path().into(), ..Default::default() };
+        let ctx = ToolCtx {
+            cwd: dir.path().into(),
+            ..Default::default()
+        };
         let out = ViewImage.run(json!({"path": "a.png"}), &ctx).await;
         assert!(!out.is_error);
         assert_eq!(out.images.len(), 1);
@@ -413,18 +507,35 @@ mod tests {
 
     #[test]
     fn view_image_refuses_credential_files() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("NYQ_HOME");
         let old_auth = std::env::var_os("NYQ_CODEX_AUTH");
         std::env::set_var("NYQ_HOME", home.path());
         std::env::remove_var("NYQ_CODEX_AUTH");
         std::fs::write(home.path().join("shot.png"), PNG).unwrap();
-        let ctx = ToolCtx { cwd: home.path().into(), ..Default::default() };
+        let ctx = ToolCtx {
+            cwd: home.path().into(),
+            ..Default::default()
+        };
         let out = futures::executor::block_on(ViewImage.run(json!({"path": "shot.png"}), &ctx));
-        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("credential"),
+            "{}",
+            out.content
+        );
         assert!(out.images.is_empty());
-        if let Some(v) = old_home { std::env::set_var("NYQ_HOME", v); } else { std::env::remove_var("NYQ_HOME"); }
-        if let Some(v) = old_auth { std::env::set_var("NYQ_CODEX_AUTH", v); } else { std::env::remove_var("NYQ_CODEX_AUTH"); }
+        if let Some(v) = old_home {
+            std::env::set_var("NYQ_HOME", v);
+        } else {
+            std::env::remove_var("NYQ_HOME");
+        }
+        if let Some(v) = old_auth {
+            std::env::set_var("NYQ_CODEX_AUTH", v);
+        } else {
+            std::env::remove_var("NYQ_CODEX_AUTH");
+        }
     }
 }

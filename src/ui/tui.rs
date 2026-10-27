@@ -24,8 +24,8 @@ use super::chrome::{self, Mark};
 use super::editor::{Action, Editor};
 use super::keys::{KeyAction, Keymap};
 use super::render::{
-    escape_len, is_table_sep, numbered_diff, looks_like_diff, one_line, sanitize_text, table, table_cells,
-    truncate, visible_width, wrap_row, file_url, link, Fence, Markdown,
+    escape_len, file_url, is_table_sep, link, looks_like_diff, numbered_diff, one_line,
+    sanitize_text, table, table_cells, truncate, visible_width, wrap_row, Fence, Markdown,
 };
 use super::statusline::{tilde, tokens};
 use super::theme::{fg, BRIGHT, FAINT, GRAY, MID, RED, YELLOW};
@@ -171,10 +171,21 @@ fn approval_choices(a: &PendingApproval) -> Vec<(char, Approval, String)> {
         Some(r) => format!("Always allow {r}"),
         None => "Always: can't be scoped to a rule here, approves once".into(),
     };
-    let mut choices = vec![('y', Approval::Yes, "Yes, once".to_string()), ('a', Approval::Always, always)];
+    let mut choices = vec![
+        ('y', Approval::Yes, "Yes, once".to_string()),
+        ('a', Approval::Always, always),
+    ];
     if let Some(r) = &a.save_rule {
-        choices.push(('s', Approval::AlwaysSave, format!("Always, and save `{r}` to permissions.json")));
-        choices.push(('l', Approval::AlwaysSaveLocal, format!("Always, and save `{r}` for this workspace only")));
+        choices.push((
+            's',
+            Approval::AlwaysSave,
+            format!("Always, and save `{r}` to permissions.json"),
+        ));
+        choices.push((
+            'l',
+            Approval::AlwaysSaveLocal,
+            format!("Always, and save `{r}` for this workspace only"),
+        ));
     }
     choices.push(('n', Approval::No, "No, tell nyq what to do instead".into()));
     choices
@@ -217,7 +228,9 @@ impl ModelMenu {
     fn visible(&self) -> Vec<&ModelChoice> {
         let tab = &self.tabs[self.tab];
         crate::models::search(
-            self.choices.iter().filter(|c| tab == "All" || &c.provider == tab),
+            self.choices
+                .iter()
+                .filter(|c| tab == "All" || &c.provider == tab),
             &self.filter,
         )
     }
@@ -578,8 +591,20 @@ fn diff_stat(d: &str) -> String {
 
 /// A tool call's row in the classic look: `lead`, the verb (bright for the
 /// turn's only call), the target and the note, no marks or times.
-fn classic_tool_row(t: &ToolRow, lead: &str, single: bool, live: bool, frame: usize, w: usize, cwd: &str) -> String {
-    let note = if t.note.is_empty() { String::new() } else { format!(" {}", t.note) };
+fn classic_tool_row(
+    t: &ToolRow,
+    lead: &str,
+    single: bool,
+    live: bool,
+    frame: usize,
+    w: usize,
+    cwd: &str,
+) -> String {
+    let note = if t.note.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", t.note)
+    };
     let used = visible_width(lead) + t.verb.chars().count() + note.chars().count() + 1;
     let mut target = paint(fg(GRAY), &truncate(&t.target, w.saturating_sub(used)));
     if matches!(t.tool.as_str(), "read_file" | "write_file" | "edit_file") {
@@ -776,15 +801,25 @@ impl Screen {
                 if shown.len() > INLINE_DIFF_ROWS {
                     let more = shown.len() - INLINE_DIFF_ROWS;
                     shown.truncate(INLINE_DIFF_ROWS);
-                    let view = self.keys.hint(KeyAction::ExpandTools).unwrap_or_else(|| "/transcript".into());
-                    shown.push(format!("{bar}{}", paint(fg(FAINT), &format!("… {more} more lines ({view} to view)"))));
+                    let view = self
+                        .keys
+                        .hint(KeyAction::ExpandTools)
+                        .unwrap_or_else(|| "/transcript".into());
+                    shown.push(format!(
+                        "{bar}{}",
+                        paint(fg(FAINT), &format!("… {more} more lines ({view} to view)"))
+                    ));
                 }
                 rows.extend(shown);
             }
         };
         if n == 1 {
             let t = &self.tools[0];
-            let lead = if fancy { String::new() } else { format!("{} ", paint(fg(BRIGHT), "●")) };
+            let lead = if fancy {
+                String::new()
+            } else {
+                format!("{} ", paint(fg(BRIGHT), "●"))
+            };
             rows.push(row_text(t, &lead, true));
             detail(t, rows, "  │ ");
             return;
@@ -823,11 +858,11 @@ impl Screen {
             ));
         } else {
             rows.push(format!(
-            "{} {}{}{}",
-            mark(status),
-            paint(fg(BRIGHT), &format!("{n} tool calls")),
-            paint(fg(GRAY), &format!(" · {}", parts.join(" · "))),
-            took((status != Status::Running).then_some(total))
+                "{} {}{}{}",
+                mark(status),
+                paint(fg(BRIGHT), &format!("{n} tool calls")),
+                paint(fg(GRAY), &format!(" · {}", parts.join(" · "))),
+                took((status != Status::Running).then_some(total))
             ));
         }
         if !live && crate::settings::current().collapse_tool_calls {
@@ -837,7 +872,10 @@ impl Screen {
             let last = i + 1 == n;
             rows.push(row_text(
                 t,
-                &paint(fg(if fancy { FAINT } else { GRAY }), if last { "└ " } else { "├ " }),
+                &paint(
+                    fg(if fancy { FAINT } else { GRAY }),
+                    if last { "└ " } else { "├ " },
+                ),
                 false,
             ));
             detail(t, rows, if last { "  │ " } else { "│ │ " });
@@ -874,16 +912,29 @@ impl Screen {
         if self.busy.is_some() {
             for line in crate::subagents::live_lines() {
                 let text = truncate(&sanitize_text(&line), w.saturating_sub(5).max(1));
-                rows.push(format!("  {} {}", paint(fg(FAINT), "↳"), paint(fg(GRAY), &text)));
+                rows.push(format!(
+                    "  {} {}",
+                    paint(fg(FAINT), "↳"),
+                    paint(fg(GRAY), &text)
+                ));
             }
         }
 
         // The tail of a running command's output.
         let shell = self.busy.as_ref().is_some_and(|(l, _)| l == "Running");
-        if shell || self.tools.iter().any(|t| t.status == Status::Running && t.tool == "bash") {
+        if shell
+            || self
+                .tools
+                .iter()
+                .any(|t| t.status == Status::Running && t.tool == "bash")
+        {
             for line in crate::tools::live_tail(LIVE_OUTPUT_ROWS) {
                 let text = truncate(&sanitize_text(&line), w.saturating_sub(4).max(1));
-                rows.push(format!("{}{}", paint(fg(FAINT), "  │ "), paint(fg(FAINT), &text)));
+                rows.push(format!(
+                    "{}{}",
+                    paint(fg(FAINT), "  │ "),
+                    paint(fg(FAINT), &text)
+                ));
             }
         }
 
@@ -897,13 +948,22 @@ impl Screen {
         } else if let Some((label, start)) = &self.busy {
             let mut facts = vec![chrome::clock(self.working_time(*start).as_secs())];
             if self.turn_tokens != (0, 0) {
-                facts.push(format!("↑{} ↓{}", tokens(self.turn_tokens.0), tokens(self.turn_tokens.1)));
+                facts.push(format!(
+                    "↑{} ↓{}",
+                    tokens(self.turn_tokens.0),
+                    tokens(self.turn_tokens.1)
+                ));
             }
             if !self.tally.is_empty() {
                 facts.push(tally_text(&self.tally));
             }
             let detail = if self.live_block == Block::Reasoning {
-                self.live.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
+                self.live
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
             } else {
                 ""
             };
@@ -912,7 +972,14 @@ impl Screen {
             if !rows.is_empty() {
                 rows.push(String::new());
             }
-            rows.push(chrome::working_line(&label, &facts, detail, interrupt.as_deref(), self.frame, w));
+            rows.push(chrome::working_line(
+                &label,
+                &facts,
+                detail,
+                interrupt.as_deref(),
+                self.frame,
+                w,
+            ));
         }
         if let Some(h) = &self.hint {
             rows.push(paint(fg(YELLOW), h));
@@ -971,9 +1038,17 @@ impl Screen {
                 let label = truncate(&format!("{}. {text}", i + 1), w.saturating_sub(6));
                 rows.push(format!(
                     "{}{}  {}",
-                    if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() },
+                    if sel {
+                        paint(fg(BRIGHT), "› ")
+                    } else {
+                        "  ".into()
+                    },
                     paint(fg(if sel { BRIGHT } else { GRAY }), &key.to_string()),
-                    if sel { paint(fg(BRIGHT).bold(), &label) } else { paint(fg(MID), &label) }
+                    if sel {
+                        paint(fg(BRIGHT).bold(), &label)
+                    } else {
+                        paint(fg(MID), &label)
+                    }
                 ));
             }
             if a.noting || !a.note.is_empty() {
@@ -987,7 +1062,11 @@ impl Screen {
                     cursor_row = rows.len();
                     cursor_col = 6 + visible_width(&shown);
                 }
-                rows.push(format!("{} {}", paint(fg(YELLOW), "note"), paint(fg(MID), &shown)));
+                rows.push(format!(
+                    "{} {}",
+                    paint(fg(YELLOW), "note"),
+                    paint(fg(MID), &shown)
+                ));
             }
             rows.push(rule(w));
             let keys = if a.noting {
@@ -1026,8 +1105,12 @@ impl Screen {
         } else {
             let view = self.editor.render(chrome::input_width(w));
             let busy = self.busy.is_some();
-            let placeholder = self.editor.is_empty().then(|| chrome::placeholder(busy, &self.keys));
-            let (framed, text_row, text_col) = chrome::input_box(&view.lines, placeholder.as_deref(), w, busy);
+            let placeholder = self
+                .editor
+                .is_empty()
+                .then(|| chrome::placeholder(busy, &self.keys));
+            let (framed, text_row, text_col) =
+                chrome::input_box(&view.lines, placeholder.as_deref(), w, busy);
             let top = rows.len();
             rows.extend(framed);
             cursor_row = top + text_row + view.cursor_row;
@@ -1053,7 +1136,10 @@ impl Screen {
     fn below_input(&self, rows: &mut Vec<String>, w: usize) {
         if let Some(q) = &self.question {
             rows.push(rule(w));
-            rows.push(paint(fg(BRIGHT).bold(), q.menu.as_deref().unwrap_or("Question")));
+            rows.push(paint(
+                fg(BRIGHT).bold(),
+                q.menu.as_deref().unwrap_or("Question"),
+            ));
             let question = sanitize_text(&q.question);
             for l in wrap(&question, w.saturating_sub(2).max(1)) {
                 rows.push(paint(fg(MID), &l));
@@ -1080,7 +1166,12 @@ impl Screen {
             rows.push(if q.menu.is_some() {
                 hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("Esc", "Close")])
             } else {
-                hints(&[("↑↓", "Navigate"), ("Enter", "Choose"), ("type", "Own answer"), ("Esc", "Skip")])
+                hints(&[
+                    ("↑↓", "Navigate"),
+                    ("Enter", "Choose"),
+                    ("type", "Own answer"),
+                    ("Esc", "Skip"),
+                ])
             });
         } else if !chrome::fancy() {
             if !self.menu_rows(rows) {
@@ -1091,7 +1182,11 @@ impl Screen {
             let at = rows.len();
             if !self.menu_rows(rows) {
                 rows.push(self.footer_line());
-            } else if chrome::boxed(w) && rows.get(at).is_some_and(|r| super::render::strip_ansi(r).chars().all(|c| c == '─')) {
+            } else if chrome::boxed(w)
+                && rows
+                    .get(at)
+                    .is_some_and(|r| super::render::strip_ansi(r).chars().all(|c| c == '─'))
+            {
                 // The box already closes the input: no rule above the menu.
                 rows.remove(at);
             }
@@ -1103,7 +1198,11 @@ impl Screen {
         let w = self.width;
         let mut parts = vec![format!("{}s", self.working_time(start).as_secs())];
         if self.turn_tokens != (0, 0) {
-            parts.push(format!("↑{} ↓{}", tokens(self.turn_tokens.0), tokens(self.turn_tokens.1)));
+            parts.push(format!(
+                "↑{} ↓{}",
+                tokens(self.turn_tokens.0),
+                tokens(self.turn_tokens.1)
+            ));
         }
         if !self.tally.is_empty() {
             parts.push(tally_text(&self.tally));
@@ -1114,8 +1213,17 @@ impl Screen {
         let suffix = format!(" ({})", parts.join(" · "));
         let label = truncate(label, w.saturating_sub(suffix.chars().count() + 4).max(1));
         let detail = if self.live_block == Block::Reasoning {
-            let last = self.live.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-            truncate(last, w.saturating_sub(label.chars().count() + suffix.chars().count() + 4))
+            let last = self
+                .live
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            truncate(
+                last,
+                w.saturating_sub(label.chars().count() + suffix.chars().count() + 4),
+            )
         } else {
             String::new()
         };
@@ -1142,14 +1250,22 @@ impl Screen {
         let left = match super::statusline::left(f) {
             Some(text) => {
                 let (effort, rest) = text.split_once(" · ").unwrap_or((&text, ""));
-                format!("{} {} {}", paint(fg(MID), effort), paint(fg(GRAY), "·"), paint(fg(GRAY), &sanitize_text(rest)))
+                format!(
+                    "{} {} {}",
+                    paint(fg(MID), effort),
+                    paint(fg(GRAY), "·"),
+                    paint(fg(GRAY), &sanitize_text(rest))
+                )
             }
             None => String::new(),
         };
         if visible_width(&left) > self.width {
             return clip_width(&left, self.width);
         }
-        let right: Vec<String> = super::statusline::segments(f, self.width).into_iter().map(|(_, s)| s).collect();
+        let right: Vec<String> = super::statusline::segments(f, self.width)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
         let right = right.join(" · ");
         let mut room = self.width.saturating_sub(visible_width(&left) + 4);
         let upgrade = self.upgrade_label();
@@ -1158,11 +1274,22 @@ impl Screen {
         } else {
             let label = truncate(&upgrade, room);
             room = room.saturating_sub(label.chars().count() + 3);
-            let color = if label.starts_with("upgrading") { GRAY } else { YELLOW };
-            let sep = if right.is_empty() || room == 0 { "" } else { " · " };
+            let color = if label.starts_with("upgrading") {
+                GRAY
+            } else {
+                YELLOW
+            };
+            let sep = if right.is_empty() || room == 0 {
+                ""
+            } else {
+                " · "
+            };
             format!("{}{}", paint(fg(color), &label), paint(fg(FAINT), sep))
         };
-        let right = format!("{upgrade}{}", paint(fg(FAINT), &truncate(&sanitize_text(&right), room)));
+        let right = format!(
+            "{upgrade}{}",
+            paint(fg(FAINT), &truncate(&sanitize_text(&right), room))
+        );
         if left.is_empty() {
             return right;
         }
@@ -1172,14 +1299,17 @@ impl Screen {
     /// The auto-upgrade status for the status line (empty: nothing to show).
     fn upgrade_label(&self) -> String {
         match &self.upgrader {
-            Some(u) if crate::auto_upgrade::enabled(crate::settings::current().auto_upgrade) => u.status_label(),
+            Some(u) if crate::auto_upgrade::enabled(crate::settings::current().auto_upgrade) => {
+                u.status_label()
+            }
             _ => String::new(),
         }
     }
 
     /// What Ctrl+G must know about the screen to decide whether to relaunch.
     pub fn upgrade_facts(&self) -> crate::auto_upgrade::ApplyFacts {
-        let enabled = self.upgrader.is_some() && crate::auto_upgrade::enabled(crate::settings::current().auto_upgrade);
+        let enabled = self.upgrader.is_some()
+            && crate::auto_upgrade::enabled(crate::settings::current().auto_upgrade);
         crate::auto_upgrade::ApplyFacts {
             busy: self.is_busy(),
             queued: !self.queue.is_empty(),
@@ -1327,7 +1457,11 @@ impl Screen {
                     .map(|spec| MenuItem {
                         label: spec.label.to_string(),
                         detail: sanitize_text(&match crate::settings::source(spec.id) {
-                            Some(layer) => format!("{} · {}", crate::settings::value(spec.id, &s, &live), layer.label()),
+                            Some(layer) => format!(
+                                "{} · {}",
+                                crate::settings::value(spec.id, &s, &live),
+                                layer.label()
+                            ),
                             None => crate::settings::value(spec.id, &s, &live),
                         }),
                         tag: spec.description.to_string(),
@@ -1642,11 +1776,20 @@ impl Screen {
     /// "• title · nyq" while working, "title · nyq" otherwise; the title is
     /// the session's, else the workspace folder.
     fn window_title(&self) -> String {
-        let folder = std::path::Path::new(&self.footer.cwd).file_name().map(|f| f.to_string_lossy().to_string());
-        let base = Some(self.footer.title.clone()).filter(|t| !t.trim().is_empty()).or(folder).unwrap_or_default();
+        let folder = std::path::Path::new(&self.footer.cwd)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string());
+        let base = Some(self.footer.title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .or(folder)
+            .unwrap_or_default();
         let base = one_line(&base, 60);
         let state = if self.busy.is_some() { "• " } else { "" };
-        if base.is_empty() { format!("{state}nyq") } else { format!("{state}{base} · nyq") }
+        if base.is_empty() {
+            format!("{state}nyq")
+        } else {
+            format!("{state}{base} · nyq")
+        }
     }
 
     fn sync_window_title(&mut self) {
@@ -1752,7 +1895,9 @@ impl Screen {
     /// The startup banner, sized to the terminal, with a tip that changes
     /// from launch to launch.
     pub fn print_banner(&mut self, version: &str) {
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as usize);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as usize);
         let rows = chrome::banner(version, &self.footer, &self.keys, self.width, seed);
         self.print_styled_info(&rows.join("\n"), Style::new());
     }
@@ -1792,10 +1937,18 @@ impl Screen {
         let fancy = chrome::fancy();
         for (i, line) in text.trim().lines().enumerate() {
             if !fancy {
-                rows.push(format!("{} {}", paint(fg(BRIGHT), "┃"), paint(Style::new().bold(), line)));
+                rows.push(format!(
+                    "{} {}",
+                    paint(fg(BRIGHT), "┃"),
+                    paint(Style::new().bold(), line)
+                ));
                 continue;
             }
-            let lead = if i == 0 { paint(fg(chrome::ACCENT).bold(), "›") } else { " ".into() };
+            let lead = if i == 0 {
+                paint(fg(chrome::ACCENT).bold(), "›")
+            } else {
+                " ".into()
+            };
             rows.push(format!("{lead} {}", paint(fg(BRIGHT).bold(), line)));
         }
         self.emit(&rows);
@@ -2281,7 +2434,11 @@ impl Screen {
     }
 
     /// Open the `/skills` menu over `entries`; Ctrl+O copies into `targets`.
-    pub fn open_skills(&mut self, entries: Vec<super::skills_menu::Entry>, targets: super::skills_menu::Targets) {
+    pub fn open_skills(
+        &mut self,
+        entries: Vec<super::skills_menu::Entry>,
+        targets: super::skills_menu::Targets,
+    ) {
         self.menu = None;
         self.sessions = None;
         self.settings = None;
@@ -2359,7 +2516,12 @@ impl Screen {
     fn on_skills_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
         use super::skills_menu::Action;
         let Some(m) = &mut self.skills else { return };
-        let known: Vec<String> = self.editor.commands().iter().map(|(c, _)| c.clone()).collect();
+        let known: Vec<String> = self
+            .editor
+            .commands()
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect();
         // `/tools` is a command even when `--debug` keeps it out of the menus.
         match m.on_key(key, |c| c == "/tools" || known.iter().any(|k| k == c)) {
             Action::None => {}
@@ -2388,7 +2550,9 @@ impl Screen {
 
     fn on_tools_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
         use super::tools_menu::Action;
-        let Some(m) = &mut self.tools_menu else { return };
+        let Some(m) = &mut self.tools_menu else {
+            return;
+        };
         match m.on_key(key) {
             Action::None => {}
             Action::Close => self.tools_menu = None,
@@ -2520,7 +2684,10 @@ impl Screen {
         let id = self.attachments.iter().map(|a| a.id).max().unwrap_or(0) + 1;
         let a = Attachment { id, label, image };
         self.editor.insert_token(&a.token());
-        self.hint = Some(format!("Attached {} · /images lists attachments", a.token()));
+        self.hint = Some(format!(
+            "Attached {} · /images lists attachments",
+            a.token()
+        ));
         self.attachments.push(a);
         self.redraw();
     }
@@ -2557,7 +2724,12 @@ impl Screen {
         // Set before entering so a panic in the viewer still leaves the alt screen.
         TRANSCRIPT_ALT_SCREEN.store(true, Ordering::SeqCst);
         // Mouse reporting only while the viewer is open, for the wheel.
-        let _ = execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide, crossterm::event::EnableMouseCapture);
+        let _ = execute!(
+            self.out,
+            terminal::EnterAlternateScreen,
+            cursor::Hide,
+            crossterm::event::EnableMouseCapture
+        );
         self.viewer = Some(super::transcript::Viewer::new(
             self.review.as_ref().unwrap_or(&self.log),
             self.width,
@@ -2587,7 +2759,12 @@ impl Screen {
             return;
         }
         if TRANSCRIPT_ALT_SCREEN.swap(false, Ordering::SeqCst) {
-            let _ = execute!(self.out, crossterm::event::DisableMouseCapture, terminal::LeaveAlternateScreen, cursor::Show);
+            let _ = execute!(
+                self.out,
+                crossterm::event::DisableMouseCapture,
+                terminal::LeaveAlternateScreen,
+                cursor::Show
+            );
         } else {
             let _ = execute!(self.out, cursor::Show);
         }
@@ -2649,7 +2826,9 @@ impl Screen {
         self.editor.push_history(text);
         let saving = crate::settings::current().prompt_history && !self.home.as_os_str().is_empty();
         if saving && self.last_prompt.as_deref() != Some(text) {
-            if let Err(e) = super::history::append(&self.home.join("history"), text, &self.footer.cwd) {
+            if let Err(e) =
+                super::history::append(&self.home.join("history"), text, &self.footer.cwd)
+            {
                 self.hint = Some(format!("could not save prompt history: {e}"));
             }
         }
@@ -2657,7 +2836,8 @@ impl Screen {
     }
 
     fn on_secret_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Enter => {
                 if let Some(s) = self.secret.take() {
@@ -2675,7 +2855,9 @@ impl Screen {
                     s.text.pop();
                 });
             }
-            KeyCode::Char(ch) if text_key(key, ch) => self.secret.iter_mut().for_each(|s| s.text.push(ch)),
+            KeyCode::Char(ch) if text_key(key, ch) => {
+                self.secret.iter_mut().for_each(|s| s.text.push(ch))
+            }
             _ => {}
         }
         self.redraw();
@@ -2799,7 +2981,10 @@ impl Screen {
                 || (ctrl && key.code == KeyCode::Char('o'))
                 || self.keys.matches(KeyAction::ExpandTools, &key);
             if a.review.is_some() && review {
-                let (title, text) = (super::render::strip_ansi(&a.title), a.review.clone().unwrap_or_default());
+                let (title, text) = (
+                    super::render::strip_ansi(&a.title),
+                    a.review.clone().unwrap_or_default(),
+                );
                 self.approval = Some(a);
                 return self.open_review(&title, &text);
             }
@@ -2879,13 +3064,23 @@ impl Screen {
             match key.code {
                 KeyCode::Up if arrows => q.selected = q.selected.checked_sub(1).unwrap_or(n - 1),
                 KeyCode::Down if arrows => q.selected = (q.selected + 1) % n,
-                KeyCode::Char(d @ '1'..='9') if arrows && (d as usize - '1' as usize) < q.options.len() => {
+                KeyCode::Char(d @ '1'..='9')
+                    if arrows && (d as usize - '1' as usize) < q.options.len() =>
+                {
                     q.selected = d as usize - '1' as usize;
                 }
                 KeyCode::Enter if key.modifiers.is_empty() => {
                     let q = self.question.take().unwrap();
-                    let typed = if q.menu.is_some() { String::new() } else { self.editor.submitted_text() };
-                    let answer = if typed.trim().is_empty() { q.options.get(q.selected).cloned() } else { Some(typed) };
+                    let typed = if q.menu.is_some() {
+                        String::new()
+                    } else {
+                        self.editor.submitted_text()
+                    };
+                    let answer = if typed.trim().is_empty() {
+                        q.options.get(q.selected).cloned()
+                    } else {
+                        Some(typed)
+                    };
                     if q.menu.is_none() {
                         self.editor.set_text("");
                     }
@@ -2934,7 +3129,8 @@ impl Screen {
                     return self.redraw();
                 }
                 KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
-                    self.editor.complete_at(&found[self.file_selected.min(n - 1)]);
+                    self.editor
+                        .complete_at(&found[self.file_selected.min(n - 1)]);
                     self.file_selected = 0;
                     return self.redraw();
                 }
@@ -2946,7 +3142,11 @@ impl Screen {
             }
         }
         // The slash menu takes arrows and Enter while it is showing.
-        let suggestions = if searching { Vec::new() } else { self.editor.suggestions() };
+        let suggestions = if searching {
+            Vec::new()
+        } else {
+            self.editor.suggestions()
+        };
         if !suggestions.is_empty() {
             let pick = &suggestions[self.slash_selected.min(suggestions.len() - 1)];
             match key.code {
@@ -2967,7 +3167,9 @@ impl Screen {
                 // Enter still runs what was typed unless an option was picked.
                 KeyCode::Enter
                     if key.modifiers.is_empty()
-                        && !(pick.arg && self.editor.text().ends_with(' ') && !self.slash_moved) =>
+                        && !(pick.arg
+                            && self.editor.text().ends_with(' ')
+                            && !self.slash_moved) =>
                 {
                     let fill = pick.fill.clone();
                     self.slash_selected = 0;
@@ -3014,7 +3216,9 @@ impl Screen {
             || self.keys.matches(KeyAction::HistoryNext, &key);
         match &action {
             Action::Submit(text) | Action::FollowUp(text) => self.prune_attachments(text),
-            _ if !browsing && !self.attachments.is_empty() => self.prune_attachments(&self.editor.text()),
+            _ if !browsing && !self.attachments.is_empty() => {
+                self.prune_attachments(&self.editor.text())
+            }
             _ => {}
         }
         match action {
@@ -3069,7 +3273,11 @@ impl Screen {
                 // The newest queued message comes back first, ahead of the draft.
                 if let Some((_, text)) = self.queue.pop() {
                     let draft = self.editor.text();
-                    self.editor.set_text(&if draft.is_empty() { text } else { format!("{text}\n\n{draft}") });
+                    self.editor.set_text(&if draft.is_empty() {
+                        text
+                    } else {
+                        format!("{text}\n\n{draft}")
+                    });
                 }
             }
         }
@@ -3237,8 +3445,21 @@ impl Tui {
                             {
                                 let now = Instant::now();
                                 let pasted = paste_key(k, previous, now, streak);
-                                streak = if previous.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10)) { streak + 1 } else { 0 };
-                                if let Some(text) = pasted.filter(|_| s.approval.is_none() && s.menu.is_none() && s.modes.is_none() && s.skills.is_none() && s.sessions.is_none() && s.secret.is_none()) {
+                                streak = if previous.is_some_and(|t| {
+                                    now.duration_since(t) < Duration::from_millis(10)
+                                }) {
+                                    streak + 1
+                                } else {
+                                    0
+                                };
+                                if let Some(text) = pasted.filter(|_| {
+                                    s.approval.is_none()
+                                        && s.menu.is_none()
+                                        && s.modes.is_none()
+                                        && s.skills.is_none()
+                                        && s.sessions.is_none()
+                                        && s.secret.is_none()
+                                }) {
                                     s.editor.paste(text);
                                     s.redraw();
                                     previous = Some(Instant::now());
@@ -3281,7 +3502,10 @@ impl Tui {
                         Event::Paste(text) => {
                             if let Some(sec) = &mut s.secret {
                                 sec.text.push_str(text.trim());
-                            } else if s.approval.is_none() && s.menu.is_none() && s.sessions.is_none() {
+                            } else if s.approval.is_none()
+                                && s.menu.is_none()
+                                && s.sessions.is_none()
+                            {
                                 s.editor.paste(&text);
                             }
                             s.redraw();
@@ -3316,7 +3540,8 @@ impl Tui {
                 loop {
                     tick.tick().await;
                     let mut s = lock(&screen);
-                    let upgrade_changed = s.upgrader.as_ref().is_some_and(|u| u.take_render_dirty());
+                    let upgrade_changed =
+                        s.upgrader.as_ref().is_some_and(|u| u.take_render_dirty());
                     if s.busy.is_some() && s.approval.is_none() {
                         s.frame += 1;
                         s.redraw();
@@ -3341,7 +3566,9 @@ impl Tui {
 
     /// Open the model switcher and fill it in the background.
     pub fn open_models(&self) {
-        if !super::menu_or_hint("  Pick a model with /model ID|QUERY [effort] [fast|normal]; `nyq models` lists them.") {
+        if !super::menu_or_hint(
+            "  Pick a model with /model ID|QUERY [effort] [fast|normal]; `nyq models` lists them.",
+        ) {
             return;
         }
         let home = {
@@ -3386,7 +3613,11 @@ impl Tui {
         {
             let mut s = self.screen();
             s.flush_all();
-            s.secret = Some(PendingSecret { prompt: prompt.to_string(), text: String::new(), reply: tx });
+            s.secret = Some(PendingSecret {
+                prompt: prompt.to_string(),
+                text: String::new(),
+                reply: tx,
+            });
             s.redraw();
         }
         let answer = rx.await.ok().flatten();
@@ -3394,7 +3625,9 @@ impl Tui {
         if s.secret.take().is_some() || answer.is_some() {
             s.redraw();
         }
-        answer.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+        answer
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
     }
 
     /// Clear a masked prompt left up after sign-in finishes another way.
@@ -3471,7 +3704,10 @@ impl Drop for TerminalSetup {
             pop_keyboard_enhancement();
         }
         if self.bracketed {
-            let _ = execute!(crate::record_tape::stdout(), crossterm::event::DisableBracketedPaste);
+            let _ = execute!(
+                crate::record_tape::stdout(),
+                crossterm::event::DisableBracketedPaste
+            );
         }
         let _ = execute!(crate::record_tape::stdout(), cursor::Show);
         let _ = terminal::disable_raw_mode();
@@ -3501,7 +3737,11 @@ fn restore_terminal() {
     let (alt, enhanced) = take_terminal_fixes();
     let mut out = crate::record_tape::stdout();
     if alt {
-        let _ = execute!(out, crossterm::event::DisableMouseCapture, terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            out,
+            crossterm::event::DisableMouseCapture,
+            terminal::LeaveAlternateScreen
+        );
     }
     if enhanced {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
@@ -3621,7 +3861,11 @@ impl Approver for TuiApprover {
     async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval {
         approve_on(&self.screen, Some(origin), req).await.0
     }
-    async fn approve_noted(&self, origin: &str, req: &ApprovalRequest<'_>) -> (Approval, Option<String>) {
+    async fn approve_noted(
+        &self,
+        origin: &str,
+        req: &ApprovalRequest<'_>,
+    ) -> (Approval, Option<String>) {
         approve_on(&self.screen, Some(origin), req).await
     }
 }
@@ -3773,7 +4017,14 @@ pub fn tool_progress(text: &str) {
     let Some(screen) = active() else { return };
     let mut s = lock(&screen);
     let text = one_line(&sanitize_text(text), 80);
-    let Some(t) = s.tools.iter_mut().rev().find(|t| t.status == Status::Running) else { return };
+    let Some(t) = s
+        .tools
+        .iter_mut()
+        .rev()
+        .find(|t| t.status == Status::Running)
+    else {
+        return;
+    };
     t.note = text.clone();
     let label = format!("Running {} · {text}", t.tool.replace('_', " "));
     s.set_label(&label);
@@ -4039,7 +4290,11 @@ mod tests {
             m.on_sessions_key(KeyEvent::new(code, KeyModifiers::NONE), &tx);
         };
         let mut s = Screen::new(Footer::default(), Editor::default(), PathBuf::new());
-        s.sessions = Some(SessionMenu::new(all.clone(), std::path::Path::new("/here"), None));
+        s.sessions = Some(SessionMenu::new(
+            all.clone(),
+            std::path::Path::new("/here"),
+            None,
+        ));
         key(&mut s, KeyCode::Tab);
         let menu = s.sessions.as_ref().unwrap();
         assert!(menu.all);
@@ -4256,9 +4511,14 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         for ch in "yYaAsSlLnNvV1".chars() {
             for modifiers in [
-                KeyModifiers::NONE, KeyModifiers::SHIFT, KeyModifiers::CONTROL,
-                KeyModifiers::ALT, KeyModifiers::SUPER, KeyModifiers::HYPER,
-                KeyModifiers::META, KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                KeyModifiers::NONE,
+                KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::SUPER,
+                KeyModifiers::HYPER,
+                KeyModifiers::META,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
                 KeyModifiers::ALT | KeyModifiers::SHIFT,
             ] {
                 let mut s = screen();
@@ -4347,15 +4607,24 @@ mod tests {
         let mut s = screen();
         s.set_keys(keys);
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        s.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), &cmd_tx);
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        );
         assert!(s.viewer.is_none());
-        s.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL), &cmd_tx);
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        );
         assert!(cmd_rx.try_recv().is_err(), "model_menu is unbound");
         s.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &cmd_tx);
         assert!(s.viewer.is_some());
         s.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &cmd_tx);
         assert!(s.viewer.is_none(), "the same key closes it");
-        s.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &cmd_tx);
+        s.on_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &cmd_tx,
+        );
         assert!(matches!(cmd_rx.try_recv().unwrap(), Command::CycleEffort));
     }
 
@@ -4410,8 +4679,14 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         s.approval = Some(pending(Some("mcp__wiki__ask"), tx));
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        assert!(text.contains("save `mcp__wiki__ask` for this workspace only"), "{text}");
-        s.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &cmd_tx);
+        assert!(
+            text.contains("save `mcp__wiki__ask` for this workspace only"),
+            "{text}"
+        );
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &cmd_tx,
+        );
         assert_eq!(rx.try_recv().unwrap(), (Approval::AlwaysSaveLocal, None));
     }
 
@@ -4421,13 +4696,22 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         s.editor = Editor::new(
             vec![],
-            vec![("/help".into(), "show commands".into()), ("/permissions".into(), "perms".into())],
+            vec![
+                ("/help".into(), "show commands".into()),
+                ("/permissions".into(), "perms".into()),
+            ],
         );
         s.open_help();
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        assert!(text.contains("Help 2") && text.contains("[All]") && text.contains("Security"), "{text}");
+        assert!(
+            text.contains("Help 2") && text.contains("[All]") && text.contains("Security"),
+            "{text}"
+        );
         for ch in "perm".chars() {
-            s.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &cmd_tx);
+            s.on_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &cmd_tx,
+            );
         }
         s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &cmd_tx);
         assert!(matches!(cmd_rx.try_recv(), Ok(Command::Submit(c)) if c == "/permissions"));
@@ -4443,7 +4727,11 @@ mod tests {
         assert!(matches!(cmd_rx.try_recv(), Ok(Command::Submit(c)) if c == "/permissions auto"));
         s.editor.set_text("/permissions rem");
         s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &cmd_tx);
-        assert_eq!(s.editor.text(), "/permissions remember ", "options that need more input are inserted");
+        assert_eq!(
+            s.editor.text(),
+            "/permissions remember ",
+            "options that need more input are inserted"
+        );
         assert!(cmd_rx.try_recv().is_err());
     }
 
@@ -4452,7 +4740,11 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join(".claude/skills/pdf");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("SKILL.md"), "---\nname: pdf\ndescription: Fill PDF forms\n---\nbody\n").unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Fill PDF forms\n---\nbody\n",
+        )
+        .unwrap();
         let skills = crate::skills::discover_with(&t.path().join("home"), None, t.path());
         let entry = |managed| super::super::skills_menu::Entry {
             group: crate::skills::source(&skills[0]),
@@ -4470,12 +4762,23 @@ mod tests {
         let targets = super::super::skills_menu::Targets::default;
         s.open_skills(vec![entry(false)], targets());
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        assert!(text.contains("Skills 1") && text.contains("[All 1]  Claude Code 1"), "{text}");
-        assert!(text.contains("pdf") && text.contains("Fill PDF forms") && text.contains("Claude Code · project"), "{text}");
+        assert!(
+            text.contains("Skills 1") && text.contains("[All 1]  Claude Code 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pdf")
+                && text.contains("Fill PDF forms")
+                && text.contains("Claude Code · project"),
+            "{text}"
+        );
         s.on_key(key(KeyCode::Delete), &cmd_tx);
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
         assert!(text.contains("only removes skills it installed"), "{text}");
-        s.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &cmd_tx);
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        );
         assert!(s.skills.is_none());
         assert_eq!(s.editor.text(), "/pdf ");
 
@@ -4525,8 +4828,16 @@ mod tests {
         );
         s.open_tools(entries);
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        assert!(text.contains("Tools 1") && text.contains("[All 1]  Built-in 1") && text.contains("asks"), "{text}");
-        s.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL), &cmd_tx);
+        assert!(
+            text.contains("Tools 1")
+                && text.contains("[All 1]  Built-in 1")
+                && text.contains("asks"),
+            "{text}"
+        );
+        s.on_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        );
         assert!(matches!(cmd_rx.try_recv(), Ok(Command::Submit(c)) if c == "/tools disable bash"));
         assert!(s.tools_open());
         s.on_key(key(KeyCode::Esc), &cmd_tx);
@@ -4593,7 +4904,10 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), (Approval::Yes, None));
     }
 
-    fn pending_approval(tx: oneshot::Sender<(Approval, Option<String>)>, review: Option<String>) -> PendingApproval {
+    fn pending_approval(
+        tx: oneshot::Sender<(Approval, Option<String>)>,
+        review: Option<String>,
+    ) -> PendingApproval {
         PendingApproval {
             title: "Edited a.rs".into(),
             lines: (0..30).map(|i| format!("line {i}")).collect(),
@@ -4625,7 +4939,10 @@ mod tests {
         s.on_key(key(KeyCode::Down), &cmd_tx);
         assert_eq!(s.approval.as_ref().unwrap().selected, Some(1));
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        assert!(text.contains("› a  2. Always allow edits") && text.contains("v Review"), "{text}");
+        assert!(
+            text.contains("› a  2. Always allow edits") && text.contains("v Review"),
+            "{text}"
+        );
         s.on_key(key(KeyCode::PageDown), &cmd_tx);
         assert_eq!(s.approval.as_ref().unwrap().scroll, MAX_PREVIEW - 1);
         // The review covers the prompt; its keys go to the viewer until it closes.
@@ -4675,17 +4992,33 @@ mod tests {
         s.width = 50;
         s.height = 60;
         s.tool_start("edit_file", "a.rs");
-        let d: String = "--- a/a.rs\n+++ b/a.rs\n@@ -1,20 +1,20 @@\n".to_string() + &(0..20).map(|i| format!("-old {i}\n+new {i}\n")).collect::<String>();
-        s.tool_end(&ToolOutput { content: "Edited a.rs.".into(), display: Some(d), ..ToolOutput::default() });
+        let d: String = "--- a/a.rs\n+++ b/a.rs\n@@ -1,20 +1,20 @@\n".to_string()
+            + &(0..20)
+                .map(|i| format!("-old {i}\n+new {i}\n"))
+                .collect::<String>();
+        s.tool_end(&ToolOutput {
+            content: "Edited a.rs.".into(),
+            display: Some(d),
+            ..ToolOutput::default()
+        });
         let mut rows = Vec::new();
         s.tool_rows(&mut rows, false);
-        let plain: Vec<String> = rows.iter().map(|r| super::super::render::strip_ansi(r)).collect();
+        let plain: Vec<String> = rows
+            .iter()
+            .map(|r| super::super::render::strip_ansi(r))
+            .collect();
         assert!(plain[0].starts_with("✓ Edited a.rs +20 -20"), "{plain:?}");
         assert_eq!(plain[1], "  │  1 - old 0");
-        assert_eq!(plain.last().unwrap(), "  │ … 28 more lines (ctrl+o to view)");
+        assert_eq!(
+            plain.last().unwrap(),
+            "  │ … 28 more lines (ctrl+o to view)"
+        );
         assert_eq!(plain.len(), 2 + INLINE_DIFF_ROWS);
         s.tool_start("read_file", "b.rs");
-        crate::settings::install(crate::settings::Settings { collapse_tool_calls: true, ..Default::default() });
+        crate::settings::install(crate::settings::Settings {
+            collapse_tool_calls: true,
+            ..Default::default()
+        });
         let mut rows = Vec::new();
         s.tool_rows(&mut rows, false);
         crate::settings::install(crate::settings::Settings::default());
@@ -4703,10 +5036,22 @@ mod tests {
         s.tool_start("bash", "ls");
         s.turn_tokens = (1500, 20);
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
-        let line = text.lines().find(|l| l.starts_with("⠋ Running bash")).unwrap_or_default();
-        assert!(line.starts_with("⠋ Running bash · 0s · ↑1.5k ↓20 · 2 read, 1 command "), "{text}");
-        assert!(line.ends_with(" esc to interrupt") && visible_width(line) == 120, "{text}");
-        assert!(text.contains("├ ⠋ Read a") && text.contains("│ › Steer the current task"), "{text}");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("⠋ Running bash"))
+            .unwrap_or_default();
+        assert!(
+            line.starts_with("⠋ Running bash · 0s · ↑1.5k ↓20 · 2 read, 1 command "),
+            "{text}"
+        );
+        assert!(
+            line.ends_with(" esc to interrupt") && visible_width(line) == 120,
+            "{text}"
+        );
+        assert!(
+            text.contains("├ ⠋ Read a") && text.contains("│ › Steer the current task"),
+            "{text}"
+        );
         let (tx, _rx) = oneshot::channel();
         s.approval = Some(pending_approval(tx, None));
         s.redraw();
@@ -4730,14 +5075,26 @@ mod tests {
         s.set_busy(Some("Working"), None);
         s.tool_start("edit_file", "a.rs");
         let diff = "@@ -1 +1 @@\n-old\n+new\n";
-        s.tool_end(&ToolOutput { content: "Edited a.rs.".into(), display: Some(diff.into()), ..ToolOutput::default() });
+        s.tool_end(&ToolOutput {
+            content: "Edited a.rs.".into(),
+            display: Some(diff.into()),
+            ..ToolOutput::default()
+        });
         let text = super::super::render::strip_ansi(&s.pane().0.join("\n"));
         assert!(text.contains("● Edited a.rs +1 / -1"), "{text}");
-        assert!(text.contains("• Working (0s · 1 edited · esc to interrupt)"), "{text}");
+        assert!(
+            text.contains("• Working (0s · 1 edited · esc to interrupt)"),
+            "{text}"
+        );
         assert!(text.lines().any(|l| l == "┃ "), "{text}");
         assert!(!text.contains('╭') && !text.contains('✓'), "{text}");
-        let banner = super::super::render::strip_ansi(&chrome::banner("0.4", &s.footer, &s.keys, 80, 0).join("\n"));
-        assert!(banner.starts_with("𝒏yq v0.4 · Run /help for commands ·"), "{banner}");
+        let banner = super::super::render::strip_ansi(
+            &chrome::banner("0.4", &s.footer, &s.keys, 80, 0).join("\n"),
+        );
+        assert!(
+            banner.starts_with("𝒏yq v0.4 · Run /help for commands ·"),
+            "{banner}"
+        );
     }
 
     #[test]
@@ -4753,20 +5110,38 @@ mod tests {
         s.set_busy(Some("Working"), None);
         s.tool_start("edit_file", "a.rs");
         let diff = "@@ -1 +1 @@\n-old\n+new\n";
-        s.tool_end(&ToolOutput { content: "Edited a.rs.".into(), display: Some(diff.into()), ..ToolOutput::default() });
+        s.tool_end(&ToolOutput {
+            content: "Edited a.rs.".into(),
+            display: Some(diff.into()),
+            ..ToolOutput::default()
+        });
         s.tool_start("bash", "ls");
         s.turn_tokens = (10, 2);
         let mut rows = s.pane().0;
         s.tool_rows(&mut rows, false);
         for r in &rows {
-            let params = r.split("\x1b[").skip(1).flat_map(|e| e.split('m').next().unwrap_or("").split(';'));
-            assert!(params.clone().all(|p| !matches!(p.parse::<u8>(), Ok(30..=49 | 90..=107))), "{r:?}");
+            let params = r
+                .split("\x1b[")
+                .skip(1)
+                .flat_map(|e| e.split('m').next().unwrap_or("").split(';'));
+            assert!(
+                params
+                    .clone()
+                    .all(|p| !matches!(p.parse::<u8>(), Ok(30..=49 | 90..=107))),
+                "{r:?}"
+            );
             let folded = super::super::render::strip_ansi(&chrome::fold(r));
             assert!(folded.is_ascii(), "{folded:?}");
         }
         let text = super::super::render::strip_ansi(&chrome::fold(&rows.join("\n")));
-        assert!(text.contains("| + Edited a.rs +1 -1") && text.contains("| | 1 - old"), "{text}");
-        assert!(text.contains("| > Steer the current task") && text.contains("yolo - git:main"), "{text}");
+        assert!(
+            text.contains("| + Edited a.rs +1 -1") && text.contains("| | 1 - old"),
+            "{text}"
+        );
+        assert!(
+            text.contains("| > Steer the current task") && text.contains("yolo - git:main"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -4947,7 +5322,10 @@ mod tests {
         let mut s = screen();
         let (tx, _rx) = mpsc::unbounded_channel();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        let img = || crate::types::Image { media_type: "image/png".into(), data: String::new() };
+        let img = || crate::types::Image {
+            media_type: "image/png".into(),
+            data: String::new(),
+        };
         // Images are tokens in the text; deleting a token drops its image.
         s.attach(img(), "a.png");
         s.attach(img(), "b.png");
@@ -4963,7 +5341,10 @@ mod tests {
         assert_eq!(s.attachments.len(), 1, "sent with the message");
 
         // Alt+Up takes queued messages back one at a time, newest first.
-        s.queue = vec![(Queued::Steer, "one".into()), (Queued::FollowUp, "two".into())];
+        s.queue = vec![
+            (Queued::Steer, "one".into()),
+            (Queued::FollowUp, "two".into()),
+        ];
         let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
         s.on_key(alt_up, &tx);
         assert_eq!((s.editor.text().as_str(), s.queue.len()), ("two", 1));
