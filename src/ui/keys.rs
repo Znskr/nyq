@@ -69,7 +69,13 @@ const fn spec(
     defaults: &'static [&'static str],
     description: &'static str,
 ) -> Spec {
-    Spec { action, name, context, defaults, description }
+    Spec {
+        action,
+        name,
+        context,
+        defaults,
+        description,
+    }
 }
 
 use Context::{Editor, Global};
@@ -77,38 +83,230 @@ use KeyAction as A;
 
 /// Every bindable action, in lookup order (an earlier action wins a conflict).
 pub const SPECS: &[Spec] = &[
-    spec(A::Reload, "reload", Global, &["ctrl+g"], "Relaunch into an installed upgrade"),
-    spec(A::ExpandTools, "expand_tools", Global, &["ctrl+o"], "Full transcript with every tool call; review a pending approval"),
-    spec(A::PasteImage, "paste_image", Global, &["ctrl+v"], "Attach an image from the clipboard"),
-    spec(A::ModelMenu, "model_menu", Global, &["ctrl+l"], "Switch model (/model)"),
-    spec(A::CycleEffort, "cycle_effort", Global, &["shift+tab"], "Next reasoning effort"),
-    spec(A::Suspend, "suspend", Global, &["ctrl+z"], "Suspend to the shell (Unix)"),
-    spec(A::Submit, "submit", Editor, &["enter"], "Send the message (steers while working); after a trailing \\ inserts a newline"),
-    spec(A::Newline, "newline", Editor, &["shift+enter", "ctrl+j"], "Insert a newline"),
-    spec(A::FollowUp, "follow_up", Editor, &["alt+enter"], "While working, queue a follow-up; otherwise insert a newline"),
-    spec(A::Interrupt, "interrupt", Editor, &["esc"], "Interrupt the turn; twice clears the input"),
-    spec(A::Clear, "clear", Editor, &["ctrl+c"], "Clear the input; when empty interrupt, or press twice to exit"),
-    spec(A::Exit, "exit", Editor, &["ctrl+d"], "Exit on an empty input; otherwise delete the next character"),
-    spec(A::Dequeue, "dequeue", Editor, &["alt+up"], "Move the newest queued message back into the input"),
-    spec(A::HistorySearch, "history_search", Editor, &["ctrl+r"], "Reverse-search prompt history (again for older matches)"),
-    spec(A::HistoryPrev, "history_prev", Editor, &["up", "ctrl+p"], "Up a row; on the first row, the older prompt"),
-    spec(A::HistoryNext, "history_next", Editor, &["down", "ctrl+n"], "Down a row; on the last row, the newer prompt"),
-    spec(A::Complete, "complete", Editor, &["tab"], "Complete a command"),
-    spec(A::Undo, "undo", Editor, &["ctrl+_", "ctrl+7", "ctrl+-", "super+z"], "Undo"),
-    spec(A::Redo, "redo", Editor, &["alt+_", "ctrl+shift+z", "super+shift+z"], "Redo"),
-    spec(A::CharLeft, "char_left", Editor, &["left", "ctrl+b"], "Cursor left"),
-    spec(A::CharRight, "char_right", Editor, &["right", "ctrl+f"], "Cursor right"),
-    spec(A::WordLeft, "word_left", Editor, &["ctrl+left", "alt+left", "alt+b"], "Previous word"),
-    spec(A::WordRight, "word_right", Editor, &["ctrl+right", "alt+right", "alt+f"], "Next word"),
-    spec(A::LineStart, "line_start", Editor, &["home", "ctrl+a", "super+left"], "Start of line"),
-    spec(A::LineEnd, "line_end", Editor, &["end", "ctrl+e", "super+right"], "End of line"),
-    spec(A::InputStart, "input_start", Editor, &["ctrl+home", "super+up", "super+home", "alt+<"], "Start of input"),
-    spec(A::InputEnd, "input_end", Editor, &["ctrl+end", "super+down", "super+end", "alt+>"], "End of input"),
-    spec(A::DeleteWord, "delete_word", Editor, &["alt+backspace", "ctrl+w"], "Delete the previous word"),
-    spec(A::DeleteWordForward, "delete_word_forward", Editor, &["alt+d", "ctrl+delete", "alt+delete"], "Delete the next word"),
-    spec(A::DeleteToLineStart, "delete_to_line_start", Editor, &["ctrl+u", "super+backspace"], "Delete to the start of the line"),
-    spec(A::DeleteToLineEnd, "delete_to_line_end", Editor, &["ctrl+k"], "Delete to the end of the line (joins at the end)"),
-    spec(A::Yank, "yank", Editor, &["ctrl+y"], "Paste the last deleted text"),
+    spec(
+        A::Reload,
+        "reload",
+        Global,
+        &["ctrl+g"],
+        "Relaunch into an installed upgrade",
+    ),
+    spec(
+        A::ExpandTools,
+        "expand_tools",
+        Global,
+        &["ctrl+o"],
+        "Full transcript with every tool call; review a pending approval",
+    ),
+    spec(
+        A::PasteImage,
+        "paste_image",
+        Global,
+        &["ctrl+v"],
+        "Attach an image from the clipboard",
+    ),
+    spec(
+        A::ModelMenu,
+        "model_menu",
+        Global,
+        &["ctrl+l"],
+        "Switch model (/model)",
+    ),
+    spec(
+        A::CycleEffort,
+        "cycle_effort",
+        Global,
+        &["shift+tab"],
+        "Next reasoning effort",
+    ),
+    spec(
+        A::Suspend,
+        "suspend",
+        Global,
+        &["ctrl+z"],
+        "Suspend to the shell (Unix)",
+    ),
+    spec(
+        A::Submit,
+        "submit",
+        Editor,
+        &["enter"],
+        "Send the message (steers while working); after a trailing \\ inserts a newline",
+    ),
+    spec(
+        A::Newline,
+        "newline",
+        Editor,
+        &["shift+enter", "ctrl+j"],
+        "Insert a newline",
+    ),
+    spec(
+        A::FollowUp,
+        "follow_up",
+        Editor,
+        &["alt+enter"],
+        "While working, queue a follow-up; otherwise insert a newline",
+    ),
+    spec(
+        A::Interrupt,
+        "interrupt",
+        Editor,
+        &["esc"],
+        "Interrupt the turn; twice clears the input",
+    ),
+    spec(
+        A::Clear,
+        "clear",
+        Editor,
+        &["ctrl+c"],
+        "Clear the input; when empty interrupt, or press twice to exit",
+    ),
+    spec(
+        A::Exit,
+        "exit",
+        Editor,
+        &["ctrl+d"],
+        "Exit on an empty input; otherwise delete the next character",
+    ),
+    spec(
+        A::Dequeue,
+        "dequeue",
+        Editor,
+        &["alt+up"],
+        "Move the newest queued message back into the input",
+    ),
+    spec(
+        A::HistorySearch,
+        "history_search",
+        Editor,
+        &["ctrl+r"],
+        "Reverse-search prompt history (again for older matches)",
+    ),
+    spec(
+        A::HistoryPrev,
+        "history_prev",
+        Editor,
+        &["up", "ctrl+p"],
+        "Up a row; on the first row, the older prompt",
+    ),
+    spec(
+        A::HistoryNext,
+        "history_next",
+        Editor,
+        &["down", "ctrl+n"],
+        "Down a row; on the last row, the newer prompt",
+    ),
+    spec(
+        A::Complete,
+        "complete",
+        Editor,
+        &["tab"],
+        "Complete a command",
+    ),
+    spec(
+        A::Undo,
+        "undo",
+        Editor,
+        &["ctrl+_", "ctrl+7", "ctrl+-", "super+z"],
+        "Undo",
+    ),
+    spec(
+        A::Redo,
+        "redo",
+        Editor,
+        &["alt+_", "ctrl+shift+z", "super+shift+z"],
+        "Redo",
+    ),
+    spec(
+        A::CharLeft,
+        "char_left",
+        Editor,
+        &["left", "ctrl+b"],
+        "Cursor left",
+    ),
+    spec(
+        A::CharRight,
+        "char_right",
+        Editor,
+        &["right", "ctrl+f"],
+        "Cursor right",
+    ),
+    spec(
+        A::WordLeft,
+        "word_left",
+        Editor,
+        &["ctrl+left", "alt+left", "alt+b"],
+        "Previous word",
+    ),
+    spec(
+        A::WordRight,
+        "word_right",
+        Editor,
+        &["ctrl+right", "alt+right", "alt+f"],
+        "Next word",
+    ),
+    spec(
+        A::LineStart,
+        "line_start",
+        Editor,
+        &["home", "ctrl+a", "super+left"],
+        "Start of line",
+    ),
+    spec(
+        A::LineEnd,
+        "line_end",
+        Editor,
+        &["end", "ctrl+e", "super+right"],
+        "End of line",
+    ),
+    spec(
+        A::InputStart,
+        "input_start",
+        Editor,
+        &["ctrl+home", "super+up", "super+home", "alt+<"],
+        "Start of input",
+    ),
+    spec(
+        A::InputEnd,
+        "input_end",
+        Editor,
+        &["ctrl+end", "super+down", "super+end", "alt+>"],
+        "End of input",
+    ),
+    spec(
+        A::DeleteWord,
+        "delete_word",
+        Editor,
+        &["alt+backspace", "ctrl+w"],
+        "Delete the previous word",
+    ),
+    spec(
+        A::DeleteWordForward,
+        "delete_word_forward",
+        Editor,
+        &["alt+d", "ctrl+delete", "alt+delete"],
+        "Delete the next word",
+    ),
+    spec(
+        A::DeleteToLineStart,
+        "delete_to_line_start",
+        Editor,
+        &["ctrl+u", "super+backspace"],
+        "Delete to the start of the line",
+    ),
+    spec(
+        A::DeleteToLineEnd,
+        "delete_to_line_end",
+        Editor,
+        &["ctrl+k"],
+        "Delete to the end of the line (joins at the end)",
+    ),
+    spec(
+        A::Yank,
+        "yank",
+        Editor,
+        &["ctrl+y"],
+        "Paste the last deleted text",
+    ),
 ];
 
 /// The same actions on their default keys with extra modifiers, which the
@@ -116,104 +314,285 @@ pub const SPECS: &[Spec] = &[
 /// went to the line start). They stay bound until the action is set in
 /// keybindings.toml, and `/keys` only counts them.
 pub const VARIANTS: &[(KeyAction, &[&str])] = &[
-    (A::Reload, &["ctrl+shift+g", "ctrl+super+g", "ctrl+super+shift+g"]),
-    (A::ExpandTools, &["ctrl+shift+o", "ctrl+super+o", "ctrl+super+shift+o"]),
-    (A::PasteImage, &["ctrl+shift+v", "ctrl+super+v", "ctrl+super+shift+v"]),
-    (A::ModelMenu, &["ctrl+shift+l", "ctrl+super+l", "ctrl+super+shift+l"]),
+    (
+        A::Reload,
+        &["ctrl+shift+g", "ctrl+super+g", "ctrl+super+shift+g"],
+    ),
+    (
+        A::ExpandTools,
+        &["ctrl+shift+o", "ctrl+super+o", "ctrl+super+shift+o"],
+    ),
+    (
+        A::PasteImage,
+        &["ctrl+shift+v", "ctrl+super+v", "ctrl+super+shift+v"],
+    ),
+    (
+        A::ModelMenu,
+        &["ctrl+shift+l", "ctrl+super+l", "ctrl+super+shift+l"],
+    ),
     (
         A::CycleEffort,
         &[
-            "alt+shift+tab", "ctrl+shift+tab", "super+shift+tab", "alt+super+shift+tab", "ctrl+alt+shift+tab",
-            "ctrl+super+shift+tab", "ctrl+alt+super+shift+tab",
+            "alt+shift+tab",
+            "ctrl+shift+tab",
+            "super+shift+tab",
+            "alt+super+shift+tab",
+            "ctrl+alt+shift+tab",
+            "ctrl+super+shift+tab",
+            "ctrl+alt+super+shift+tab",
         ],
     ),
     (A::Suspend, &["ctrl+super+z"]),
-    (A::Submit, &["ctrl+enter", "super+enter", "ctrl+alt+enter", "ctrl+super+enter", "ctrl+alt+super+enter"]),
+    (
+        A::Submit,
+        &[
+            "ctrl+enter",
+            "super+enter",
+            "ctrl+alt+enter",
+            "ctrl+super+enter",
+            "ctrl+alt+super+enter",
+        ],
+    ),
     (
         A::Newline,
         &[
-            "ctrl+shift+enter", "ctrl+shift+j", "ctrl+super+j", "super+shift+enter", "ctrl+alt+shift+enter",
-            "ctrl+super+shift+enter", "ctrl+super+shift+j", "ctrl+alt+super+shift+enter",
+            "ctrl+shift+enter",
+            "ctrl+shift+j",
+            "ctrl+super+j",
+            "super+shift+enter",
+            "ctrl+alt+shift+enter",
+            "ctrl+super+shift+enter",
+            "ctrl+super+shift+j",
+            "ctrl+alt+super+shift+enter",
         ],
     ),
-    (A::FollowUp, &["alt+shift+enter", "alt+super+enter", "alt+super+shift+enter"]),
+    (
+        A::FollowUp,
+        &[
+            "alt+shift+enter",
+            "alt+super+enter",
+            "alt+super+shift+enter",
+        ],
+    ),
     (
         A::Interrupt,
         &[
-            "alt+esc", "ctrl+esc", "shift+esc", "super+esc", "alt+shift+esc", "alt+super+esc", "ctrl+alt+esc",
-            "ctrl+shift+esc", "ctrl+super+esc", "super+shift+esc", "alt+super+shift+esc",
-            "ctrl+alt+shift+esc", "ctrl+alt+super+esc", "ctrl+super+shift+esc", "ctrl+alt+super+shift+esc",
+            "alt+esc",
+            "ctrl+esc",
+            "shift+esc",
+            "super+esc",
+            "alt+shift+esc",
+            "alt+super+esc",
+            "ctrl+alt+esc",
+            "ctrl+shift+esc",
+            "ctrl+super+esc",
+            "super+shift+esc",
+            "alt+super+shift+esc",
+            "ctrl+alt+shift+esc",
+            "ctrl+alt+super+esc",
+            "ctrl+super+shift+esc",
+            "ctrl+alt+super+shift+esc",
         ],
     ),
-    (A::Clear, &["ctrl+shift+c", "ctrl+super+c", "ctrl+super+shift+c"]),
-    (A::Exit, &["ctrl+shift+d", "ctrl+super+d", "ctrl+super+shift+d"]),
+    (
+        A::Clear,
+        &["ctrl+shift+c", "ctrl+super+c", "ctrl+super+shift+c"],
+    ),
+    (
+        A::Exit,
+        &["ctrl+shift+d", "ctrl+super+d", "ctrl+super+shift+d"],
+    ),
     (A::Dequeue, &["alt+super+up"]),
-    (A::HistorySearch, &["ctrl+shift+r", "ctrl+super+r", "ctrl+super+shift+r"]),
-    (A::HistoryPrev, &["ctrl+up", "ctrl+alt+up", "ctrl+shift+p", "ctrl+super+p", "ctrl+super+shift+p"]),
-    (A::HistoryNext, &["alt+down", "ctrl+down", "ctrl+alt+down", "ctrl+shift+n", "ctrl+super+n", "ctrl+super+shift+n"]),
+    (
+        A::HistorySearch,
+        &["ctrl+shift+r", "ctrl+super+r", "ctrl+super+shift+r"],
+    ),
+    (
+        A::HistoryPrev,
+        &[
+            "ctrl+up",
+            "ctrl+alt+up",
+            "ctrl+shift+p",
+            "ctrl+super+p",
+            "ctrl+super+shift+p",
+        ],
+    ),
+    (
+        A::HistoryNext,
+        &[
+            "alt+down",
+            "ctrl+down",
+            "ctrl+alt+down",
+            "ctrl+shift+n",
+            "ctrl+super+n",
+            "ctrl+super+shift+n",
+        ],
+    ),
     (
         A::Complete,
         &[
-            "alt+tab", "ctrl+tab", "super+tab", "alt+super+tab", "ctrl+alt+tab", "ctrl+super+tab",
+            "alt+tab",
+            "ctrl+tab",
+            "super+tab",
+            "alt+super+tab",
+            "ctrl+alt+tab",
+            "ctrl+super+tab",
             "ctrl+alt+super+tab",
         ],
     ),
-    (A::Undo, &["alt+super+z", "ctrl+super+-", "ctrl+super+7", "ctrl+super+_", "ctrl+alt+super+z"]),
-    (A::Redo, &["alt+super+_", "alt+super+shift+z", "ctrl+super+shift+z", "ctrl+alt+super+shift+z"]),
-    (A::CharLeft, &["ctrl+alt+left", "ctrl+shift+b", "ctrl+super+b", "ctrl+super+shift+b"]),
-    (A::CharRight, &["ctrl+alt+right", "ctrl+shift+f", "ctrl+super+f", "ctrl+super+shift+f"]),
-    (A::WordLeft, &["alt+shift+b", "alt+super+b", "alt+super+left", "ctrl+super+left", "alt+super+shift+b"]),
-    (A::WordRight, &["alt+shift+f", "alt+super+f", "alt+super+right", "ctrl+super+right", "alt+super+shift+f"]),
-    (A::LineStart, &["alt+home", "ctrl+alt+home", "ctrl+shift+a", "ctrl+alt+super+left"]),
+    (
+        A::Undo,
+        &[
+            "alt+super+z",
+            "ctrl+super+-",
+            "ctrl+super+7",
+            "ctrl+super+_",
+            "ctrl+alt+super+z",
+        ],
+    ),
+    (
+        A::Redo,
+        &[
+            "alt+super+_",
+            "alt+super+shift+z",
+            "ctrl+super+shift+z",
+            "ctrl+alt+super+shift+z",
+        ],
+    ),
+    (
+        A::CharLeft,
+        &[
+            "ctrl+alt+left",
+            "ctrl+shift+b",
+            "ctrl+super+b",
+            "ctrl+super+shift+b",
+        ],
+    ),
+    (
+        A::CharRight,
+        &[
+            "ctrl+alt+right",
+            "ctrl+shift+f",
+            "ctrl+super+f",
+            "ctrl+super+shift+f",
+        ],
+    ),
+    (
+        A::WordLeft,
+        &[
+            "alt+shift+b",
+            "alt+super+b",
+            "alt+super+left",
+            "ctrl+super+left",
+            "alt+super+shift+b",
+        ],
+    ),
+    (
+        A::WordRight,
+        &[
+            "alt+shift+f",
+            "alt+super+f",
+            "alt+super+right",
+            "ctrl+super+right",
+            "alt+super+shift+f",
+        ],
+    ),
+    (
+        A::LineStart,
+        &[
+            "alt+home",
+            "ctrl+alt+home",
+            "ctrl+shift+a",
+            "ctrl+alt+super+left",
+        ],
+    ),
     (
         A::LineEnd,
         &[
-            "alt+end", "ctrl+alt+end", "ctrl+shift+e", "ctrl+super+e", "ctrl+alt+super+right",
+            "alt+end",
+            "ctrl+alt+end",
+            "ctrl+shift+e",
+            "ctrl+super+e",
+            "ctrl+alt+super+right",
             "ctrl+super+shift+e",
         ],
     ),
     (
         A::InputStart,
         &[
-            "alt+super+<", "alt+super+home", "ctrl+super+home", "ctrl+super+up", "ctrl+alt+super+home",
+            "alt+super+<",
+            "alt+super+home",
+            "ctrl+super+home",
+            "ctrl+super+up",
+            "ctrl+alt+super+home",
             "ctrl+alt+super+up",
         ],
     ),
     (
         A::InputEnd,
         &[
-            "alt+super+>", "alt+super+down", "alt+super+end", "ctrl+super+down", "ctrl+super+end",
-            "ctrl+alt+super+down", "ctrl+alt+super+end",
+            "alt+super+>",
+            "alt+super+down",
+            "alt+super+end",
+            "ctrl+super+down",
+            "ctrl+super+end",
+            "ctrl+alt+super+down",
+            "ctrl+alt+super+end",
         ],
     ),
     (
         A::DeleteWord,
         &[
-            "alt+shift+backspace", "alt+super+backspace", "ctrl+shift+w", "ctrl+super+w",
-            "alt+super+shift+backspace", "ctrl+super+shift+w",
+            "alt+shift+backspace",
+            "alt+super+backspace",
+            "ctrl+shift+w",
+            "ctrl+super+w",
+            "alt+super+shift+backspace",
+            "ctrl+super+shift+w",
         ],
     ),
     (
         A::DeleteWordForward,
         &[
-            "alt+shift+d", "alt+shift+delete", "alt+super+d", "alt+super+delete", "ctrl+shift+delete",
-            "ctrl+super+delete", "alt+super+shift+d", "alt+super+shift+delete", "ctrl+super+shift+delete",
+            "alt+shift+d",
+            "alt+shift+delete",
+            "alt+super+d",
+            "alt+super+delete",
+            "ctrl+shift+delete",
+            "ctrl+super+delete",
+            "alt+super+shift+d",
+            "alt+super+shift+delete",
+            "ctrl+super+shift+delete",
         ],
     ),
     (
         A::DeleteToLineStart,
         &[
-            "ctrl+shift+u", "ctrl+super+backspace", "ctrl+super+u", "super+shift+backspace",
-            "ctrl+alt+super+backspace", "ctrl+super+shift+backspace", "ctrl+super+shift+u",
+            "ctrl+shift+u",
+            "ctrl+super+backspace",
+            "ctrl+super+u",
+            "super+shift+backspace",
+            "ctrl+alt+super+backspace",
+            "ctrl+super+shift+backspace",
+            "ctrl+super+shift+u",
             "ctrl+alt+super+shift+backspace",
         ],
     ),
-    (A::DeleteToLineEnd, &["ctrl+shift+k", "ctrl+super+k", "ctrl+super+shift+k"]),
-    (A::Yank, &["ctrl+shift+y", "ctrl+super+y", "ctrl+super+shift+y"]),
+    (
+        A::DeleteToLineEnd,
+        &["ctrl+shift+k", "ctrl+super+k", "ctrl+super+shift+k"],
+    ),
+    (
+        A::Yank,
+        &["ctrl+shift+y", "ctrl+super+y", "ctrl+super+shift+y"],
+    ),
 ];
 
 fn index(action: KeyAction) -> usize {
-    SPECS.iter().position(|s| s.action == action).expect("every action has a spec")
+    SPECS
+        .iter()
+        .position(|s| s.action == action)
+        .expect("every action has a spec")
 }
 
 /// The modifiers a binding can name; others on an event (Hyper, Meta) are
@@ -268,7 +647,10 @@ impl Chord {
             None => s.rsplit_once('+').unwrap_or(("", &s)),
         };
         let mut mods = KeyModifiers::NONE;
-        for m in prefix.split('+').filter(|m| !prefix.is_empty() || !m.is_empty()) {
+        for m in prefix
+            .split('+')
+            .filter(|m| !prefix.is_empty() || !m.is_empty())
+        {
             mods |= match m {
                 "ctrl" | "control" => KeyModifiers::CONTROL,
                 "alt" | "meta" | "option" => KeyModifiers::ALT,
@@ -296,7 +678,10 @@ impl Chord {
             "space" => KeyCode::Char(' '),
             "plus" => KeyCode::Char('+'),
             "minus" => KeyCode::Char('-'),
-            f if f.len() > 1 && f.starts_with('f') && f[1..].parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)) => {
+            f if f.len() > 1
+                && f.starts_with('f')
+                && f[1..].parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)) =>
+            {
                 KeyCode::F(f[1..].parse().unwrap())
             }
             k if k.chars().count() == 1 => KeyCode::Char(k.chars().next().unwrap()),
@@ -306,9 +691,13 @@ impl Chord {
         let chord = Chord::new(code, mods);
         // A plain character types text; it can't also be a shortcut.
         if matches!(chord.code, KeyCode::Char(_))
-            && !chord.mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            && !chord
+                .mods
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
-            return Err(format!("`{text}` types text; bind it with ctrl, alt or super"));
+            return Err(format!(
+                "`{text}` types text; bind it with ctrl, alt or super"
+            ));
         }
         Ok(chord)
     }
@@ -355,7 +744,9 @@ impl Chord {
             .split('+')
             .map(|p| {
                 let mut c = p.chars();
-                c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+                c.next()
+                    .map(|f| f.to_uppercase().chain(c).collect())
+                    .unwrap_or_default()
             })
             .collect::<Vec<String>>()
             .join("+")
@@ -376,14 +767,26 @@ impl Default for Keymap {
         let parse = |k: &&str| Chord::parse(k).expect("default keys parse");
         let keys = SPECS
             .iter()
-            .map(|s| s.defaults.iter().chain(variants(s.action)).map(parse).collect())
+            .map(|s| {
+                s.defaults
+                    .iter()
+                    .chain(variants(s.action))
+                    .map(parse)
+                    .collect()
+            })
             .collect();
-        Keymap { keys, custom: vec![false; SPECS.len()] }
+        Keymap {
+            keys,
+            custom: vec![false; SPECS.len()],
+        }
     }
 }
 
 fn variants(action: KeyAction) -> &'static [&'static str] {
-    VARIANTS.iter().find(|(a, _)| *a == action).map_or(&[], |(_, v)| v)
+    VARIANTS
+        .iter()
+        .find(|(a, _)| *a == action)
+        .map_or(&[], |(_, v)| v)
 }
 
 impl Keymap {
@@ -397,14 +800,19 @@ impl Keymap {
             Err(e) => {
                 let msg = e.to_string();
                 let first = msg.lines().next().unwrap_or("").trim().to_string();
-                return (map, vec![format!("keybindings.toml: {first}; using the default keys")]);
+                return (
+                    map,
+                    vec![format!("keybindings.toml: {first}; using the default keys")],
+                );
             }
         };
         // Which actions the file sets, in file order.
         let mut set: Vec<usize> = Vec::new();
         for (name, item) in doc.iter() {
             let Some(i) = SPECS.iter().position(|s| s.name == name) else {
-                warnings.push(format!("keybindings.toml: unknown action `{name}` (see /keys)"));
+                warnings.push(format!(
+                    "keybindings.toml: unknown action `{name}` (see /keys)"
+                ));
                 continue;
             };
             let values: Vec<Option<&str>> = if let Some(s) = item.as_str() {
@@ -412,7 +820,9 @@ impl Keymap {
             } else if let Some(list) = item.as_array() {
                 list.iter().map(|v| v.as_str()).collect()
             } else {
-                warnings.push(format!("keybindings.toml: `{name}` must be a key string or a list of them"));
+                warnings.push(format!(
+                    "keybindings.toml: `{name}` must be a key string or a list of them"
+                ));
                 continue;
             };
             let mut keys = Vec::new();
@@ -422,7 +832,9 @@ impl Keymap {
                     Some(Ok(c)) if !keys.contains(&c) => keys.push(c),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => warnings.push(format!("keybindings.toml: {name}: {e}")),
-                    None => warnings.push(format!("keybindings.toml: {name}: keys must be strings")),
+                    None => {
+                        warnings.push(format!("keybindings.toml: {name}: keys must be strings"))
+                    }
                 }
             }
             // Nothing usable keeps the defaults; only `[]` unbinds.
@@ -446,11 +858,19 @@ impl Keymap {
         // Variants go with the default keys they extend (`ctrl+shift+o`
         // with `ctrl+o`).
         for j in (0..SPECS.len()).filter(|j| !set.contains(j)) {
-            let defaults: Vec<Chord> = SPECS[j].defaults.iter().filter_map(|k| Chord::parse(k).ok()).collect();
+            let defaults: Vec<Chord> = SPECS[j]
+                .defaults
+                .iter()
+                .filter_map(|k| Chord::parse(k).ok())
+                .collect();
             let kept = map.keys[j].clone();
             map.keys[j].retain(|v| {
-                let mut owners = defaults.iter().filter(|d| d.code == v.code && v.mods.contains(d.mods));
-                defaults.contains(v) || owners.clone().next().is_none() || owners.any(|d| kept.contains(d))
+                let mut owners = defaults
+                    .iter()
+                    .filter(|d| d.code == v.code && v.mods.contains(d.mods));
+                defaults.contains(v)
+                    || owners.clone().next().is_none()
+                    || owners.any(|d| kept.contains(d))
             });
         }
         warnings.extend(map.conflicts());
@@ -501,7 +921,9 @@ impl Keymap {
 
     /// Like [`Keymap::hint`] but `Ctrl+O`, and "unbound" when unbound.
     pub fn title(&self, action: KeyAction) -> String {
-        self.keys(action).first().map_or_else(|| "unbound".into(), Chord::title)
+        self.keys(action)
+            .first()
+            .map_or_else(|| "unbound".into(), Chord::title)
     }
 
     /// `/keys`: every action with its keys.
@@ -515,9 +937,19 @@ impl Keymap {
                 if keys.is_empty() {
                     return "(unbound)".to_string();
                 }
-                let extra: Vec<Chord> =
-                    if custom { Vec::new() } else { variants(s.action).iter().filter_map(|k| Chord::parse(k).ok()).collect() };
-                let shown: Vec<String> = keys.iter().filter(|k| !extra.contains(k)).map(Chord::label).collect();
+                let extra: Vec<Chord> = if custom {
+                    Vec::new()
+                } else {
+                    variants(s.action)
+                        .iter()
+                        .filter_map(|k| Chord::parse(k).ok())
+                        .collect()
+                };
+                let shown: Vec<String> = keys
+                    .iter()
+                    .filter(|k| !extra.contains(k))
+                    .map(Chord::label)
+                    .collect();
                 let hidden = keys.len() - shown.len();
                 if shown.is_empty() {
                     return keys.iter().map(Chord::label).collect::<Vec<_>>().join(", ");
@@ -533,8 +965,15 @@ impl Keymap {
         let mut out = Vec::new();
         for (context, heading) in [(Global, "Global"), (Editor, "Input")] {
             out.push(heading.to_string());
-            for (s, keys) in SPECS.iter().zip(&labels).filter(|(s, _)| s.context == context) {
-                out.push(format!("  {:width$}  {keys:key_width$}  {}", s.name, s.description));
+            for (s, keys) in SPECS
+                .iter()
+                .zip(&labels)
+                .filter(|(s, _)| s.context == context)
+            {
+                out.push(format!(
+                    "  {:width$}  {keys:key_width$}  {}",
+                    s.name, s.description
+                ));
             }
         }
         out
@@ -547,7 +986,10 @@ pub fn load(home: &Path) -> (Keymap, Vec<String>) {
     match std::fs::read_to_string(&path) {
         Ok(text) => Keymap::parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Keymap::default(), Vec::new()),
-        Err(e) => (Keymap::default(), vec![format!("could not read {}: {e}", path.display())]),
+        Err(e) => (
+            Keymap::default(),
+            vec![format!("could not read {}: {e}", path.display())],
+        ),
     }
 }
 
@@ -560,7 +1002,11 @@ pub fn install(keys: Keymap) {
 
 /// The keymap in effect (the defaults until [`install`]).
 pub fn current() -> Arc<Keymap> {
-    CURRENT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).clone()
+    CURRENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .clone()
 }
 
 /// The first key for `action`, or "unbound", for status hints.
@@ -591,7 +1037,11 @@ mod tests {
         assert_eq!(p("ctrl++").unwrap(), "ctrl+plus");
         assert_eq!(p("ctrl+shift+z").unwrap(), "ctrl+shift+z");
         assert_eq!(p("shift+super+z").unwrap(), "super+shift+z");
-        assert_eq!(p("alt+shift+<").unwrap(), "alt+<", "shift is part of the character");
+        assert_eq!(
+            p("alt+shift+<").unwrap(),
+            "alt+<",
+            "shift is part of the character"
+        );
         assert_eq!(p("super+space").unwrap(), "super+space");
         assert!(p("hyper+x").unwrap_err().contains("unknown modifier"));
         assert!(p("ctrl+banana").unwrap_err().contains("unknown key"));
@@ -605,10 +1055,23 @@ mod tests {
     fn events_match_like_the_old_hard_coded_keys() {
         let k = Keymap::default();
         let at = |code, mods| k.action(Editor, &ev(code, mods));
-        assert_eq!(k.action(Global, &ev(Char('o'), M::CONTROL)), Some(A::ExpandTools));
-        assert_eq!(k.action(Global, &ev(BackTab, M::SHIFT)), Some(A::CycleEffort));
-        assert_eq!(k.action(Global, &ev(BackTab, M::NONE)), Some(A::CycleEffort));
-        assert_eq!(k.action(Global, &ev(Char('z'), M::CONTROL | M::SHIFT)), None, "ctrl+shift+z is redo");
+        assert_eq!(
+            k.action(Global, &ev(Char('o'), M::CONTROL)),
+            Some(A::ExpandTools)
+        );
+        assert_eq!(
+            k.action(Global, &ev(BackTab, M::SHIFT)),
+            Some(A::CycleEffort)
+        );
+        assert_eq!(
+            k.action(Global, &ev(BackTab, M::NONE)),
+            Some(A::CycleEffort)
+        );
+        assert_eq!(
+            k.action(Global, &ev(Char('z'), M::CONTROL | M::SHIFT)),
+            None,
+            "ctrl+shift+z is redo"
+        );
         assert_eq!(at(Char('Z'), M::CONTROL | M::SHIFT), Some(A::Redo));
         assert_eq!(at(Char('_'), M::CONTROL | M::SHIFT), Some(A::Undo));
         assert_eq!(at(Char('7'), M::CONTROL), Some(A::Undo));
@@ -637,31 +1100,77 @@ mod tests {
             "#,
         );
         assert!(w.is_empty(), "{w:?}");
-        assert_eq!(k.action(Global, &ev(Char('t'), M::CONTROL)), Some(A::ExpandTools));
+        assert_eq!(
+            k.action(Global, &ev(Char('t'), M::CONTROL)),
+            Some(A::ExpandTools)
+        );
         assert_eq!(k.action(Global, &ev(Char('o'), M::CONTROL)), None);
-        assert_eq!(k.action(Editor, &ev(Char('r'), M::ALT)), Some(A::HistorySearch));
+        assert_eq!(
+            k.action(Editor, &ev(Char('r'), M::ALT)),
+            Some(A::HistorySearch)
+        );
         assert_eq!(k.action(Editor, &ev(Char('j'), M::CONTROL)), None);
         assert!(k.keys(A::PasteImage).is_empty());
         assert_eq!(k.title(A::PasteImage), "unbound");
-        assert!(k.lines().iter().any(|l| l.contains("paste_image") && l.contains("(unbound)")));
-        assert_eq!(k.keys(A::Submit), Keymap::default().keys(A::Submit), "others keep their defaults");
+        assert!(k
+            .lines()
+            .iter()
+            .any(|l| l.contains("paste_image") && l.contains("(unbound)")));
+        assert_eq!(
+            k.keys(A::Submit),
+            Keymap::default().keys(A::Submit),
+            "others keep their defaults"
+        );
 
         // A key the file binds leaves the action that had it by default.
         let (k, w) = Keymap::parse("delete_word = \"ctrl+o\"");
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(k.action(Global, &ev(Char('o'), M::CONTROL)), None);
-        assert_eq!(k.action(Editor, &ev(Char('o'), M::CONTROL)), Some(A::DeleteWord));
-        assert_eq!(k.action(Global, &ev(Char('o'), M::CONTROL | M::SHIFT)), None, "its variants go too");
-        let line = |name: &str| k.lines().into_iter().find(|l| l.trim_start().starts_with(&format!("{name} "))).unwrap();
-        assert!(line("expand_tools").contains("(unbound)"), "{}", line("expand_tools"));
-        assert!(line("delete_word").contains(" ctrl+o "), "{}", line("delete_word"));
-        assert!(!line("delete_word").contains("ctrl+w"), "the file replaces the defaults");
-        assert!(Keymap::default().lines().iter().any(|l| l.contains(" enter (+5 with extra modifiers) ")));
+        assert_eq!(
+            k.action(Editor, &ev(Char('o'), M::CONTROL)),
+            Some(A::DeleteWord)
+        );
+        assert_eq!(
+            k.action(Global, &ev(Char('o'), M::CONTROL | M::SHIFT)),
+            None,
+            "its variants go too"
+        );
+        let line = |name: &str| {
+            k.lines()
+                .into_iter()
+                .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+                .unwrap()
+        };
+        assert!(
+            line("expand_tools").contains("(unbound)"),
+            "{}",
+            line("expand_tools")
+        );
+        assert!(
+            line("delete_word").contains(" ctrl+o "),
+            "{}",
+            line("delete_word")
+        );
+        assert!(
+            !line("delete_word").contains("ctrl+w"),
+            "the file replaces the defaults"
+        );
+        assert!(Keymap::default()
+            .lines()
+            .iter()
+            .any(|l| l.contains(" enter (+5 with extra modifiers) ")));
         // Stealing one of several defaults keeps the rest and their variants.
         let (k, _) = Keymap::parse("yank = \"home\"");
         assert_eq!(k.keys(A::LineStart)[0].label(), "ctrl+a");
-        assert_eq!(k.action(Editor, &ev(Home, M::ALT)), None, "alt+home went with home");
-        assert_eq!(k.action(Editor, &ev(Char('a'), M::CONTROL | M::SHIFT)), Some(A::LineStart));
+        assert_eq!(
+            k.action(Editor, &ev(Home, M::ALT)),
+            None,
+            "alt+home went with home"
+        );
+        assert_eq!(
+            k.action(Editor, &ev(Char('a'), M::CONTROL | M::SHIFT)),
+            Some(A::LineStart)
+        );
 
         let (k, w) = Keymap::parse(
             "frobnicate = \"ctrl+x\"\nundo = [\"ctrl+nope\", 3, \"ctrl+u\"]\nredo = 5\nyank = \"y\"\n",
@@ -674,7 +1183,11 @@ mod tests {
         assert!(w[4].contains("types text"));
         assert_eq!(k.keys(A::Undo).len(), 1, "the good key in a list stays");
         assert_eq!(k.keys(A::Redo), Keymap::default().keys(A::Redo));
-        assert_eq!(k.keys(A::Yank), Keymap::default().keys(A::Yank), "a rejected key keeps the defaults");
+        assert_eq!(
+            k.keys(A::Yank),
+            Keymap::default().keys(A::Yank),
+            "a rejected key keeps the defaults"
+        );
         let (k, _) = Keymap::parse("model_menu = \"ctrl+banana\"");
         assert_eq!(k, Keymap::default(), "no usable key keeps the defaults");
 
@@ -686,7 +1199,10 @@ mod tests {
     #[test]
     fn conflicts_warn_and_the_earlier_action_wins() {
         let (k, w) = Keymap::parse("reload = \"f5\"\nsubmit = [\"enter\", \"f5\"]\n");
-        assert_eq!(w, ["keybindings.toml: f5 is bound to both reload and submit; reload wins"]);
+        assert_eq!(
+            w,
+            ["keybindings.toml: f5 is bound to both reload and submit; reload wins"]
+        );
         assert_eq!(k.action(Global, &ev(F(5), M::NONE)), Some(A::Reload));
     }
 
@@ -794,14 +1310,19 @@ mod tests {
     #[test]
     fn default_keys_do_everything_the_old_keys_did() {
         let k = Keymap::default();
-        let mut codes = vec![Esc, Enter, Tab, BackTab, Backspace, Delete, Home, End, Left, Right, Up, Down];
+        let mut codes = vec![
+            Esc, Enter, Tab, BackTab, Backspace, Delete, Home, End, Left, Right, Up, Down,
+        ];
         codes.extend("abcdefghijklmnopqrstuvwxyz_7-<> ".chars().map(Char));
         codes.extend(('A'..='Z').map(Char));
         let mut missing = Vec::new();
         for code in codes {
             for bits in 0..32u8 {
                 let mut m = M::NONE;
-                for (bit, flag) in [M::CONTROL, M::ALT, M::SHIFT, M::SUPER, M::HYPER].into_iter().enumerate() {
+                for (bit, flag) in [M::CONTROL, M::ALT, M::SHIFT, M::SUPER, M::HYPER]
+                    .into_iter()
+                    .enumerate()
+                {
                     if bits & (1 << bit) != 0 {
                         m |= flag;
                     }
@@ -815,7 +1336,11 @@ mod tests {
                 let now = new_action(&k, ev(code, m));
                 if let Some(old) = old_action(code, m) {
                     if old != now {
-                        missing.push(format!("MISSING {:?} {}", old, Chord::of(&ev(code, m)).label()));
+                        missing.push(format!(
+                            "MISSING {:?} {}",
+                            old,
+                            Chord::of(&ev(code, m)).label()
+                        ));
                     }
                 }
             }

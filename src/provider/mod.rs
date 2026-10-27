@@ -20,8 +20,12 @@ pub trait Provider: Send + Sync {
     /// Short provider label for the UI, e.g. "codex" or "openai".
     fn name(&self) -> &str;
     fn model(&self) -> &str;
-    fn endpoint(&self) -> Option<String> { None }
-    fn pricing_provider(&self) -> &str { self.name() }
+    fn endpoint(&self) -> Option<String> {
+        None
+    }
+    fn pricing_provider(&self) -> &str {
+        self.name()
+    }
 
     fn set_model(&mut self, model: String);
     /// Reasoning effort, if the provider supports choosing one (None = auto).
@@ -91,7 +95,11 @@ pub fn remember_listing(provider: &str, models: Vec<String>, fast: Vec<String>) 
 
 /// `provider`'s listing, once it has been fetched.
 pub fn listing(provider: &str) -> Option<Listing> {
-    LISTINGS.lock().unwrap_or_else(|e| e.into_inner()).get(provider).cloned()
+    LISTINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(provider)
+        .cloned()
 }
 
 /// Whether the listing says `model` offers fast mode (false until listed).
@@ -137,7 +145,11 @@ fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
 /// [`Provider::stream`], retried with backoff on transient failures as long
 /// as nothing has been streamed yet. Each retry is announced to `on_event`
 /// as [`StreamEvent::Retrying`].
-pub async fn stream_with_retry(provider: &dyn Provider, req: Request<'_>, on_event: EventSink<'_>) -> anyhow::Result<Response> {
+pub async fn stream_with_retry(
+    provider: &dyn Provider,
+    req: Request<'_>,
+    on_event: EventSink<'_>,
+) -> anyhow::Result<Response> {
     let mut attempt = 0;
     loop {
         let mut produced = false;
@@ -156,7 +168,13 @@ pub async fn stream_with_retry(provider: &dyn Provider, req: Request<'_>, on_eve
             return Err(error);
         };
         attempt += 1;
-        let reason: String = format!("{error:#}").lines().next().unwrap_or_default().chars().take(120).collect();
+        let reason: String = format!("{error:#}")
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(120)
+            .collect();
         on_event(StreamEvent::Retrying(format!(
             "Retrying in {:.0}s ({attempt}/{RETRIES}) · {reason}",
             delay.as_secs_f64().ceil()
@@ -173,12 +191,26 @@ mod tests {
         types::Item,
     };
 
-    async fn run(replies: Vec<(u16, &str, &str)>) -> (anyhow::Result<Response>, Vec<StreamEvent>, usize) {
-        let replies = replies.into_iter().map(|(s, h, b)| (s, h.to_string(), b.to_string())).collect();
+    async fn run(
+        replies: Vec<(u16, &str, &str)>,
+    ) -> (anyhow::Result<Response>, Vec<StreamEvent>, usize) {
+        let replies = replies
+            .into_iter()
+            .map(|(s, h, b)| (s, h.to_string(), b.to_string()))
+            .collect();
         let (url, mut requests, task) = server_with_headers(replies).await;
         let provider = OpenAiProvider::new(url, None, "m".into());
         let mut events = Vec::new();
-        let result = stream_with_retry(&provider, Request { system: "", items: &[], tools: &[] }, &mut |e| events.push(e)).await;
+        let result = stream_with_retry(
+            &provider,
+            Request {
+                system: "",
+                items: &[],
+                tools: &[],
+            },
+            &mut |e| events.push(e),
+        )
+        .await;
         task.await.unwrap();
         let mut seen = 0;
         while requests.try_recv().is_ok() {
@@ -191,27 +223,53 @@ mod tests {
 
     #[tokio::test]
     async fn retries_transient_failures() {
-        let (result, events, seen) = run(vec![(503, "", "busy"), (429, "Retry-After: 0\r\n", "slow down"), (200, "", OK)]).await;
-        assert_eq!(result.unwrap().items, vec![Item::Assistant { text: "hi".into() }]);
+        let (result, events, seen) = run(vec![
+            (503, "", "busy"),
+            (429, "Retry-After: 0\r\n", "slow down"),
+            (200, "", OK),
+        ])
+        .await;
+        assert_eq!(
+            result.unwrap().items,
+            vec![Item::Assistant { text: "hi".into() }]
+        );
         assert_eq!(seen, 3);
-        let StreamEvent::Retrying(first) = &events[0] else { panic!("{events:?}") };
-        assert!(first.contains("(1/3)") && first.contains("HTTP 503"), "{first}");
-        assert!(matches!(&events[1], StreamEvent::Retrying(s) if s.starts_with("Retrying in 0s (2/3)")), "{events:?}");
+        let StreamEvent::Retrying(first) = &events[0] else {
+            panic!("{events:?}")
+        };
+        assert!(
+            first.contains("(1/3)") && first.contains("HTTP 503"),
+            "{first}"
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::Retrying(s) if s.starts_with("Retrying in 0s (2/3)")),
+            "{events:?}"
+        );
         assert_eq!(events[2], StreamEvent::Text("hi".into()));
     }
 
     #[tokio::test]
     async fn gives_up() {
         // Client errors are final.
-        let (result, events, seen) = run(vec![(401, "", r#"{"error":{"message":"bad key"}}"#)]).await;
-        assert_eq!(result.unwrap_err().to_string(), "API access denied · HTTP 401 · bad key");
+        let (result, events, seen) =
+            run(vec![(401, "", r#"{"error":{"message":"bad key"}}"#)]).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "API access denied · HTTP 401 · bad key"
+        );
         assert!(events.is_empty() && seen == 1);
         // A long Retry-After is a quota window.
         let (result, events, _) = run(vec![(429, "Retry-After: 3600\r\n", "limit")]).await;
         assert!(result.unwrap_err().to_string().contains("429"));
         assert!(events.is_empty());
         // Four attempts at most.
-        let (result, events, seen) = run(vec![(500, "", "a"), (502, "", "b"), (504, "", "c"), (503, "", "d")]).await;
+        let (result, events, seen) = run(vec![
+            (500, "", "a"),
+            (502, "", "b"),
+            (504, "", "c"),
+            (503, "", "d"),
+        ])
+        .await;
         assert!(result.unwrap_err().to_string().contains("HTTP 503"));
         assert_eq!((events.len(), seen), (3, 4));
     }
@@ -232,7 +290,16 @@ mod tests {
         drop(listener);
         let provider = OpenAiProvider::new(url, None, "m".into());
         let mut events = Vec::new();
-        let result = stream_with_retry(&provider, Request { system: "", items: &[], tools: &[] }, &mut |e| events.push(e)).await;
+        let result = stream_with_retry(
+            &provider,
+            Request {
+                system: "",
+                items: &[],
+                tools: &[],
+            },
+            &mut |e| events.push(e),
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(events.len(), 3, "{events:?}");
     }

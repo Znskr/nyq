@@ -37,7 +37,8 @@ pub fn plan(s: &Settings, event: &Event) -> Plan {
             let cue = if *failed { Cue::Failed } else { Cue::Done };
             Plan {
                 sound: (s.sound == "max" || (s.sound == "on" && long)).then_some(cue),
-                desktop: (s.notifications && long).then(|| ("nyq".into(), format!("{what} after {}", duration(*secs)))),
+                desktop: (s.notifications && long)
+                    .then(|| ("nyq".into(), format!("{what} after {}", duration(*secs)))),
             }
         }
         Event::Attention(what) => Plan {
@@ -67,7 +68,8 @@ fn chime(cue: Cue) -> bool {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn chime(cue: Cue) -> bool {
-    let graphical = std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let graphical =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
     if !graphical || std::env::var_os("SSH_CONNECTION").is_some() {
         return false;
     }
@@ -118,7 +120,12 @@ pub fn osc_for(term: &str, term_program: &str, vte: bool) -> Osc {
 
 /// Text safe inside an OSC string: no control characters, one line.
 fn clean(s: &str, max: usize) -> String {
-    s.chars().map(|c| if c.is_control() { ' ' } else { c }).take(max).collect::<String>().trim().to_string()
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// The escape sequence for a desktop notification; inside tmux it is wrapped
@@ -168,8 +175,13 @@ fn emit_with(out: &mut impl Write, plan: &Plan, chime: impl Fn(Cue) -> bool) {
     }
     if let Some((title, body)) = &plan.desktop {
         if !native(title, body) {
-            let osc = osc_for(&env("TERM"), &env("TERM_PROGRAM"), std::env::var_os("VTE_VERSION").is_some());
-            let _ = out.write_all(escape(osc, title, body, std::env::var_os("TMUX").is_some()).as_bytes());
+            let osc = osc_for(
+                &env("TERM"),
+                &env("TERM_PROGRAM"),
+                std::env::var_os("VTE_VERSION").is_some(),
+            );
+            let _ = out
+                .write_all(escape(osc, title, body, std::env::var_os("TMUX").is_some()).as_bytes());
         }
     }
     let _ = out.flush();
@@ -190,7 +202,12 @@ pub fn notify(event: &Event) {
 #[cfg_attr(windows, allow(dead_code))]
 fn spawn_detached(mut cmd: std::process::Command) -> bool {
     use std::process::Stdio;
-    match cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+    match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
         Ok(mut child) => {
             std::thread::spawn(move || child.wait());
             true
@@ -204,15 +221,25 @@ fn native(title: &str, body: &str) -> bool {
     if std::env::var_os("SSH_CONNECTION").is_some() {
         return false;
     }
-    let quote = |s: &str| format!("\"{}\"", clean(s, 200).replace('\\', "\\\\").replace('"', "\\\""));
+    let quote = |s: &str| {
+        format!(
+            "\"{}\"",
+            clean(s, 200).replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    };
     let mut cmd = std::process::Command::new("osascript");
-    cmd.arg("-e").arg(format!("display notification {} with title {}", quote(body), quote(title)));
+    cmd.arg("-e").arg(format!(
+        "display notification {} with title {}",
+        quote(body),
+        quote(title)
+    ));
     spawn_detached(cmd)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn native(title: &str, body: &str) -> bool {
-    let graphical = std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let graphical =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
     if !graphical || std::env::var_os("SSH_CONNECTION").is_some() {
         return false;
     }
@@ -233,8 +260,14 @@ mod tests {
 
     #[test]
     fn escape_sequences() {
-        assert_eq!(escape(Osc::Nine, "nyq", "Finished after 12s", false), "\x1b]9;nyq: Finished after 12s\x07");
-        assert_eq!(escape(Osc::SevenSevenSeven, "a;b", "done", false), "\x1b]777;notify;a,b;done\x07");
+        assert_eq!(
+            escape(Osc::Nine, "nyq", "Finished after 12s", false),
+            "\x1b]9;nyq: Finished after 12s\x07"
+        );
+        assert_eq!(
+            escape(Osc::SevenSevenSeven, "a;b", "done", false),
+            "\x1b]777;notify;a,b;done\x07"
+        );
         // Control characters can't end the sequence early or inject another.
         let evil = escape(Osc::Nine, "nyq", "x\x07\x1b]52;c;AAAA\x07", false);
         assert_eq!(evil.matches('\x07').count(), 1);
@@ -243,7 +276,10 @@ mod tests {
             escape(Osc::Nine, "nyq", "hi", true),
             "\x1bPtmux;\x1b\x1b]9;nyq: hi\x07\x1b\\"
         );
-        assert_eq!(osc_for("rxvt-unicode-256color", "", false), Osc::SevenSevenSeven);
+        assert_eq!(
+            osc_for("rxvt-unicode-256color", "", false),
+            Osc::SevenSevenSeven
+        );
         assert_eq!(osc_for("xterm-256color", "", true), Osc::SevenSevenSeven);
         assert_eq!(osc_for("foot", "", false), Osc::SevenSevenSeven);
         assert_eq!(osc_for("xterm-ghostty", "ghostty", false), Osc::Nine);
@@ -252,22 +288,64 @@ mod tests {
 
     #[test]
     fn plans_follow_settings() {
-        let mut s = Settings { sound: "on".into(), notifications: true, notify_after_secs: 10, ..Settings::default() };
-        let short = plan(&s, &Event::TurnEnd { secs: 3, failed: false });
+        let mut s = Settings {
+            sound: "on".into(),
+            notifications: true,
+            notify_after_secs: 10,
+            ..Settings::default()
+        };
+        let short = plan(
+            &s,
+            &Event::TurnEnd {
+                secs: 3,
+                failed: false,
+            },
+        );
         assert_eq!(short, Plan::default());
-        let long = plan(&s, &Event::TurnEnd { secs: 75, failed: true });
+        let long = plan(
+            &s,
+            &Event::TurnEnd {
+                secs: 75,
+                failed: true,
+            },
+        );
         assert_eq!(long.sound, Some(Cue::Failed));
-        assert_eq!(long.desktop, Some(("nyq".into(), "Stopped after 1m 15s".into())));
-        assert_eq!(plan(&s, &Event::Attention("Approve bash")).sound, Some(Cue::Attention));
+        assert_eq!(
+            long.desktop,
+            Some(("nyq".into(), "Stopped after 1m 15s".into()))
+        );
+        assert_eq!(
+            plan(&s, &Event::Attention("Approve bash")).sound,
+            Some(Cue::Attention)
+        );
         s.sound = "max".into();
         s.notifications = false;
-        assert_eq!(plan(&s, &Event::TurnEnd { secs: 1, failed: false }), Plan { sound: Some(Cue::Done), desktop: None });
+        assert_eq!(
+            plan(
+                &s,
+                &Event::TurnEnd {
+                    secs: 1,
+                    failed: false
+                }
+            ),
+            Plan {
+                sound: Some(Cue::Done),
+                desktop: None
+            }
+        );
         s.sound = "off".into();
         assert_eq!(plan(&s, &Event::Attention("Question")), Plan::default());
         // A chime replaces the bell, except for prompts; no chime falls back to it.
         let ring = |cue, played: bool| {
             let mut out = Vec::new();
-            emit_with(&mut out, &Plan { sound: Some(cue), desktop: None }, |_| played);
+            emit_with(
+                &mut out,
+                &Plan {
+                    sound: Some(cue),
+                    desktop: None,
+                },
+                |_| played,
+            );
             out
         };
         assert_eq!(ring(Cue::Done, true), b"");

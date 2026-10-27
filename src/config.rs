@@ -35,7 +35,10 @@ pub const USER_AGENT: &str = concat!("nyq/", env!("CARGO_PKG_VERSION"));
 /// Atomically replace `path` with `bytes`, readable only by the user (0600).
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     let temp = parent.join(format!(".nyq-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
@@ -72,8 +75,12 @@ pub fn debug() -> bool {
 
 /// `NYQ_DEBUG` set to anything but empty, `0`, `false` or `off`.
 pub fn debug_from_env() -> bool {
-    std::env::var("NYQ_DEBUG")
-        .is_ok_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no"))
+    std::env::var("NYQ_DEBUG").is_ok_and(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 pub fn home() -> PathBuf {
@@ -158,8 +165,12 @@ fn ollama_url_from(host: &str) -> String {
 /// The provider keys of the user's settings file.
 fn user_settings(home: &Path) -> Result<Settings> {
     let map = crate::settings::file::read_user(home).map_err(anyhow::Error::msg)?;
-    serde_json::from_value(serde_json::Value::Object(map))
-        .with_context(|| format!("parsing {}", crate::settings::file::user_path(home).display()))
+    serde_json::from_value(serde_json::Value::Object(map)).with_context(|| {
+        format!(
+            "parsing {}",
+            crate::settings::file::user_path(home).display()
+        )
+    })
 }
 
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T> {
@@ -358,7 +369,9 @@ mod tests {
 
     #[test]
     fn saved_precedence() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let keys = [
             "NYQ_HOME",
             "NYQ_PROVIDER",

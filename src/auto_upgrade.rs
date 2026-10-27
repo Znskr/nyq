@@ -71,7 +71,9 @@ pub fn is_development_build_path(path: &str) -> bool {
     let parts: Vec<&str> = path.split(['/', '\\']).collect();
     let profile = |p: &str| p == "debug" || p == "release";
     parts.windows(2).any(|w| w[0] == "target" && profile(w[1]))
-        || parts.windows(3).any(|w| w[0] == "target" && w[1].contains('-') && profile(w[2]))
+        || parts
+            .windows(3)
+            .any(|w| w[0] == "target" && w[1].contains('-') && profile(w[2]))
 }
 
 /// Whether the background task may start for the executable at `exe`.
@@ -100,7 +102,11 @@ pub struct GithubSource {
 
 impl GithubSource {
     pub fn new(home: PathBuf, channel: Channel) -> Self {
-        Self { home, channel, found: None }
+        Self {
+            home,
+            channel,
+            found: None,
+        }
     }
 }
 
@@ -122,7 +128,8 @@ impl Source for GithubSource {
         let bytes = upgrade::download_verified(&gh, &release, &name).await?;
         anyhow::ensure!(!cancel.is_cancelled(), "cancelled");
         let version = version.to_string();
-        tokio::task::spawn_blocking(move || upgrade::install_archive(&bytes, &name, &version, &exe)).await?
+        tokio::task::spawn_blocking(move || upgrade::install_archive(&bytes, &name, &version, &exe))
+            .await?
     }
 }
 
@@ -177,14 +184,20 @@ impl Upgrader {
     }
 
     fn latest(&self) -> String {
-        self.latest.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// What the status line shows (empty: nothing).
     pub fn status_label(&self) -> String {
         match self.state() {
             State::Downloading => format!("upgrading to {}...", self.latest()),
-            State::Ready => format!("update ready: {} to reload", crate::ui::keys::hint(crate::ui::keys::KeyAction::Reload)),
+            State::Ready => format!(
+                "update ready: {} to reload",
+                crate::ui::keys::hint(crate::ui::keys::KeyAction::Reload)
+            ),
             State::Failed => "upgrade failed".into(),
             State::Idle | State::Checking | State::Waiting => String::new(),
         }
@@ -242,7 +255,11 @@ impl Upgrader {
             _ = self.cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
             r = source.install(&latest, &self.cancel) => r,
         };
-        self.set_state(if installed.is_ok() { State::Ready } else { State::Failed });
+        self.set_state(if installed.is_ok() {
+            State::Ready
+        } else {
+            State::Failed
+        });
     }
 }
 
@@ -273,14 +290,29 @@ pub fn apply_refusal(f: &ApplyFacts) -> Option<&'static str> {
     let busy = [
         (f.busy, "upgrade is unavailable until the response finishes"),
         (f.queued, "upgrade is unavailable while prompts are queued"),
-        (f.question, "upgrade is unavailable while a question is open"),
-        (f.approval, "upgrade is unavailable while an approval is open"),
+        (
+            f.question,
+            "upgrade is unavailable while a question is open",
+        ),
+        (
+            f.approval,
+            "upgrade is unavailable while an approval is open",
+        ),
         (f.secret, "upgrade is unavailable during API key entry"),
-        (f.session_picker, "close the session picker before upgrading"),
+        (
+            f.session_picker,
+            "close the session picker before upgrading",
+        ),
         (f.menu, "close the menu before upgrading"),
         (f.transcript, "close the transcript view before upgrading"),
-        (f.draft, "submit or clear the current prompt before upgrading"),
-        (f.attachments, "submit or clear pending images before upgrading"),
+        (
+            f.draft,
+            "submit or clear the current prompt before upgrading",
+        ),
+        (
+            f.attachments,
+            "submit or clear pending images before upgrading",
+        ),
     ];
     if let Some((_, notice)) = busy.iter().find(|(on, _)| *on) {
         return Some(notice);
@@ -325,7 +357,8 @@ const DROP_SHORT: &[char] = &['c', 'p'];
 pub fn relaunch_args(args: &[OsString], resume: Option<&str>) -> Vec<OsString> {
     let mut out: Vec<OsString> = Vec::new();
     let mut it = args.iter().peekable();
-    let looks_like_value = |a: Option<&&OsString>| a.is_some_and(|a| !a.to_string_lossy().starts_with('-'));
+    let looks_like_value =
+        |a: Option<&&OsString>| a.is_some_and(|a| !a.to_string_lossy().starts_with('-'));
     while let Some(arg) = it.next() {
         let Some(s) = arg.to_str() else {
             continue; // a non-UTF-8 prompt word
@@ -400,14 +433,21 @@ pub fn relaunch_args(args: &[OsString], resume: Option<&str>) -> Vec<OsString> {
 #[cfg(unix)]
 pub fn relaunch(r: &Relaunch) -> std::io::Error {
     use std::os::unix::process::CommandExt;
-    std::process::Command::new(&r.exe).args(&r.args).current_dir(&r.cwd).exec()
+    std::process::Command::new(&r.exe)
+        .args(&r.args)
+        .current_dir(&r.cwd)
+        .exec()
 }
 
 /// Run `r` with this terminal and exit with its status (Windows has no exec).
 /// Returns only on failure to start it.
 #[cfg(not(unix))]
 pub fn relaunch(r: &Relaunch) -> std::io::Error {
-    match std::process::Command::new(&r.exe).args(&r.args).current_dir(&r.cwd).status() {
+    match std::process::Command::new(&r.exe)
+        .args(&r.args)
+        .current_dir(&r.cwd)
+        .status()
+    {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(e) => e,
     }
@@ -484,7 +524,10 @@ mod tests {
         }
     }
 
-    fn fake(versions: &[Option<&str>], install_ok: bool) -> (Fake, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn fake(
+        versions: &[Option<&str>],
+        install_ok: bool,
+    ) -> (Fake, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let checks = Arc::new(AtomicUsize::new(0));
         let installs = Arc::new(AtomicUsize::new(0));
         let f = Fake {
@@ -501,20 +544,34 @@ mod tests {
     async fn wait_until(what: &str, done: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !done() {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
             tokio::time::sleep(MS).await;
         }
     }
 
     #[tokio::test]
     async fn a_newer_release_is_installed_and_the_loop_stops() {
-        let (src, checks, installs) = fake(&[None, Some("0.0.1"), Some("v999.0.0"), Some("v1000.0.0")], true);
+        let (src, checks, installs) = fake(
+            &[None, Some("0.0.1"), Some("v999.0.0"), Some("v1000.0.0")],
+            true,
+        );
         let u = Arc::new(Upgrader::default());
-        tokio::time::timeout(Duration::from_secs(5), u.clone().run(src, MS, MS)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), u.clone().run(src, MS, MS))
+            .await
+            .unwrap();
         assert_eq!(u.state(), State::Ready);
         assert_eq!(u.latest(), "999.0.0");
         // A failed check and an older release are skipped; nothing after ready.
-        assert_eq!((checks.load(Ordering::SeqCst), installs.load(Ordering::SeqCst)), (3, 1));
+        assert_eq!(
+            (
+                checks.load(Ordering::SeqCst),
+                installs.load(Ordering::SeqCst)
+            ),
+            (3, 1)
+        );
     }
 
     #[tokio::test]
@@ -525,9 +582,15 @@ mod tests {
         // Poll rather than sleep a fixed time: Windows timers tick ~15ms.
         wait_until("failed", || u.state() == State::Failed).await;
         assert_eq!(u.status_label(), "upgrade failed");
-        wait_until("a second attempt", || checks.load(Ordering::SeqCst) >= 2 && installs.load(Ordering::SeqCst) >= 2).await;
+        wait_until("a second attempt", || {
+            checks.load(Ordering::SeqCst) >= 2 && installs.load(Ordering::SeqCst) >= 2
+        })
+        .await;
         u.stop();
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -538,7 +601,10 @@ mod tests {
         wait_until("waiting", || u.state() == State::Waiting).await;
         assert_eq!(checks.load(Ordering::SeqCst), 1);
         u.stop();
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
         // Stopped during the initial delay: never checks.
         let (src, checks, _) = fake(&[Some("999.0.0")], true);
         let u = Arc::new(Upgrader::default());
@@ -551,17 +617,30 @@ mod tests {
     fn development_builds_are_detected() {
         assert!(is_development_build_path("/repo/target/debug/nyq"));
         assert!(is_development_build_path("/repo/target/release/nyq"));
-        assert!(is_development_build_path("/repo/target/release/deps/nyq-1234"));
-        assert!(is_development_build_path("/repo/target/x86_64-unknown-linux-gnu/release/nyq"));
-        assert!(is_development_build_path("C:\\repo\\target\\debug\\nyq.exe"));
-        assert!(is_development_build_path("C:\\repo\\target\\release\\nyq.exe"));
-        assert!(is_development_build_path("C:\\repo\\target\\x86_64-pc-windows-msvc\\release\\nyq.exe"));
+        assert!(is_development_build_path(
+            "/repo/target/release/deps/nyq-1234"
+        ));
+        assert!(is_development_build_path(
+            "/repo/target/x86_64-unknown-linux-gnu/release/nyq"
+        ));
+        assert!(is_development_build_path(
+            "C:\\repo\\target\\debug\\nyq.exe"
+        ));
+        assert!(is_development_build_path(
+            "C:\\repo\\target\\release\\nyq.exe"
+        ));
+        assert!(is_development_build_path(
+            "C:\\repo\\target\\x86_64-pc-windows-msvc\\release\\nyq.exe"
+        ));
         assert!(!is_development_build_path("/home/me/.local/bin/nyq"));
         assert!(!is_development_build_path("/home/me/.cargo/bin/nyq"));
         assert!(!is_development_build_path("C:\\Users\\me\\bin\\nyq.exe"));
         assert!(!is_development_build_path("/srv/targets/release-notes/nyq"));
         assert!(!is_development_build_path("/opt/target/nyq"));
-        assert!(!should_start(true, Some(Path::new("/repo/target/debug/nyq"))));
+        assert!(!should_start(
+            true,
+            Some(Path::new("/repo/target/debug/nyq"))
+        ));
         assert!(!should_start(false, Some(Path::new("/usr/local/bin/nyq"))));
         assert!(!should_start(true, None));
     }
@@ -583,17 +662,68 @@ mod tests {
         let run = |a: &[&str], id: Option<&str>| strs(&relaunch_args(&args(a), id));
         assert_eq!(run(&["fix", "the", "bug"], Some("S")), ["--resume", "S"]);
         assert_eq!(
-            run(&["--yolo", "-m", "gpt-5", "--provider=xai", "hello", "--sandbox", "off", "world"], Some("S")),
-            ["--yolo", "-m", "gpt-5", "--provider=xai", "--sandbox", "off", "--resume", "S"]
+            run(
+                &[
+                    "--yolo",
+                    "-m",
+                    "gpt-5",
+                    "--provider=xai",
+                    "hello",
+                    "--sandbox",
+                    "off",
+                    "world"
+                ],
+                Some("S")
+            ),
+            [
+                "--yolo",
+                "-m",
+                "gpt-5",
+                "--provider=xai",
+                "--sandbox",
+                "off",
+                "--resume",
+                "S"
+            ]
         );
-        assert_eq!(run(&["-c", "--allow-network", "more"], Some("S")), ["--allow-network", "--resume", "S"]);
-        assert_eq!(run(&["--continue", "--add-dir", "/x", "--add-dir=/y"], Some("S")), ["--add-dir", "/x", "--add-dir=/y", "--resume", "S"]);
+        assert_eq!(
+            run(&["-c", "--allow-network", "more"], Some("S")),
+            ["--allow-network", "--resume", "S"]
+        );
+        assert_eq!(
+            run(
+                &["--continue", "--add-dir", "/x", "--add-dir=/y"],
+                Some("S")
+            ),
+            ["--add-dir", "/x", "--add-dir=/y", "--resume", "S"]
+        );
         assert_eq!(run(&["-r", "abc", "prompt"], Some("S")), ["--resume", "S"]);
-        assert_eq!(run(&["-r", "--yolo"], Some("S")), ["--yolo", "--resume", "S"]);
-        assert_eq!(run(&["--resume=abc", "-rabc", "--resume", "def"], Some("S")), ["--resume", "S"]);
-        assert_eq!(run(&["--permission-mode", "auto", "session", "resume", "abc"], Some("S")), ["--permission-mode", "auto", "--resume", "S"]);
-        assert_eq!(run(&["-cm", "gpt-5", "-mo3"], Some("S")), ["-m", "gpt-5", "-mo3", "--resume", "S"]);
-        assert_eq!(run(&["--record", "--no-additional-dirs", "--", "--yolo"], Some("S")), ["--no-additional-dirs", "--resume", "S"]);
+        assert_eq!(
+            run(&["-r", "--yolo"], Some("S")),
+            ["--yolo", "--resume", "S"]
+        );
+        assert_eq!(
+            run(&["--resume=abc", "-rabc", "--resume", "def"], Some("S")),
+            ["--resume", "S"]
+        );
+        assert_eq!(
+            run(
+                &["--permission-mode", "auto", "session", "resume", "abc"],
+                Some("S")
+            ),
+            ["--permission-mode", "auto", "--resume", "S"]
+        );
+        assert_eq!(
+            run(&["-cm", "gpt-5", "-mo3"], Some("S")),
+            ["-m", "gpt-5", "-mo3", "--resume", "S"]
+        );
+        assert_eq!(
+            run(
+                &["--record", "--no-additional-dirs", "--", "--yolo"],
+                Some("S")
+            ),
+            ["--no-additional-dirs", "--resume", "S"]
+        );
         // An unsaved conversation starts fresh.
         assert_eq!(run(&["hello", "--yolo"], None), ["--yolo"]);
         assert!(run(&[], None).is_empty());
@@ -601,7 +731,11 @@ mod tests {
 
     #[test]
     fn apply_is_refused_while_the_app_is_busy() {
-        let ready = ApplyFacts { enabled: true, state: Some(State::Ready), ..Default::default() };
+        let ready = ApplyFacts {
+            enabled: true,
+            state: Some(State::Ready),
+            ..Default::default()
+        };
         assert_eq!(apply_refusal(&ready), None);
         type Set = fn(&mut ApplyFacts);
         let cases: [(Set, &str); 10] = [
@@ -622,13 +756,33 @@ mod tests {
             assert!(apply_refusal(&f).unwrap().contains(want), "{want}");
         }
         // Busy states come first, then disabled, then not ready.
-        let busy_off = ApplyFacts { busy: true, ..Default::default() };
-        assert!(apply_refusal(&busy_off).unwrap().contains("response finishes"));
-        assert_eq!(apply_refusal(&ApplyFacts::default()), Some("auto-upgrade is disabled"));
-        for state in [None, Some(State::Idle), Some(State::Downloading), Some(State::Failed)] {
-            let f = ApplyFacts { enabled: true, state, ..Default::default() };
+        let busy_off = ApplyFacts {
+            busy: true,
+            ..Default::default()
+        };
+        assert!(apply_refusal(&busy_off)
+            .unwrap()
+            .contains("response finishes"));
+        assert_eq!(
+            apply_refusal(&ApplyFacts::default()),
+            Some("auto-upgrade is disabled")
+        );
+        for state in [
+            None,
+            Some(State::Idle),
+            Some(State::Downloading),
+            Some(State::Failed),
+        ] {
+            let f = ApplyFacts {
+                enabled: true,
+                state,
+                ..Default::default()
+            };
             assert_eq!(apply_refusal(&f), Some("no installed upgrade is ready"));
         }
-        assert_eq!(manual_hint(Some("x")), "restart nyq manually (nyq --resume x)");
+        assert_eq!(
+            manual_hint(Some("x")),
+            "restart nyq manually (nyq --resume x)"
+        );
     }
 }

@@ -56,7 +56,9 @@ impl Version {
         let raw = raw.trim();
         let raw = raw.strip_prefix('v').unwrap_or(raw);
         let raw = raw.split_once('+').map_or(raw, |(v, _)| v);
-        let (core, pre) = raw.split_once('-').map_or((raw, None), |(c, p)| (c, Some(p)));
+        let (core, pre) = raw
+            .split_once('-')
+            .map_or((raw, None), |(c, p)| (c, Some(p)));
         let mut parts = core.split('.');
         let mut nums = [0u64; 3];
         for n in &mut nums {
@@ -86,12 +88,14 @@ impl Version {
 
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.core.cmp(&other.core).then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => self.pre.cmp(&other.pre),
-        })
+        self.core
+            .cmp(&other.core)
+            .then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => self.pre.cmp(&other.pre),
+            })
     }
 }
 
@@ -158,7 +162,11 @@ pub fn target_for(os: &str, arch: &str) -> Option<&'static str> {
 
 /// The release archive name for a target triple.
 pub fn archive_name(target: &str) -> String {
-    let ext = if target.contains("windows") { "zip" } else { "tar.gz" };
+    let ext = if target.contains("windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
     format!("nyq-{target}.{ext}")
 }
 
@@ -168,12 +176,16 @@ pub fn checksum_for(sums: &str, name: &str) -> Option<String> {
         let (hex, file) = line.trim().split_once(char::is_whitespace)?;
         let file = file.trim_start();
         let file = file.strip_prefix('*').unwrap_or(file);
-        (file == name && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_ascii_lowercase())
+        (file == name && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hex.to_ascii_lowercase())
     })
 }
 
 pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
-    let actual: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let actual: String = Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if !actual.eq_ignore_ascii_case(expected) {
         bail!("checksum mismatch: expected {expected}, got {actual}; the download may be incomplete or tampered with");
     }
@@ -188,7 +200,9 @@ pub(crate) struct Github {
 }
 
 fn env_token() -> Option<String> {
-    ["GITHUB_TOKEN", "GH_TOKEN"].iter().find_map(|k| std::env::var(k).ok().filter(|t| !t.trim().is_empty()))
+    ["GITHUB_TOKEN", "GH_TOKEN"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|t| !t.trim().is_empty()))
 }
 
 fn gh_token() -> Option<String> {
@@ -204,11 +218,18 @@ impl Github {
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout)
             .build()?;
-        Ok(Github { client, token: env_token() })
+        Ok(Github {
+            client,
+            token: env_token(),
+        })
     }
 
     async fn get(&self, url: &str, accept: &str) -> Result<reqwest::Response> {
-        let mut req = self.client.get(url).header("Accept", accept).header("X-GitHub-Api-Version", "2022-11-28");
+        let mut req = self
+            .client
+            .get(url)
+            .header("Accept", accept)
+            .header("X-GitHub-Api-Version", "2022-11-28");
         if let Some(token) = &self.token {
             req = req.bearer_auth(token);
         }
@@ -219,11 +240,17 @@ impl Github {
     /// retry once with `gh auth token`.
     pub(crate) async fn releases(&mut self) -> Result<Vec<Release>> {
         let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=30");
-        let mut resp = self.get(&url, "application/vnd.github+json").await.context("contacting GitHub")?;
+        let mut resp = self
+            .get(&url, "application/vnd.github+json")
+            .await
+            .context("contacting GitHub")?;
         if matches!(resp.status().as_u16(), 401 | 403 | 404) && self.token.is_none() {
             if let Some(token) = gh_token() {
                 self.token = Some(token);
-                resp = self.get(&url, "application/vnd.github+json").await.context("contacting GitHub")?;
+                resp = self
+                    .get(&url, "application/vnd.github+json")
+                    .await
+                    .context("contacting GitHub")?;
             }
         }
         match resp.status().as_u16() {
@@ -241,11 +268,23 @@ impl Github {
         // Browser links ignore tokens; private assets need the API address.
         let resp = match &self.token {
             Some(_) => self.get(&asset.url, "application/octet-stream").await,
-            None => self.get(&asset.browser_download_url, "application/octet-stream").await,
+            None => {
+                self.get(&asset.browser_download_url, "application/octet-stream")
+                    .await
+            }
         }
         .with_context(|| format!("downloading {}", asset.name))?;
-        anyhow::ensure!(resp.status().is_success(), "downloading {} failed: HTTP {}", asset.name, resp.status());
-        Ok(resp.bytes().await.with_context(|| format!("downloading {}", asset.name))?.to_vec())
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "downloading {} failed: HTTP {}",
+            asset.name,
+            resp.status()
+        );
+        Ok(resp
+            .bytes()
+            .await
+            .with_context(|| format!("downloading {}", asset.name))?
+            .to_vec())
     }
 }
 
@@ -262,7 +301,10 @@ struct State {
 }
 
 fn load(home: &Path) -> State {
-    std::fs::read(home.join(STATE_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    std::fs::read(home.join(STATE_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 fn save(home: &Path, state: &State) -> Result<()> {
@@ -292,7 +334,8 @@ pub(crate) fn record_check(home: &Path, latest: Option<&str>) {
 
 /// The path of the running executable, with symlinks resolved.
 pub(crate) fn current_exe() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("could not determine the path of the running binary")?;
+    let exe =
+        std::env::current_exe().context("could not determine the path of the running binary")?;
     let exe = match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
         Some(stripped) => PathBuf::from(stripped),
         None => exe,
@@ -322,9 +365,19 @@ fn swap_aside(staged: &Path, exe: &Path) -> std::io::Result<()> {
 
 /// Replace `exe` with `new_bin`: stage a copy next to it (same filesystem),
 /// let `check` vet the staged file, then rename it over the original.
-pub fn replace_exe(new_bin: &Path, exe: &Path, check: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
-    let dir = exe.parent().context("the executable has no parent directory")?;
-    let staged = dir.join(format!(".nyq-upgrade-{}{}", uuid::Uuid::new_v4(), std::env::consts::EXE_SUFFIX));
+pub fn replace_exe(
+    new_bin: &Path,
+    exe: &Path,
+    check: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let dir = exe
+        .parent()
+        .context("the executable has no parent directory")?;
+    let staged = dir.join(format!(
+        ".nyq-upgrade-{}{}",
+        uuid::Uuid::new_v4(),
+        std::env::consts::EXE_SUFFIX
+    ));
     let result = (|| -> Result<()> {
         std::fs::copy(new_bin, &staged)
             .with_context(|| format!("cannot write to {} (permission denied?)", dir.display()))?;
@@ -334,7 +387,11 @@ pub fn replace_exe(new_bin: &Path, exe: &Path, check: impl FnOnce(&Path) -> Resu
             std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
         }
         check(&staged)?;
-        let swapped = if cfg!(windows) { swap_aside(&staged, exe) } else { std::fs::rename(&staged, exe) };
+        let swapped = if cfg!(windows) {
+            swap_aside(&staged, exe)
+        } else {
+            std::fs::rename(&staged, exe)
+        };
         swapped.with_context(|| format!("failed to replace {} (permission denied?)", exe.display()))
     })();
     if result.is_err() {
@@ -345,9 +402,15 @@ pub fn replace_exe(new_bin: &Path, exe: &Path, check: impl FnOnce(&Path) -> Resu
 
 /// Make sure the staged binary runs and reports the expected version.
 fn check_binary(path: &Path, version: &str) -> Result<()> {
-    let out = Command::new(path).arg("--version").output().context("the downloaded binary does not run")?;
+    let out = Command::new(path)
+        .arg("--version")
+        .output()
+        .context("the downloaded binary does not run")?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let reported = text.trim().strip_prefix("nyq ").context("the downloaded binary is not nyq")?;
+    let reported = text
+        .trim()
+        .strip_prefix("nyq ")
+        .context("the downloaded binary is not nyq")?;
     anyhow::ensure!(
         Version::parse(reported) == Version::parse(version),
         "the downloaded binary reports version {reported}, expected {version}"
@@ -362,7 +425,11 @@ fn find_binary(dir: &Path) -> Option<PathBuf> {
     if top.is_file() {
         return Some(top);
     }
-    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path().join(&name)).find(|p| p.is_file())
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join(&name))
+        .find(|p| p.is_file())
 }
 
 struct TempDir(PathBuf);
@@ -375,8 +442,18 @@ impl Drop for TempDir {
 
 fn extract(archive: &Path, dest: &Path) -> Result<()> {
     // bsdtar (bundled with Windows 10+) also reads zip archives.
-    let flags = if archive.extension().is_some_and(|e| e == "zip") { "-xf" } else { "-xzf" };
-    let status = Command::new("tar").arg(flags).arg(archive).arg("-C").arg(dest).status().context("running tar")?;
+    let flags = if archive.extension().is_some_and(|e| e == "zip") {
+        "-xf"
+    } else {
+        "-xzf"
+    };
+    let status = Command::new("tar")
+        .arg(flags)
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .context("running tar")?;
     anyhow::ensure!(status.success(), "failed to extract {}", archive.display());
     Ok(())
 }
@@ -410,14 +487,24 @@ pub(crate) async fn newest(gh: &mut Github, channel: Channel) -> Result<(Release
 
 /// Download the archive `name` of `release` and verify it against the
 /// release's SHA256SUMS.
-pub(crate) async fn download_verified(gh: &Github, release: &Release, name: &str) -> Result<Vec<u8>> {
+pub(crate) async fn download_verified(
+    gh: &Github,
+    release: &Release,
+    name: &str,
+) -> Result<Vec<u8>> {
     let name = &release_asset_name(release, name);
-    let asset = release.asset(name).with_context(|| format!("release {} has no asset named {name}", release.tag_name))?;
-    let sums = release
-        .asset("SHA256SUMS")
-        .with_context(|| format!("release {} has no SHA256SUMS: refusing to install without checksum verification", release.tag_name))?;
+    let asset = release
+        .asset(name)
+        .with_context(|| format!("release {} has no asset named {name}", release.tag_name))?;
+    let sums = release.asset("SHA256SUMS").with_context(|| {
+        format!(
+            "release {} has no SHA256SUMS: refusing to install without checksum verification",
+            release.tag_name
+        )
+    })?;
     let sums = String::from_utf8_lossy(&gh.download(sums).await?).into_owned();
-    let expected = checksum_for(&sums, name).with_context(|| format!("SHA256SUMS has no entry for {name}"))?;
+    let expected =
+        checksum_for(&sums, name).with_context(|| format!("SHA256SUMS has no entry for {name}"))?;
     let bytes = gh.download(asset).await?;
     verify_sha256(&bytes, &expected)?;
     Ok(bytes)
@@ -434,7 +521,8 @@ pub(crate) fn install_archive(bytes: &[u8], name: &str, version: &str, exe: &Pat
     let unpacked = tmp.0.join("unpacked");
     std::fs::create_dir_all(&unpacked)?;
     extract(&archive, &unpacked)?;
-    let new_bin = find_binary(&unpacked).with_context(|| format!("{name} does not contain a nyq binary"))?;
+    let new_bin =
+        find_binary(&unpacked).with_context(|| format!("{name} does not contain a nyq binary"))?;
     replace_exe(&new_bin, exe, |staged| check_binary(staged, version))
 }
 
@@ -446,7 +534,8 @@ pub async fn run(home: &Path, channel: Option<Channel>, check: bool, json: bool)
         save(home, &state)?;
     }
     let channel = state.channel.unwrap_or_default();
-    let name = platform_archive().context("no prebuilt nyq release exists for this platform; build from source instead")?;
+    let name = platform_archive()
+        .context("no prebuilt nyq release exists for this platform; build from source instead")?;
     let report = |status: &str, latest: &str, text: String| {
         if json {
             let value = serde_json::json!({
@@ -466,7 +555,11 @@ pub async fn run(home: &Path, channel: Option<Channel>, check: bool, json: bool)
     let (release, latest) = newest(&mut gh, channel).await?;
     record_check(home, Some(&latest));
     if !is_newer(&latest, CURRENT) {
-        report("up_to_date", &latest, format!("nyq {CURRENT} is up to date ({} channel).", channel.label()));
+        report(
+            "up_to_date",
+            &latest,
+            format!("nyq {CURRENT} is up to date ({} channel).", channel.label()),
+        );
         return Ok(());
     }
     if check {
@@ -482,7 +575,11 @@ pub async fn run(home: &Path, channel: Option<Channel>, check: bool, json: bool)
     eprintln!("Downloading {name} ({})...", release.tag_name);
     let bytes = download_verified(&gh, &release, &name).await?;
     install_archive(&bytes, &name, &latest, &exe)?;
-    report("upgraded", &latest, format!("Upgraded nyq {CURRENT} -> {latest} ({}).", exe.display()));
+    report(
+        "upgraded",
+        &latest,
+        format!("Upgraded nyq {CURRENT} -> {latest} ({}).", exe.display()),
+    );
     Ok(())
 }
 
@@ -497,7 +594,11 @@ mod tests {
             draft: false,
             assets: assets
                 .iter()
-                .map(|n| Asset { name: n.to_string(), url: format!("api/{n}"), browser_download_url: format!("dl/{n}") })
+                .map(|n| Asset {
+                    name: n.to_string(),
+                    url: format!("api/{n}"),
+                    browser_download_url: format!("dl/{n}"),
+                })
                 .collect(),
         }
     }
@@ -514,39 +615,90 @@ mod tests {
         assert!(!is_newer("0.3.0", "0.3.0+build.7"));
         assert!(!is_newer("0.2.9", "0.3.0"));
         assert!(!is_newer("garbage", "0.1.0"));
-        assert!(Version::parse("1.2").is_none() && Version::parse("1.2.3.4").is_none() && Version::parse("1.2.3-").is_none());
+        assert!(
+            Version::parse("1.2").is_none()
+                && Version::parse("1.2.3.4").is_none()
+                && Version::parse("1.2.3-").is_none()
+        );
     }
 
     #[test]
     fn releases_are_picked_per_channel() {
         let mut draft = release("v9.0.0", false, &[]);
         draft.draft = true;
-        let all = vec![release("v0.3.0", false, &[]), release("v0.5.0-rc.1", true, &[]), release("v0.4.0", false, &[]), draft, release("nightly", false, &[])];
-        assert_eq!(pick_release(all.clone(), Channel::Stable).unwrap().tag_name, "v0.4.0");
-        assert_eq!(pick_release(all, Channel::Latest).unwrap().tag_name, "v0.5.0-rc.1");
+        let all = vec![
+            release("v0.3.0", false, &[]),
+            release("v0.5.0-rc.1", true, &[]),
+            release("v0.4.0", false, &[]),
+            draft,
+            release("nightly", false, &[]),
+        ];
+        assert_eq!(
+            pick_release(all.clone(), Channel::Stable).unwrap().tag_name,
+            "v0.4.0"
+        );
+        assert_eq!(
+            pick_release(all, Channel::Latest).unwrap().tag_name,
+            "v0.5.0-rc.1"
+        );
         assert!(pick_release(vec![release("v1.0.0-rc.1", true, &[])], Channel::Stable).is_none());
     }
 
     #[test]
     fn assets_are_selected_per_target() {
-        assert_eq!(target_for("linux", "x86_64"), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(
+            target_for("linux", "x86_64"),
+            Some("x86_64-unknown-linux-musl")
+        );
         assert_eq!(target_for("macos", "aarch64"), Some("aarch64-apple-darwin"));
-        assert_eq!(target_for("windows", "x86_64"), Some("x86_64-pc-windows-msvc"));
+        assert_eq!(
+            target_for("windows", "x86_64"),
+            Some("x86_64-pc-windows-msvc")
+        );
         assert_eq!(target_for("freebsd", "x86_64"), None);
-        assert_eq!(archive_name("aarch64-unknown-linux-gnu"), "nyq-aarch64-unknown-linux-gnu.tar.gz");
-        assert_eq!(archive_name("x86_64-pc-windows-msvc"), "nyq-x86_64-pc-windows-msvc.zip");
-        let r = release("v1.0.0", false, &["nyq-x86_64-apple-darwin.tar.gz", "nyq-aarch64-apple-darwin.tar.gz", "SHA256SUMS"]);
-        let a = r.asset(&archive_name(target_for("macos", "aarch64").unwrap())).unwrap();
+        assert_eq!(
+            archive_name("aarch64-unknown-linux-gnu"),
+            "nyq-aarch64-unknown-linux-gnu.tar.gz"
+        );
+        assert_eq!(
+            archive_name("x86_64-pc-windows-msvc"),
+            "nyq-x86_64-pc-windows-msvc.zip"
+        );
+        let r = release(
+            "v1.0.0",
+            false,
+            &[
+                "nyq-x86_64-apple-darwin.tar.gz",
+                "nyq-aarch64-apple-darwin.tar.gz",
+                "SHA256SUMS",
+            ],
+        );
+        let a = r
+            .asset(&archive_name(target_for("macos", "aarch64").unwrap()))
+            .unwrap();
         assert_eq!(a.browser_download_url, "dl/nyq-aarch64-apple-darwin.tar.gz");
         assert!(r.asset("nyq-x86_64-pc-windows-msvc.zip").is_none());
         // Older releases only have glibc Linux archives; newer ones prefer musl.
         let musl = archive_name(target_for("linux", "aarch64").unwrap());
         let old = release("v0.4.1", false, &["nyq-aarch64-unknown-linux-gnu.tar.gz"]);
-        assert_eq!(release_asset_name(&old, &musl), "nyq-aarch64-unknown-linux-gnu.tar.gz");
-        let new = release("v0.5.0", false, &["nyq-aarch64-unknown-linux-gnu.tar.gz", "nyq-aarch64-unknown-linux-musl.tar.gz"]);
+        assert_eq!(
+            release_asset_name(&old, &musl),
+            "nyq-aarch64-unknown-linux-gnu.tar.gz"
+        );
+        let new = release(
+            "v0.5.0",
+            false,
+            &[
+                "nyq-aarch64-unknown-linux-gnu.tar.gz",
+                "nyq-aarch64-unknown-linux-musl.tar.gz",
+            ],
+        );
         assert_eq!(release_asset_name(&new, &musl), musl);
         // The running platform maps to a target wherever nyq ships binaries.
-        if cfg!(all(any(target_os = "linux", target_os = "macos"), any(target_arch = "x86_64", target_arch = "aarch64"))) {
+        if cfg!(all(
+            any(target_os = "linux", target_os = "macos"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )) {
             assert!(target_for(std::env::consts::OS, std::env::consts::ARCH).is_some());
         }
     }
@@ -554,15 +706,28 @@ mod tests {
     #[test]
     fn checksums_are_parsed_and_verified() {
         let data = b"hello nyq";
-        let hex: String = Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect();
-        let sums = format!("{}  nyq-a.tar.gz\n{hex}  nyq-b.tar.gz\n{} *nyq-c.zip\nshort  nyq-d.tar.gz\n", "0".repeat(64), "A".repeat(64));
-        assert_eq!(checksum_for(&sums, "nyq-b.tar.gz").as_deref(), Some(hex.as_str()));
+        let hex: String = Sha256::digest(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let sums = format!(
+            "{}  nyq-a.tar.gz\n{hex}  nyq-b.tar.gz\n{} *nyq-c.zip\nshort  nyq-d.tar.gz\n",
+            "0".repeat(64),
+            "A".repeat(64)
+        );
+        assert_eq!(
+            checksum_for(&sums, "nyq-b.tar.gz").as_deref(),
+            Some(hex.as_str())
+        );
         assert_eq!(checksum_for(&sums, "nyq-c.zip"), Some("a".repeat(64)));
         assert_eq!(checksum_for(&sums, "nyq-d.tar.gz"), None);
         assert_eq!(checksum_for(&sums, "nyq-b.tar"), None);
         verify_sha256(data, &hex).unwrap();
         verify_sha256(data, &hex.to_uppercase()).unwrap();
-        assert!(verify_sha256(b"tampered", &hex).unwrap_err().to_string().contains("checksum mismatch"));
+        assert!(verify_sha256(b"tampered", &hex)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch"));
     }
 
     #[test]
@@ -581,7 +746,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
         // A failed check leaves the original alone and cleans up the staged copy.
         std::fs::write(&new, "broken").unwrap();
@@ -589,7 +757,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
         let staged = std::fs::read_dir(tmp.path())
             .unwrap()
-            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(".nyq-upgrade-"))
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".nyq-upgrade-")
+            })
             .count();
         assert_eq!(staged, 0);
     }
@@ -604,7 +778,10 @@ mod tests {
         std::fs::write(aside_path(&exe), "stale").unwrap();
         swap_aside(&staged, &exe).unwrap();
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
-        assert_eq!(std::fs::read_to_string(tmp.path().join("nyq.exe.old")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("nyq.exe.old")).unwrap(),
+            "old"
+        );
         // A missing replacement restores the original.
         assert!(swap_aside(&tmp.path().join("missing"), &exe).is_err());
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
@@ -617,7 +794,10 @@ mod tests {
         let name = format!("nyq{}", std::env::consts::EXE_SUFFIX);
         std::fs::create_dir(tmp.path().join("pkg")).unwrap();
         std::fs::write(tmp.path().join("pkg").join(&name), "x").unwrap();
-        assert_eq!(find_binary(tmp.path()).unwrap(), tmp.path().join("pkg").join(&name));
+        assert_eq!(
+            find_binary(tmp.path()).unwrap(),
+            tmp.path().join("pkg").join(&name)
+        );
         std::fs::write(tmp.path().join(&name), "x").unwrap();
         assert_eq!(find_binary(tmp.path()).unwrap(), tmp.path().join(&name));
     }
@@ -635,7 +815,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(tmp.path().join(STATE_FILE)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(tmp.path().join(STATE_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
     }

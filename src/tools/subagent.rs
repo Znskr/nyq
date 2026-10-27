@@ -65,7 +65,10 @@ pub fn register(r: &mut Registry) {
 struct Subagent;
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 fn is_general(args: &Value) -> bool {
@@ -182,9 +185,18 @@ impl Tool for Subagent {
     }
 
     fn preview(&self, args: &Value, _: &ToolCtx) -> Option<String> {
-        let task = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty())?;
-        let mode = if is_general(args) { "general" } else { "explore" };
-        let name = str_arg(args, "name").map(|n| format!(" · name: {n}")).unwrap_or_default();
+        let task = args
+            .get("task")
+            .and_then(Value::as_str)
+            .filter(|t| !t.trim().is_empty())?;
+        let mode = if is_general(args) {
+            "general"
+        } else {
+            "explore"
+        };
+        let name = str_arg(args, "name")
+            .map(|n| format!(" · name: {n}"))
+            .unwrap_or_default();
         Some(format!("mode: {mode}{name}\n{task}"))
     }
 
@@ -219,9 +231,17 @@ impl Tool for Subagent {
 
 /// A child agent with `items` as its transcript. `args` may override the
 /// model, effort and (only towards stricter) permission mode.
-fn child(ctx: &ToolCtx, general: bool, persistent: bool, items: Vec<Item>, args: &Value) -> Result<Agent, ToolOutput> {
+fn child(
+    ctx: &ToolCtx,
+    general: bool,
+    persistent: bool,
+    items: Vec<Item>,
+    args: &Value,
+) -> Result<Agent, ToolOutput> {
     let Some(provider) = &ctx.provider else {
-        return Err(ToolOutput::err("Subagents are unavailable: no model provider in this context."));
+        return Err(ToolOutput::err(
+            "Subagents are unavailable: no model provider in this context.",
+        ));
     };
     let mut provider = provider.fork();
     if let Some(model) = str_arg(args, "model") {
@@ -230,17 +250,28 @@ fn child(ctx: &ToolCtx, general: bool, persistent: bool, items: Vec<Item>, args:
     if let Some(effort) = str_arg(args, "effort") {
         provider.set_effort(Some(effort.to_string()));
     }
-    let parent_mode = if ctx.yolo { crate::permissions::Mode::Yolo } else { ctx.permission_mode };
+    let parent_mode = if ctx.yolo {
+        crate::permissions::Mode::Yolo
+    } else {
+        ctx.permission_mode
+    };
     let permission_mode = match str_arg(args, "permission_mode") {
         None => parent_mode,
         Some(raw) => match crate::permissions::Mode::parse(raw) {
             Some(mode) if mode_rank(mode) <= mode_rank(parent_mode) => mode,
             Some(_) => parent_mode,
-            None => return Err(ToolOutput::err(format!("Unknown permission_mode `{raw}` (ask, auto, yolo)."))),
+            None => {
+                return Err(ToolOutput::err(format!(
+                    "Unknown permission_mode `{raw}` (ask, auto, yolo)."
+                )))
+            }
         },
     };
     let context_window = crate::config::context_window_for(provider.name(), None);
-    let mut system = format!("{}\n\n{PREAMBLE}", crate::prompt::system(&ctx.cwd, &ctx.sandbox));
+    let mut system = format!(
+        "{}\n\n{PREAMBLE}",
+        crate::prompt::system(&ctx.cwd, &ctx.sandbox)
+    );
     if persistent {
         system.push_str(&format!("\n\n{PERSISTENT}"));
     }
@@ -294,33 +325,71 @@ async fn drive_child(
     live: LiveGuard,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Outcome {
-    let mut ui = Collector { calls: Vec::new(), approver: ctx.approver.clone(), origin, live, note: None };
+    let mut ui = Collector {
+        calls: Vec::new(),
+        approver: ctx.approver.clone(),
+        origin,
+        live,
+        note: None,
+    };
     let result = match input {
-        Some(item) => drive_turn(agent.turn(item, &mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await,
-        None => drive_turn(agent.continue_turn(&mut ui, cancel.clone()), TIMEOUT, CLEANUP, cancel).await,
+        Some(item) => {
+            drive_turn(
+                agent.turn(item, &mut ui, cancel.clone()),
+                TIMEOUT,
+                CLEANUP,
+                cancel,
+            )
+            .await
+        }
+        None => {
+            drive_turn(
+                agent.continue_turn(&mut ui, cancel.clone()),
+                TIMEOUT,
+                CLEANUP,
+                cancel,
+            )
+            .await
+        }
     };
     ctx.granted
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .extend(agent.allowed.difference(&ctx.allowed).cloned());
-    Outcome { result, calls: std::mem::take(&mut ui.calls), undo: std::mem::take(&mut agent.undo), stopped: ui.live.stopped() }
+    Outcome {
+        result,
+        calls: std::mem::take(&mut ui.calls),
+        undo: std::mem::take(&mut agent.undo),
+        stopped: ui.live.stopped(),
+    }
 }
 
 fn display(calls: &[(String, String)]) -> String {
     if calls.is_empty() {
         return "(no tool calls)".into();
     }
-    calls.iter().map(|(name, summary)| format!("{name} {summary}").trim_end().to_string()).collect::<Vec<_>>().join("\n")
+    calls
+        .iter()
+        .map(|(name, summary)| format!("{name} {summary}").trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The tool output for a finished turn: the report or the failure.
 fn report(outcome: Outcome, agent: &Agent, footer: String) -> ToolOutput {
     let display = Some(display(&outcome.calls));
     let undo = outcome.undo;
-    let fail = |msg: String| ToolOutput { display: display.clone(), undo: undo.clone(), ..ToolOutput::err(msg) };
+    let fail = |msg: String| ToolOutput {
+        display: display.clone(),
+        undo: undo.clone(),
+        ..ToolOutput::err(msg)
+    };
     match outcome.result {
         Err(e) if e.to_string().contains("timed out") => {
-            return fail(format!("Subagent timed out after {} minutes{footer}.", TIMEOUT.as_secs() / 60));
+            return fail(format!(
+                "Subagent timed out after {} minutes{footer}.",
+                TIMEOUT.as_secs() / 60
+            ));
         }
         Err(e) => return fail(format!("Subagent failed: {e:#}{footer}")),
         Ok(TurnEnd::Cancelled) => return fail(format!("Subagent cancelled{footer}.")),
@@ -342,11 +411,19 @@ fn report(outcome: Outcome, agent: &Agent, footer: String) -> ToolOutput {
         agent.usage.input_tokens,
         agent.usage.output_tokens
     ));
-    ToolOutput { display, undo, ..ToolOutput::ok(content) }
+    ToolOutput {
+        display,
+        undo,
+        ..ToolOutput::ok(content)
+    }
 }
 
 async fn one_shot(args: &Value, ctx: &ToolCtx) -> ToolOutput {
-    let Some(task) = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) else {
+    let Some(task) = args
+        .get("task")
+        .and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+    else {
         return ToolOutput::err("Missing required argument `task`.");
     };
     let mut agent = match child(ctx, is_general(args), false, Vec::new(), args) {
@@ -358,13 +435,25 @@ async fn one_shot(args: &Value, ctx: &ToolCtx) -> ToolOutput {
     let Some(live) = LiveGuard::start(None, &label, cancel.clone()) else {
         return ToolOutput::err("Subagent could not start.");
     };
-    let outcome = drive_child(&mut agent, Some(Item::user(task)), ctx, format!("subagent: {label}"), live, cancel).await;
+    let outcome = drive_child(
+        &mut agent,
+        Some(Item::user(task)),
+        ctx,
+        format!("subagent: {label}"),
+        live,
+        cancel,
+    )
+    .await;
     report(outcome, &agent, String::new())
 }
 
 /// Create the named subagent `name`, or send it a follow-up message.
 async fn named_run(args: &Value, name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
-    let Some(task) = args.get("task").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) else {
+    let Some(task) = args
+        .get("task")
+        .and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+    else {
         return ToolOutput::err("Missing required argument `task` (the message for the subagent).");
     };
     let record = match subagents::load(dir, name) {
@@ -374,7 +463,15 @@ async fn named_run(args: &Value, name: &str, dir: &Path, ctx: &ToolCtx) -> ToolO
             ));
         }
         Ok(Some(r)) => r,
-        Ok(None) => Record::new(name, if is_general(args) { "general" } else { "explore" }, label(args)),
+        Ok(None) => Record::new(
+            name,
+            if is_general(args) {
+                "general"
+            } else {
+                "explore"
+            },
+            label(args),
+        ),
         Err(e) => return ToolOutput::err(format!("{e:#}")),
     };
     run_named(record, Some(Item::user(task)), dir, ctx, args).await
@@ -391,7 +488,8 @@ async fn resume(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
     if subagents::is_live(&subagents::key(dir, name)) {
         return ToolOutput::err(format!("Subagent `{name}` is already working."));
     }
-    let unfinished = record.status != Status::Idle && !matches!(record.items.last(), Some(Item::Assistant { .. }) | None);
+    let unfinished = record.status != Status::Idle
+        && !matches!(record.items.last(), Some(Item::Assistant { .. }) | None);
     if !unfinished {
         if record.status != Status::Idle {
             record.status = Status::Idle;
@@ -400,7 +498,10 @@ async fn resume(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
                 return ToolOutput::err(format!("{e:#}"));
             }
         }
-        let last = record.last_answer().map(|a| format!("\nIts last answer:\n{}", truncate(a, 2_000))).unwrap_or_default();
+        let last = record
+            .last_answer()
+            .map(|a| format!("\nIts last answer:\n{}", truncate(a, 2_000)))
+            .unwrap_or_default();
         return ToolOutput::ok(format!(
             "Subagent `{name}` is ready for follow-up messages (call subagent with name \"{name}\" and a task).{last}"
         ));
@@ -409,12 +510,28 @@ async fn resume(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
 }
 
 /// Run a turn of a saved subagent and save it again.
-async fn run_named(mut record: Record, input: Option<Item>, dir: &Path, ctx: &ToolCtx, args: &Value) -> ToolOutput {
+async fn run_named(
+    mut record: Record,
+    input: Option<Item>,
+    dir: &Path,
+    ctx: &ToolCtx,
+    args: &Value,
+) -> ToolOutput {
     let name = record.name.clone();
     let cancel = ctx.cancel.child_token();
-    let live_label = if record.description.is_empty() { name.clone() } else { format!("{name}: {}", one_line(&record.description)) };
-    let Some(live) = LiveGuard::start(Some(subagents::key(dir, &name)), &live_label, cancel.clone()) else {
-        return ToolOutput::err(format!("Subagent `{name}` is still working on an earlier message; wait for it or stop it."));
+    let live_label = if record.description.is_empty() {
+        name.clone()
+    } else {
+        format!("{name}: {}", one_line(&record.description))
+    };
+    let Some(live) = LiveGuard::start(
+        Some(subagents::key(dir, &name)),
+        &live_label,
+        cancel.clone(),
+    ) else {
+        return ToolOutput::err(format!(
+            "Subagent `{name}` is still working on an earlier message; wait for it or stop it."
+        ));
     };
     // A turn cut short earlier may have left calls without results.
     let mut items = std::mem::take(&mut record.items);
@@ -432,7 +549,15 @@ async fn run_named(mut record: Record, input: Option<Item>, dir: &Path, ctx: &To
     if let Err(e) = subagents::save(dir, &record) {
         return ToolOutput::err(format!("{e:#}"));
     }
-    let outcome = drive_child(&mut agent, input, ctx, format!("subagent {name}"), live, cancel).await;
+    let outcome = drive_child(
+        &mut agent,
+        input,
+        ctx,
+        format!("subagent {name}"),
+        live,
+        cancel,
+    )
+    .await;
     record.status = match &outcome.result {
         Ok(TurnEnd::Done) => Status::Idle,
         _ if outcome.stopped => Status::Stopped,
@@ -445,13 +570,16 @@ async fn run_named(mut record: Record, input: Option<Item>, dir: &Path, ctx: &To
     record.updated = chrono::Utc::now();
     let saved = subagents::save(dir, &record);
     let footer = match record.status {
-        Status::Idle => format!("; `{name}` keeps its context: send follow-ups with name \"{name}\""),
+        Status::Idle => {
+            format!("; `{name}` keeps its context: send follow-ups with name \"{name}\"")
+        }
         Status::Stopped => format!("; `{name}` was stopped"),
         _ => format!("; `{name}` can finish this with action \"resume\""),
     };
     let mut out = report(outcome, &agent, footer);
     if let Err(e) = saved {
-        out.content.push_str(&format!("\n(could not save subagent `{name}`: {e:#})"));
+        out.content
+            .push_str(&format!("\n(could not save subagent `{name}`: {e:#})"));
     }
     out
 }
@@ -569,7 +697,10 @@ mod tests {
             Box::new(self.clone())
         }
         async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> anyhow::Result<Response> {
-            self.seen_tools.lock().unwrap().push(req.tools.iter().map(|t| t.name.clone()).collect());
+            self.seen_tools
+                .lock()
+                .unwrap()
+                .push(req.tools.iter().map(|t| t.name.clone()).collect());
             self.requests.lock().unwrap().push(req.items.to_vec());
             *self.seen_results.lock().unwrap() = req
                 .items
@@ -656,7 +787,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Tool for Named {
         fn spec(&self) -> ToolSpec {
-            ToolSpec { name: self.0.into(), description: String::new(), parameters: json!({}) }
+            ToolSpec {
+                name: self.0.into(),
+                description: String::new(),
+                parameters: json!({}),
+            }
         }
         fn summary(&self, _: &Value) -> String {
             String::new()
@@ -668,18 +803,38 @@ mod tests {
 
     #[test]
     fn children_inherit_skills_mcp_and_at_most_the_parent_mode() {
-        let shared: Vec<Arc<dyn Tool>> = vec![Arc::new(Named("skill")), Arc::new(Named("mcp__wiki__ask"))];
-        let names = |general| -> Vec<String> { child_tools(general, &shared).specs().into_iter().map(|s| s.name).collect() };
-        assert!(names(false).contains(&"skill".into()) && !names(false).contains(&"mcp__wiki__ask".into()));
-        assert!(names(true).contains(&"skill".into()) && names(true).contains(&"mcp__wiki__ask".into()));
+        let shared: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(Named("skill")), Arc::new(Named("mcp__wiki__ask"))];
+        let names = |general| -> Vec<String> {
+            child_tools(general, &shared)
+                .specs()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        assert!(
+            names(false).contains(&"skill".into())
+                && !names(false).contains(&"mcp__wiki__ask".into())
+        );
+        assert!(
+            names(true).contains(&"skill".into()) && names(true).contains(&"mcp__wiki__ask".into())
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let mut parent = ctx(&Fake::default(), dir.path());
         parent.permission_mode = crate::permissions::Mode::Auto;
-        let mode = |args: Value| child(&parent, false, false, Vec::new(), &args).map(|a| a.permission_mode);
+        let mode = |args: Value| {
+            child(&parent, false, false, Vec::new(), &args).map(|a| a.permission_mode)
+        };
         assert_eq!(mode(json!({})).ok(), Some(crate::permissions::Mode::Auto));
-        assert_eq!(mode(json!({"permission_mode": "ask"})).ok(), Some(crate::permissions::Mode::Ask));
-        assert_eq!(mode(json!({"permission_mode": "yolo"})).ok(), Some(crate::permissions::Mode::Auto));
+        assert_eq!(
+            mode(json!({"permission_mode": "ask"})).ok(),
+            Some(crate::permissions::Mode::Ask)
+        );
+        assert_eq!(
+            mode(json!({"permission_mode": "yolo"})).ok(),
+            Some(crate::permissions::Mode::Auto)
+        );
         assert!(mode(json!({"permission_mode": "bogus"})).is_err());
     }
 
@@ -947,7 +1102,10 @@ mod tests {
     }
 
     fn named_ctx(fake: &Fake, dir: &std::path::Path, store: &std::path::Path) -> ToolCtx {
-        ToolCtx { subagent_dir: Some(store.to_path_buf()), ..ctx(fake, dir) }
+        ToolCtx {
+            subagent_dir: Some(store.to_path_buf()),
+            ..ctx(fake, dir)
+        }
     }
 
     fn users(items: &[Item]) -> Vec<String> {
@@ -955,7 +1113,12 @@ mod tests {
             .iter()
             .filter_map(|i| match i {
                 // Without the per-request session note on the newest message.
-                Item::User { text, .. } => Some(text.split("\n\n[Session state]").next().unwrap_or("").to_string()),
+                Item::User { text, .. } => Some(
+                    text.split("\n\n[Session state]")
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                ),
                 Item::Assistant { text } => Some(format!("A:{text}")),
                 _ => None,
             })
@@ -965,45 +1128,122 @@ mod tests {
     #[tokio::test]
     async fn named_subagent_keeps_context_across_follow_ups_and_session_resume() {
         let dir = tempfile::tempdir().unwrap();
-        let session = crate::session::Session::create(&dir.path().join("sessions"), dir.path(), "fake").unwrap();
+        let session =
+            crate::session::Session::create(&dir.path().join("sessions"), dir.path(), "fake")
+                .unwrap();
         let store = subagents::store_dir(&session.path);
         let fake = Fake::default();
-        *fake.script.lock().unwrap() = vec![answer("the parser is in src/parse.rs"), answer("it has 3 functions")];
+        *fake.script.lock().unwrap() = vec![
+            answer("the parser is in src/parse.rs"),
+            answer("it has 3 functions"),
+        ];
         let c = named_ctx(&fake, dir.path(), &store);
 
-        let out = Subagent.run(json!({"task": "find the parser", "name": "scout", "description": "Find parser"}), &c).await;
+        let out = Subagent
+            .run(
+                json!({"task": "find the parser", "name": "scout", "description": "Find parser"}),
+                &c,
+            )
+            .await;
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.starts_with("the parser is in src/parse.rs"), "{}", out.content);
-        assert!(out.content.contains("send follow-ups with name \"scout\""), "{}", out.content);
-        let out = Subagent.run(json!({"task": "how many functions?", "name": "scout"}), &c).await;
-        assert!(out.content.starts_with("it has 3 functions"), "{}", out.content);
+        assert!(
+            out.content.starts_with("the parser is in src/parse.rs"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("send follow-ups with name \"scout\""),
+            "{}",
+            out.content
+        );
+        let out = Subagent
+            .run(json!({"task": "how many functions?", "name": "scout"}), &c)
+            .await;
+        assert!(
+            out.content.starts_with("it has 3 functions"),
+            "{}",
+            out.content
+        );
         let requests = fake.requests.lock().unwrap().clone();
-        assert_eq!(users(&requests[1]), ["find the parser", "A:the parser is in src/parse.rs", "how many functions?"]);
+        assert_eq!(
+            users(&requests[1]),
+            [
+                "find the parser",
+                "A:the parser is in src/parse.rs",
+                "how many functions?"
+            ]
+        );
 
         let record = subagents::load(&store, "scout").unwrap().unwrap();
-        assert_eq!((record.status, record.turns, record.mode.as_str()), (Status::Idle, 2, "explore"));
+        assert_eq!(
+            (record.status, record.turns, record.mode.as_str()),
+            (Status::Idle, 2, "explore")
+        );
         assert_eq!(record.description, "Find parser");
         assert_eq!(record.usage.input_tokens, 200);
 
         // A resumed session (a new process: fresh provider, same store) still has it.
         let fake2 = Fake::default();
         *fake2.script.lock().unwrap() = vec![answer("still remember parse.rs")];
-        let out = Subagent.run(json!({"task": "where was it?", "name": "scout"}), &named_ctx(&fake2, dir.path(), &store)).await;
-        assert!(out.content.starts_with("still remember parse.rs"), "{}", out.content);
+        let out = Subagent
+            .run(
+                json!({"task": "where was it?", "name": "scout"}),
+                &named_ctx(&fake2, dir.path(), &store),
+            )
+            .await;
+        assert!(
+            out.content.starts_with("still remember parse.rs"),
+            "{}",
+            out.content
+        );
         let seen = fake2.requests.lock().unwrap()[0].clone();
         assert_eq!(users(&seen)[0], "find the parser");
         assert_eq!(users(&seen).len(), 5);
 
         let list = Subagent.run(json!({"action": "list"}), &c).await;
-        assert!(list.content.contains("scout") && list.content.contains("idle"), "{}", list.content);
-        let inspect = Subagent.run(json!({"action": "inspect", "name": "scout"}), &c).await;
-        assert!(inspect.content.contains("where was it?"), "{}", inspect.content);
-        assert!(Subagent.run(json!({"action": "inspect"}), &c).await.is_error);
-        assert!(Subagent.run(json!({"task": "x", "name": "../evil"}), &c).await.is_error);
-        assert!(Subagent.run(json!({"task": "x", "name": "a"}), &ctx(&fake, dir.path())).await.is_error, "no session store");
-        assert_eq!(Subagent.summary(&json!({"task": "go", "name": "scout"})), "scout: go");
-        assert_eq!(Subagent.summary(&json!({"action": "stop", "name": "scout"})), "stop scout");
-        assert!(!Subagent.needs_approval(&json!({"action": "stop", "name": "w", "mode": "general"})));
+        assert!(
+            list.content.contains("scout") && list.content.contains("idle"),
+            "{}",
+            list.content
+        );
+        let inspect = Subagent
+            .run(json!({"action": "inspect", "name": "scout"}), &c)
+            .await;
+        assert!(
+            inspect.content.contains("where was it?"),
+            "{}",
+            inspect.content
+        );
+        assert!(
+            Subagent
+                .run(json!({"action": "inspect"}), &c)
+                .await
+                .is_error
+        );
+        assert!(
+            Subagent
+                .run(json!({"task": "x", "name": "../evil"}), &c)
+                .await
+                .is_error
+        );
+        assert!(
+            Subagent
+                .run(json!({"task": "x", "name": "a"}), &ctx(&fake, dir.path()))
+                .await
+                .is_error,
+            "no session store"
+        );
+        assert_eq!(
+            Subagent.summary(&json!({"task": "go", "name": "scout"})),
+            "scout: go"
+        );
+        assert_eq!(
+            Subagent.summary(&json!({"action": "stop", "name": "scout"})),
+            "stop scout"
+        );
+        assert!(
+            !Subagent.needs_approval(&json!({"action": "stop", "name": "w", "mode": "general"}))
+        );
         assert!(Subagent.needs_approval(&json!({"task": "x", "name": "w", "mode": "general"})));
     }
 
@@ -1016,44 +1256,84 @@ mod tests {
         r.status = Status::Running;
         r.items = vec![
             Item::user("check a.txt"),
-            Item::ToolCall { id: "c1".into(), name: "read_file".into(), arguments: r#"{"path":"a.txt"}"#.into() },
+            Item::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.txt"}"#.into(),
+            },
         ];
         subagents::save(&store, &r).unwrap();
-        assert_eq!(subagents::load(&store, "fixer").unwrap().unwrap().effective_status(&store), Status::Interrupted);
+        assert_eq!(
+            subagents::load(&store, "fixer")
+                .unwrap()
+                .unwrap()
+                .effective_status(&store),
+            Status::Interrupted
+        );
 
         let fake = Fake::default();
         *fake.script.lock().unwrap() = vec![answer("a.txt is fine"), answer("ok again")];
         let c = named_ctx(&fake, dir.path(), &store);
-        let out = Subagent.run(json!({"action": "resume", "name": "fixer"}), &c).await;
+        let out = Subagent
+            .run(json!({"action": "resume", "name": "fixer"}), &c)
+            .await;
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.starts_with("a.txt is fine"), "{}", out.content);
         let sent = fake.requests.lock().unwrap()[0].clone();
         assert!(
-            sent.iter().any(|i| matches!(i, Item::ToolResult { id, is_error: true, .. } if id == "c1")),
+            sent.iter()
+                .any(|i| matches!(i, Item::ToolResult { id, is_error: true, .. } if id == "c1")),
             "the dangling call is answered: {sent:?}"
         );
-        assert_eq!(subagents::load(&store, "fixer").unwrap().unwrap().status, Status::Idle);
+        assert_eq!(
+            subagents::load(&store, "fixer").unwrap().unwrap().status,
+            Status::Idle
+        );
 
         // Stopped: follow-ups are refused until it is resumed.
         subagents::stop(&store, "fixer").unwrap();
-        let out = Subagent.run(json!({"task": "more", "name": "fixer"}), &c).await;
-        assert!(out.is_error && out.content.contains("is stopped"), "{}", out.content);
-        let out = Subagent.run(json!({"action": "resume", "name": "fixer"}), &c).await;
-        assert!(out.content.contains("ready for follow-up") && out.content.contains("a.txt is fine"), "{}", out.content);
-        let out = Subagent.run(json!({"task": "more", "name": "fixer"}), &c).await;
+        let out = Subagent
+            .run(json!({"task": "more", "name": "fixer"}), &c)
+            .await;
+        assert!(
+            out.is_error && out.content.contains("is stopped"),
+            "{}",
+            out.content
+        );
+        let out = Subagent
+            .run(json!({"action": "resume", "name": "fixer"}), &c)
+            .await;
+        assert!(
+            out.content.contains("ready for follow-up") && out.content.contains("a.txt is fine"),
+            "{}",
+            out.content
+        );
+        let out = Subagent
+            .run(json!({"task": "more", "name": "fixer"}), &c)
+            .await;
         assert!(out.content.starts_with("ok again"), "{}", out.content);
-        assert!(Subagent.run(json!({"action": "resume", "name": "ghost"}), &c).await.is_error);
+        assert!(
+            Subagent
+                .run(json!({"action": "resume", "name": "ghost"}), &c)
+                .await
+                .is_error
+        );
     }
 
     #[tokio::test]
     async fn stopping_a_working_subagent_cancels_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("s.agents");
-        let fake = Fake { hang: true, ..Fake::default() };
+        let fake = Fake {
+            hang: true,
+            ..Fake::default()
+        };
         let c = named_ctx(&fake, dir.path(), &store);
         let task = {
             let c = c.clone();
-            tokio::spawn(async move { Subagent.run(json!({"task": "spin", "name": "w"}), &c).await })
+            tokio::spawn(
+                async move { Subagent.run(json!({"task": "spin", "name": "w"}), &c).await },
+            )
         };
         let key = subagents::key(&store, "w");
         for _ in 0..200 {
@@ -1063,12 +1343,27 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(subagents::is_live(&key));
-        let busy = Subagent.run(json!({"task": "again", "name": "w"}), &c).await;
-        assert!(busy.is_error && busy.content.contains("still working"), "{}", busy.content);
-        let stop = Subagent.run(json!({"action": "stop", "name": "w"}), &c).await;
+        let busy = Subagent
+            .run(json!({"task": "again", "name": "w"}), &c)
+            .await;
+        assert!(
+            busy.is_error && busy.content.contains("still working"),
+            "{}",
+            busy.content
+        );
+        let stop = Subagent
+            .run(json!({"action": "stop", "name": "w"}), &c)
+            .await;
         assert!(stop.content.contains("Stopping"), "{}", stop.content);
-        let out = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
-        assert!(out.is_error && out.content.contains("was stopped"), "{}", out.content);
+        let out = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            out.is_error && out.content.contains("was stopped"),
+            "{}",
+            out.content
+        );
         let record = subagents::load(&store, "w").unwrap().unwrap();
         assert_eq!(record.status, Status::Stopped);
         assert_eq!(users(&record.items), ["spin"]);

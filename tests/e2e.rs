@@ -78,7 +78,8 @@ fn print_mode_runs_tools_and_answers() {
     let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
         .args(["--print", "--yolo", "--sandbox", "off", "copy the notes"])
         .current_dir(work.path())
-        .env("NYQ_HOME", home.path()).env("HOME", home.path())
+        .env("NYQ_HOME", home.path())
+        .env("HOME", home.path())
         .env("NYQ_BASE_URL", &url)
         .env("NYQ_MODEL", "fake-model")
         .env_remove("NYQ_API_KEY")
@@ -121,7 +122,8 @@ fn print_mode_runs_tools_and_answers() {
     let elsewhere = tempfile::tempdir().unwrap();
     assert!(sessions(elsewhere.path(), &[]).contains("No saved conversations in this directory"));
     assert!(sessions(elsewhere.path(), &["--all"]).contains("copy the notes"));
-    let listed: Value = serde_json::from_str(&sessions(work.path(), &["--json", "--limit", "1"])).unwrap();
+    let listed: Value =
+        serde_json::from_str(&sessions(work.path(), &["--json", "--limit", "1"])).unwrap();
     assert_eq!(listed.as_array().unwrap().len(), 1);
     assert_eq!(listed[0]["title"], "copy the notes");
     // `nyq session ID` is short for `nyq session show ID`.
@@ -154,7 +156,8 @@ fn print_mode_denies_mutations_without_yolo() {
     let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
         .args(["-p", "--sandbox", "off", "write x"])
         .current_dir(work.path())
-        .env("NYQ_HOME", home.path()).env("HOME", home.path())
+        .env("NYQ_HOME", home.path())
+        .env("HOME", home.path())
         .env("NYQ_BASE_URL", &url)
         .env("NYQ_MODEL", "fake-model")
         .output()
@@ -181,7 +184,8 @@ fn print_command(work: &std::path::Path, home: &std::path::Path, url: &str) -> C
         "openai",
     ])
     .current_dir(work)
-    .env("NYQ_HOME", home).env("HOME", home)
+    .env("NYQ_HOME", home)
+    .env("HOME", home)
     .env("NYQ_BASE_URL", url)
     .env("NYQ_MODEL", "fake-model")
     .env("NYQ_CONTEXT_WINDOW", "1000")
@@ -399,37 +403,69 @@ fn oversized_compaction_warns_and_continues() {
 fn usage_is_logged_and_reported_without_exposing_auth() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("models.json"), r#"{"openai":{"models":{"priced":{"cost":{"input":2,"output":8,"cache_read":0.5}}}}}"#).unwrap();
+    std::fs::write(
+        home.path().join("models.json"),
+        r#"{"openai":{"models":{"priced":{"cost":{"input":2,"output":8,"cache_read":0.5}}}}}"#,
+    )
+    .unwrap();
     let (url, _) = fake_server(vec![vec![
         delta(json!({"content":"Done."})),
         json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":40}}}),
     ]]);
     let mut cmd = print_command(work.path(), home.path(), &url);
-    let out = cmd.env("NYQ_MODEL", "priced").arg("hello").output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = cmd
+        .env("NYQ_MODEL", "priced")
+        .arg("hello")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let log = std::fs::read_to_string(home.path().join("usage.jsonl")).unwrap();
     assert_eq!(log.lines().count(), 1);
     let r: Value = serde_json::from_str(log.trim()).unwrap();
-    assert_eq!((r["input"].as_u64(), r["cached"].as_u64(), r["output"].as_u64()), (Some(100),Some(40),Some(20)));
+    assert_eq!(
+        (
+            r["input"].as_u64(),
+            r["cached"].as_u64(),
+            r["output"].as_u64()
+        ),
+        (Some(100), Some(40), Some(20))
+    );
     assert_eq!(r["provider"], "openai");
     assert_eq!(r["model"], "priced");
     assert!(!r["session"].as_str().unwrap().is_empty());
     assert!((r["cost_usd"].as_f64().unwrap() - 0.0003).abs() < 1e-12);
-    let report = Command::new(env!("CARGO_BIN_EXE_nyq")).args(["usage", "--period", "24h"])
-        .env("HOME", home.path()).env("NYQ_HOME", home.path()).output().unwrap();
+    let report = Command::new(env!("CARGO_BIN_EXE_nyq"))
+        .args(["usage", "--period", "24h"])
+        .env("HOME", home.path())
+        .env("NYQ_HOME", home.path())
+        .output()
+        .unwrap();
     assert!(report.status.success());
     let text = String::from_utf8_lossy(&report.stderr);
     assert!(text.contains("openai/priced: 1 requests"), "{text}");
     assert!(text.contains("$0.000300"), "{text}");
-    let out = Command::new(env!("CARGO_BIN_EXE_nyq")).args(["status", "--json", "--provider", "openai"])
-        .env("HOME", home.path()).env("NYQ_HOME", home.path()).env("NYQ_BASE_URL", &url)
-        .env("NYQ_MODEL", "priced").env("NYQ_API_KEY", "must-never-appear").output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
+        .args(["status", "--json", "--provider", "openai"])
+        .env("HOME", home.path())
+        .env("NYQ_HOME", home.path())
+        .env("NYQ_BASE_URL", &url)
+        .env("NYQ_MODEL", "priced")
+        .env("NYQ_API_KEY", "must-never-appear")
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains("must-never-appear"));
     let status: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(status["model"], "priced");
-    assert!(status["auth_sources"].as_array().unwrap().contains(&json!("NYQ_API_KEY")));
+    assert!(status["auth_sources"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("NYQ_API_KEY")));
 }
 
 #[test]
@@ -440,24 +476,42 @@ fn usage_status_and_doctor_commands_work_without_model_requests() {
     std::fs::write(home.path().join("usage.jsonl"), format!("{record}\n")).unwrap();
     let command = || {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_nyq"));
-        cmd.current_dir(work.path()).env("HOME", home.path()).env("NYQ_HOME", home.path())
-            .env_remove("NYQ_PROVIDER").env_remove("NYQ_MODEL").env_remove("NYQ_BASE_URL").env_remove("NYQ_API_KEY")
+        cmd.current_dir(work.path())
+            .env("HOME", home.path())
+            .env("NYQ_HOME", home.path())
+            .env_remove("NYQ_PROVIDER")
+            .env_remove("NYQ_MODEL")
+            .env_remove("NYQ_BASE_URL")
+            .env_remove("NYQ_API_KEY")
             .env("NYQ_CODEX_AUTH", home.path().join("missing.json"));
         cmd
     };
-    let report = command().args(["usage", "--period", "24h"]).output().unwrap();
+    let report = command()
+        .args(["usage", "--period", "24h"])
+        .output()
+        .unwrap();
     assert!(report.status.success());
     assert!(String::from_utf8_lossy(&report.stderr).contains("openai/priced: 1 requests"));
-    let status = command().args(["status", "--json", "--provider", "openai"])
-        .env("NYQ_BASE_URL", "http://127.0.0.1:1/v1").env("NYQ_MODEL", "priced")
-        .env("NYQ_API_KEY", "must-never-appear").output().unwrap();
+    let status = command()
+        .args(["status", "--json", "--provider", "openai"])
+        .env("NYQ_BASE_URL", "http://127.0.0.1:1/v1")
+        .env("NYQ_MODEL", "priced")
+        .env("NYQ_API_KEY", "must-never-appear")
+        .output()
+        .unwrap();
     assert!(status.status.success());
     let text = String::from_utf8_lossy(&status.stdout);
     assert!(!text.contains("must-never-appear"));
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["model"], "priced");
-    assert!(v["auth_sources"].as_array().unwrap().contains(&json!("NYQ_API_KEY")));
-    let doctor = command().args(["doctor", "--sandbox", "off"]).output().unwrap();
+    assert!(v["auth_sources"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("NYQ_API_KEY")));
+    let doctor = command()
+        .args(["doctor", "--sandbox", "off"])
+        .output()
+        .unwrap();
     assert!(!doctor.status.success());
     let text = String::from_utf8_lossy(&doctor.stderr);
     assert!(text.contains("✗ auth:"));
@@ -481,14 +535,21 @@ fn print_mode_runs_user_hooks_but_not_untrusted_project_hooks() {
     ]});
     std::fs::write(home.path().join("hooks.json"), hooks.to_string()).unwrap();
     std::fs::create_dir_all(work.path().join(".nyq")).unwrap();
-    let project = json!({"hooks": [{"event": "SessionStart", "command": format!("echo project >> {l}")}]});
+    let project =
+        json!({"hooks": [{"event": "SessionStart", "command": format!("echo project >> {l}")}]});
     std::fs::write(work.path().join(".nyq/hooks.json"), project.to_string()).unwrap();
 
     let (url, seen) = fake_server(vec![
-        vec![tool_call("write_file", json!({"path": "x.txt", "content": "x"}))],
+        vec![tool_call(
+            "write_file",
+            json!({"path": "x.txt", "content": "x"}),
+        )],
         vec![delta(json!({"content": "Okay."}))],
     ]);
-    let out = print_command(work.path(), home.path(), &url).arg("write x").output().unwrap();
+    let out = print_command(work.path(), home.path(), &url)
+        .arg("write x")
+        .output()
+        .unwrap();
     assert_success(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not trusted"), "{stderr}");
@@ -506,10 +567,19 @@ fn print_mode_runs_user_hooks_but_not_untrusted_project_hooks() {
 fn print_mode_ignores_a_saved_yolo_mode() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("settings.toml"), "permission_mode = \"yolo\"\n").unwrap();
-    let write_call = delta(json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
-        "function": {"name": "write_file", "arguments": "{\"path\":\"x.txt\",\"content\":\"x\"}"}}]}));
-    let (url, _seen) = fake_server(vec![vec![write_call], vec![delta(json!({"content": "Okay."}))]]);
+    std::fs::write(
+        home.path().join("settings.toml"),
+        "permission_mode = \"yolo\"\n",
+    )
+    .unwrap();
+    let write_call = delta(
+        json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+        "function": {"name": "write_file", "arguments": "{\"path\":\"x.txt\",\"content\":\"x\"}"}}]}),
+    );
+    let (url, _seen) = fake_server(vec![
+        vec![write_call],
+        vec![delta(json!({"content": "Okay."}))],
+    ]);
 
     let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
         .args(["-p", "--sandbox", "off", "--provider", "openai", "write x"])
@@ -520,9 +590,18 @@ fn print_mode_ignores_a_saved_yolo_mode() {
         .env("NYQ_MODEL", "fake-model")
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("saved yolo permission mode does not apply"));
-    assert!(!work.path().join("x.txt").exists(), "a saved yolo must not let print mode write files");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("saved yolo permission mode does not apply")
+    );
+    assert!(
+        !work.path().join("x.txt").exists(),
+        "a saved yolo must not let print mode write files"
+    );
 }
 
 #[test]
@@ -535,18 +614,29 @@ fn acp_ignores_saved_yolo_unless_explicit() {
     ] {
         let work = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("settings.toml"), "permission_mode = \"yolo\"\n").unwrap();
+        std::fs::write(
+            home.path().join("settings.toml"),
+            "permission_mode = \"yolo\"\n",
+        )
+        .unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_nyq"));
-        cmd.args(["acp", "--sandbox", "off", "--provider", "openai"]).args(flags)
-            .current_dir(work.path()).env("NYQ_HOME", home.path()).env("HOME", home.path())
-            .env("NYQ_BASE_URL", "http://127.0.0.1:1/v1").env("NYQ_MODEL", "fake-model")
+        cmd.args(["acp", "--sandbox", "off", "--provider", "openai"])
+            .args(flags)
+            .current_dir(work.path())
+            .env("NYQ_HOME", home.path())
+            .env("HOME", home.path())
+            .env("NYQ_BASE_URL", "http://127.0.0.1:1/v1")
+            .env("NYQ_MODEL", "fake-model")
             .env_remove("NYQ_PERMISSION_MODE");
         if let Some(mode) = env_mode {
             cmd.env("NYQ_PERMISSION_MODE", mode);
         }
-        let mut child = cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
-            .spawn().unwrap();
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
         let mut input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -567,7 +657,10 @@ fn acp_ignores_saved_yolo_unless_explicit() {
         reader.join().unwrap();
         assert!(init.unwrap().get("result").is_some());
         let session = session.unwrap();
-        assert_eq!(session["result"]["modes"]["currentModeId"], expected, "{session}");
+        assert_eq!(
+            session["result"]["modes"]["currentModeId"], expected,
+            "{session}"
+        );
     }
 }
 
@@ -600,7 +693,14 @@ fn ask_json_reports_answer_tools_and_session() {
         vec![delta(json!({"content": "It says hello."}))],
     ]);
     let out = ask_command(work.path(), home.path(), &url)
-        .args(["--json", "--system", "You are a terse test bot.", "--image", "shot.png", "what is in notes"])
+        .args([
+            "--json",
+            "--system",
+            "You are a terse test bot.",
+            "--image",
+            "shot.png",
+            "what is in notes",
+        ])
         .output()
         .unwrap();
     assert_success(&out);
@@ -615,13 +715,20 @@ fn ask_json_reports_answer_tools_and_session() {
     assert_eq!(v["tool_calls"][0]["status"], "ok");
     assert!(v["error"].is_null());
     let id = v["session_id"].as_str().unwrap();
-    assert!(home.path().join("sessions").join(format!("{id}.jsonl")).exists());
+    assert!(home
+        .path()
+        .join("sessions")
+        .join(format!("{id}.jsonl"))
+        .exists());
 
     let seen = seen.lock().unwrap();
     let system = seen[0]["messages"][0]["content"].as_str().unwrap();
     assert!(system.starts_with("You are a terse test bot."), "{system}");
     assert!(!system.contains("You are nyq"));
-    assert!(system.contains("Working directory"), "context still applies: {system}");
+    assert!(
+        system.contains("Working directory"),
+        "context still applies: {system}"
+    );
     assert_image(&seen[0]["messages"][1]);
 }
 
@@ -636,7 +743,13 @@ fn ask_json_reports_startup_errors_and_no_save_keeps_nothing() {
     assert_eq!(out.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["exit_code"], 1);
-    assert!(v["error"].as_str().unwrap().contains("unknown context limit"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown context limit"),
+        "{v}"
+    );
 
     let (url, _seen) = fake_server(vec![vec![delta(json!({"content": "Hi."}))]]);
     let out = ask_command(work.path(), home.path(), &url)
@@ -661,7 +774,10 @@ fn env_sets_permission_mode_and_step_limit() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let (url, _seen) = fake_server(vec![
-        vec![tool_call("write_file", json!({"path": "x.txt", "content": "x"}))],
+        vec![tool_call(
+            "write_file",
+            json!({"path": "x.txt", "content": "x"}),
+        )],
         vec![delta(json!({"content": "Done."}))],
     ]);
     let out = ask_command(work.path(), home.path(), &url)
@@ -670,7 +786,10 @@ fn env_sets_permission_mode_and_step_limit() {
         .output()
         .unwrap();
     assert_success(&out);
-    assert!(work.path().join("x.txt").exists(), "NYQ_PERMISSION_MODE=yolo allows writes");
+    assert!(
+        work.path().join("x.txt").exists(),
+        "NYQ_PERMISSION_MODE=yolo allows writes"
+    );
 
     let (url, _seen) = fake_server(vec![vec![tool_call("read_file", json!({"path": "x.txt"}))]]);
     let out = ask_command(work.path(), home.path(), &url)
@@ -681,7 +800,13 @@ fn env_sets_permission_mode_and_step_limit() {
     // Reaching the limit ends the run with a notice, not an error.
     assert_eq!(out.status.code(), Some(0));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(v["notices"][0].as_str().unwrap().contains("Stopped after 1 model steps"), "{v}");
+    assert!(
+        v["notices"][0]
+            .as_str()
+            .unwrap()
+            .contains("Stopped after 1 model steps"),
+        "{v}"
+    );
     assert_eq!(v["tool_calls"][0]["status"], "ok");
 }
 
@@ -714,14 +839,21 @@ fn signals_interrupt_print_mode_with_conventional_exit_codes() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        connected.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+        connected
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap();
         let status = Command::new("kill")
             .args([signal, &child.id().to_string()])
             .status()
             .unwrap();
         assert!(status.success());
         let out = child.wait_with_output().unwrap();
-        assert_eq!(out.status.code(), Some(code), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(v["exit_code"], code);
     }
@@ -738,13 +870,18 @@ fn signals_interrupt_print_mode_while_stdin_is_open() {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn().unwrap();
+            .spawn()
+            .unwrap();
         // Hold the pipe open after partial input: EOF must not be needed to exit.
         let mut input = child.stdin.take().unwrap();
         // More than a pipe buffer makes this wait until nyq starts reading.
         input.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
         thread::sleep(std::time::Duration::from_millis(50));
-        assert!(Command::new("kill").args([signal, &child.id().to_string()]).status().unwrap().success());
+        assert!(Command::new("kill")
+            .args([signal, &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
             thread::sleep(std::time::Duration::from_millis(10));
@@ -756,7 +893,12 @@ fn signals_interrupt_print_mode_while_stdin_is_open() {
         let out = child.wait_with_output().unwrap();
         drop(input);
         assert!(exited, "did not exit while stdin was open");
-        assert_eq!(out.status.code(), Some(code), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let value: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(value["exit_code"], code);
         assert_eq!(value["steps"], 0);
@@ -772,13 +914,22 @@ fn print_mode_reads_the_complete_piped_prompt() {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn().unwrap();
-    child.stdin.take().unwrap().write_all(b"hello\nfrom stdin").unwrap();
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello\nfrom stdin")
+        .unwrap();
     assert_success(&child.wait_with_output().unwrap());
     let seen = seen.lock().unwrap();
     let messages = seen[0]["messages"].as_array().unwrap();
     let user = messages.iter().find(|m| m["role"] == "user").unwrap();
-    assert!(user["content"].to_string().contains("hello\\nfrom stdin"), "{user}");
+    assert!(
+        user["content"].to_string().contains("hello\\nfrom stdin"),
+        "{user}"
+    );
 }
 
 #[test]
@@ -789,7 +940,12 @@ fn continue_recovery_resumes_the_cut_off_answer() {
         vec![delta(json!({"content": "Part one"}))],
         vec![delta(json!({"content": " and part two."}))],
     ]);
-    assert_success(&ask_command(work.path(), home.path(), &url).arg("write it").output().unwrap());
+    assert_success(
+        &ask_command(work.path(), home.path(), &url)
+            .arg("write it")
+            .output()
+            .unwrap(),
+    );
     let out = ask_command(work.path(), home.path(), &url)
         .args(["-c", "--continue-recovery"])
         .stdin(std::process::Stdio::null())
@@ -799,9 +955,17 @@ fn continue_recovery_resumes_the_cut_off_answer() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("part two"));
     let seen = seen.lock().unwrap();
     let system = seen[1]["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("Continue from where you stopped"), "{system}");
+    assert!(
+        system.contains("Continue from where you stopped"),
+        "{system}"
+    );
     // No new user message was added.
-    let users = seen[1]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "user").count();
+    let users = seen[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .count();
     assert_eq!(users, 1);
 }
 
@@ -810,29 +974,61 @@ fn file_and_search_results_redact_password_assignments() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let secret = "audit_password_12345";
-    std::fs::write(work.path().join("config.env"), format!("DATABASE_PASSWORD={secret}\n")).unwrap();
-    let calls = [("read_file", json!({"path":"config.env"})), ("grep", json!({"pattern":"PASSWORD"}))];
-    let mut replies: Vec<Vec<Value>> = calls.iter().enumerate().map(|(i, (name, args))| {
-        vec![delta(json!({"tool_calls":[{"index":0,"id":format!("call_{i}"),"type":"function",
-            "function":{"name":name,"arguments":args.to_string()}}]}))]
-    }).collect();
+    std::fs::write(
+        work.path().join("config.env"),
+        format!("DATABASE_PASSWORD={secret}\n"),
+    )
+    .unwrap();
+    let calls = [
+        ("read_file", json!({"path":"config.env"})),
+        ("grep", json!({"pattern":"PASSWORD"})),
+    ];
+    let mut replies: Vec<Vec<Value>> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (name, args))| {
+            vec![delta(
+                json!({"tool_calls":[{"index":0,"id":format!("call_{i}"),"type":"function",
+            "function":{"name":name,"arguments":args.to_string()}}]}),
+            )]
+        })
+        .collect();
     replies.push(vec![delta(json!({"content":"Done."}))]);
     let (url, seen) = fake_server(replies);
     let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
-        .args(["-p", "--provider", "openai", "--sandbox", "off", "inspect config"])
+        .args([
+            "-p",
+            "--provider",
+            "openai",
+            "--sandbox",
+            "off",
+            "inspect config",
+        ])
         .current_dir(work.path())
-        .env("NYQ_HOME", home.path()).env("HOME", home.path())
-        .env("NYQ_BASE_URL", url).env("NYQ_MODEL", "fake-model")
-        .output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        .env("NYQ_HOME", home.path())
+        .env("HOME", home.path())
+        .env("NYQ_BASE_URL", url)
+        .env("NYQ_MODEL", "fake-model")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 3);
     let sent = serde_json::to_string(&*seen).unwrap();
     assert!(!sent.contains(secret));
     assert!(sent.contains("DATABASE_PASSWORD=[redacted]"));
-    for entry in std::fs::read_dir(home.path().join("sessions")).unwrap().flatten() {
+    for entry in std::fs::read_dir(home.path().join("sessions"))
+        .unwrap()
+        .flatten()
+    {
         if entry.path().extension().is_some_and(|e| e == "jsonl") {
-            assert!(!std::fs::read_to_string(entry.path()).unwrap().contains(secret));
+            assert!(!std::fs::read_to_string(entry.path())
+                .unwrap()
+                .contains(secret));
         }
     }
 }

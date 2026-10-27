@@ -64,10 +64,20 @@ pub fn segments(f: &Footer, width: usize) -> Vec<(Kind, String)> {
     }
     if on(Segment::Context) && f.context_window > 0 && f.context_tokens > 0 {
         let used = f.context_tokens as f64 / f.context_window as f64;
-        out.push((Kind::Context(used), format!("{:.0}% of {}", used * 100.0, tokens(f.context_window))));
+        out.push((
+            Kind::Context(used),
+            format!("{:.0}% of {}", used * 100.0, tokens(f.context_window)),
+        ));
     }
     if on(Segment::Tokens) && f.usage.input_tokens + f.usage.output_tokens > 0 {
-        out.push((Kind::Tokens, format!("↑{} ↓{}", tokens(f.usage.input_tokens), tokens(f.usage.output_tokens))));
+        out.push((
+            Kind::Tokens,
+            format!(
+                "↑{} ↓{}",
+                tokens(f.usage.input_tokens),
+                tokens(f.usage.output_tokens)
+            ),
+        ));
     }
     if on(Segment::Sandbox) {
         if !f.sandbox.is_empty() {
@@ -82,11 +92,19 @@ pub fn segments(f: &Footer, width: usize) -> Vec<(Kind, String)> {
     }
     if on(Segment::Branch) {
         if let Some(b) = &f.branch {
-            let mark = if super::theme::ascii() { "git:" } else { "⎇ " };
+            let mark = if super::theme::ascii() {
+                "git:"
+            } else {
+                "⎇ "
+            };
             out.push((Kind::Branch, format!("{mark}{}", one_line(b, 60))));
         }
     }
-    out.extend(f.extensions.iter().map(|s| (Kind::Extension, one_line(s, 60))));
+    out.extend(
+        f.extensions
+            .iter()
+            .map(|s| (Kind::Extension, one_line(s, 60))),
+    );
     out
 }
 

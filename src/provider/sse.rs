@@ -30,7 +30,12 @@ pub async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(std::time::Duration::from_secs);
         let body = response.text().await?;
-        return Err(HttpError { status: status.as_u16(), retry_after, message: http_error(status, &body) }.into());
+        return Err(HttpError {
+            status: status.as_u16(),
+            retry_after,
+            message: http_error(status, &body),
+        }
+        .into());
     }
     Ok(response)
 }
@@ -40,15 +45,32 @@ pub async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
 pub fn http_error(status: reqwest::StatusCode, body: &str) -> String {
     let code = status.as_u16();
     let parsed = serde_json::from_str::<Value>(body).ok();
-    let Some(error) = parsed.as_ref().map(|v| &v["error"]).filter(|e| e.is_object() || e.is_string()) else {
+    let Some(error) = parsed
+        .as_ref()
+        .map(|v| &v["error"])
+        .filter(|e| e.is_object() || e.is_string())
+    else {
         let excerpt: String = body.trim().chars().take(4096).collect();
-        return if excerpt.is_empty() { format!("HTTP {status}") } else { format!("HTTP {status}: {excerpt}") };
+        return if excerpt.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status}: {excerpt}")
+        };
     };
-    let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let text = |v: &Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
     let message = text(error).or_else(|| text(&error["message"]));
     let kind = text(&error["code"]).or_else(|| text(&error["type"]));
     let provider = text(&error["provider"]);
-    let title = if matches!(code, 401 | 403) { "API access denied" } else { "API request failed" };
+    let title = if matches!(code, 401 | 403) {
+        "API access denied"
+    } else {
+        "API request failed"
+    };
     let mut out = format!("{title} · HTTP {code}");
     if let Some(p) = provider {
         out.push_str(&format!(" · Provider: {p}"));
@@ -58,7 +80,12 @@ pub fn http_error(status: reqwest::StatusCode, body: &str) -> String {
         (Some(t), _) | (None, Some(t)) => out.push_str(&format!(" · {t}")),
         (None, None) => {}
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(1024).collect()
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(1024)
+        .collect()
 }
 
 pub fn string(value: &Value, key: &str) -> String {
@@ -112,7 +139,13 @@ pub mod tests {
         mpsc::UnboundedReceiver<String>,
         tokio::task::JoinHandle<()>,
     ) {
-        server_with_headers(replies.into_iter().map(|(s, b)| (s, String::new(), b)).collect()).await
+        server_with_headers(
+            replies
+                .into_iter()
+                .map(|(s, b)| (s, String::new(), b))
+                .collect(),
+        )
+        .await
     }
 
     /// Like [`server`], with extra raw header lines (`"Name: value\r\n"`) per reply.
@@ -171,7 +204,9 @@ mod parsing_tests {
 
     #[test]
     fn http_errors() {
-        let e = |status: u16, body: &str| super::http_error(StatusCode::from_u16(status).unwrap(), body);
+        let e = |status: u16, body: &str| {
+            super::http_error(StatusCode::from_u16(status).unwrap(), body)
+        };
         assert_eq!(
             e(403, r#"{"error":{"code":"model_not_allowed","message":"this key may not use the model","provider":"anthropic"}}"#),
             "API access denied · HTTP 403 · Provider: anthropic · model_not_allowed: this key may not use the model"
@@ -181,13 +216,25 @@ mod parsing_tests {
             "API access denied · HTTP 401 · api_key_required: Set OPENCODE_API_KEY to use this endpoint."
         );
         assert_eq!(
-            e(529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#),
+            e(
+                529,
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+            ),
             "API request failed · HTTP 529 · overloaded_error: Overloaded"
         );
-        assert_eq!(e(400, r#"{"error":"bad model"}"#), "API request failed · HTTP 400 · bad model");
-        assert_eq!(e(502, "<html>bad gateway</html>"), "HTTP 502 Bad Gateway: <html>bad gateway</html>");
+        assert_eq!(
+            e(400, r#"{"error":"bad model"}"#),
+            "API request failed · HTTP 400 · bad model"
+        );
+        assert_eq!(
+            e(502, "<html>bad gateway</html>"),
+            "HTTP 502 Bad Gateway: <html>bad gateway</html>"
+        );
         assert_eq!(e(500, ""), "HTTP 500 Internal Server Error");
-        assert_eq!(e(500, r#"{"detail":"x"}"#), r#"HTTP 500 Internal Server Error: {"detail":"x"}"#);
+        assert_eq!(
+            e(500, r#"{"detail":"x"}"#),
+            r#"HTTP 500 Internal Server Error: {"detail":"x"}"#
+        );
     }
 
     #[tokio::test]

@@ -6,17 +6,17 @@ pub mod clipboard;
 pub mod editor;
 mod files;
 pub mod help_menu;
+mod highlight;
+pub mod history;
 pub mod keys;
 pub mod menu;
-pub mod history;
 pub mod mode_menu;
-pub mod skills_menu;
-pub mod tools_menu;
-mod highlight;
 mod render;
-pub mod theme;
 pub mod settings;
+pub mod skills_menu;
 pub mod statusline;
+pub mod theme;
+pub mod tools_menu;
 pub mod transcript;
 pub mod tui;
 
@@ -86,7 +86,10 @@ impl RunRecord {
     }
 
     fn tool_end(&mut self, tool: &str, output: &ToolOutput) {
-        let status = match (output.is_error, output.content.starts_with("The user denied")) {
+        let status = match (
+            output.is_error,
+            output.content.starts_with("The user denied"),
+        ) {
             (false, _) => "ok",
             (true, true) => "denied",
             (true, false) => "error",
@@ -299,7 +302,10 @@ pub fn replay(items: &[Item]) {
 /// piped output stay quiet.
 pub fn banner(version: &str) {
     if let Some(screen) = tui::active() {
-        screen.lock().unwrap_or_else(|e| e.into_inner()).print_banner(version);
+        screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .print_banner(version);
     }
 }
 
@@ -367,7 +373,10 @@ mod tests {
         ui.tool_start("bash", "ls");
         ui.tool_end("bash", &ToolOutput::ok("a\nb"));
         // A denied call never started.
-        ui.tool_end("write_file", &ToolOutput::err("The user denied this tool call."));
+        ui.tool_end(
+            "write_file",
+            &ToolOutput::err("The user denied this tool call."),
+        );
         ui.stream(&StreamEvent::Text("Two files.".into()));
         ui.end_message();
         let r = ui.record.unwrap();

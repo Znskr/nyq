@@ -68,8 +68,16 @@ fn log(home: &Path, name: &str, text: &str) {
     use std::io::Write;
     let path = log_path(home, name);
     let _ = std::fs::create_dir_all(path.parent().unwrap_or(home));
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "[nyq {}] {text}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(
+            f,
+            "[nyq {}] {text}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
     }
 }
 
@@ -89,20 +97,33 @@ pub struct Found {
 /// Names disabled with `[extensions]` `name = false` in settings.toml.
 fn disabled() -> HashSet<String> {
     match crate::settings::current().extra.get("extensions") {
-        Some(Value::Object(m)) => m.iter().filter(|(_, v)| **v == Value::Bool(false)).map(|(k, _)| k.clone()).collect(),
+        Some(Value::Object(m)) => m
+            .iter()
+            .filter(|(_, v)| **v == Value::Bool(false))
+            .map(|(k, _)| k.clone())
+            .collect(),
         _ => HashSet::new(),
     }
 }
 
 /// The extensions in one directory, sorted by directory name.
 fn scan(root: &Path, warnings: &mut Vec<String>) -> Vec<(PathBuf, Manifest)> {
-    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
-    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.join(MANIFEST).is_file()).collect();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join(MANIFEST).is_file())
+        .collect();
     dirs.sort();
     let mut out = Vec::new();
     for dir in dirs {
         let file = dir.join(MANIFEST);
-        match std::fs::read_to_string(&file).map_err(|e| e.to_string()).and_then(|t| Manifest::parse(&t)) {
+        match std::fs::read_to_string(&file)
+            .map_err(|e| e.to_string())
+            .and_then(|t| Manifest::parse(&t))
+        {
             Ok(m) => out.push((dir, m)),
             Err(e) => warnings.push(format!("ignoring {}: {e}", file.display())),
         }
@@ -129,11 +150,18 @@ pub fn discover(home: &Path, cwd: &Path) -> (Vec<Found>, Vec<String>) {
     for (root, is_project) in roots {
         for (dir, manifest) in scan(&root, &mut warnings) {
             if found.iter().any(|f| f.manifest.name == manifest.name) {
-                warnings.push(format!("ignoring {}: an extension named `{}` is already loaded", dir.display(), manifest.name));
+                warnings.push(format!(
+                    "ignoring {}: an extension named `{}` is already loaded",
+                    dir.display(),
+                    manifest.name
+                ));
                 continue;
             }
             let hash = is_project.then(|| dir_hash(&dir));
-            let trusted = !is_project || trusts.get(&trust_key(&dir)).is_some_and(|h| Some(h) == hash.as_ref());
+            let trusted = !is_project
+                || trusts
+                    .get(&trust_key(&dir))
+                    .is_some_and(|h| Some(h) == hash.as_ref());
             if !trusted {
                 warnings.push(format!(
                     "project extension `{}` in {} is not trusted and will not start; review it, then run /extensions trust",
@@ -142,7 +170,14 @@ pub fn discover(home: &Path, cwd: &Path) -> (Vec<Found>, Vec<String>) {
                 ));
             }
             let enabled = !off.contains(&manifest.name);
-            found.push(Found { manifest, dir, project: is_project, hash, trusted, enabled });
+            found.push(Found {
+                manifest,
+                dir,
+                project: is_project,
+                hash,
+                trusted,
+                enabled,
+            });
         }
     }
     (found, warnings)
@@ -152,7 +187,9 @@ pub fn discover(home: &Path, cwd: &Path) -> (Vec<Found>, Vec<String>) {
 /// (symlinks by target), skipping VCS and dependency directories.
 pub fn dir_hash(dir: &Path) -> String {
     fn walk(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in entries.flatten() {
             let path = e.path();
             let Ok(ty) = e.file_type() else { continue };
@@ -183,7 +220,10 @@ pub fn dir_hash(dir: &Path) -> String {
 }
 
 fn trust_key(dir: &Path) -> String {
-    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).display().to_string()
+    std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn read_trusts(home: &Path) -> Result<BTreeMap<String, String>, String> {
@@ -201,7 +241,12 @@ fn read_trusts(home: &Path) -> Result<BTreeMap<String, String>, String> {
 /// Trust the project extensions as `found` lists them (their hash as
 /// loaded), refusing any that changed since. Returns the trusted names.
 pub fn trust(home: &Path, found: &[Found]) -> Result<Vec<String>> {
-    let mut trusts = read_trusts(home).map_err(|e| anyhow::anyhow!("{} is malformed ({e}); fix or remove it first", trust_file(home).display()))?;
+    let mut trusts = read_trusts(home).map_err(|e| {
+        anyhow::anyhow!(
+            "{} is malformed ({e}); fix or remove it first",
+            trust_file(home).display()
+        )
+    })?;
     let mut names = Vec::new();
     for f in found.iter().filter(|f| f.project && !f.trusted) {
         let now = dir_hash(&f.dir);
@@ -389,7 +434,11 @@ impl Extensions {
 
     /// Commands extensions may not register (nyq's own and their aliases).
     pub fn reserve(&self, names: impl IntoIterator<Item = String>) {
-        lock(&self.0.reserved).extend(names.into_iter().map(|n| n.trim_start_matches('/').to_string()));
+        lock(&self.0.reserved).extend(
+            names
+                .into_iter()
+                .map(|n| n.trim_start_matches('/').to_string()),
+        );
     }
 
     /// Called whenever commands or status texts change.
@@ -417,7 +466,9 @@ impl Extensions {
     /// Wait until no extension is still starting (at most `timeout`).
     pub async fn wait_ready(&self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
-        while self.exts().iter().any(|e| e.state() == State::Starting) && tokio::time::Instant::now() < deadline {
+        while self.exts().iter().any(|e| e.state() == State::Starting)
+            && tokio::time::Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -436,7 +487,9 @@ impl Extensions {
             }
             lock(&ext.status).take();
         }
-        self.0.live.push(Box::new(|r: &mut Registry| r.remove_prefix(TOOL_PREFIX)));
+        self.0
+            .live
+            .push(Box::new(|r: &mut Registry| r.remove_prefix(TOOL_PREFIX)));
     }
 
     /// `/extensions reload`: stop them all, look again, start the enabled ones.
@@ -464,8 +517,15 @@ impl Extensions {
                 lock(&e.commands)
                     .iter()
                     .map(|c| {
-                        let hint = if c.args_hint.is_empty() { String::new() } else { format!(" {}", c.args_hint) };
-                        (format!("/{}", c.name), format!("{}{hint} ({name})", c.description))
+                        let hint = if c.args_hint.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", c.args_hint)
+                        };
+                        (
+                            format!("/{}", c.name),
+                            format!("{}{hint} ({name})", c.description),
+                        )
                     })
                     .collect::<Vec<_>>()
             })
@@ -484,21 +544,41 @@ impl Extensions {
     }
 
     /// Run `/cmd args` (`command/run`).
-    pub async fn run_command(&self, cmd: &str, args: &str, cancel: &CancellationToken) -> Result<CommandResult> {
-        let ext = self.command_owner(cmd).with_context(|| format!("no extension command {cmd}"))?;
-        let conn = ext.conn().with_context(|| format!("extension `{}` is not running", ext.name()))?;
+    pub async fn run_command(
+        &self,
+        cmd: &str,
+        args: &str,
+        cancel: &CancellationToken,
+    ) -> Result<CommandResult> {
+        let ext = self
+            .command_owner(cmd)
+            .with_context(|| format!("no extension command {cmd}"))?;
+        let conn = ext
+            .conn()
+            .with_context(|| format!("extension `{}` is not running", ext.name()))?;
         let params = json!({"name": cmd.trim_start_matches('/'), "args": args});
         let v = tokio::select! {
             r = conn.request("command/run", params, COMMAND_TIMEOUT) => r.map_err(|e| anyhow::anyhow!("{cmd} ({}): {e}", ext.name()))?,
             _ = cancel.cancelled() => anyhow::bail!("{cmd} cancelled"),
         };
-        let text = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(String::from);
-        Ok(CommandResult { message: text("message"), prompt: text("prompt") })
+        let text = |k: &str| {
+            v.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from)
+        };
+        Ok(CommandResult {
+            message: text("message"),
+            prompt: text("prompt"),
+        })
     }
 
     /// Status-line segments, in extension order.
     pub fn statuses(&self) -> Vec<String> {
-        self.exts().iter().filter_map(|e| lock(&e.status).clone()).collect()
+        self.exts()
+            .iter()
+            .filter_map(|e| lock(&e.status).clone())
+            .collect()
     }
 
     /// Messages extensions queued with `session/send`: steering ones, or
@@ -541,7 +621,9 @@ impl Extensions {
         for e in &exts {
             let state = match e.state() {
                 State::Disabled => "disabled in settings".to_string(),
-                State::Untrusted => "untrusted — not running; /extensions trust enables it".to_string(),
+                State::Untrusted => {
+                    "untrusted — not running; /extensions trust enables it".to_string()
+                }
                 State::Starting => "starting".to_string(),
                 State::Ready => "running".to_string(),
                 State::Failed(why) => format!("failed: {why}"),
@@ -549,17 +631,32 @@ impl Extensions {
             };
             let m = &e.found.manifest;
             let scope = if e.found.project { "project" } else { "user" };
-            let version = if m.version.is_empty() { String::new() } else { format!(" {}", m.version) };
+            let version = if m.version.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", m.version)
+            };
             out.push(format!("{}{version} · {scope} · {state}", m.name));
             if !m.description.is_empty() {
                 out.push(format!("  {}", m.description));
             }
             if e.state() == State::Ready {
                 let reg = lock(&e.reg);
-                let tools: Vec<String> = reg.tools.iter().map(|t| tool_name(&m.name, &t.name)).collect();
-                let commands: Vec<String> = lock(&e.commands).iter().map(|c| format!("/{}", c.name)).collect();
+                let tools: Vec<String> = reg
+                    .tools
+                    .iter()
+                    .map(|t| tool_name(&m.name, &t.name))
+                    .collect();
+                let commands: Vec<String> = lock(&e.commands)
+                    .iter()
+                    .map(|c| format!("/{}", c.name))
+                    .collect();
                 let events: Vec<&str> = reg.events.iter().map(|e| e.as_str()).collect();
-                for (label, list) in [("tools", tools.join(", ")), ("commands", commands.join(", ")), ("events", events.join(", "))] {
+                for (label, list) in [
+                    ("tools", tools.join(", ")),
+                    ("commands", commands.join(", ")),
+                    ("events", events.join(", ")),
+                ] {
                     if !list.is_empty() {
                         out.push(format!("  {label}: {list}"));
                     }
@@ -568,7 +665,11 @@ impl Extensions {
                     out.push(format!("  status: {s}"));
                 }
             }
-            out.push(format!("  {} · log {}", e.found.dir.display(), log_path(&self.0.home, &m.name).display()));
+            out.push(format!(
+                "  {} · log {}",
+                e.found.dir.display(),
+                log_path(&self.0.home, &m.name).display()
+            ));
         }
         out
     }
@@ -578,10 +679,17 @@ impl Extensions {
     async fn event(&self, ext: &Ext, ev: Event, mut payload: Value) -> Option<Value> {
         let conn = ext.conn()?;
         payload["session_id"] = json!(lock(&self.0.session_id).clone());
-        match conn.request(&ev.method(), payload, ext.found.manifest.event_timeout).await {
+        match conn
+            .request(&ev.method(), payload, ext.found.manifest.event_timeout)
+            .await
+        {
             Ok(v) => Some(v),
             Err(e) => {
-                log(&self.0.home, ext.name(), &format!("{} skipped: {e}", ev.method()));
+                log(
+                    &self.0.home,
+                    ext.name(),
+                    &format!("{} skipped: {e}", ev.method()),
+                );
                 None
             }
         }
@@ -608,7 +716,10 @@ impl Extensions {
         let ready: Vec<Arc<Ext>> = {
             let mut started = lock(&self.0.started);
             *started = Some(source.to_string());
-            self.exts().into_iter().filter(|e| e.subscribes(Event::SessionStart)).collect()
+            self.exts()
+                .into_iter()
+                .filter(|e| e.subscribes(Event::SessionStart))
+                .collect()
         };
         for ext in ready {
             self.session_start_one(ext, source);
@@ -628,18 +739,33 @@ impl Extensions {
     /// first block wins.
     pub async fn user_prompt(&self, prompt: &str) -> PromptEdit {
         let mut edit = PromptEdit::default();
-        for ext in self.exts().iter().filter(|e| e.subscribes(Event::UserPrompt)) {
+        for ext in self
+            .exts()
+            .iter()
+            .filter(|e| e.subscribes(Event::UserPrompt))
+        {
             let current = edit.prompt.as_deref().unwrap_or(prompt);
-            let Some(v) = self.event(ext, Event::UserPrompt, json!({"prompt": current})).await else { continue };
+            let Some(v) = self
+                .event(ext, Event::UserPrompt, json!({"prompt": current}))
+                .await
+            else {
+                continue;
+            };
             if let Some(reason) = text_field(&v, "block") {
-                edit.blocked = Some(format!("prompt blocked by extension {}: {reason}", ext.name()));
+                edit.blocked = Some(format!(
+                    "prompt blocked by extension {}: {reason}",
+                    ext.name()
+                ));
                 return edit;
             }
             if let Some(p) = text_field(&v, "prompt") {
                 edit.prompt = Some(p);
             }
             if let Some(c) = text_field(&v, "context") {
-                edit.context.push(format!("[extension {} added this context]\n{c}", ext.name()));
+                edit.context.push(format!(
+                    "[extension {} added this context]\n{c}",
+                    ext.name()
+                ));
             }
         }
         edit
@@ -651,7 +777,16 @@ impl Extensions {
         let mut updated: Option<Value> = None;
         for ext in self.exts().iter().filter(|e| e.subscribes(Event::ToolCall)) {
             let current = updated.as_ref().unwrap_or(input);
-            let Some(v) = self.event(ext, Event::ToolCall, json!({"tool": tool, "input": current})).await else { continue };
+            let Some(v) = self
+                .event(
+                    ext,
+                    Event::ToolCall,
+                    json!({"tool": tool, "input": current}),
+                )
+                .await
+            else {
+                continue;
+            };
             if let Some(reason) = text_field(&v, "block") {
                 return Err(format!(
                     "This call was blocked by extension {}: {reason}. Do not retry it; find another way or ask the user.",
@@ -667,9 +802,17 @@ impl Extensions {
 
     /// `tool_result`: handlers may replace the text the model sees.
     pub async fn tool_result(&self, tool: &str, input: &Value, out: &mut ToolOutput) {
-        for ext in self.exts().iter().filter(|e| e.subscribes(Event::ToolResult)) {
+        for ext in self
+            .exts()
+            .iter()
+            .filter(|e| e.subscribes(Event::ToolResult))
+        {
             let payload = json!({"tool": tool, "input": input, "content": out.content, "is_error": out.is_error});
-            if let Some(content) = self.event(ext, Event::ToolResult, payload).await.and_then(|v| text_field(&v, "content")) {
+            if let Some(content) = self
+                .event(ext, Event::ToolResult, payload)
+                .await
+                .and_then(|v| text_field(&v, "content"))
+            {
                 out.content = content;
             }
         }
@@ -678,13 +821,27 @@ impl Extensions {
     /// `before_compact`: extra instructions for the summary.
     pub async fn before_compact(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for ext in self.exts().iter().filter(|e| e.subscribes(Event::BeforeCompact)) {
-            out.extend(self.event(ext, Event::BeforeCompact, json!({})).await.and_then(|v| text_field(&v, "instructions")));
+        for ext in self
+            .exts()
+            .iter()
+            .filter(|e| e.subscribes(Event::BeforeCompact))
+        {
+            out.extend(
+                self.event(ext, Event::BeforeCompact, json!({}))
+                    .await
+                    .and_then(|v| text_field(&v, "instructions")),
+            );
         }
         out
     }
 
-    async fn call_tool(&self, ext_name: &str, tool: &str, input: Value, cancel: &CancellationToken) -> ToolOutput {
+    async fn call_tool(
+        &self,
+        ext_name: &str,
+        tool: &str,
+        input: Value,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
         let Some(ext) = self.exts().into_iter().find(|e| e.name() == ext_name) else {
             return ToolOutput::err(format!("extension `{ext_name}` is not loaded"));
         };
@@ -699,9 +856,15 @@ impl Extensions {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let Some(conn) = ext.conn().filter(|_| ext.state() == State::Ready) else {
-            return ToolOutput::err(format!("extension `{ext_name}` is not running (see /extensions)"));
+            return ToolOutput::err(format!(
+                "extension `{ext_name}` is not running (see /extensions)"
+            ));
         };
-        let request = conn.request("tool/call", json!({"name": tool, "input": input}), TOOL_TIMEOUT);
+        let request = conn.request(
+            "tool/call",
+            json!({"name": tool, "input": input}),
+            TOOL_TIMEOUT,
+        );
         tokio::select! {
             r = request => match r {
                 Ok(v) => protocol::tool_output(&v),
@@ -713,7 +876,10 @@ impl Extensions {
 }
 
 fn text_field(v: &Value, key: &str) -> Option<String> {
-    v.get(key).and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(String::from)
+    v.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
 }
 
 pub fn tool_name(ext: &str, tool: &str) -> String {
@@ -749,14 +915,20 @@ async fn launch(shared: Weak<Shared>, ext: Arc<Ext>) {
         }
         Err(e) => {
             log(&this.0.home, &name, &format!("failed to start: {e:#}"));
-            crate::ui::error(&format!("extension {name} failed to start: {e:#} (log: {})", log_path(&this.0.home, &name).display()));
+            crate::ui::error(&format!(
+                "extension {name} failed to start: {e:#} (log: {})",
+                log_path(&this.0.home, &name).display()
+            ));
             ext.set_state(State::Failed(format!("{e:#}")));
         }
     }
     this.changed();
 }
 
-async fn connect(this: &Extensions, ext: &Arc<Ext>) -> Result<(Arc<Conn>, Registration, Vec<String>)> {
+async fn connect(
+    this: &Extensions,
+    ext: &Arc<Ext>,
+) -> Result<(Arc<Conn>, Registration, Vec<String>)> {
     let name = ext.name().to_string();
     let handler: conn::Handler = {
         let (shared, ext) = (Arc::downgrade(&this.0), Arc::downgrade(ext));
@@ -779,8 +951,22 @@ async fn connect(this: &Extensions, ext: &Arc<Ext>) -> Result<(Arc<Conn>, Regist
         })
     };
     let log_file = log_path(&this.0.home, &name);
-    log(&this.0.home, &name, &format!("starting `{}` in {}", ext.found.manifest.command.join(" "), ext.found.dir.display()));
-    let conn = Conn::spawn(&ext.found.dir, &ext.found.manifest, &log_file, handler, on_exit)?;
+    log(
+        &this.0.home,
+        &name,
+        &format!(
+            "starting `{}` in {}",
+            ext.found.manifest.command.join(" "),
+            ext.found.dir.display()
+        ),
+    );
+    let conn = Conn::spawn(
+        &ext.found.dir,
+        &ext.found.manifest,
+        &log_file,
+        handler,
+        on_exit,
+    )?;
     let params = json!({
         "nyq_version": env!("CARGO_PKG_VERSION"),
         "protocol": protocol::PROTOCOL,
@@ -807,12 +993,20 @@ fn register(this: &Extensions, ext: &Arc<Ext>, reg: Registration) {
         .exts()
         .iter()
         .filter(|e| !Arc::ptr_eq(e, ext))
-        .flat_map(|e| lock(&e.commands).iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+        .flat_map(|e| {
+            lock(&e.commands)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+        })
         .collect();
     let mut commands = Vec::new();
     for c in &reg.commands {
         if reserved.contains(&c.name) || taken.contains(&c.name) {
-            crate::ui::info(&format!("extension {name}: /{} is already a command; skipped", c.name));
+            crate::ui::info(&format!(
+                "extension {name}: /{} is already a command; skipped",
+                c.name
+            ));
         } else {
             commands.push(c.clone());
         }
@@ -820,7 +1014,15 @@ fn register(this: &Extensions, ext: &Arc<Ext>, reg: Registration) {
     *lock(&ext.commands) = commands;
     *lock(&ext.status) = reg.status.clone();
     let weak = Arc::downgrade(&this.0);
-    let tools: Vec<ExtTool> = reg.tools.iter().map(|t| ExtTool { ext: name.clone(), def: t.clone(), shared: weak.clone() }).collect();
+    let tools: Vec<ExtTool> = reg
+        .tools
+        .iter()
+        .map(|t| ExtTool {
+            ext: name.clone(),
+            def: t.clone(),
+            shared: weak.clone(),
+        })
+        .collect();
     let prefix = format!("{TOOL_PREFIX}{name}__");
     this.0.live.push(Box::new(move |r: &mut Registry| {
         r.remove_prefix(&prefix);
@@ -834,23 +1036,34 @@ fn register(this: &Extensions, ext: &Arc<Ext>, reg: Registration) {
 /// The process ended: restart it once, then report it.
 fn exited(this: Extensions, ext: Arc<Ext>, status: String) {
     let name = ext.name().to_string();
-    let was_running = lock(&ext.conn).take().is_some_and(|c| !c.closing.load(Ordering::SeqCst));
+    let was_running = lock(&ext.conn)
+        .take()
+        .is_some_and(|c| !c.closing.load(Ordering::SeqCst));
     if !was_running || ext.state() != State::Ready {
         log(&this.0.home, &name, &format!("exited ({status})"));
         return;
     }
-    log(&this.0.home, &name, &format!("exited unexpectedly ({status})"));
+    log(
+        &this.0.home,
+        &name,
+        &format!("exited unexpectedly ({status})"),
+    );
     this.0.live.push(Box::new({
         let prefix = format!("{TOOL_PREFIX}{name}__");
         move |r: &mut Registry| r.remove_prefix(&prefix)
     }));
     lock(&ext.status).take();
     if ext.restarts.fetch_add(1, Ordering::SeqCst) < RESTARTS {
-        crate::ui::info(&format!("extension {name} exited ({status}); restarting it"));
+        crate::ui::info(&format!(
+            "extension {name} exited ({status}); restarting it"
+        ));
         ext.set_state(State::Starting);
         tokio::spawn(launch(Arc::downgrade(&this.0), ext));
     } else {
-        let why = format!("exited ({status}) after a restart; see {}", log_path(&this.0.home, &name).display());
+        let why = format!(
+            "exited ({status}) after a restart; see {}",
+            log_path(&this.0.home, &name).display()
+        );
         crate::ui::error(&format!("extension {name} {why}"));
         ext.set_state(State::Failed(why));
     }
@@ -858,9 +1071,20 @@ fn exited(this: Extensions, ext: Arc<Ext>, status: String) {
 }
 
 /// A request or notification from an extension.
-async fn incoming(this: Extensions, ext: Arc<Ext>, method: &str, params: Value) -> Result<Value, String> {
+async fn incoming(
+    this: Extensions,
+    ext: Arc<Ext>,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let name = ext.name().to_string();
-    let text = |k: &str| params.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let text = |k: &str| {
+        params
+            .get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let tui = this.0.mode == Mode::Tui;
     match method {
         "ui/notify" => {
@@ -876,7 +1100,8 @@ async fn incoming(this: Extensions, ext: Arc<Ext>, method: &str, params: Value) 
                 return Ok(json!(false));
             }
             let options = ["Yes".to_string(), "No".to_string()];
-            let answer = crate::ui::tui::ask_active(&format!("[{name}] {}", text("text")), &options).await;
+            let answer =
+                crate::ui::tui::ask_active(&format!("[{name}] {}", text("text")), &options).await;
             Ok(json!(matches!(answer, Some(Some(a)) if a == "Yes")))
         }
         "ui/input" => {
@@ -894,7 +1119,14 @@ async fn incoming(this: Extensions, ext: Arc<Ext>, method: &str, params: Value) 
                 return Err("\"text\" is required".into());
             }
             let steer = text("queue") == "steer";
-            log(&this.0.home, &name, &format!("session/send ({})", if steer { "steer" } else { "follow_up" }));
+            log(
+                &this.0.home,
+                &name,
+                &format!(
+                    "session/send ({})",
+                    if steer { "steer" } else { "follow_up" }
+                ),
+            );
             lock(&this.0.queue).push(Queued { steer, text: body });
             this.0.wake.notify_one();
             Ok(Value::Null)
@@ -950,7 +1182,9 @@ impl Tool for ExtTool {
         let Some(shared) = self.shared.upgrade() else {
             return ToolOutput::err("extensions are shut down");
         };
-        Extensions(shared).call_tool(&self.ext, &self.def.name, args, &ctx.cancel).await
+        Extensions(shared)
+            .call_tool(&self.ext, &self.def.name, args, &ctx.cancel)
+            .await
     }
 }
 
@@ -975,7 +1209,9 @@ pub async fn slash(ext: &Extensions, args: &[&str]) {
             }
             Err(e) => crate::ui::error(&format!("{e:#}")),
         },
-        Some(other) => crate::ui::error(&format!("unknown /extensions argument `{other}` (try list, reload or trust)")),
+        Some(other) => crate::ui::error(&format!(
+            "unknown /extensions argument `{other}` (try list, reload or trust)"
+        )),
     }
 }
 

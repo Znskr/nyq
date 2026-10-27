@@ -303,10 +303,7 @@ pub fn classifier_model() -> Option<String> {
 /// a notice when a project or workspace layer overrides a changed value.
 /// Only the changed keys are written to the user file; an overridden change
 /// is saved but the layer's value stays in effect here.
-pub fn update(
-    home: &Path,
-    f: impl FnOnce(&mut Settings),
-) -> Result<(Settings, Option<String>)> {
+pub fn update(home: &Path, f: impl FnOnce(&mut Settings)) -> Result<(Settings, Option<String>)> {
     let before = serde_json::to_value(current())?;
     let mut wanted = current();
     f(&mut wanted);
@@ -324,8 +321,12 @@ pub fn update(
     }
     let effective: Settings = serde_json::from_value(effective)?;
     install(effective.clone());
-    let notice = (!shadowed.is_empty())
-        .then(|| format!("Saved, but overridden in this workspace by {}", shadowed.join(", ")));
+    let notice = (!shadowed.is_empty()).then(|| {
+        format!(
+            "Saved, but overridden in this workspace by {}",
+            shadowed.join(", ")
+        )
+    });
     Ok((effective, notice))
 }
 
@@ -355,23 +356,38 @@ impl List {
 }
 
 fn names(m: &Map<String, Value>, key: &str) -> Option<Vec<String>> {
-    m.get(key)
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+    m.get(key).and_then(Value::as_array).map(|a| {
+        a.iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect()
+    })
 }
 
 /// Put `name` on (`on`) or take it off the user's `list` in settings.toml
 /// and apply the change. Unlike [`update`], only the user's own entries are
 /// written: the project's stay in its file, and a name the project (or this
 /// workspace's override) lists stays off, with a notice saying so.
-pub fn set_listed(home: &Path, list: List, name: &str, on: bool) -> Result<(Settings, Option<String>)> {
+pub fn set_listed(
+    home: &Path,
+    list: List,
+    name: &str,
+    on: bool,
+) -> Result<(Settings, Option<String>)> {
     let (s, notice) = listed(home, &overrides(), current(), list, name, on)?;
     install(s.clone());
     Ok((s, notice))
 }
 
 /// [`set_listed`] over explicit layers and settings, without applying them.
-fn listed(home: &Path, layers: &Overrides, mut s: Settings, list: List, name: &str, on: bool) -> Result<(Settings, Option<String>)> {
+fn listed(
+    home: &Path,
+    layers: &Overrides,
+    mut s: Settings,
+    list: List,
+    name: &str,
+    on: bool,
+) -> Result<(Settings, Option<String>)> {
     let key = list.key();
     let user = file::read_user(home).map_err(|e| anyhow::anyhow!(e))?;
     let mut mine = names(&user, key).unwrap_or_default();
@@ -460,9 +476,7 @@ struct Overrides {
 impl Overrides {
     /// The highest layer that sets `path`.
     fn layer(&self, path: &[String]) -> Option<Layer> {
-        let has = |m: &Map<String, Value>| {
-            get_path(&Value::Object(m.clone()), path).is_some()
-        };
+        let has = |m: &Map<String, Value>| get_path(&Value::Object(m.clone()), path).is_some();
         if has(&self.workspace) {
             Some(Layer::Workspace)
         } else if has(&self.project) {
@@ -476,7 +490,11 @@ impl Overrides {
 static OVERRIDES: Mutex<Option<Overrides>> = Mutex::new(None);
 
 fn overrides() -> Overrides {
-    OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+    OVERRIDES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
 }
 
 fn get_path<'a>(v: &'a Value, path: &[String]) -> Option<&'a Value> {
@@ -485,7 +503,9 @@ fn get_path<'a>(v: &'a Value, path: &[String]) -> Option<&'a Value> {
 
 /// Set (or with `None`, remove) the value at `path`, creating objects on the way.
 fn set_path(v: &mut Value, path: &[String], new: Option<Value>) {
-    let Some((last, parents)) = path.split_last() else { return };
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
     let mut cur = v;
     for k in parents {
         if !cur.get(k).is_some_and(Value::is_object) {
@@ -510,7 +530,12 @@ fn set_path(v: &mut Value, path: &[String], new: Option<Value>) {
 
 /// The leaf paths that differ between `old` and `new`, with the new value
 /// (`None`: removed).
-fn diff(old: &Value, new: &Value, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, Option<Value>)>) {
+fn diff(
+    old: &Value,
+    new: &Value,
+    path: &mut Vec<String>,
+    out: &mut Vec<(Vec<String>, Option<Value>)>,
+) {
     match (old, new) {
         (Value::Object(a), Value::Object(b)) => {
             let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
@@ -569,7 +594,9 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
     });
     let project_path = file::project_path(cwd);
     // Started in the home directory, the "project" file is the user's own.
-    let mut project = if file::project_path(cwd) == file::user_path(home) || crate::config::workspace_is_profile(cwd) {
+    let mut project = if file::project_path(cwd) == file::user_path(home)
+        || crate::config::workspace_is_profile(cwd)
+    {
         Map::new()
     } else {
         file::read(&project_path).unwrap_or_else(|e| {
@@ -595,7 +622,9 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
     // The layer itself keeps only its own names, for `set_listed`.
     let mut layered = project.clone();
     for key in [List::Tools, List::Skills].map(List::key) {
-        if let (Some(Value::Array(mine)), Some(Value::Array(theirs))) = (user.get(key), layered.get_mut(key)) {
+        if let (Some(Value::Array(mine)), Some(Value::Array(theirs))) =
+            (user.get(key), layered.get_mut(key))
+        {
             let extra: Vec<Value> = theirs.drain(..).filter(|n| !mine.contains(n)).collect();
             *theirs = mine.iter().cloned().chain(extra).collect();
         }
@@ -605,7 +634,9 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
     merge(&mut merged, &workspace);
     let settings: Settings = serde_json::from_value(Value::Object(merged))
         .or_else(|e| {
-            warnings.push(format!("project or workspace settings: {e} (using your settings.toml)"));
+            warnings.push(format!(
+                "project or workspace settings: {e} (using your settings.toml)"
+            ));
             // The layers are unusable: none of them may be reported as the
             // source of a value or shadow a later change.
             project.clear();
@@ -618,7 +649,10 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
         });
     let unknown = crate::tools::unknown_tool_names(&settings.disabled_tools);
     if !unknown.is_empty() {
-        warnings.push(format!("disabled_tools: unknown tool {} (ignored)", unknown.join(", ")));
+        warnings.push(format!(
+            "disabled_tools: unknown tool {} (ignored)",
+            unknown.join(", ")
+        ));
     }
     *OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()) = Some(Overrides { project, workspace });
     (settings, warnings)
@@ -657,10 +691,16 @@ pub fn load(home: &Path) -> (Settings, Option<String>) {
             Ok(s) => (s, None),
             Err(e) => (
                 Settings::default(),
-                Some(format!("{}: {e} (using default settings)", file::user_path(home).display())),
+                Some(format!(
+                    "{}: {e} (using default settings)",
+                    file::user_path(home).display()
+                )),
             ),
         },
-        Err(e) => (Settings::default(), Some(format!("{e} (using default settings)"))),
+        Err(e) => (
+            Settings::default(),
+            Some(format!("{e} (using default settings)")),
+        ),
     }
 }
 
@@ -877,7 +917,11 @@ pub fn value(id: Id, s: &Settings, live: &Live) -> String {
                 live.permission_mode.clone()
             }
         }
-        Id::ClassifierModel => s.classifier_model.clone().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "auto".into()),
+        Id::ClassifierModel => s
+            .classifier_model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| "auto".into()),
         Id::Sandbox => s.sandbox.clone(),
         Id::AutoCompact if s.auto_compact == 0 => "off".into(),
         Id::AutoCompact => format!("{}%", s.auto_compact),
@@ -906,7 +950,9 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
             .collect(),
         Id::Fast if !live.fast_supported && !live.fast => Vec::new(),
         Id::Permission => list(&["ask", "auto", "yolo"]),
-        Id::ClassifierModel => std::iter::once("auto".to_string()).chain(live.models.iter().cloned()).collect(),
+        Id::ClassifierModel => std::iter::once("auto".to_string())
+            .chain(live.models.iter().cloned())
+            .collect(),
         Id::Sandbox => list(&["workspace-write", "read-only", "off"]),
         Id::AutoCompact => list(&["off", "50%", "60%", "70%", "80%", "90%"]),
         Id::Sound => list(&["off", "on", "max"]),
@@ -920,9 +966,7 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
         | Id::AutoUpgrade
         | Id::SlashCategories
         | Id::CollapseToolCalls
-        | Id::StartupScrollback => {
-            list(&["off", "on"])
-        }
+        | Id::StartupScrollback => list(&["off", "on"]),
     }
 }
 
@@ -998,7 +1042,12 @@ mod tests {
     fn save(home: &Path, s: &Settings) -> Result<()> {
         let mut changes = Vec::new();
         let old = serde_json::to_value(load(home).0)?;
-        diff(&old, &serde_json::to_value(s)?, &mut Vec::new(), &mut changes);
+        diff(
+            &old,
+            &serde_json::to_value(s)?,
+            &mut Vec::new(),
+            &mut changes,
+        );
         write_changes(home, &changes)
     }
 
@@ -1014,7 +1063,11 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let home = t.path().join(".nyq");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join("settings.toml"), "permission_mode = \"auto\"\ntheme = \"light\"\n").unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            "permission_mode = \"auto\"\ntheme = \"light\"\n",
+        )
+        .unwrap();
         let (s, warnings) = load_layered(&home, t.path());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(s.permission_mode, "auto");
@@ -1063,13 +1116,21 @@ mod tests {
         let mut next = s.clone();
         next.sound = "off".into();
         next.notifications = true;
-        diff(&serde_json::to_value(&s).unwrap(), &serde_json::to_value(&next).unwrap(), &mut Vec::new(), &mut changes);
+        diff(
+            &serde_json::to_value(&s).unwrap(),
+            &serde_json::to_value(&next).unwrap(),
+            &mut Vec::new(),
+            &mut changes,
+        );
         assert_eq!(changes.len(), 2);
         write_changes(home.path(), &changes).unwrap();
         let raw = user_file(home.path());
         assert_eq!(raw["sound"], "off");
         assert_eq!(raw["notifications"], true);
-        assert_eq!(raw["auto_compact"], 70, "layer values stay out of the user file");
+        assert_eq!(
+            raw["auto_compact"], 70,
+            "layer values stay out of the user file"
+        );
         assert!(raw["statusline"].get("branch").is_none());
         assert_eq!(o.layer(&["sound".to_string()]), Some(Layer::Project));
         assert_eq!(o.layer(&["notifications".to_string()]), None);
@@ -1094,8 +1155,15 @@ mod tests {
         let (s, warnings) = load_layered(home.path(), cwd.path());
         assert_eq!(s.sound, "on");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("project or workspace settings"), "{warnings:?}");
-        assert_eq!(source(Id::Sound), None, "a dropped layer must not be a source");
+        assert!(
+            warnings[0].contains("project or workspace settings"),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            source(Id::Sound),
+            None,
+            "a dropped layer must not be a source"
+        );
         assert_eq!(source(Id::AutoCompact), None);
         install(s);
         let (effective, notice) = update(home.path(), |s| s.sound = "off".into()).unwrap();
@@ -1104,7 +1172,11 @@ mod tests {
         assert_eq!(user_file(home.path())["sound"], "off");
 
         // A project's disabled tools add to the user's; unknown names warn.
-        std::fs::write(home.path().join("settings.toml"), "disabled_tools = [\"web_search\", \"bash\"]\n").unwrap();
+        std::fs::write(
+            home.path().join("settings.toml"),
+            "disabled_tools = [\"web_search\", \"bash\"]\n",
+        )
+        .unwrap();
         std::fs::write(
             cwd.path().join(".nyq/settings.toml"),
             "disabled_tools = [\"web_fetch\", \"bash\", \"mcp__gh__create_issue\", \"no_such_tool\"]\n",
@@ -1113,13 +1185,26 @@ mod tests {
         let (s, warnings) = load_layered(home.path(), cwd.path());
         assert_eq!(
             s.disabled_tools,
-            ["web_search", "bash", "web_fetch", "mcp__gh__create_issue", "no_such_tool"]
+            [
+                "web_search",
+                "bash",
+                "web_fetch",
+                "mcp__gh__create_issue",
+                "no_such_tool"
+            ]
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("unknown tool no_such_tool"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("unknown tool no_such_tool"),
+            "{warnings:?}"
+        );
 
         // Disabled skills merge the same way, and toggles only touch the user's list.
-        std::fs::write(home.path().join("settings.toml"), "# mine\nsound = \"on\"\ndisabled_skills = [\"pdf\"]\ndisabled_tools = [\"bash\"]\n").unwrap();
+        std::fs::write(
+            home.path().join("settings.toml"),
+            "# mine\nsound = \"on\"\ndisabled_skills = [\"pdf\"]\ndisabled_tools = [\"bash\"]\n",
+        )
+        .unwrap();
         std::fs::write(
             cwd.path().join(".nyq/settings.toml"),
             "disabled_skills = [\"review\", \"pdf\"]\ndisabled_tools = [\"web_fetch\"]\n",
@@ -1135,20 +1220,36 @@ mod tests {
     #[test]
     fn list_toggles_touch_only_the_users_entries() {
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("settings.toml"), "# mine\nsound = \"on\"\ndisabled_skills = [\"pdf\"]\ndisabled_tools = [\"bash\"]\n").unwrap();
+        std::fs::write(
+            home.path().join("settings.toml"),
+            "# mine\nsound = \"on\"\ndisabled_skills = [\"pdf\"]\ndisabled_tools = [\"bash\"]\n",
+        )
+        .unwrap();
         let project: Map<String, Value> =
             serde_json::from_value(serde_json::json!({"disabled_skills": ["review", "pdf"], "disabled_tools": ["web_fetch"]})).unwrap();
-        let layers = Overrides { project, workspace: Map::new() };
-        let s = Settings { disabled_skills: vec!["pdf".into(), "review".into()], ..Default::default() };
+        let layers = Overrides {
+            project,
+            workspace: Map::new(),
+        };
+        let s = Settings {
+            disabled_skills: vec!["pdf".into(), "review".into()],
+            ..Default::default()
+        };
         let (s, notice) = listed(home.path(), &layers, s, List::Skills, "lint", true).unwrap();
         assert_eq!(s.disabled_skills, ["pdf", "lint", "review"]);
         assert!(notice.is_none());
-        assert_eq!(user_file(home.path())["disabled_skills"], serde_json::json!(["pdf", "lint"]));
+        assert_eq!(
+            user_file(home.path())["disabled_skills"],
+            serde_json::json!(["pdf", "lint"])
+        );
         // The project lists `pdf` too, so it stays off, and says so.
         let (s, notice) = listed(home.path(), &layers, s, List::Skills, "pdf", false).unwrap();
         assert_eq!(s.disabled_skills, ["lint", "review", "pdf"]);
         assert!(notice.unwrap().contains(".nyq/settings.toml"));
-        assert_eq!(user_file(home.path())["disabled_skills"], serde_json::json!(["lint"]));
+        assert_eq!(
+            user_file(home.path())["disabled_skills"],
+            serde_json::json!(["lint"])
+        );
         let (s, notice) = listed(home.path(), &layers, s, List::Skills, "lint", false).unwrap();
         assert_eq!(s.disabled_skills, ["review", "pdf"]);
         assert!(notice.is_none());
@@ -1156,11 +1257,26 @@ mod tests {
         assert_eq!(s.disabled_tools, ["web_fetch"]);
         // An emptied list is dropped from the file; comments stay.
         let text = std::fs::read_to_string(home.path().join("settings.toml")).unwrap();
-        assert!(text.starts_with("# mine") && !text.contains("disabled") && !text.contains("review"), "{text}");
+        assert!(
+            text.starts_with("# mine") && !text.contains("disabled") && !text.contains("review"),
+            "{text}"
+        );
         // A workspace override replaces the list outright.
-        let ws: Map<String, Value> = serde_json::from_value(serde_json::json!({"disabled_skills": ["x"]})).unwrap();
-        let layers = Overrides { project: Map::new(), workspace: ws };
-        let (s, notice) = listed(home.path(), &layers, Settings::default(), List::Skills, "x", false).unwrap();
+        let ws: Map<String, Value> =
+            serde_json::from_value(serde_json::json!({"disabled_skills": ["x"]})).unwrap();
+        let layers = Overrides {
+            project: Map::new(),
+            workspace: ws,
+        };
+        let (s, notice) = listed(
+            home.path(),
+            &layers,
+            Settings::default(),
+            List::Skills,
+            "x",
+            false,
+        )
+        .unwrap();
         assert_eq!(s.disabled_skills, ["x"]);
         assert!(notice.unwrap().contains("workspaces in settings.toml"));
     }
@@ -1188,7 +1304,10 @@ mod tests {
         assert_eq!(raw["statusline"]["branch"], false);
         assert_eq!(raw["effort"], "high");
         let text = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
-        assert!(text.starts_with("# mine\n") && text.contains("codex = \"m\" # pinned"), "{text}");
+        assert!(
+            text.starts_with("# mine\n") && text.contains("codex = \"m\" # pinned"),
+            "{text}"
+        );
         let (back, _) = load(dir.path());
         assert_eq!(back, s);
         // Clearing the effort removes the key instead of leaving a stale one.
@@ -1211,7 +1330,11 @@ mod tests {
     #[test]
     fn partial_and_bad_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("settings.toml"), "[statusline]\ntokens = false\n").unwrap();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "[statusline]\ntokens = false\n",
+        )
+        .unwrap();
         let (s, warn) = load(dir.path());
         assert!(warn.is_none());
         assert!(!s.statusline.tokens && s.statusline.model && s.prompt_history && s.auto_upgrade);
@@ -1230,19 +1353,36 @@ mod tests {
     fn classifier_model_setting() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Settings::default();
-        let live = Live { models: vec!["gpt-mini".into(), "gpt-big".into()], ..Live::default() };
+        let live = Live {
+            models: vec!["gpt-mini".into(), "gpt-big".into()],
+            ..Live::default()
+        };
         assert_eq!(value(Id::ClassifierModel, &s, &live), "auto");
-        assert_eq!(cycle(Id::ClassifierModel, &s, &live, 1).as_deref(), Some("gpt-mini"));
+        assert_eq!(
+            cycle(Id::ClassifierModel, &s, &live, 1).as_deref(),
+            Some("gpt-mini")
+        );
         assert!(apply(Id::ClassifierModel, "gpt-mini", &mut s));
         assert_eq!(value(Id::ClassifierModel, &s, &live), "gpt-mini");
-        assert_eq!(cycle(Id::ClassifierModel, &s, &live, -1).as_deref(), Some("auto"));
+        assert_eq!(
+            cycle(Id::ClassifierModel, &s, &live, -1).as_deref(),
+            Some("auto")
+        );
         save(dir.path(), &s).unwrap();
-        assert_eq!(load(dir.path()).0.classifier_model.as_deref(), Some("gpt-mini"));
+        assert_eq!(
+            load(dir.path()).0.classifier_model.as_deref(),
+            Some("gpt-mini")
+        );
         // Back to auto removes the key.
         assert!(apply(Id::ClassifierModel, "auto", &mut s) && s.classifier_model.is_none());
         save(dir.path(), &s).unwrap();
-        assert!(!std::fs::read_to_string(dir.path().join("settings.toml")).unwrap().contains("classifier_model"));
-        assert_eq!(filtered(Category::Agent, "classifier model", &s, &live)[0].id, Id::ClassifierModel);
+        assert!(!std::fs::read_to_string(dir.path().join("settings.toml"))
+            .unwrap()
+            .contains("classifier_model"));
+        assert_eq!(
+            filtered(Category::Agent, "classifier model", &s, &live)[0].id,
+            Id::ClassifierModel
+        );
     }
 
     #[test]
@@ -1279,7 +1419,10 @@ mod tests {
         assert_eq!(value(Id::AutoUpgrade, &s, &live), "on");
         assert_eq!(cycle(Id::AutoUpgrade, &s, &live, 1).as_deref(), Some("off"));
         assert!(apply(Id::AutoUpgrade, "off", &mut t) && !t.auto_upgrade);
-        assert_eq!(filtered(Category::Advanced, "upgrade", &s, &live)[0].id, Id::AutoUpgrade);
+        assert_eq!(
+            filtered(Category::Advanced, "upgrade", &s, &live)[0].id,
+            Id::AutoUpgrade
+        );
         let off: Settings = serde_json::from_str(r#"{"auto_upgrade": false}"#).unwrap();
         assert!(!off.auto_upgrade);
         assert_eq!(

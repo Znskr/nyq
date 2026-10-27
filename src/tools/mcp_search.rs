@@ -34,7 +34,9 @@ pub(crate) fn should_defer(mcp: &[ToolSpec]) -> bool {
 }
 
 fn server_of(name: &str) -> &str {
-    name.strip_prefix("mcp__").and_then(|r| r.split("__").next()).unwrap_or("")
+    name.strip_prefix("mcp__")
+        .and_then(|r| r.split("__").next())
+        .unwrap_or("")
 }
 
 /// The two meta-tools, describing what is hidden.
@@ -75,14 +77,21 @@ pub(crate) fn meta_specs(mcp: &[ToolSpec]) -> [ToolSpec; 2] {
 }
 
 fn words(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(str::to_lowercase).collect()
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 1)
+        .map(str::to_lowercase)
+        .collect()
 }
 
 fn score(spec: &ToolSpec, terms: &[String]) -> usize {
     let name = words(&spec.name.replace("__", " "));
     let desc = spec.description.to_lowercase();
-    let params: Vec<String> =
-        spec.parameters.get("properties").and_then(Value::as_object).map(|p| p.keys().map(|k| k.to_lowercase()).collect()).unwrap_or_default();
+    let params: Vec<String> = spec
+        .parameters
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|p| p.keys().map(|k| k.to_lowercase()).collect())
+        .unwrap_or_default();
     terms
         .iter()
         .map(|t| {
@@ -125,19 +134,32 @@ fn skill_score(skill: &crate::skills::Skill, terms: &[String]) -> usize {
 
 /// Matching skills (name, location, description), best first.
 fn skill_hits(skills: &[crate::skills::Skill], terms: &[String], limit: usize) -> String {
-    let mut hits: Vec<(usize, &crate::skills::Skill)> =
-        skills.iter().map(|s| (skill_score(s, terms), s)).filter(|(n, _)| *n > 0).collect();
+    let mut hits: Vec<(usize, &crate::skills::Skill)> = skills
+        .iter()
+        .map(|s| (skill_score(s, terms), s))
+        .filter(|(n, _)| *n > 0)
+        .collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
     if hits.is_empty() {
         return String::new();
     }
     let mut out = String::from("Skills (load one with the `skill` tool):\n");
     for (_, skill) in hits.iter().take(limit) {
-        let desc: String = skill.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+        let desc: String = skill
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect();
         out.push_str(&format!("- {} ({}) — {desc}\n", skill.id, skill.location));
     }
     if hits.len() > limit {
-        out.push_str(&format!("({} more matching skills; refine the query)\n", hits.len() - limit));
+        out.push_str(&format!(
+            "({} more matching skills; refine the query)\n",
+            hits.len() - limit
+        ));
     }
     out
 }
@@ -151,18 +173,32 @@ pub(crate) fn search(
     args: &Value,
     notes: &BTreeMap<String, String>,
 ) -> Result<String, String> {
-    let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     let terms = words(query);
     if terms.is_empty() {
         return Err(format!("{SEARCH}: `query` needs at least one keyword"));
     }
-    let limit = args.get("limit").and_then(Value::as_u64).map_or(DEFAULT_RESULTS, |n| n as usize).clamp(1, MAX_RESULTS);
-    let mut hits: Vec<(usize, &ToolSpec)> = mcp.iter().map(|s| (score(s, &terms), s)).filter(|(n, _)| *n > 0).collect();
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_RESULTS, |n| n as usize)
+        .clamp(1, MAX_RESULTS);
+    let mut hits: Vec<(usize, &ToolSpec)> = mcp
+        .iter()
+        .map(|s| (score(s, &terms), s))
+        .filter(|(n, _)| *n > 0)
+        .collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
     let skills = skill_hits(skills, &terms, limit);
     if hits.is_empty() {
         return Ok(if skills.is_empty() {
-            format!("No MCP tools or skills match \"{query}\". Try other keywords or the server name.")
+            format!(
+                "No MCP tools or skills match \"{query}\". Try other keywords or the server name."
+            )
         } else {
             format!("No MCP tools match \"{query}\".\n{skills}")
         });
@@ -171,27 +207,50 @@ pub(crate) fn search(
     let mut out = String::new();
     let mut matched: Vec<&str> = Vec::new();
     for (_, spec) in hits.into_iter().take(limit) {
-        if let Some((server, _)) = notes.iter().find(|(s, _)| spec.name.starts_with(&crate::mcp::tool_prefix(s))) {
+        if let Some((server, _)) = notes
+            .iter()
+            .find(|(s, _)| spec.name.starts_with(&crate::mcp::tool_prefix(s)))
+        {
             if !matched.contains(&server.as_str()) {
                 matched.push(server);
             }
         }
-        let desc: String = spec.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+        let desc: String = spec
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect();
         let params: Vec<String> = spec
             .parameters
             .get("properties")
             .and_then(Value::as_object)
             .map(|p| p.keys().cloned().collect())
             .unwrap_or_default();
-        out.push_str(&format!("- {} — {desc}\n  parameters: {}\n", spec.name, if params.is_empty() { "none".into() } else { params.join(", ") }));
+        out.push_str(&format!(
+            "- {} — {desc}\n  parameters: {}\n",
+            spec.name,
+            if params.is_empty() {
+                "none".into()
+            } else {
+                params.join(", ")
+            }
+        ));
     }
     if more > 0 {
         out.push_str(&format!("({more} more matches; refine the query)\n"));
     }
     for server in matched {
-        out.push_str(&format!("Instructions from MCP server {server}:\n{}\n", note_text(&notes[server])));
+        out.push_str(&format!(
+            "Instructions from MCP server {server}:\n{}\n",
+            note_text(&notes[server])
+        ));
     }
-    out.push_str(&format!("Call {SELECT} with an exact name to make a tool callable."));
+    out.push_str(&format!(
+        "Call {SELECT} with an exact name to make a tool callable."
+    ));
     if !skills.is_empty() {
         out.push_str(&format!("\n{}", skills.trim_end()));
     }
@@ -232,7 +291,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Tool for Fake {
         fn spec(&self) -> ToolSpec {
-            ToolSpec { name: self.0.clone(), description: self.1.clone(), parameters: json!({"type": "object", "properties": {"q": {}}}) }
+            ToolSpec {
+                name: self.0.clone(),
+                description: self.1.clone(),
+                parameters: json!({"type": "object", "properties": {"q": {}}}),
+            }
         }
         fn summary(&self, _: &Value) -> String {
             String::new()
@@ -246,9 +309,15 @@ mod tests {
         let mut r = Registry::default();
         r.add(Box::new(Fake("read_file".into(), "builtin".into())));
         for i in 0..n {
-            r.add(Box::new(Fake(format!("mcp__gh__tool_{i}"), format!("Does thing number {i}"))));
+            r.add(Box::new(Fake(
+                format!("mcp__gh__tool_{i}"),
+                format!("Does thing number {i}"),
+            )));
         }
-        r.add(Box::new(Fake("mcp__gh__create_issue".into(), "Create a GitHub issue in a repository".into())));
+        r.add(Box::new(Fake(
+            "mcp__gh__create_issue".into(),
+            "Create a GitHub issue in a repository".into(),
+        )));
         r
     }
 
@@ -262,15 +331,25 @@ mod tests {
         let n = names(&r);
         assert!(n.contains(&"mcp__gh__create_issue".to_string()));
         assert!(!n.contains(&SEARCH.to_string()));
-        assert!(r.handle_meta(SEARCH, "{}").is_none(), "meta tools only exist while deferring");
+        assert!(
+            r.handle_meta(SEARCH, "{}").is_none(),
+            "meta tools only exist while deferring"
+        );
     }
 
     #[test]
     fn disabled_tools_are_neither_listed_nor_callable() {
         let mut r = registry(2);
-        r.disable(&["read_file".into(), "mcp__gh__create_issue".into(), "mcp__gh__later".into()]);
+        r.disable(&[
+            "read_file".into(),
+            "mcp__gh__create_issue".into(),
+            "mcp__gh__later".into(),
+        ]);
         // Also a tool that arrives after the setting was applied.
-        r.add(Box::new(Fake("mcp__gh__later".into(), "added later".into())));
+        r.add(Box::new(Fake(
+            "mcp__gh__later".into(),
+            "added later".into(),
+        )));
         assert_eq!(names(&r), ["mcp__gh__tool_0", "mcp__gh__tool_1"]);
         assert!(r.get("read_file").is_none() && r.get("mcp__gh__later").is_none());
         assert!(r.get("mcp__gh__tool_0").is_some());
@@ -293,19 +372,49 @@ mod tests {
         assert!(n.contains(&"read_file".to_string()));
         assert!(n.contains(&SEARCH.to_string()) && n.contains(&SELECT.to_string()));
         assert!(!n.iter().any(|n| n.starts_with("mcp__")), "{n:?}");
-        let search = r.advertised().into_iter().find(|s| s.name == SEARCH).unwrap();
-        assert!(search.description.contains("61 tools") && search.description.contains("(gh)"), "{}", search.description);
+        let search = r
+            .advertised()
+            .into_iter()
+            .find(|s| s.name == SEARCH)
+            .unwrap();
+        assert!(
+            search.description.contains("61 tools") && search.description.contains("(gh)"),
+            "{}",
+            search.description
+        );
 
-        let found = r.handle_meta(SEARCH, r#"{"query": "github issue"}"#).unwrap();
+        let found = r
+            .handle_meta(SEARCH, r#"{"query": "github issue"}"#)
+            .unwrap();
         assert!(!found.is_error);
-        assert!(found.content.starts_with("- mcp__gh__create_issue"), "{}", found.content);
-        assert!(r.handle_meta(SEARCH, r#"{"query": "  "}"#).unwrap().is_error);
-        assert!(r.handle_meta(SEARCH, r#"{"query": "zzzz"}"#).unwrap().content.contains("No MCP tools or skills match"));
+        assert!(
+            found.content.starts_with("- mcp__gh__create_issue"),
+            "{}",
+            found.content
+        );
+        assert!(
+            r.handle_meta(SEARCH, r#"{"query": "  "}"#)
+                .unwrap()
+                .is_error
+        );
+        assert!(r
+            .handle_meta(SEARCH, r#"{"query": "zzzz"}"#)
+            .unwrap()
+            .content
+            .contains("No MCP tools or skills match"));
 
-        let bad = r.handle_meta(SELECT, r#"{"name": "mcp__gh__nope"}"#).unwrap();
+        let bad = r
+            .handle_meta(SELECT, r#"{"name": "mcp__gh__nope"}"#)
+            .unwrap();
         assert!(bad.is_error);
-        assert!(r.handle_meta(SELECT, r#"{"name": "read_file"}"#).unwrap().is_error);
-        let ok = r.handle_meta(SELECT, r#"{"name": "mcp__gh__create_issue"}"#).unwrap();
+        assert!(
+            r.handle_meta(SELECT, r#"{"name": "read_file"}"#)
+                .unwrap()
+                .is_error
+        );
+        let ok = r
+            .handle_meta(SELECT, r#"{"name": "mcp__gh__create_issue"}"#)
+            .unwrap();
         assert!(!ok.is_error, "{}", ok.content);
         let n = names(&r);
         assert!(n.contains(&"mcp__gh__create_issue".to_string()));
@@ -323,16 +432,33 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join(".claude/skills/pdf-tools");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("SKILL.md"), "---\nname: pdf-tools\ndescription: Fill and merge PDF forms\n---\nbody\n").unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: pdf-tools\ndescription: Fill and merge PDF forms\n---\nbody\n",
+        )
+        .unwrap();
         let skills = crate::skills::discover_with(&t.path().join("home"), None, t.path());
         let mut r = registry(60);
         r.set_skills(skills);
-        let found = r.handle_meta(SEARCH, r#"{"query": "github issue"}"#).unwrap().content;
+        let found = r
+            .handle_meta(SEARCH, r#"{"query": "github issue"}"#)
+            .unwrap()
+            .content;
         assert!(!found.contains("Skills"), "{found}");
-        let found = r.handle_meta(SEARCH, r#"{"query": "merge pdf"}"#).unwrap().content;
+        let found = r
+            .handle_meta(SEARCH, r#"{"query": "merge pdf"}"#)
+            .unwrap()
+            .content;
         assert!(found.starts_with("No MCP tools match"), "{found}");
-        assert!(found.contains("- pdf-tools (.claude/skills) — Fill and merge PDF forms"), "{found}");
-        let search = r.advertised().into_iter().find(|s| s.name == SEARCH).unwrap();
+        assert!(
+            found.contains("- pdf-tools (.claude/skills) — Fill and merge PDF forms"),
+            "{found}"
+        );
+        let search = r
+            .advertised()
+            .into_iter()
+            .find(|s| s.name == SEARCH)
+            .unwrap();
         assert!(search.description.contains("installed skills"));
     }
 
@@ -345,9 +471,20 @@ mod tests {
         live.set_note("gh", Some("Always pass the repo as owner/name.".into()));
         live.set_note("other", Some("  ".into()));
         let section = notes_section(&r.mcp_notes()).unwrap();
-        assert!(section.contains("## gh\nAlways pass the repo") && !section.contains("other"), "{section}");
-        let found = r.handle_meta(SEARCH, r#"{"query": "github issue"}"#).unwrap();
-        assert!(found.content.contains("Instructions from MCP server gh:\nAlways pass"), "{}", found.content);
+        assert!(
+            section.contains("## gh\nAlways pass the repo") && !section.contains("other"),
+            "{section}"
+        );
+        let found = r
+            .handle_meta(SEARCH, r#"{"query": "github issue"}"#)
+            .unwrap();
+        assert!(
+            found
+                .content
+                .contains("Instructions from MCP server gh:\nAlways pass"),
+            "{}",
+            found.content
+        );
         assert_eq!(note_text(&"x".repeat(3000)).chars().count(), 2001);
         // Queued patches apply on refresh.
         live.push(Box::new(|r| r.remove_prefix("mcp__gh__")));

@@ -146,7 +146,11 @@ impl Hooks {
         match read(&user_file).and_then(|text| text.map(|t| parse(&t)).transpose()) {
             Ok(None) => {}
             Ok(Some((parsed, warns))) => {
-                warnings.extend(warns.iter().map(|w| format!("{}: {w}", user_file.display())));
+                warnings.extend(
+                    warns
+                        .iter()
+                        .map(|w| format!("{}: {w}", user_file.display())),
+                );
                 hooks.user = parsed;
             }
             Err(e) => warnings.push(format!("ignoring {}: {e}", user_file.display())),
@@ -161,7 +165,11 @@ impl Hooks {
                     let hash = content_hash(text.as_bytes());
                     match parse(&text) {
                         Ok((parsed, warns)) => {
-                            warnings.extend(warns.iter().map(|w| format!("{}: {w}", project_file.display())));
+                            warnings.extend(
+                                warns
+                                    .iter()
+                                    .map(|w| format!("{}: {w}", project_file.display())),
+                            );
                             // A project's hooks only run once its file is
                             // trusted (path + content hash recorded by
                             // /hooks trust).
@@ -179,7 +187,9 @@ impl Hooks {
                             hooks.project_path = project_file;
                             hooks.project_trusted = trusted;
                         }
-                        Err(e) => warnings.push(format!("ignoring {}: {e}", project_file.display())),
+                        Err(e) => {
+                            warnings.push(format!("ignoring {}: {e}", project_file.display()))
+                        }
                     }
                 }
                 Err(e) => warnings.push(format!("ignoring {}: {e}", project_file.display())),
@@ -219,7 +229,10 @@ impl Hooks {
     /// the parent's.
     pub fn for_subagent(&self) -> Self {
         let tools = |v: &[Hook]| {
-            v.iter().filter(|h| h.event.is_tool_event() || h.event == Event::AttentionRequired).cloned().collect()
+            v.iter()
+                .filter(|h| h.event.is_tool_event() || h.event == Event::AttentionRequired)
+                .cloned()
+                .collect()
         };
         Hooks {
             user_path: self.user_path.clone(),
@@ -238,7 +251,8 @@ impl Hooks {
     /// changed since must be reviewed again first.
     pub fn trust_project(&self, home: &Path, cwd: &Path) -> Result<PathBuf> {
         let path = project_path(cwd);
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
         trust_file_content(home, &path, &text, self.project_hash.as_deref())?;
         Ok(path)
     }
@@ -258,7 +272,10 @@ fn read_trusts(home: &Path) -> Result<BTreeMap<String, String>, String> {
     let Value::Object(map) = v else {
         return Err("expected a JSON object of file path → content hash".into());
     };
-    Ok(map.into_iter().filter_map(|(k, v)| v.as_str().map(|h| (k, h.to_string()))).collect())
+    Ok(map
+        .into_iter()
+        .filter_map(|(k, v)| v.as_str().map(|h| (k, h.to_string())))
+        .collect())
 }
 
 /// The trust-store key for a project hooks file: its canonical path.
@@ -281,8 +298,14 @@ fn content_hash(bytes: &[u8]) -> String {
 /// Record `text` (the content of the hooks file at `path`) as trusted when
 /// it is valid and is the version that was reviewed (`reviewed` hash).
 fn trust_file_content(home: &Path, path: &Path, text: &str, reviewed: Option<&str>) -> Result<()> {
-    let (parsed, warnings) = parse(text).map_err(|e| anyhow::anyhow!("{} is malformed ({e}); fix it first", path.display()))?;
-    anyhow::ensure!(warnings.is_empty(), "{} has invalid entries ({}); fix them first", path.display(), warnings.join("; "));
+    let (parsed, warnings) = parse(text)
+        .map_err(|e| anyhow::anyhow!("{} is malformed ({e}); fix it first", path.display()))?;
+    anyhow::ensure!(
+        warnings.is_empty(),
+        "{} has invalid entries ({}); fix them first",
+        path.display(),
+        warnings.join("; ")
+    );
     anyhow::ensure!(!parsed.is_empty(), "{} has no hooks", path.display());
     let hash = content_hash(text.as_bytes());
     anyhow::ensure!(
@@ -290,8 +313,12 @@ fn trust_file_content(home: &Path, path: &Path, text: &str, reviewed: Option<&st
         "{} changed since it was loaded; review it with /hooks, then trust it again",
         path.display()
     );
-    let mut trusts = read_trusts(home)
-        .map_err(|e| anyhow::anyhow!("{} is malformed ({e}); fix or remove it first", trust_file(home).display()))?;
+    let mut trusts = read_trusts(home).map_err(|e| {
+        anyhow::anyhow!(
+            "{} is malformed ({e}); fix or remove it first",
+            trust_file(home).display()
+        )
+    })?;
     trusts.insert(trust_key(path), hash);
     let mut out = serde_json::to_string_pretty(&trusts)?;
     out.push('\n');
@@ -348,27 +375,51 @@ fn parse_hook(v: &Value) -> Result<Hook, String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|c| !c.is_empty())
-        .ok_or_else(|| format!("\"command\" must be a non-empty string, got {}", map.get("command").unwrap_or(&Value::Null)))?
+        .ok_or_else(|| {
+            format!(
+                "\"command\" must be a non-empty string, got {}",
+                map.get("command").unwrap_or(&Value::Null)
+            )
+        })?
         .to_string();
     let matcher = match map.get("matcher") {
         None | Some(Value::Null) => None,
         Some(Value::String(m)) if !m.trim().is_empty() => Some(m.trim().to_string()),
-        Some(other) => return Err(format!("\"matcher\" must be a non-empty string, got {other}")),
+        Some(other) => {
+            return Err(format!(
+                "\"matcher\" must be a non-empty string, got {other}"
+            ))
+        }
     };
     let timeout_secs = match map.get("timeout_secs") {
         None | Some(Value::Null) => DEFAULT_TIMEOUT,
         Some(Value::Number(n)) => match n.as_u64().filter(|t| *t >= 1) {
             Some(t) => t.min(MAX_TIMEOUT),
-            None => return Err(format!("\"timeout_secs\" must be a positive integer, got {n}")),
+            None => {
+                return Err(format!(
+                    "\"timeout_secs\" must be a positive integer, got {n}"
+                ))
+            }
         },
-        Some(other) => return Err(format!("\"timeout_secs\" must be a positive integer, got {other}")),
+        Some(other) => {
+            return Err(format!(
+                "\"timeout_secs\" must be a positive integer, got {other}"
+            ))
+        }
     };
     if let Some(m) = &matcher {
         if !event.is_tool_event() {
-            return Err(format!("matcher `{m}` applies only to PreToolUse and PostToolUse"));
+            return Err(format!(
+                "matcher `{m}` applies only to PreToolUse and PostToolUse"
+            ));
         }
     }
-    Ok(Hook { event, matcher, command, timeout_secs })
+    Ok(Hook {
+        event,
+        matcher,
+        command,
+        timeout_secs,
+    })
 }
 
 /// Result of running one hook command.
@@ -388,7 +439,12 @@ struct RunOutcome {
 /// Run one hook command with the event JSON on stdin, bounded output
 /// collection, and a timeout (or cancellation) that kills the whole process
 /// group.
-async fn run_hook(hook: &Hook, payload: &str, cwd: &Path, cancel: &CancellationToken) -> RunOutcome {
+async fn run_hook(
+    hook: &Hook,
+    payload: &str,
+    cwd: &Path,
+    cancel: &CancellationToken,
+) -> RunOutcome {
     let failed = |error: String| RunOutcome {
         exit: None,
         timed_out: false,
@@ -399,7 +455,10 @@ async fn run_hook(hook: &Hook, payload: &str, cwd: &Path, cancel: &CancellationT
     };
     // Hooks are the user's own commands (project hooks only after trust),
     // so they run unsandboxed, like `!cmd`.
-    let policy = crate::sandbox::Policy { mode: crate::sandbox::Mode::Off, ..Default::default() };
+    let policy = crate::sandbox::Policy {
+        mode: crate::sandbox::Mode::Off,
+        ..Default::default()
+    };
     let Ok(mut command) = crate::sandbox::shell_command(&policy, cwd, &hook.command) else {
         return failed("could not start a shell".into());
     };
@@ -473,7 +532,11 @@ async fn run_hook(hook: &Hook, payload: &str, cwd: &Path, cancel: &CancellationT
     }
 }
 
-async fn pump<R: tokio::io::AsyncRead + Unpin>(mut r: R, sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>, cap: usize) {
+async fn pump<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    cap: usize,
+) {
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 4096];
     loop {
@@ -528,7 +591,9 @@ impl Hooks {
     fn matching(&self, event: Event, tool: Option<&str>) -> Vec<&Hook> {
         let hit = |h: &Hook| {
             h.event == event
-                && h.matcher.as_deref().is_none_or(|m| tool.is_some_and(|t| crate::permissions::glob(m, t)))
+                && h.matcher
+                    .as_deref()
+                    .is_none_or(|m| tool.is_some_and(|t| crate::permissions::glob(m, t)))
         };
         let mut out: Vec<&Hook> = self.user.iter().filter(|h| hit(h)).collect();
         if self.project_trusted {
@@ -587,13 +652,20 @@ impl Hooks {
         });
         let mut blocked = None;
         let mut updated = None;
-        self.dispatch(Event::PreToolUse, Some(tool), &payload, cwd, cancel, |_, r| {
-            blocked = block_reason(r);
-            if blocked.is_none() {
-                updated = updated_input(r).or(updated.take());
-            }
-            blocked.is_some()
-        })
+        self.dispatch(
+            Event::PreToolUse,
+            Some(tool),
+            &payload,
+            cwd,
+            cancel,
+            |_, r| {
+                blocked = block_reason(r);
+                if blocked.is_none() {
+                    updated = updated_input(r).or(updated.take());
+                }
+                blocked.is_some()
+            },
+        )
         .await;
         if let Some(reason) = blocked {
             return Err(format!(
@@ -606,7 +678,10 @@ impl Hooks {
             return Err("Cancelled by user.".to_string());
         }
         if let Some(ext) = &self.ext {
-            if let Some(input) = ext.tool_call(tool, updated.as_ref().unwrap_or(args)).await? {
+            if let Some(input) = ext
+                .tool_call(tool, updated.as_ref().unwrap_or(args))
+                .await?
+            {
                 updated = Some(input);
             }
         }
@@ -632,7 +707,15 @@ impl Hooks {
             "output": cap(&output.content, MAX_TEXT),
             "is_error": output.is_error,
         });
-        self.dispatch(Event::PostToolUse, Some(tool), &payload, cwd, cancel, |_, _| false).await;
+        self.dispatch(
+            Event::PostToolUse,
+            Some(tool),
+            &payload,
+            cwd,
+            cancel,
+            |_, _| false,
+        )
+        .await;
     }
 
     /// UserPromptSubmit, before a prompt is sent: a hook may block it or
@@ -652,14 +735,25 @@ impl Hooks {
         });
         let mut context = Vec::new();
         let mut blocked = None;
-        self.dispatch(Event::UserPromptSubmit, None, &payload, cwd, cancel, |label, r| {
-            match prompt_decision(r) {
-                PromptDecision::Block(reason) => blocked = Some(format!("prompt blocked by hook {label}: {reason}")),
-                PromptDecision::Context(text) => context.push(format!("[hook {label} added this context]\n{text}")),
-                PromptDecision::None => {}
-            }
-            blocked.is_some()
-        })
+        self.dispatch(
+            Event::UserPromptSubmit,
+            None,
+            &payload,
+            cwd,
+            cancel,
+            |label, r| {
+                match prompt_decision(r) {
+                    PromptDecision::Block(reason) => {
+                        blocked = Some(format!("prompt blocked by hook {label}: {reason}"))
+                    }
+                    PromptDecision::Context(text) => {
+                        context.push(format!("[hook {label} added this context]\n{text}"))
+                    }
+                    PromptDecision::None => {}
+                }
+                blocked.is_some()
+            },
+        )
         .await;
         match blocked {
             Some(msg) => PromptOutcome::Blocked(msg),
@@ -697,7 +791,13 @@ impl Hooks {
     /// AttentionRequired, when nyq waits for the user (`kind` is `approval`
     /// or `question`). Runs in the background so a slow hook never delays
     /// the prompt.
-    pub fn attention(self: &std::sync::Arc<Self>, kind: &str, message: &str, cwd: &Path, session_id: Option<&str>) {
+    pub fn attention(
+        self: &std::sync::Arc<Self>,
+        kind: &str,
+        message: &str,
+        cwd: &Path,
+        session_id: Option<&str>,
+    ) {
         if self.matching(Event::AttentionRequired, None).is_empty() {
             return;
         }
@@ -711,7 +811,14 @@ impl Hooks {
         let (hooks, cwd) = (std::sync::Arc::clone(self), cwd.to_path_buf());
         tokio::spawn(async move {
             hooks
-                .dispatch(Event::AttentionRequired, None, &payload, &cwd, &CancellationToken::new(), |_, _| false)
+                .dispatch(
+                    Event::AttentionRequired,
+                    None,
+                    &payload,
+                    &cwd,
+                    &CancellationToken::new(),
+                    |_, _| false,
+                )
                 .await;
         });
     }
@@ -724,14 +831,26 @@ impl Hooks {
             "cwd": cwd.display().to_string(),
             "source": source,
         });
-        self.dispatch(Event::SessionStart, None, &payload, cwd, &CancellationToken::new(), |_, _| false).await;
+        self.dispatch(
+            Event::SessionStart,
+            None,
+            &payload,
+            cwd,
+            &CancellationToken::new(),
+            |_, _| false,
+        )
+        .await;
     }
 
     /// Rows for `/hooks`.
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!(
             "Hooks file   {}",
-            if self.user_path.as_os_str().is_empty() { "(none)".into() } else { self.user_path.display().to_string() }
+            if self.user_path.as_os_str().is_empty() {
+                "(none)".into()
+            } else {
+                self.user_path.display().to_string()
+            }
         )];
         if self.user.is_empty() {
             out.push("  (no hooks)".into());
@@ -746,7 +865,10 @@ impl Hooks {
             } else {
                 "untrusted — not running; /hooks trust enables it".to_string()
             };
-            out.push(format!("Project file {} · {state}", self.project_path.display()));
+            out.push(format!(
+                "Project file {} · {state}",
+                self.project_path.display()
+            ));
             out.extend(self.project.iter().map(|h| format!("  {}", hook_row(h))));
         }
         out.push("Hooks run unsandboxed via the shell with the event as JSON on stdin; their stderr is shown.".into());
@@ -758,7 +880,10 @@ impl Hooks {
 impl Hooks {
     /// A configuration whose user file is just this hook (for wiring tests).
     pub(crate) fn from_user_hook(hook: Hook) -> Self {
-        Hooks { user: vec![hook], ..Default::default() }
+        Hooks {
+            user: vec![hook],
+            ..Default::default()
+        }
     }
 }
 
@@ -779,16 +904,26 @@ pub async fn stop(agent: &crate::agent::Agent, cancel: &CancellationToken) -> Op
         _ => None,
     });
     let session = agent.session.as_ref().map(|s| s.id.as_str());
-    agent.hooks.stop(last.unwrap_or(""), &agent.cwd, session, cancel).await
+    agent
+        .hooks
+        .stop(last.unwrap_or(""), &agent.cwd, session, cancel)
+        .await
 }
 
 /// UserPromptSubmit hooks for a prompt; any context they add is placed in
 /// the conversation before it. Returns the block message when the prompt
 /// must not run.
-pub async fn prompt_submit(agent: &mut crate::agent::Agent, prompt: &str, cancel: &CancellationToken) -> Option<String> {
+pub async fn prompt_submit(
+    agent: &mut crate::agent::Agent,
+    prompt: &str,
+    cancel: &CancellationToken,
+) -> Option<String> {
     let hooks = agent.hooks.clone();
     let session = agent.session.as_ref().map(|s| s.id.clone());
-    match hooks.user_prompt_submit(prompt, &agent.cwd, session.as_deref(), cancel).await {
+    match hooks
+        .user_prompt_submit(prompt, &agent.cwd, session.as_deref(), cancel)
+        .await
+    {
         PromptOutcome::Blocked(msg) => Some(msg),
         PromptOutcome::Run(_) if cancel.is_cancelled() => Some("cancelled".into()),
         PromptOutcome::Run(items) => {
@@ -827,7 +962,9 @@ pub fn command(agent: &mut crate::agent::Agent, arg: Option<&str>) {
             }
             Err(e) => crate::ui::error(&format!("{e:#}")),
         },
-        Some(other) => crate::ui::error(&format!("unknown /hooks argument `{other}` (try /hooks or /hooks trust)")),
+        Some(other) => crate::ui::error(&format!(
+            "unknown /hooks argument `{other}` (try /hooks or /hooks trust)"
+        )),
     }
 }
 
@@ -839,7 +976,10 @@ fn report(hook: &Hook, r: &RunOutcome) {
     } else if let Some(e) = &r.error {
         crate::ui::info(&format!("hook {label} could not run: {e}"));
     } else if r.timed_out {
-        crate::ui::info(&format!("hook {label} timed out after {}s (skipped)", hook.timeout_secs));
+        crate::ui::info(&format!(
+            "hook {label} timed out after {}s (skipped)",
+            hook.timeout_secs
+        ));
     }
     let stderr = r.stderr.trim();
     if !stderr.is_empty() {
@@ -864,14 +1004,21 @@ fn block_reason(r: &RunOutcome) -> Option<String> {
             .map(|c| format!("exit code {c}"))
             .unwrap_or_else(|| "died without an exit status".into());
         let why = r.stderr.trim();
-        return Some(if why.is_empty() { code } else { format!("{} ({code})", cut(why, 300)) });
+        return Some(if why.is_empty() {
+            code
+        } else {
+            format!("{} ({code})", cut(why, 300))
+        });
     }
     None
 }
 
 /// `{"decision":"block","reason":…}` on stdout → the reason.
 fn block_decision(stdout: &str) -> Option<String> {
-    let obj = serde_json::from_str::<Value>(stdout.trim()).ok()?.as_object()?.clone();
+    let obj = serde_json::from_str::<Value>(stdout.trim())
+        .ok()?
+        .as_object()?
+        .clone();
     if obj.get("decision").and_then(Value::as_str) != Some("block") {
         return None;
     }
@@ -916,8 +1063,15 @@ fn prompt_decision(r: &RunOutcome) -> PromptDecision {
         }
         return ["context", "additionalContext"]
             .iter()
-            .find_map(|k| obj.get(*k).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()))
-            .map_or(PromptDecision::None, |t| PromptDecision::Context(t.to_string()));
+            .find_map(|k| {
+                obj.get(*k)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+            })
+            .map_or(PromptDecision::None, |t| {
+                PromptDecision::Context(t.to_string())
+            });
     }
     if r.exit == Some(0) {
         PromptDecision::Context(out.to_string())
@@ -949,7 +1103,11 @@ fn cap(s: &str, max: usize) -> String {
 
 /// The first non-empty line, trimmed and capped (for display).
 fn cut(s: &str, max: usize) -> String {
-    let first = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let first = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     cap(first, max)
 }
 
@@ -963,7 +1121,12 @@ mod tests {
     }
 
     fn hook(event: Event, matcher: Option<&str>, command: &str) -> Hook {
-        Hook { event, matcher: matcher.map(String::from), command: command.into(), timeout_secs: DEFAULT_TIMEOUT }
+        Hook {
+            event,
+            matcher: matcher.map(String::from),
+            command: command.into(),
+            timeout_secs: DEFAULT_TIMEOUT,
+        }
     }
 
     fn hooks_with(user: Vec<Hook>, project: Vec<Hook>, trusted: bool) -> Hooks {
@@ -990,14 +1153,29 @@ mod tests {
             vec![hook(Event::PreToolUse, Some("bash"), "project.sh")],
             true,
         );
-        let fire = |e: Event, t: Option<&str>| h.matching(e, t).iter().map(|x| x.command.as_str()).collect::<Vec<&str>>();
-        assert_eq!(fire(Event::PreToolUse, Some("bash")), ["guard.sh", "project.sh"]);
+        let fire = |e: Event, t: Option<&str>| {
+            h.matching(e, t)
+                .iter()
+                .map(|x| x.command.as_str())
+                .collect::<Vec<&str>>()
+        };
+        assert_eq!(
+            fire(Event::PreToolUse, Some("bash")),
+            ["guard.sh", "project.sh"]
+        );
         assert_eq!(fire(Event::PreToolUse, Some("write_file")), [] as [&str; 0]);
-        assert_eq!(fire(Event::PreToolUse, Some("mcp__wiki__ask")), ["audit.sh"]);
+        assert_eq!(
+            fire(Event::PreToolUse, Some("mcp__wiki__ask")),
+            ["audit.sh"]
+        );
         assert_eq!(fire(Event::PostToolUse, Some("bash")), ["log.sh"]);
         assert_eq!(fire(Event::Stop, None), ["done.sh"]);
         // Untrusted project hooks never fire.
-        let h = hooks_with(Vec::new(), vec![hook(Event::Stop, None, "project.sh")], false);
+        let h = hooks_with(
+            Vec::new(),
+            vec![hook(Event::Stop, None, "project.sh")],
+            false,
+        );
         assert_eq!(h.matching(Event::Stop, None).len(), 0);
     }
 
@@ -1022,17 +1200,39 @@ mod tests {
         assert_eq!(
             hooks,
             vec![
-                Hook { event: Event::PreToolUse, matcher: Some("bash".into()), command: "a.sh".into(), timeout_secs: MAX_TIMEOUT },
+                Hook {
+                    event: Event::PreToolUse,
+                    matcher: Some("bash".into()),
+                    command: "a.sh".into(),
+                    timeout_secs: MAX_TIMEOUT
+                },
                 hook(Event::Stop, None, "b.sh"),
                 hook(Event::PreToolUse, None, "h.sh"),
             ]
         );
         assert_eq!(warnings.len(), 8, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("event\" must be")), "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("command\" must be")), "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("timeout_secs\" must be")), "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("matcher")), "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("applies only to")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("event\" must be")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("command\" must be")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("timeout_secs\" must be")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("matcher")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("applies only to")),
+            "{warnings:?}"
+        );
 
         assert!(parse("[]").is_err());
         assert!(parse("{").is_err());
@@ -1058,7 +1258,14 @@ mod tests {
     }
 
     fn outcome(exit: Option<i32>, stdout: &str, stderr: &str) -> RunOutcome {
-        RunOutcome { exit, timed_out: false, cancelled: false, stdout: stdout.into(), stderr: stderr.into(), error: None }
+        RunOutcome {
+            exit,
+            timed_out: false,
+            cancelled: false,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            error: None,
+        }
     }
 
     #[test]
@@ -1073,25 +1280,58 @@ mod tests {
             block_reason(&outcome(Some(2), &json_block("nope"), "ignored")),
             Some("nope".into())
         );
-        assert_eq!(block_reason(&outcome(Some(0), r#"{"decision":"block"}"#, "")), Some("blocked by a hook".into()));
         assert_eq!(
-            block_reason(&outcome(Some(0), r#"{"decision":"block","reason":"  "}"#, "")),
+            block_reason(&outcome(Some(0), r#"{"decision":"block"}"#, "")),
+            Some("blocked by a hook".into())
+        );
+        assert_eq!(
+            block_reason(&outcome(
+                Some(0),
+                r#"{"decision":"block","reason":"  "}"#,
+                ""
+            )),
             Some("blocked by a hook".into())
         );
         // A plain non-zero exit blocks, with stderr as the reason.
-        assert_eq!(block_reason(&outcome(Some(2), "", "bad idea\n")), Some("bad idea (exit code 2)".into()));
-        assert_eq!(block_reason(&outcome(Some(127), "noise", "")), Some("exit code 127".into()));
-        assert_eq!(block_reason(&outcome(None, "", "killed")), Some("killed (died without an exit status)".into()));
+        assert_eq!(
+            block_reason(&outcome(Some(2), "", "bad idea\n")),
+            Some("bad idea (exit code 2)".into())
+        );
+        assert_eq!(
+            block_reason(&outcome(Some(127), "noise", "")),
+            Some("exit code 127".into())
+        );
+        assert_eq!(
+            block_reason(&outcome(None, "", "killed")),
+            Some("killed (died without an exit status)".into())
+        );
         // Exit 0, other decisions, junk stdout and timeouts never block.
         assert_eq!(block_reason(&outcome(Some(0), "", "")), None);
-        assert_eq!(block_reason(&outcome(Some(0), r#"{"decision":"allow"}"#, "")), None);
+        assert_eq!(
+            block_reason(&outcome(Some(0), r#"{"decision":"allow"}"#, "")),
+            None
+        );
         assert_eq!(block_reason(&outcome(Some(0), "hello", "")), None);
         assert_eq!(
-            block_reason(&RunOutcome { exit: None, timed_out: true, cancelled: false, stdout: String::new(), stderr: "late".into(), error: None }),
+            block_reason(&RunOutcome {
+                exit: None,
+                timed_out: true,
+                cancelled: false,
+                stdout: String::new(),
+                stderr: "late".into(),
+                error: None
+            }),
             None
         );
         assert_eq!(
-            block_reason(&RunOutcome { exit: None, timed_out: false, cancelled: false, stdout: String::new(), stderr: String::new(), error: Some("spawn".into()) }),
+            block_reason(&RunOutcome {
+                exit: None,
+                timed_out: false,
+                cancelled: false,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some("spawn".into())
+            }),
             None
         );
         // Parse quirks: the decision must be a JSON object.
@@ -1103,11 +1343,17 @@ mod tests {
     fn prompt_decisions() {
         let d = |exit, stdout: &str| prompt_decision(&outcome(exit, stdout, ""));
         let ctx = |t: &str| PromptDecision::Context(t.into());
-        assert_eq!(d(Some(0), r#"{"context":"PROJECT NOTES"}"#), ctx("PROJECT NOTES"));
+        assert_eq!(
+            d(Some(0), r#"{"context":"PROJECT NOTES"}"#),
+            ctx("PROJECT NOTES")
+        );
         assert_eq!(d(Some(0), r#"{"additionalContext":"alt"}"#), ctx("alt"));
         assert_eq!(d(Some(0), r#"{"context":"  "}"#), PromptDecision::None);
         assert_eq!(d(Some(0), r#"{"other":1}"#), PromptDecision::None);
-        assert_eq!(d(Some(1), r#"{"decision":"block","reason":"x"}"#), PromptDecision::Block("x".into()));
+        assert_eq!(
+            d(Some(1), r#"{"decision":"block","reason":"x"}"#),
+            PromptDecision::Block("x".into())
+        );
         // Plain text from a successful hook is context; from a failed one, nothing.
         assert_eq!(d(Some(0), "  branch: main\n"), ctx("branch: main"));
         assert_eq!(d(Some(2), "branch: main"), PromptDecision::None);
@@ -1131,7 +1377,10 @@ mod tests {
     #[test]
     fn payload_fields_are_capped() {
         let payload = json!({ "assistant_text": cap(&"x".repeat(20), 10) });
-        assert_eq!(payload["assistant_text"].as_str().unwrap().chars().count(), 10);
+        assert_eq!(
+            payload["assistant_text"].as_str().unwrap().chars().count(),
+            10
+        );
     }
 
     #[test]
@@ -1158,46 +1407,91 @@ mod tests {
         // Project hooks exist but are untrusted: listed, warned, not run.
         let project = project_path(cwd.path());
         std::fs::create_dir_all(project.parent().unwrap()).unwrap();
-        std::fs::write(&project, r#"{"hooks": [{"event": "Stop", "command": "p.sh"}]}"#).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"hooks": [{"event": "Stop", "command": "p.sh"}]}"#,
+        )
+        .unwrap();
         let (h, warnings) = Hooks::load(home.path(), cwd.path());
         assert_eq!(h.project_path, project);
-        assert!(h.lines().iter().any(|l| l.contains("untrusted")), "{:?}", h.lines());
+        assert!(
+            h.lines().iter().any(|l| l.contains("untrusted")),
+            "{:?}",
+            h.lines()
+        );
         assert_eq!(h.matching(Event::Stop, None).len(), 1);
-        assert!(warnings.iter().any(|w| w.contains("not trusted")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("not trusted")),
+            "{warnings:?}"
+        );
 
         // Trusted: they run; the user's hooks still come first.
         h.trust_project(home.path(), cwd.path()).unwrap();
         let (h, warnings) = Hooks::load(home.path(), cwd.path());
-        assert!(!warnings.iter().any(|w| w.contains("not trusted")), "{warnings:?}");
-        let fire: Vec<_> = h.matching(Event::Stop, None).iter().map(|x| x.command.clone()).collect();
+        assert!(
+            !warnings.iter().any(|w| w.contains("not trusted")),
+            "{warnings:?}"
+        );
+        let fire: Vec<_> = h
+            .matching(Event::Stop, None)
+            .iter()
+            .map(|x| x.command.clone())
+            .collect();
         assert_eq!(fire, ["done.sh".to_string(), "p.sh".into()]);
-        assert!(h.lines().iter().any(|l| l.contains("trusted") && !l.contains("untrusted")));
+        assert!(h
+            .lines()
+            .iter()
+            .any(|l| l.contains("trusted") && !l.contains("untrusted")));
 
         // A changed project file is untrusted again, and the version loaded
         // before the change cannot be trusted in its place.
-        std::fs::write(&project, r#"{"hooks": [{"event": "Stop", "command": "p2.sh"}]}"#).unwrap();
-        let err = h.trust_project(home.path(), cwd.path()).unwrap_err().to_string();
+        std::fs::write(
+            &project,
+            r#"{"hooks": [{"event": "Stop", "command": "p2.sh"}]}"#,
+        )
+        .unwrap();
+        let err = h
+            .trust_project(home.path(), cwd.path())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("changed since it was loaded"), "{err}");
         let (h, warnings) = Hooks::load(home.path(), cwd.path());
-        assert!(warnings.iter().any(|w| w.contains("not trusted")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("not trusted")),
+            "{warnings:?}"
+        );
         assert_eq!(h.matching(Event::Stop, None).len(), 1);
 
         // The trust file is private and survives re-trusting other projects.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(trust_file(home.path())).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(trust_file(home.path()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600);
         }
         let other = tempfile::tempdir().unwrap();
         let other_project = project_path(other.path());
         std::fs::create_dir_all(other_project.parent().unwrap()).unwrap();
-        std::fs::write(&other_project, r#"{"hooks": [{"event": "Stop", "command": "o.sh"}]}"#).unwrap();
-        Hooks::load(home.path(), other.path()).0.trust_project(home.path(), other.path()).unwrap();
+        std::fs::write(
+            &other_project,
+            r#"{"hooks": [{"event": "Stop", "command": "o.sh"}]}"#,
+        )
+        .unwrap();
+        Hooks::load(home.path(), other.path())
+            .0
+            .trust_project(home.path(), other.path())
+            .unwrap();
         let (h, _) = Hooks::load(home.path(), other.path());
         assert!(h.project_trusted);
         let (h, _) = Hooks::load(home.path(), cwd.path());
-        assert!(!h.project_trusted, "the stale trust must not match the changed file");
+        assert!(
+            !h.project_trusted,
+            "the stale trust must not match the changed file"
+        );
     }
 
     #[test]
@@ -1206,7 +1500,9 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let trust = || {
             let (h, _) = Hooks::load(home.path(), cwd.path());
-            h.trust_project(home.path(), cwd.path()).unwrap_err().to_string()
+            h.trust_project(home.path(), cwd.path())
+                .unwrap_err()
+                .to_string()
         };
         // No project hooks file.
         assert!(trust().contains("reading"));
@@ -1215,28 +1511,46 @@ mod tests {
         // Malformed, invalid entries, and empty files are not trusted.
         std::fs::write(&project, "{oops").unwrap();
         assert!(trust().contains("malformed"));
-        std::fs::write(&project, r#"{"hooks": [{"event": "Nope", "command": "x"}]}"#).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"hooks": [{"event": "Nope", "command": "x"}]}"#,
+        )
+        .unwrap();
         assert!(trust().contains("invalid entries"));
         std::fs::write(&project, "{}").unwrap();
         assert!(trust().contains("no hooks"));
         // A file that appeared after loading must be listed first.
         let (stale, _) = Hooks::load(home.path(), cwd.path());
-        std::fs::write(&project, r#"{"hooks": [{"event": "Stop", "command": "p.sh"}]}"#).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"hooks": [{"event": "Stop", "command": "p.sh"}]}"#,
+        )
+        .unwrap();
         assert!(stale.trust_project(home.path(), cwd.path()).is_err());
         // A malformed trust file is never overwritten.
         std::fs::write(trust_file(home.path()), "{bad").unwrap();
         assert!(trust().contains("malformed"));
-        assert_eq!(std::fs::read_to_string(trust_file(home.path())).unwrap(), "{bad");
+        assert_eq!(
+            std::fs::read_to_string(trust_file(home.path())).unwrap(),
+            "{bad"
+        );
         // A malformed trust file also means nothing is trusted.
         let (h, warnings) = Hooks::load(home.path(), cwd.path());
         assert!(!h.project_trusted);
-        assert!(warnings.iter().any(|w| w.contains("not trusted")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("not trusted")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
     fn workspace_profile_is_loaded_once() {
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(user_path(home.path()), r#"{"hooks": [{"event": "Stop", "command": "solo.sh"}]}"#).unwrap();
+        std::fs::write(
+            user_path(home.path()),
+            r#"{"hooks": [{"event": "Stop", "command": "solo.sh"}]}"#,
+        )
+        .unwrap();
         let (h, warnings) = Hooks::load(home.path(), home.path());
         assert!(warnings.is_empty(), "{warnings:?}");
         // The profile's own hooks.json is only the user's file; there is no
@@ -1254,13 +1568,22 @@ mod tests {
         // The event JSON arrives on stdin: dump it to a file.
         let dumped = dir.path().join("stdin.json");
         let h = hooks_with(
-            vec![hook(Event::PreToolUse, Some("bash"), &format!("cat > {}", dumped.display()))],
+            vec![hook(
+                Event::PreToolUse,
+                Some("bash"),
+                &format!("cat > {}", dumped.display()),
+            )],
             Vec::new(),
             false,
         );
         let args = json!({"command": "cargo test"});
-        assert_eq!(h.pre_tool_use("bash", &args, &cwd, Some("sess-7"), &live()).await, Ok(None));
-        let payload: Value = serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
+        assert_eq!(
+            h.pre_tool_use("bash", &args, &cwd, Some("sess-7"), &live())
+                .await,
+            Ok(None)
+        );
+        let payload: Value =
+            serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
         assert_eq!(payload["event"], "PreToolUse");
         assert_eq!(payload["tool"], "bash");
         assert_eq!(payload["args"]["command"], "cargo test");
@@ -1270,41 +1593,90 @@ mod tests {
         // A blocking decision (stdout JSON) and a non-zero exit both block,
         // with the reason reaching the model.
         let h = hooks_with(
-            vec![hook(Event::PreToolUse, None, r#"echo '{"decision":"block","reason":"not on my watch"}'"#)],
+            vec![hook(
+                Event::PreToolUse,
+                None,
+                r#"echo '{"decision":"block","reason":"not on my watch"}'"#,
+            )],
             Vec::new(),
             false,
         );
-        let msg = h.pre_tool_use("bash", &args, &cwd, None, &live()).await.unwrap_err();
-        assert!(msg.contains("blocked by a PreToolUse hook") && msg.contains(": not on my watch."), "{msg}");
-        let h = hooks_with(vec![hook(Event::PreToolUse, None, "echo why not >&2; exit 3")], Vec::new(), false);
-        let msg = h.pre_tool_use("bash", &args, &cwd, None, &live()).await.unwrap_err();
+        let msg = h
+            .pre_tool_use("bash", &args, &cwd, None, &live())
+            .await
+            .unwrap_err();
+        assert!(
+            msg.contains("blocked by a PreToolUse hook") && msg.contains(": not on my watch."),
+            "{msg}"
+        );
+        let h = hooks_with(
+            vec![hook(Event::PreToolUse, None, "echo why not >&2; exit 3")],
+            Vec::new(),
+            false,
+        );
+        let msg = h
+            .pre_tool_use("bash", &args, &cwd, None, &live())
+            .await
+            .unwrap_err();
         assert!(msg.contains("why not (exit code 3)"), "{msg}");
 
         // The first block wins: later hooks do not run.
         let marker = dir.path().join("second-ran");
         let h = hooks_with(
-            vec![hook(Event::PreToolUse, None, "exit 1"), hook(Event::PreToolUse, None, &format!("touch {}", marker.display()))],
-            Vec::new(),
-            false,
-        );
-        assert!(h.pre_tool_use("bash", &args, &cwd, None, &live()).await.is_err());
-        assert!(!marker.exists());
-
-        // A hook that does not match leaves the call alone.
-        let h = hooks_with(vec![hook(Event::PreToolUse, Some("write_file"), "exit 1")], Vec::new(), false);
-        assert_eq!(h.pre_tool_use("bash", &args, &cwd, None, &live()).await, Ok(None));
-
-        // updatedInput rewrites the arguments; the last hook that sets it wins.
-        let h = hooks_with(
             vec![
-                hook(Event::PreToolUse, None, r#"echo '{"updatedInput":{"command":"first"}}'"#),
-                hook(Event::PreToolUse, None, r#"echo '{"updatedInput":{"command":"cargo test -q"}}'"#),
-                hook(Event::PreToolUse, None, r#"echo '{"updatedInput":"not an object"}'"#),
+                hook(Event::PreToolUse, None, "exit 1"),
+                hook(
+                    Event::PreToolUse,
+                    None,
+                    &format!("touch {}", marker.display()),
+                ),
             ],
             Vec::new(),
             false,
         );
-        let updated = h.pre_tool_use("bash", &args, &cwd, None, &live()).await.unwrap();
+        assert!(h
+            .pre_tool_use("bash", &args, &cwd, None, &live())
+            .await
+            .is_err());
+        assert!(!marker.exists());
+
+        // A hook that does not match leaves the call alone.
+        let h = hooks_with(
+            vec![hook(Event::PreToolUse, Some("write_file"), "exit 1")],
+            Vec::new(),
+            false,
+        );
+        assert_eq!(
+            h.pre_tool_use("bash", &args, &cwd, None, &live()).await,
+            Ok(None)
+        );
+
+        // updatedInput rewrites the arguments; the last hook that sets it wins.
+        let h = hooks_with(
+            vec![
+                hook(
+                    Event::PreToolUse,
+                    None,
+                    r#"echo '{"updatedInput":{"command":"first"}}'"#,
+                ),
+                hook(
+                    Event::PreToolUse,
+                    None,
+                    r#"echo '{"updatedInput":{"command":"cargo test -q"}}'"#,
+                ),
+                hook(
+                    Event::PreToolUse,
+                    None,
+                    r#"echo '{"updatedInput":"not an object"}'"#,
+                ),
+            ],
+            Vec::new(),
+            false,
+        );
+        let updated = h
+            .pre_tool_use("bash", &args, &cwd, None, &live())
+            .await
+            .unwrap();
         assert_eq!(updated, Some(json!({"command": "cargo test -q"})));
     }
 
@@ -1313,22 +1685,42 @@ mod tests {
     async fn stop_hooks_can_continue_the_turn_and_attention_runs() {
         let dir = tempfile::tempdir().unwrap();
         let h = hooks_with(
-            vec![hook(Event::Stop, None, r#"echo '{"decision":"block","reason":"tests are failing"}'"#)],
+            vec![hook(
+                Event::Stop,
+                None,
+                r#"echo '{"decision":"block","reason":"tests are failing"}'"#,
+            )],
             Vec::new(),
             false,
         );
-        assert_eq!(h.stop("done", dir.path(), None, &live()).await.as_deref(), Some("tests are failing"));
+        assert_eq!(
+            h.stop("done", dir.path(), None, &live()).await.as_deref(),
+            Some("tests are failing")
+        );
         // A failing or silent Stop hook does not continue anything.
-        let h = hooks_with(vec![hook(Event::Stop, None, "echo hi; exit 3")], Vec::new(), false);
+        let h = hooks_with(
+            vec![hook(Event::Stop, None, "echo hi; exit 3")],
+            Vec::new(),
+            false,
+        );
         assert_eq!(h.stop("done", dir.path(), None, &live()).await, None);
 
         let dumped = dir.path().join("attention.json");
         let h = std::sync::Arc::new(hooks_with(
-            vec![hook(Event::AttentionRequired, None, &format!("cat > {}", dumped.display()))],
+            vec![hook(
+                Event::AttentionRequired,
+                None,
+                &format!("cat > {}", dumped.display()),
+            )],
             Vec::new(),
             false,
         ));
-        h.attention("approval", "Approve: Run cargo test", dir.path(), Some("s1"));
+        h.attention(
+            "approval",
+            "Approve: Run cargo test",
+            dir.path(),
+            Some("s1"),
+        );
         for _ in 0..100 {
             if std::fs::read_to_string(&dumped).is_ok_and(|t| t.ends_with('}')) {
                 break;
@@ -1339,7 +1731,12 @@ mod tests {
         assert_eq!(line["event"], "AttentionRequired");
         assert_eq!(line["kind"], "approval");
         assert_eq!(line["message"], "Approve: Run cargo test");
-        assert_eq!(h.for_subagent().matching(Event::AttentionRequired, None).len(), 1);
+        assert_eq!(
+            h.for_subagent()
+                .matching(Event::AttentionRequired, None)
+                .len(),
+            1
+        );
     }
 
     #[cfg(unix)]
@@ -1348,7 +1745,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_path_buf();
         let h = hooks_with(
-            vec![hook(Event::UserPromptSubmit, None, r#"echo '{"context":"PROJECT NOTES"}'"#)],
+            vec![hook(
+                Event::UserPromptSubmit,
+                None,
+                r#"echo '{"context":"PROJECT NOTES"}'"#,
+            )],
             Vec::new(),
             false,
         );
@@ -1359,7 +1760,11 @@ mod tests {
                 && items[0].ends_with("PROJECT NOTES")
         ));
         let h = hooks_with(
-            vec![hook(Event::UserPromptSubmit, None, r#"echo '{"decision":"block","reason":"after hours"}'"#)],
+            vec![hook(
+                Event::UserPromptSubmit,
+                None,
+                r#"echo '{"decision":"block","reason":"after hours"}'"#,
+            )],
             Vec::new(),
             false,
         );
@@ -1368,8 +1773,15 @@ mod tests {
             PromptOutcome::Blocked(msg) if msg.contains("after hours") && msg.contains("blocked by hook")
         ));
         // A non-zero exit alone does not block a prompt.
-        let h = hooks_with(vec![hook(Event::UserPromptSubmit, None, "exit 1")], Vec::new(), false);
-        assert_eq!(h.user_prompt_submit("fix it", &cwd, None, &live()).await, PromptOutcome::Run(Vec::new()));
+        let h = hooks_with(
+            vec![hook(Event::UserPromptSubmit, None, "exit 1")],
+            Vec::new(),
+            false,
+        );
+        assert_eq!(
+            h.user_prompt_submit("fix it", &cwd, None, &live()).await,
+            PromptOutcome::Run(Vec::new())
+        );
     }
 
     #[cfg(unix)]
@@ -1396,7 +1808,11 @@ mod tests {
     #[tokio::test]
     async fn cancel_kills_the_hook_and_never_lets_the_call_through() {
         let dir = tempfile::tempdir().unwrap();
-        let h = hooks_with(vec![hook(Event::PreToolUse, None, "sleep 30")], Vec::new(), false);
+        let h = hooks_with(
+            vec![hook(Event::PreToolUse, None, "sleep 30")],
+            Vec::new(),
+            false,
+        );
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
         tokio::spawn(async move {
@@ -1404,7 +1820,9 @@ mod tests {
             trigger.cancel();
         });
         let started = std::time::Instant::now();
-        let msg = h.pre_tool_use("bash", &json!({}), dir.path(), None, &cancel).await;
+        let msg = h
+            .pre_tool_use("bash", &json!({}), dir.path(), None, &cancel)
+            .await;
         assert_eq!(msg.err().as_deref(), Some("Cancelled by user."));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
@@ -1423,16 +1841,31 @@ mod tests {
         assert_eq!(r.stdout.trim(), "hi");
         assert!(started.elapsed() < Duration::from_secs(10));
         // A command that cannot be found is a failed hook, not a crash.
-        let r = run_hook(&hook(Event::Stop, None, "/nonexistent/hook-binary"), "{}", dir.path(), &live()).await;
+        let r = run_hook(
+            &hook(Event::Stop, None, "/nonexistent/hook-binary"),
+            "{}",
+            dir.path(),
+            &live(),
+        )
+        .await;
         assert_eq!(r.exit, Some(127));
-        assert!(block_reason(&r).is_some(), "a broken PreToolUse guard fails closed");
+        assert!(
+            block_reason(&r).is_some(),
+            "a broken PreToolUse guard fails closed"
+        );
     }
 
     #[test]
     fn subagents_get_only_tool_hooks() {
         let h = hooks_with(
-            vec![hook(Event::PreToolUse, Some("bash"), "guard.sh"), hook(Event::Stop, None, "done.sh")],
-            vec![hook(Event::PostToolUse, None, "p.sh"), hook(Event::SessionStart, None, "s.sh")],
+            vec![
+                hook(Event::PreToolUse, Some("bash"), "guard.sh"),
+                hook(Event::Stop, None, "done.sh"),
+            ],
+            vec![
+                hook(Event::PostToolUse, None, "p.sh"),
+                hook(Event::SessionStart, None, "s.sh"),
+            ],
             true,
         );
         let sub = h.for_subagent();
@@ -1440,8 +1873,15 @@ mod tests {
         assert_eq!(sub.matching(Event::PostToolUse, Some("bash")).len(), 1);
         assert!(sub.matching(Event::Stop, None).is_empty());
         assert!(sub.matching(Event::SessionStart, None).is_empty());
-        let untrusted = hooks_with(Vec::new(), vec![hook(Event::PreToolUse, None, "p.sh")], false).for_subagent();
-        assert!(untrusted.matching(Event::PreToolUse, Some("bash")).is_empty());
+        let untrusted = hooks_with(
+            Vec::new(),
+            vec![hook(Event::PreToolUse, None, "p.sh")],
+            false,
+        )
+        .for_subagent();
+        assert!(untrusted
+            .matching(Event::PreToolUse, Some("bash"))
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -1463,8 +1903,20 @@ mod tests {
         assert_eq!(line["session_id"], "s1");
 
         std::fs::remove_file(&dumped).unwrap();
-        let h = hooks_with(vec![dumper(Event::PostToolUse, Some("bash"))], Vec::new(), false);
-        h.post_tool_use("bash", &json!({"command": "ls"}), &ToolOutput::err("boom"), &cwd, None, &live()).await;
+        let h = hooks_with(
+            vec![dumper(Event::PostToolUse, Some("bash"))],
+            Vec::new(),
+            false,
+        );
+        h.post_tool_use(
+            "bash",
+            &json!({"command": "ls"}),
+            &ToolOutput::err("boom"),
+            &cwd,
+            None,
+            &live(),
+        )
+        .await;
         let line: Value = serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
         assert_eq!(line["event"], "PostToolUse");
         assert_eq!(line["tool"], "bash");
