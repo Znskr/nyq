@@ -632,7 +632,11 @@ fn call_keys(tool: &str, args: &Value) -> Vec<String> {
         // Resource tools are not named `mcp__<server>__…`, but server-wide
         // rules (`mcp__docs__*`, `mcp__*`) still cover the server they name.
         "mcp_list_resources" | "mcp_read_resource" => {
-            if let Some(server) = args.get("server").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            if let Some(server) = args
+                .get("server")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
                 keys.push(format!("{}{tool}", crate::mcp::tool_prefix(server)));
             }
             keys.push(format!("mcp__{tool}"));
@@ -678,7 +682,13 @@ fn path_kind(tool: &str) -> Option<&'static str> {
 /// workspace; `*` matches within one path segment and `**` any number of
 /// segments. `strict` (allow semantics) requires the path with symlinks
 /// resolved to match; otherwise either spelling does.
-pub(crate) fn path_rule_matches(rule: &str, tool: &str, args: &Value, cwd: &Path, strict: bool) -> bool {
+pub(crate) fn path_rule_matches(
+    rule: &str,
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    strict: bool,
+) -> bool {
     let Some((prefix, pattern)) = rule.split_once(':') else {
         return false;
     };
@@ -819,7 +829,11 @@ pub fn format_report(perms: &Permissions, mode: Mode, warnings: &[String], json:
         });
         return serde_json::to_string_pretty(&v).unwrap_or_default();
     }
-    let mut out = vec![format!("Mode         {} ({})", mode.as_str(), mode.summary())];
+    let mut out = vec![format!(
+        "Mode         {} ({})",
+        mode.as_str(),
+        mode.summary()
+    )];
     out.extend(
         perms
             .lines(&Default::default())
@@ -937,11 +951,15 @@ fn kind_ord(kind: TrustKind) -> u8 {
 }
 
 fn source_label(entry: &TrustEntry) -> String {
-    let sources: Vec<&str> = [(entry.session, "session"), (entry.saved, "permissions.json"), (entry.local, "this workspace")]
-        .iter()
-        .filter(|(on, _)| *on)
-        .map(|(_, label)| *label)
-        .collect();
+    let sources: Vec<&str> = [
+        (entry.session, "session"),
+        (entry.saved, "permissions.json"),
+        (entry.local, "this workspace"),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, label)| *label)
+    .collect();
     if sources.is_empty() {
         "unknown".into()
     } else {
@@ -1057,7 +1075,15 @@ mod tests {
 
     #[test]
     fn bash_allow_rules_reject_dynamic_arguments() {
-        for arg in ["$'--short'", "$\"--short\"", "$", "$FLAGS", "${FLAGS}", "`echo --short`", "$(echo --short)"] {
+        for arg in [
+            "$'--short'",
+            "$\"--short\"",
+            "$",
+            "$FLAGS",
+            "${FLAGS}",
+            "`echo --short`",
+            "$(echo --short)",
+        ] {
             let cmd = format!("git status {arg}");
             let args = serde_json::json!({"command": cmd});
             assert!(!matches("bash:git status", "bash", &args, true), "{cmd}");
@@ -1068,25 +1094,52 @@ mod tests {
     #[test]
     fn tool_approval_follows_decide_order() {
         let cwd = Path::new("/w");
-        let mut p = perms(&["mcp__gh__*", "write_file"], &["web_fetch"], &["mcp__gh__delete*", "bash:rm"]);
+        let mut p = perms(
+            &["mcp__gh__*", "write_file"],
+            &["web_fetch"],
+            &["mcp__gh__delete*", "bash:rm"],
+        );
         p.local = vec!["mcp__db__query".into()];
         let none = HashSet::new();
-        let a = |p: &Permissions, s: &HashSet<String>, tool: &str, needs: bool, mode| p.tool_approval(s, tool, cwd, needs, mode);
-        assert_eq!(a(&p, &none, "mcp__gh__delete_repo", true, Mode::Yolo), ToolApproval::Denied("deny mcp__gh__delete*".into()));
-        assert_eq!(a(&p, &none, "web_fetch", true, Mode::Ask), ToolApproval::AskRule("ask web_fetch".into()));
-        assert_eq!(a(&p, &none, "read_file", false, Mode::Ask), ToolApproval::Free);
-        assert_eq!(a(&p, &none, "mcp__gh__list", true, Mode::Ask), ToolApproval::Allowed("allow mcp__gh__*".into()));
+        let a = |p: &Permissions, s: &HashSet<String>, tool: &str, needs: bool, mode| {
+            p.tool_approval(s, tool, cwd, needs, mode)
+        };
+        assert_eq!(
+            a(&p, &none, "mcp__gh__delete_repo", true, Mode::Yolo),
+            ToolApproval::Denied("deny mcp__gh__delete*".into())
+        );
+        assert_eq!(
+            a(&p, &none, "web_fetch", true, Mode::Ask),
+            ToolApproval::AskRule("ask web_fetch".into())
+        );
+        assert_eq!(
+            a(&p, &none, "read_file", false, Mode::Ask),
+            ToolApproval::Free
+        );
+        assert_eq!(
+            a(&p, &none, "mcp__gh__list", true, Mode::Ask),
+            ToolApproval::Allowed("allow mcp__gh__*".into())
+        );
         assert_eq!(
             a(&p, &none, "mcp__db__query", true, Mode::Ask),
             ToolApproval::Allowed("allow mcp__db__query (this workspace)".into())
         );
         // A rule for one command doesn't decide the whole tool.
-        assert_eq!(a(&p, &none, "bash", true, Mode::Auto), ToolApproval::Mode(Mode::Auto));
+        assert_eq!(
+            a(&p, &none, "bash", true, Mode::Auto),
+            ToolApproval::Mode(Mode::Auto)
+        );
         let session: HashSet<String> = ["edit_file".to_string()].into();
-        assert_eq!(a(&p, &session, "edit_file", true, Mode::Ask), ToolApproval::Session);
+        assert_eq!(
+            a(&p, &session, "edit_file", true, Mode::Ask),
+            ToolApproval::Session
+        );
         assert_eq!(a(&p, &none, "edit_file", true, Mode::Ask).badge(), "asks");
         assert!(p.allows_exactly("write_file") && p.allows_exactly("mcp__db__query"));
-        assert!(!p.allows_exactly("mcp__gh__list"), "a pattern is not an exact entry");
+        assert!(
+            !p.allows_exactly("mcp__gh__list"),
+            "a pattern is not an exact entry"
+        );
     }
 
     #[test]
@@ -1414,7 +1467,10 @@ mod tests {
         assert_eq!(d("write_file", "src/new/b.rs"), Decision::Run);
         assert_eq!(d("write_file", "docs/a.md"), Decision::Ask { forced: None });
         // Ask: forced even in auto; deny: every read tool, any spelling.
-        assert!(matches!(d("write_file", "Cargo.toml"), Decision::Ask { forced: Some(_) }));
+        assert!(matches!(
+            d("write_file", "Cargo.toml"),
+            Decision::Ask { forced: Some(_) }
+        ));
         assert!(matches!(d("read_file", "secrets/key"), Decision::Deny(_)));
         assert!(matches!(d("grep", "./secrets/key"), Decision::Deny(_)));
         assert!(matches!(
@@ -1425,7 +1481,11 @@ mod tests {
         // Absolute allows reach outside the workspace; never under .git.
         let outside = tempfile::tempdir().unwrap();
         let root = outside.path().to_str().unwrap();
-        let p = perms(&[&format!("read:{root}/**"), &format!("edit:{root}/**")], &[], &[]);
+        let p = perms(
+            &[&format!("read:{root}/**"), &format!("edit:{root}/**")],
+            &[],
+            &[],
+        );
         let d = |tool: &str, path: String| {
             p.decide(&none, tool, &json!({ "path": path }), cwd, true, Mode::Ask)
         };
@@ -1441,7 +1501,14 @@ mod tests {
             let p = perms(&["edit:src/**"], &[], &[]);
             std::os::unix::fs::symlink(outside.path(), cwd.join("src/out")).unwrap();
             assert_eq!(
-                p.decide(&none, "write_file", &json!({"path": "src/out/x"}), cwd, true, Mode::Ask),
+                p.decide(
+                    &none,
+                    "write_file",
+                    &json!({"path": "src/out/x"}),
+                    cwd,
+                    true,
+                    Mode::Ask
+                ),
                 Decision::Ask { forced: None }
             );
         }
@@ -1473,7 +1540,14 @@ mod tests {
         let mut denied = perms(&[], &[], &["edit_file:src/**"]);
         denied.local = vec!["edit_file:src/**".into()];
         assert!(matches!(
-            denied.decide(&none, "edit_file", &json!({"path": "src/a.rs"}), cwd, true, Mode::Ask),
+            denied.decide(
+                &none,
+                "edit_file",
+                &json!({"path": "src/a.rs"}),
+                cwd,
+                true,
+                Mode::Ask
+            ),
             Decision::Deny(_)
         ));
     }
@@ -1523,7 +1597,12 @@ mod tests {
             Decision::Deny(_)
         ));
         assert!(matches!(
-            decide(&denied, "mcp_list_resources", &json!({"server": "docs"}), Mode::Yolo),
+            decide(
+                &denied,
+                "mcp_list_resources",
+                &json!({"server": "docs"}),
+                Mode::Yolo
+            ),
             Decision::Deny(_)
         ));
         let blanket = perms(&[], &[], &["mcp__*"]);
@@ -1542,7 +1621,12 @@ mod tests {
         );
         // A different server is not covered by the docs rule.
         assert_eq!(
-            decide(&denied, "mcp_read_resource", &json!({"server": "other"}), Mode::Yolo),
+            decide(
+                &denied,
+                "mcp_read_resource",
+                &json!({"server": "other"}),
+                Mode::Yolo
+            ),
             Decision::Run
         );
     }

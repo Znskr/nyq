@@ -9,15 +9,47 @@ use serde_json::{json, Value};
 
 /// (name, default, what it caps); None means unlimited.
 pub const LIMITS: &[(&str, Option<usize>, &str)] = &[
-    ("skill_description_bytes", Some(120), "each skill description in the system prompt"),
-    ("skill_catalog_bytes", None, "the whole skill list in the system prompt"),
-    ("skill_file_bytes", None, "a whole SKILL.md or skill resource loaded by the `skill` tool"),
-    ("skill_chunk_bytes", Some(32 * 1024), "each part of a skill the `skill` tool returns (the rest via `offset`)"),
+    (
+        "skill_description_bytes",
+        Some(120),
+        "each skill description in the system prompt",
+    ),
+    (
+        "skill_catalog_bytes",
+        None,
+        "the whole skill list in the system prompt",
+    ),
+    (
+        "skill_file_bytes",
+        None,
+        "a whole SKILL.md or skill resource loaded by the `skill` tool",
+    ),
+    (
+        "skill_chunk_bytes",
+        Some(32 * 1024),
+        "each part of a skill the `skill` tool returns (the rest via `offset`)",
+    ),
     ("mcp_description_bytes", None, "each MCP tool description"),
-    ("mcp_content_block_bytes", Some(8 * 1024), "each text block of an MCP prompt or resource"),
-    ("mcp_content_total_bytes", Some(32 * 1024), "a whole MCP prompt or resource"),
-    ("project_instruction_file_bytes", None, "each project instruction or prompt file (AGENTS.md, system.md, ...)"),
-    ("project_instructions_total_bytes", None, "all project instructions together"),
+    (
+        "mcp_content_block_bytes",
+        Some(8 * 1024),
+        "each text block of an MCP prompt or resource",
+    ),
+    (
+        "mcp_content_total_bytes",
+        Some(32 * 1024),
+        "a whole MCP prompt or resource",
+    ),
+    (
+        "project_instruction_file_bytes",
+        None,
+        "each project instruction or prompt file (AGENTS.md, system.md, ...)",
+    ),
+    (
+        "project_instructions_total_bytes",
+        None,
+        "all project instructions together",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +80,10 @@ fn known(name: &str) -> Result<&'static str> {
         .find(|n| *n == name)
         .with_context(|| {
             let names: Vec<_> = LIMITS.iter().map(|(n, ..)| *n).collect();
-            format!("unknown context limit `{name}` (expected one of: {})", names.join(", "))
+            format!(
+                "unknown context limit `{name}` (expected one of: {})",
+                names.join(", ")
+            )
         })
 }
 
@@ -60,7 +95,11 @@ fn parse_value(name: &str, raw: &str) -> Result<Option<usize>> {
             .ok()
             .filter(|n| *n > 0)
             .map(Some)
-            .with_context(|| format!("context limit {name}: expected a positive byte count or `off`, got `{raw}`")),
+            .with_context(|| {
+                format!(
+                    "context limit {name}: expected a positive byte count or `off`, got `{raw}`"
+                )
+            }),
     }
 }
 
@@ -76,7 +115,11 @@ pub fn parse(spec: &str) -> Result<(&'static str, Option<usize>)> {
 /// The settings' `context_limits` object, then the flags over it.
 fn build(settings: &crate::settings::Settings, flags: &[String]) -> Result<Overrides> {
     let mut out = Vec::new();
-    if let Some(map) = settings.extra.get("context_limits").and_then(Value::as_object) {
+    if let Some(map) = settings
+        .extra
+        .get("context_limits")
+        .and_then(Value::as_object)
+    {
         for (name, value) in map {
             let name = known(name).context("settings.toml context_limits")?;
             let limit = match value {
@@ -106,7 +149,10 @@ fn resolve_in(overrides: &Overrides, name: &str) -> (Option<usize>, Source) {
     if let Some((_, limit, source)) = overrides.iter().rev().find(|(n, ..)| *n == name) {
         return (*limit, *source);
     }
-    let default = LIMITS.iter().find(|(n, ..)| *n == name).and_then(|(_, d, _)| *d);
+    let default = LIMITS
+        .iter()
+        .find(|(n, ..)| *n == name)
+        .and_then(|(_, d, _)| *d);
     (default, Source::Default)
 }
 
@@ -116,7 +162,10 @@ fn resolve(name: &str) -> (Option<usize>, Source) {
 
 /// The limit in effect for `name` (one of [`LIMITS`]); None is unlimited.
 pub fn get(name: &str) -> Option<usize> {
-    debug_assert!(LIMITS.iter().any(|(n, ..)| *n == name), "unknown limit {name}");
+    debug_assert!(
+        LIMITS.iter().any(|(n, ..)| *n == name),
+        "unknown limit {name}"
+    );
     resolve(name).0
 }
 
@@ -162,20 +211,35 @@ mod tests {
         assert!(parse("nope=1").is_err());
         assert!(parse("skill_catalog_bytes").is_err());
         assert!(parse("skill_catalog_bytes=0").is_err());
-        assert_eq!(parse("skill_catalog_bytes=off").unwrap(), ("skill_catalog_bytes", None));
+        assert_eq!(
+            parse("skill_catalog_bytes=off").unwrap(),
+            ("skill_catalog_bytes", None)
+        );
         let mut s = crate::settings::Settings::default();
         s.extra.insert(
             "context_limits".into(),
             json!({"skill_catalog_bytes": 500, "project_instructions_total_bytes": "40"}),
         );
         let o = build(&s, &["project_instructions_total_bytes=64".into()]).unwrap();
-        assert_eq!(resolve_in(&o, "skill_catalog_bytes"), (Some(500), Source::Settings));
-        assert_eq!(resolve_in(&o, "project_instructions_total_bytes"), (Some(64), Source::Flag));
-        assert_eq!(resolve_in(&o, "mcp_content_total_bytes"), (Some(32 * 1024), Source::Default));
+        assert_eq!(
+            resolve_in(&o, "skill_catalog_bytes"),
+            (Some(500), Source::Settings)
+        );
+        assert_eq!(
+            resolve_in(&o, "project_instructions_total_bytes"),
+            (Some(64), Source::Flag)
+        );
+        assert_eq!(
+            resolve_in(&o, "mcp_content_total_bytes"),
+            (Some(32 * 1024), Source::Default)
+        );
         s.extra.insert("context_limits".into(), json!({"bogus": 1}));
         assert!(build(&s, &[]).is_err());
         let clipped = clip_to(Some(64), &"é".repeat(100));
-        assert!(clipped.len() <= 64 && clipped.ends_with("[truncated]"), "{clipped}");
+        assert!(
+            clipped.len() <= 64 && clipped.ends_with("[truncated]"),
+            "{clipped}"
+        );
         assert_eq!(clip_to(None, "short"), "short");
         assert_eq!(report().as_array().unwrap().len(), LIMITS.len());
     }

@@ -7,7 +7,6 @@ use unicode_width::UnicodeWidthChar;
 use super::highlight::Code;
 use super::theme::{fg, BLUE, BRIGHT, FAINT, GRAY, GREEN, MID, RED};
 
-
 pub fn dim() -> Style {
     Style::new().dimmed()
 }
@@ -112,7 +111,12 @@ impl Fence {
         let ch = t.chars().next().filter(|c| matches!(c, '`' | '~'))?;
         let n = t.chars().take_while(|&c| c == ch).count();
         let lang = t[n..].trim();
-        (n >= 3 && !(ch == '`' && lang.contains('`'))).then(|| Fence { ch, n, lang: lang.to_string(), code: Code::new(lang) })
+        (n >= 3 && !(ch == '`' && lang.contains('`'))).then(|| Fence {
+            ch,
+            n,
+            lang: lang.to_string(),
+            code: Code::new(lang),
+        })
     }
 
     pub fn closes(&self, line: &str) -> bool {
@@ -139,19 +143,26 @@ pub struct Markdown {
 /// `---`, `***` or `___` (spaces allowed between).
 fn is_rule(t: &str) -> bool {
     let t = t.trim_end();
-    let Some(ch) = t.chars().next().filter(|c| matches!(c, '-' | '*' | '_')) else { return false };
+    let Some(ch) = t.chars().next().filter(|c| matches!(c, '-' | '*' | '_')) else {
+        return false;
+    };
     t.chars().all(|c| c == ch || c == ' ') && t.chars().filter(|&c| c == ch).count() >= 3
 }
 
 /// `1. ` or `12) `: the marker's length.
 fn number_marker(t: &str) -> Option<usize> {
     let digits = t.chars().take_while(char::is_ascii_digit).count();
-    ((1..=9).contains(&digits) && (t[digits..].starts_with(". ") || t[digits..].starts_with(") "))).then_some(digits + 1)
+    ((1..=9).contains(&digits) && (t[digits..].starts_with(". ") || t[digits..].starts_with(") ")))
+        .then_some(digits + 1)
 }
 
 /// A list item, quote or paragraph line (no indent).
 fn body(t: &str) -> String {
-    if let Some(rest) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).or_else(|| t.strip_prefix("+ ")) {
+    if let Some(rest) = t
+        .strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("+ "))
+    {
         return format!("{} {}", dim().paint("•"), inline(rest, true));
     }
     if let Some(n) = number_marker(t) {
@@ -192,7 +203,11 @@ impl Markdown {
                 depth += 1;
                 rest = r.strip_prefix(' ').unwrap_or(r);
             }
-            return format!("{indent}{}{}", fg(FAINT).paint("│ ".repeat(depth)), body(rest));
+            return format!(
+                "{indent}{}{}",
+                fg(FAINT).paint("│ ".repeat(depth)),
+                body(rest)
+            );
         }
         format!("{indent}{}", body(trimmed))
     }
@@ -214,10 +229,14 @@ fn italic_end(s: &str, i: usize) -> Option<usize> {
 /// A bare `http(s)://` URL at `i`: its end, without trailing punctuation.
 fn url_end(s: &str, i: usize) -> Option<usize> {
     let b = s.as_bytes();
-    if !(b[i..].starts_with(b"https://") || b[i..].starts_with(b"http://")) || (i > 0 && b[i - 1].is_ascii_alphanumeric()) {
+    if !(b[i..].starts_with(b"https://") || b[i..].starts_with(b"http://"))
+        || (i > 0 && b[i - 1].is_ascii_alphanumeric())
+    {
         return None;
     }
-    let mut j = s[i..].find(|c: char| c.is_whitespace() || "<>\"'`".contains(c)).map_or(s.len(), |j| j + i);
+    let mut j = s[i..]
+        .find(|c: char| c.is_whitespace() || "<>\"'`".contains(c))
+        .map_or(s.len(), |j| j + i);
     while j > i && (b".,;:!?".contains(&b[j - 1]) || (b[j - 1] == b')' && !s[i..j].contains('('))) {
         j -= 1;
     }
@@ -254,14 +273,17 @@ pub fn inline(s: &str, color: bool) -> String {
                     .filter(|&j| j > i + 2)
                     .map(|j| (j + 2, Style::new().bold().paint(&s[i + 2..j]).to_string()))
             }
-            b'*' | b'_' => italic_end(s, i).map(|j| (j + 1, Style::new().italic().paint(&s[i + 1..j]).to_string())),
+            b'*' | b'_' => italic_end(s, i)
+                .map(|j| (j + 1, Style::new().italic().paint(&s[i + 1..j]).to_string())),
             b'[' => s[i..].find("](").map(|j| j + i).and_then(|mid| {
                 let end = s[mid..].find(')')? + mid;
                 let (text, url) = (&s[i + 1..mid], s[mid + 2..end].trim());
                 (!text.is_empty() && !text.contains('[') && !url.is_empty() && !url.contains(' '))
                     .then(|| (end + 1, link(url, &link_style.paint(text).to_string())))
             }),
-            b'h' => url_end(s, i).map(|j| (j, link(&s[i..j], &link_style.paint(&s[i..j]).to_string()))),
+            b'h' => {
+                url_end(s, i).map(|j| (j, link(&s[i..j], &link_style.paint(&s[i..j]).to_string())))
+            }
             _ => None,
         };
         match span {
@@ -283,7 +305,10 @@ pub fn inline(s: &str, color: bool) -> String {
 pub fn escape_len(s: &str) -> usize {
     let b = s.as_bytes();
     match b.get(1) {
-        Some(b'[') => b[2..].iter().position(u8::is_ascii_alphabetic).map_or(b.len(), |p| p + 3),
+        Some(b'[') => b[2..]
+            .iter()
+            .position(u8::is_ascii_alphabetic)
+            .map_or(b.len(), |p| p + 3),
         Some(b']') => {
             let mut i = 2;
             while i < b.len() {
@@ -319,7 +344,10 @@ fn pieces(s: &str) -> impl Iterator<Item = Result<&str, char>> {
 
 /// Display width of text that may contain ANSI escapes.
 pub fn visible_width(s: &str) -> usize {
-    pieces(s).filter_map(Result::err).map(|c| c.width().unwrap_or(0)).sum()
+    pieces(s)
+        .filter_map(Result::err)
+        .map(|c| c.width().unwrap_or(0))
+        .sum()
 }
 
 /// `text` as a terminal hyperlink (OSC 8) to `url`.
@@ -330,17 +358,31 @@ pub fn link(url: &str, text: &str) -> String {
 /// A `file://` URL for a path, absolute or relative to `cwd`.
 pub fn file_url(cwd: &str, path: &str) -> Option<String> {
     let p = std::path::Path::new(path);
-    let abs = if p.is_absolute() { p.to_path_buf() } else if cwd.is_empty() { return None } else { std::path::Path::new(cwd).join(p) };
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else if cwd.is_empty() {
+        return None;
+    } else {
+        std::path::Path::new(cwd).join(p)
+    };
     let s = abs.to_string_lossy().replace('\\', "/");
     let s = s.replace(' ', "%20");
-    Some(if s.starts_with('/') { format!("file://{s}") } else { format!("file:///{s}") })
+    Some(if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
+    })
 }
 
 /// Wrap styled text to `width` columns, at spaces where possible. Rows after
 /// the first start with `cont`; colors and links carry over to them.
 pub fn wrap_styled(s: &str, width: usize, cont: &str) -> Vec<String> {
     let width = width.max(1);
-    let cont = if visible_width(cont) + 8 > width { "" } else { cont };
+    let cont = if visible_width(cont) + 8 > width {
+        ""
+    } else {
+        cont
+    };
     let cont_w = visible_width(cont);
     // Open SGR sequences since the last reset, and the open link.
     #[derive(Clone, Default)]
@@ -370,8 +412,13 @@ pub fn wrap_styled(s: &str, width: usize, cont: &str) -> Vec<String> {
             Ok(esc) => {
                 row.push_str(esc);
                 if esc.starts_with("\x1b]8;") {
-                    let url = esc.trim_start_matches("\x1b]8;").split_once(';').map_or("", |(_, u)| u);
-                    let url = url.trim_end_matches(['\x07', '\\']).trim_end_matches('\x1b');
+                    let url = esc
+                        .trim_start_matches("\x1b]8;")
+                        .split_once(';')
+                        .map_or("", |(_, u)| u);
+                    let url = url
+                        .trim_end_matches(['\x07', '\\'])
+                        .trim_end_matches('\x1b');
                     state.link = (!url.is_empty()).then(|| esc.to_string());
                 } else if esc.ends_with('m') && esc.starts_with("\x1b[") {
                     if matches!(&esc[2..esc.len() - 1], "" | "0") {
@@ -454,7 +501,12 @@ pub fn continuation(row: &str) -> String {
                 out.push(' ');
                 c.len_utf8()
             }
-            '0'..='9' if !marker && (1..=9).contains(&digits) && (rest[digits..].starts_with('.') || rest[digits..].starts_with(')')) && then(digits + 1) == Some(' ') => {
+            '0'..='9'
+                if !marker
+                    && (1..=9).contains(&digits)
+                    && (rest[digits..].starts_with('.') || rest[digits..].starts_with(')'))
+                    && then(digits + 1) == Some(' ') =>
+            {
                 marker = true;
                 out.push_str(&" ".repeat(digits + 1));
                 digits + 1
@@ -503,12 +555,18 @@ pub fn truncate(s: &str, width: usize) -> String {
 pub fn table_cells(line: &str) -> Vec<String> {
     let t = line.trim();
     let t = t.strip_prefix('|').unwrap_or(t);
-    let t = if t.ends_with('|') && !t.ends_with("\\|") { &t[..t.len() - 1] } else { t };
+    let t = if t.ends_with('|') && !t.ends_with("\\|") {
+        &t[..t.len() - 1]
+    } else {
+        t
+    };
     let mut cells = vec![String::new()];
     let mut chars = t.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\\' if chars.peek() == Some(&'|') => cells.last_mut().unwrap().push(chars.next().unwrap()),
+            '\\' if chars.peek() == Some(&'|') => {
+                cells.last_mut().unwrap().push(chars.next().unwrap())
+            }
             '|' => cells.push(String::new()),
             c => cells.last_mut().unwrap().push(c),
         }
@@ -532,7 +590,11 @@ fn fit_columns(natural: &[usize], sep: usize, width: usize) -> Vec<usize> {
     let mut w = natural.to_vec();
     let budget = width.saturating_sub(sep * w.len().saturating_sub(1));
     while w.iter().sum::<usize>() > budget {
-        let (i, &max) = w.iter().enumerate().max_by_key(|(i, &c)| (c, std::cmp::Reverse(*i))).unwrap();
+        let (i, &max) = w
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, &c)| (c, std::cmp::Reverse(*i)))
+            .unwrap();
         if max <= 3 {
             break;
         }
@@ -546,19 +608,36 @@ fn fit_columns(natural: &[usize], sep: usize, width: usize) -> Vec<usize> {
 pub fn table(lines: &[String], width: usize, color: bool) -> Vec<String> {
     let line_style = fg(FAINT);
     let header_style = fg(BRIGHT).bold();
-    let aligns: Vec<(bool, bool)> = lines.get(1).map(|l| table_cells(l)).unwrap_or_default().iter().map(|c| (c.starts_with(':'), c.ends_with(':'))).collect();
+    let aligns: Vec<(bool, bool)> = lines
+        .get(1)
+        .map(|l| table_cells(l))
+        .unwrap_or_default()
+        .iter()
+        .map(|c| (c.starts_with(':'), c.ends_with(':')))
+        .collect();
     let n = aligns.len().max(1);
     let rows: Vec<Vec<String>> = lines
         .iter()
         .take(1)
         .chain(lines.iter().skip(2))
         .map(|l| {
-            let mut cells: Vec<String> = table_cells(l).into_iter().map(|c| inline(&c, color)).collect();
+            let mut cells: Vec<String> = table_cells(l)
+                .into_iter()
+                .map(|c| inline(&c, color))
+                .collect();
             cells.resize(n, String::new());
             cells
         })
         .collect();
-    let natural: Vec<usize> = (0..n).map(|c| rows.iter().map(|r| visible_width(&r[c])).max().unwrap_or(0).max(1)).collect();
+    let natural: Vec<usize> = (0..n)
+        .map(|c| {
+            rows.iter()
+                .map(|r| visible_width(&r[c]))
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        })
+        .collect();
     let widths = fit_columns(&natural, 3, width);
     let mut out = Vec::new();
     for (r, row) in rows.iter().enumerate() {
@@ -567,7 +646,11 @@ pub fn table(lines: &[String], width: usize, color: bool) -> Vec<String> {
             .zip(&widths)
             .enumerate()
             .map(|(c, (cell, &w))| {
-                let text = if visible_width(cell) > w { truncate(&strip_ansi(cell), w) } else { cell.clone() };
+                let text = if visible_width(cell) > w {
+                    truncate(&strip_ansi(cell), w)
+                } else {
+                    cell.clone()
+                };
                 let pad = w.saturating_sub(visible_width(&text));
                 let (left, right) = match aligns.get(c).copied().unwrap_or_default() {
                     (true, true) => (pad / 2, pad - pad / 2),
@@ -576,11 +659,20 @@ pub fn table(lines: &[String], width: usize, color: bool) -> Vec<String> {
                     _ => (0, pad),
                 };
                 // The header is uniformly bright and bold (inline styles dropped).
-                let text = if r == 0 { paint(color, header_style, &strip_ansi(&text)) } else { text };
+                let text = if r == 0 {
+                    paint(color, header_style, &strip_ansi(&text))
+                } else {
+                    text
+                };
                 format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
             })
             .collect();
-        out.push(cells.join(&paint(color, line_style, " │ ")).trim_end().to_string());
+        out.push(
+            cells
+                .join(&paint(color, line_style, " │ "))
+                .trim_end()
+                .to_string(),
+        );
         if r == 0 {
             let rule: Vec<String> = widths.iter().map(|&w| "─".repeat(w)).collect();
             out.push(paint(color, line_style, &rule.join("─┼─")));
@@ -660,7 +752,10 @@ pub fn numbered_diff(text: &str, color: bool, width: usize, indent: &str) -> Vec
     for l in text.lines() {
         if let Some(h) = l.strip_prefix("@@") {
             let start = |sign: char| {
-                h.split_whitespace().find_map(|p| p.strip_prefix(sign)).and_then(|p| p.split(',').next()?.parse::<usize>().ok()).unwrap_or(1)
+                h.split_whitespace()
+                    .find_map(|p| p.strip_prefix(sign))
+                    .and_then(|p| p.split(',').next()?.parse::<usize>().ok())
+                    .unwrap_or(1)
             };
             if seen {
                 lines.push(None);
@@ -687,14 +782,25 @@ pub fn numbered_diff(text: &str, color: bool, width: usize, indent: &str) -> Vec
         }
     }
     if !seen {
-        return diff(text, color, usize::MAX, width, indent).lines().map(str::to_string).collect();
+        return diff(text, color, usize::MAX, width, indent)
+            .lines()
+            .map(str::to_string)
+            .collect();
     }
-    let gutter = lines.iter().flatten().map(|(n, _, _)| n.to_string().len()).max().unwrap_or(1);
+    let gutter = lines
+        .iter()
+        .flatten()
+        .map(|(n, _, _)| n.to_string().len())
+        .max()
+        .unwrap_or(1);
     let room = width.saturating_sub(visible_width(indent) + gutter + 3);
     lines
         .iter()
         .map(|l| match l {
-            None => format!("{indent}{}", paint(color, fg(FAINT), &format!("{:>gutter$}", "⋯"))),
+            None => format!(
+                "{indent}{}",
+                paint(color, fg(FAINT), &format!("{:>gutter$}", "⋯"))
+            ),
             Some((n, sign, t)) => {
                 // The sign sits in the gutter, bold; the line keeps its color.
                 let style = match sign {
@@ -719,7 +825,10 @@ mod tests {
 
     fn render(md: &str, color: bool) -> String {
         let mut m = Markdown::default();
-        md.lines().map(|l| m.line(l, color)).collect::<Vec<_>>().join("\n")
+        md.lines()
+            .map(|l| m.line(l, color))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -764,17 +873,32 @@ mod tests {
     #[test]
     fn italics_links_and_urls() {
         let out = inline("an *em* and _word_ but snake_case_name and 2 * 3 * 4", true);
-        assert!(out.contains(&Style::new().italic().paint("em").to_string()), "{out:?}");
-        assert!(out.contains(&Style::new().italic().paint("word").to_string()), "{out:?}");
-        assert!(strip_ansi(&out).ends_with("but snake_case_name and 2 * 3 * 4"), "{out:?}");
+        assert!(
+            out.contains(&Style::new().italic().paint("em").to_string()),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(&Style::new().italic().paint("word").to_string()),
+            "{out:?}"
+        );
+        assert!(
+            strip_ansi(&out).ends_with("but snake_case_name and 2 * 3 * 4"),
+            "{out:?}"
+        );
         let out = inline("see [the docs](https://x.dev/a) now", true);
         assert!(out.contains("\x1b]8;;https://x.dev/a\x1b\\"), "{out:?}");
         assert_eq!(strip_ansi(&out), "see the docs now");
         assert_eq!(visible_width(&out), "see the docs now".len());
         let out = inline("visit https://example.com/x_(y). ok", true);
-        assert!(out.contains("\x1b]8;;https://example.com/x_(y)\x1b\\"), "{out:?}");
+        assert!(
+            out.contains("\x1b]8;;https://example.com/x_(y)\x1b\\"),
+            "{out:?}"
+        );
         assert_eq!(strip_ansi(&out), "visit https://example.com/x_(y). ok");
-        assert_eq!(inline("nohttps://x.y and [a](b c)", true), "nohttps://x.y and [a](b c)");
+        assert_eq!(
+            inline("nohttps://x.y and [a](b c)", true),
+            "nohttps://x.y and [a](b c)"
+        );
     }
 
     #[test]
@@ -783,9 +907,15 @@ mod tests {
         let plain: Vec<String> = out.lines().map(strip_ansi).collect();
         assert_eq!(plain, ["│ quoted text", "│ │ deeper"]);
         assert_eq!(strip_ansi(&render("---", true)), "─".repeat(RULE));
-        assert_eq!(strip_ansi(&render("  * * *", true)), format!("  {}", "─".repeat(RULE)));
+        assert_eq!(
+            strip_ansi(&render("  * * *", true)),
+            format!("  {}", "─".repeat(RULE))
+        );
         assert_eq!(strip_ansi(&render("  3. third `x`", true)), "  3. third x");
-        assert_eq!(strip_ansi(&render("2024 was a year", true)), "2024 was a year");
+        assert_eq!(
+            strip_ansi(&render("2024 was a year", true)),
+            "2024 was a year"
+        );
         assert_eq!(strip_ansi(&render("+ plus item", true)), "• plus item");
     }
 
@@ -796,7 +926,10 @@ mod tests {
         let body = m.line("let x = 1;", true);
         assert_eq!(strip_ansi(&body), "let x = 1;");
         assert!(body.matches("\x1b[").count() > 2, "{body:?}");
-        assert!(m.line("```rust", true).contains("rust"), "a fence with an info string does not close");
+        assert!(
+            m.line("```rust", true).contains("rust"),
+            "a fence with an info string does not close"
+        );
         m.line("```", true);
         assert!(m.line("# heading", true).contains("\x1b[1m"));
         assert!(Fence::open("```a`b").is_none());
@@ -811,28 +944,47 @@ mod tests {
         assert_eq!(escape_len("\x1b]8;;u\x07rest"), 7);
         assert_eq!(escape_len("\x1b[38;2;1;2;3mx"), 13);
         assert_eq!(escape_len("\x1b]0;unterminated"), 16);
-        assert_eq!(file_url("/w", "src/a b.rs").as_deref(), Some("file:///w/src/a%20b.rs"));
+        assert_eq!(
+            file_url("/w", "src/a b.rs").as_deref(),
+            Some("file:///w/src/a%20b.rs")
+        );
         assert_eq!(file_url("", "rel.rs"), None);
     }
 
     #[test]
     fn styled_rows_wrap_with_hanging_indents() {
-        let row = format!("  {} {}", dim().paint("•"), Style::new().bold().paint("alpha beta gamma delta"));
+        let row = format!(
+            "  {} {}",
+            dim().paint("•"),
+            Style::new().bold().paint("alpha beta gamma delta")
+        );
         let rows = wrap_row(&row, 14);
-        assert_eq!(rows.iter().map(|r| strip_ansi(r)).collect::<Vec<_>>(), ["  • alpha beta", "    gamma", "    delta"]);
+        assert_eq!(
+            rows.iter().map(|r| strip_ansi(r)).collect::<Vec<_>>(),
+            ["  • alpha beta", "    gamma", "    delta"]
+        );
         assert!(rows.iter().all(|r| visible_width(r) <= 14));
         // Bold carries onto every continuation row and is closed on each.
-        assert!(rows[1].contains("\x1b[1m") && rows[1].ends_with("\x1b[0m"), "{rows:?}");
+        assert!(
+            rows[1].contains("\x1b[1m") && rows[1].ends_with("\x1b[0m"),
+            "{rows:?}"
+        );
         let quote = render("> > one two three four five six", true);
         let rows: Vec<String> = wrap_row(&quote, 16).iter().map(|r| strip_ansi(r)).collect();
         assert_eq!(rows, ["│ │ one two", "│ │ three four", "│ │ five six"]);
         assert_eq!(strip_ansi(&continuation("  12. item")), "      ");
-        assert_eq!(strip_ansi(&continuation(&format!("{} text", fg(BLUE).paint("›")))), "  ");
+        assert_eq!(
+            strip_ansi(&continuation(&format!("{} text", fg(BLUE).paint("›")))),
+            "  "
+        );
         assert_eq!(continuation("plain"), "");
         // Links reopen on the next row and long words hard-wrap.
         let rows = wrap_styled(&link("https://a.b", "aaaa bbbb"), 6, "");
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].ends_with("\x1b]8;;\x1b\\") && rows[1].starts_with("\x1b]8;;https://a.b"), "{rows:?}");
+        assert!(
+            rows[0].ends_with("\x1b]8;;\x1b\\") && rows[1].starts_with("\x1b]8;;https://a.b"),
+            "{rows:?}"
+        );
         assert_eq!(wrap_styled("abcdefgh", 3, "").len(), 3);
         assert_eq!(wrap_row("short", 10), ["short"]);
     }
@@ -840,19 +992,48 @@ mod tests {
     #[test]
     fn numbered_diffs_have_a_gutter() {
         let d = "--- a/x\n+++ b/x\n@@ -8,3 +8,3 @@\n ctx\n-old\n+new\n ctx2\n@@ -120 +120 @@\n-a\n+b\n\\ No newline at end of file";
-        let rows: Vec<String> = numbered_diff(d, true, 40, "  ").iter().map(|r| strip_ansi(r)).collect();
-        assert_eq!(rows, ["    8   ctx", "    9 - old", "    9 + new", "   10   ctx2", "    ⋯", "  120 - a", "  120 + b"]);
+        let rows: Vec<String> = numbered_diff(d, true, 40, "  ")
+            .iter()
+            .map(|r| strip_ansi(r))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "    8   ctx",
+                "    9 - old",
+                "    9 + new",
+                "   10   ctx2",
+                "    ⋯",
+                "  120 - a",
+                "  120 + b"
+            ]
+        );
         let colored = numbered_diff(d, true, 40, "");
-        assert!(colored[1].contains(&fg(RED).paint("old").to_string()), "{colored:?}");
-        assert!(colored[1].contains(&fg(RED).bold().paint("- ").to_string()), "{colored:?}");
-        assert!(numbered_diff(&format!("@@ -1 +1 @@\n+{}", "x".repeat(99)), false, 20, "").iter().all(|r| visible_width(r) <= 20));
+        assert!(
+            colored[1].contains(&fg(RED).paint("old").to_string()),
+            "{colored:?}"
+        );
+        assert!(
+            colored[1].contains(&fg(RED).bold().paint("- ").to_string()),
+            "{colored:?}"
+        );
+        assert!(
+            numbered_diff(&format!("@@ -1 +1 @@\n+{}", "x".repeat(99)), false, 20, "")
+                .iter()
+                .all(|r| visible_width(r) <= 20)
+        );
         assert_eq!(numbered_diff("not a diff", false, 40, ""), ["not a diff"]);
     }
 
     #[test]
     fn bullets_and_unicode() {
         let out = render("  - héllo `wörld`", true);
-        assert!(out.starts_with("  ") && out.contains('•') && out.contains("héllo") && out.contains("wörld"));
+        assert!(
+            out.starts_with("  ")
+                && out.contains('•')
+                && out.contains("héllo")
+                && out.contains("wörld")
+        );
     }
 
     #[test]
@@ -863,7 +1044,10 @@ mod tests {
         assert!(out.contains(&fg(GREEN).paint("+new").to_string()));
         assert!(out.contains(&fg(RED).paint("-old").to_string()));
         assert!(out.contains(&fg(BLUE).paint("@@ -1,2 +1,2 @@").to_string()));
-        assert_eq!(diff(d, false, 60, usize::MAX, ""), "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n");
+        assert_eq!(
+            diff(d, false, 60, usize::MAX, ""),
+            "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n"
+        );
         let long: String = (0..100).map(|i| format!("+{i}\n")).collect();
         let out = diff(&long, false, 60, usize::MAX, "");
         assert_eq!(out.lines().count(), 61);
@@ -923,16 +1107,26 @@ mod tests {
         let t = lines("| Name | Size |\n|------|-----:|\n| main.rs | 12 |\n| a | 1234 |");
         assert_eq!(
             table(&t, 80, false),
-            vec!["Name    │ Size", "────────┼─────", "main.rs │   12", "a       │ 1234"]
+            vec![
+                "Name    │ Size",
+                "────────┼─────",
+                "main.rs │   12",
+                "a       │ 1234"
+            ]
         );
         // Centered columns, missing and extra cells.
         let t = lines("|a|b|c|\n|:-:|---|---|\n|x|\n|1|2|3|4|");
-        assert_eq!(table(&t, 80, false), vec!["a │ b │ c", "──┼───┼──", "x │   │", "1 │ 2 │ 3"]);
+        assert_eq!(
+            table(&t, 80, false),
+            vec!["a │ b │ c", "──┼───┼──", "x │   │", "1 │ 2 │ 3"]
+        );
     }
 
     #[test]
     fn wide_tables_shrink_the_widest_columns() {
-        let t = lines("| id | description |\n|---|---|\n| 1 | a very long description that does not fit |");
+        let t = lines(
+            "| id | description |\n|---|---|\n| 1 | a very long description that does not fit |",
+        );
         let out = table(&t, 24, false);
         assert!(out.iter().all(|l| visible_width(l) <= 24), "{out:?}");
         assert_eq!(out[0], "id │ description");

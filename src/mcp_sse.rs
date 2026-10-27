@@ -26,19 +26,29 @@ fn io_err(msg: impl Into<String>) -> std::io::Error {
 
 impl SseTransport {
     /// Open the event stream and wait (up to `timeout`) for the endpoint.
-    pub async fn connect(url: &str, headers: &BTreeMap<String, String>, timeout: Duration) -> std::io::Result<Self> {
+    pub async fn connect(
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        timeout: Duration,
+    ) -> std::io::Result<Self> {
         let base = reqwest::Url::parse(url).map_err(|e| io_err(format!("invalid url: {e}")))?;
         let mut map = reqwest::header::HeaderMap::new();
         for (k, v) in headers {
-            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).map_err(|_| io_err(format!("invalid header name {k}")))?;
-            let mut value = reqwest::header::HeaderValue::from_str(v).map_err(|_| io_err(format!("invalid value for header {k}")))?;
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|_| io_err(format!("invalid header name {k}")))?;
+            let mut value = reqwest::header::HeaderValue::from_str(v)
+                .map_err(|_| io_err(format!("invalid value for header {k}")))?;
             value.set_sensitive(true);
             map.insert(name, value);
         }
         let client = crate::http::client();
         let response = tokio::time::timeout(
             timeout,
-            client.get(base.clone()).headers(map.clone()).header(reqwest::header::ACCEPT, "text/event-stream").send(),
+            client
+                .get(base.clone())
+                .headers(map.clone())
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .send(),
         )
         .await
         .map_err(|_| io_err("the event stream did not open in time"))?
@@ -52,7 +62,9 @@ impl SseTransport {
             while let Some(event) = events.next().await {
                 let event = event.map_err(|e| io_err(e.to_string()))?;
                 if event.event == "endpoint" {
-                    return base.join(event.data.trim()).map_err(|e| io_err(format!("invalid endpoint: {e}")));
+                    return base
+                        .join(event.data.trim())
+                        .map_err(|e| io_err(format!("invalid endpoint: {e}")));
                 }
             }
             Err(io_err("the event stream ended before naming an endpoint"))
@@ -61,7 +73,9 @@ impl SseTransport {
         .map_err(|_| io_err("the server sent no endpoint event"))??;
         // Messages must go back to the server that sent the stream.
         if endpoint.origin() != base.origin() {
-            return Err(io_err(format!("the endpoint {endpoint} is on another origin")));
+            return Err(io_err(format!(
+                "the endpoint {endpoint} is on another origin"
+            )));
         }
         let (tx, incoming) = mpsc::channel(64);
         let reader = tokio::spawn(async move {
@@ -77,7 +91,13 @@ impl SseTransport {
                 }
             }
         });
-        Ok(Self { client, endpoint, headers: map, incoming, reader })
+        Ok(Self {
+            client,
+            endpoint,
+            headers: map,
+            incoming,
+            reader,
+        })
     }
 }
 
@@ -88,7 +108,11 @@ impl Transport<RoleClient> for SseTransport {
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let request = self.client.post(self.endpoint.clone()).headers(self.headers.clone()).json(&item);
+        let request = self
+            .client
+            .post(self.endpoint.clone())
+            .headers(self.headers.clone())
+            .json(&item);
         async move {
             let response = request.send().await.map_err(|e| io_err(e.to_string()))?;
             match response.status() {
@@ -98,7 +122,9 @@ impl Transport<RoleClient> for SseTransport {
         }
     }
 
-    fn receive(&mut self) -> impl std::future::Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
+    fn receive(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
         self.incoming.recv()
     }
 

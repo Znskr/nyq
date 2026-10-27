@@ -36,7 +36,9 @@ pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME
         && name.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
         && !name.contains("__")
 }
 
@@ -47,7 +49,11 @@ fn words(v: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
         Value::String(s) => s.split_whitespace().map(String::from).collect(),
         Value::Array(a) => a
             .iter()
-            .map(|w| w.as_str().map(String::from).ok_or_else(|| format!("\"{key}\" must hold strings, got {w}")))
+            .map(|w| {
+                w.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| format!("\"{key}\" must hold strings, got {w}"))
+            })
             .collect::<Result<Vec<_>, _>>()?,
         other => return Err(format!("\"{key}\" must be a list of strings, got {other}")),
     };
@@ -63,7 +69,13 @@ impl Manifest {
         let Value::Object(map) = v else {
             return Err("expected a JSON object".into());
         };
-        let text_of = |key: &str| map.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let text_of = |key: &str| {
+            map.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
         let name = text_of("name");
         if !valid_name(&name) {
             return Err(format!(
@@ -89,7 +101,11 @@ impl Manifest {
             None | Some(Value::Null) => DEFAULT_EVENT_TIMEOUT,
             Some(v) => match v.as_u64().filter(|n| *n > 0) {
                 Some(ms) => Duration::from_millis(ms.min(MAX_EVENT_TIMEOUT_MS)),
-                None => return Err(format!("\"event_timeout_ms\" must be a positive integer, got {v}")),
+                None => {
+                    return Err(format!(
+                        "\"event_timeout_ms\" must be a positive integer, got {v}"
+                    ))
+                }
             },
         };
         Ok(Manifest {
@@ -188,7 +204,13 @@ pub fn parse_registration(v: &Value) -> (Registration, Vec<String>) {
             }
         }
     };
-    let str_of = |o: &Map<String, Value>, k: &str| o.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let str_of = |o: &Map<String, Value>, k: &str| {
+        o.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
     for (i, t) in list("tools", &mut warnings).iter().enumerate() {
         let Some(o) = t.as_object() else {
             warnings.push(format!("tools[{i}]: expected an object"));
@@ -207,7 +229,9 @@ pub fn parse_registration(v: &Value) -> (Registration, Vec<String>) {
             None | Some(Value::Null) => serde_json::json!({"type": "object", "properties": {}}),
             Some(s @ Value::Object(_)) => s.clone(),
             Some(other) => {
-                warnings.push(format!("tools[{i}]: \"input_schema\" must be an object, got {other}"));
+                warnings.push(format!(
+                    "tools[{i}]: \"input_schema\" must be an object, got {other}"
+                ));
                 continue;
             }
         };
@@ -233,7 +257,11 @@ pub fn parse_registration(v: &Value) -> (Registration, Vec<String>) {
             warnings.push(format!("commands[{i}]: duplicate command `/{name}`"));
             continue;
         }
-        reg.commands.push(CommandDef { name, description: str_of(o, "description"), args_hint: str_of(o, "args_hint") });
+        reg.commands.push(CommandDef {
+            name,
+            description: str_of(o, "description"),
+            args_hint: str_of(o, "args_hint"),
+        });
     }
     for e in list("events", &mut warnings) {
         match e.as_str().and_then(Event::parse) {
@@ -242,7 +270,12 @@ pub fn parse_registration(v: &Value) -> (Registration, Vec<String>) {
             None => warnings.push(format!("unknown event {e}")),
         }
     }
-    reg.status = v.get("status").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    reg.status = v
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     (reg, warnings)
 }
 
@@ -264,7 +297,10 @@ pub fn tool_output(v: &Value) -> ToolOutput {
                             .and_then(Value::as_str)
                             .unwrap_or("image/png");
                         if !data.is_empty() {
-                            out.images.push(crate::types::Image { media_type: media.to_string(), data: data.to_string() });
+                            out.images.push(crate::types::Image {
+                                media_type: media.to_string(),
+                                data: data.to_string(),
+                            });
                         }
                     }
                     _ => texts.extend(b.get("text").and_then(Value::as_str).map(String::from)),
@@ -295,10 +331,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.command, ["python3", "ext.py"]);
-        assert_eq!(m.install.as_deref(), Some(&["npm".to_string(), "install".into()][..]));
+        assert_eq!(
+            m.install.as_deref(),
+            Some(&["npm".to_string(), "install".into()][..])
+        );
         assert_eq!(m.env["A"], "1");
         assert_eq!(m.event_timeout, Duration::from_millis(250));
-        assert_eq!(Manifest::parse(r#"{"name":"x","command":"./bin"}"#).unwrap().event_timeout, DEFAULT_EVENT_TIMEOUT);
+        assert_eq!(
+            Manifest::parse(r#"{"name":"x","command":"./bin"}"#)
+                .unwrap()
+                .event_timeout,
+            DEFAULT_EVENT_TIMEOUT
+        );
         for bad in [
             r#"{"name":"../x","command":["a"]}"#,
             r#"{"name":"a__b","command":["a"]}"#,
@@ -337,8 +381,10 @@ mod tests {
 
     #[test]
     fn tool_results_become_outputs() {
-        let out = tool_output(&json!({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"},
-            {"type": "image", "data": "AAAA", "mime_type": "image/jpeg"}], "is_error": true}));
+        let out = tool_output(
+            &json!({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"},
+            {"type": "image", "data": "AAAA", "mime_type": "image/jpeg"}], "is_error": true}),
+        );
         assert_eq!(out.content, "a\nb");
         assert!(out.is_error);
         assert_eq!(out.images[0].media_type, "image/jpeg");

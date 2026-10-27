@@ -4,6 +4,7 @@ mod agent;
 mod auto_upgrade;
 mod catalog;
 mod classifier;
+mod cli;
 mod command_effect;
 mod commands;
 mod config;
@@ -20,8 +21,8 @@ mod mcp;
 mod mcp_cli;
 mod mcp_client;
 mod mcp_features;
-mod mcp_slash;
 mod mcp_schema;
+mod mcp_slash;
 mod mcp_sse;
 mod models;
 mod notify;
@@ -29,9 +30,9 @@ mod permissions;
 mod pricing;
 mod prompt;
 mod provider;
+mod record_tape;
 mod sandbox;
 mod session;
-mod record_tape;
 mod settings;
 mod skill_install;
 mod skill_invoke;
@@ -40,8 +41,8 @@ mod slash;
 mod subagents;
 mod templates;
 mod tool_list;
-mod trace;
 mod tools;
+mod trace;
 mod types;
 mod ui;
 mod undo;
@@ -52,299 +53,17 @@ mod workspace;
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result};
+use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
 use agent::{Agent, TurnEnd};
+use cli::{AskOpts, Cli, Command, Ctx, SessionCommand};
 use mcp::{McpManager, ServerConfig};
 use session::Session;
 use tools::Registry;
 use types::Usage;
 use ui::tui::{Command as UiCommand, Footer, Tui};
-
-#[derive(Parser)]
-#[command(
-    name = "nyq",
-    version,
-    disable_version_flag = true,
-    about = "A small, friendly coding agent for your terminal"
-)]
-struct Cli {
-    /// Start the conversation with this message.
-    prompt: Vec<String>,
-    /// Print version.
-    #[arg(short = 'v', short_alias = 'V', long, action = clap::ArgAction::Version)]
-    version: Option<bool>,
-    /// Answer the prompt non-interactively and exit (reads stdin if no prompt).
-    #[arg(short, long)]
-    print: bool,
-    #[command(flatten)]
-    ask: AskOpts,
-    /// Record interactive terminal output under <home>/tapes/<session>.cast.
-    #[arg(long)]
-    record: bool,
-    /// Model id (overrides config).
-    #[arg(short, long, global = true)]
-    model: Option<String>,
-    /// Provider: codex, grok, anthropic, openai, ollama, opencode-go, opencode or xai.
-    #[arg(long, global = true)]
-    provider: Option<String>,
-    /// Run tools without asking for approval.
-    #[arg(long, global = true)]
-    yolo: bool,
-    /// Permission mode: ask (default), auto, or yolo. Overrides --yolo and settings.
-    #[arg(long, global = true, value_name = "MODE")]
-    permission_mode: Option<String>,
-    /// Confine shell commands the model runs [default: workspace-write where supported].
-    #[arg(long, value_enum, global = true)]
-    sandbox: Option<sandbox::Mode>,
-    /// Allow network access from sandboxed shell commands.
-    #[arg(long, global = true)]
-    allow_network: bool,
-    /// Add a workspace directory for this run. Repeatable.
-    #[arg(long = "add-dir", value_name = "PATH", global = true)]
-    add_dir: Vec<std::path::PathBuf>,
-    /// Ignore additional directories saved for this workspace.
-    #[arg(long = "no-additional-dirs", global = true)]
-    no_additional_dirs: bool,
-    /// Continue the most recent conversation in this directory.
-    #[arg(short = 'c', long = "continue", global = true)]
-    continue_last: bool,
-    /// Resume a saved conversation by id (or id prefix); without an id, pick one.
-    #[arg(short, long, value_name = "ID", num_args = 0..=1, default_missing_value = "", global = true)]
-    resume: Option<String>,
-    /// Override a prompt budget for this run: NAME=BYTES or NAME=off. Repeatable.
-    #[arg(long = "context-limit", value_name = "NAME=BYTES", global = true)]
-    context_limit: Vec<String>,
-    /// Show developer-only commands (`/tools`) for this run. Also NYQ_DEBUG=1.
-    #[arg(long, global = true)]
-    debug: bool,
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-/// Options for one non-interactive answer (`nyq ask`, `nyq -p`).
-#[derive(clap::Args, Clone, Default)]
-struct AskOpts {
-    /// Print one JSON object with the answer, tool calls and exit code (implies -p).
-    #[arg(long)]
-    json: bool,
-    /// Don't print the assistant's text; with --json only the JSON is printed (implies -p).
-    #[arg(long)]
-    quiet: bool,
-    /// Replace the built-in base system prompt for this run.
-    #[arg(long, value_name = "TEXT")]
-    system: Option<String>,
-    /// Don't create or save a session (implies -p; not with --resume or --continue).
-    #[arg(long)]
-    no_save: bool,
-    /// Ask y/N on the terminal for permission requests instead of denying them.
-    #[arg(long)]
-    prompt_permissions: bool,
-    /// Attach an image to the prompt. Repeatable.
-    #[arg(long, value_name = "PATH")]
-    image: Vec<std::path::PathBuf>,
-    /// Continue the interrupted or cut-off response of the resumed session (with -r ID or -c).
-    #[arg(long)]
-    continue_recovery: bool,
-}
-
-impl AskOpts {
-    /// Options that only make sense without the interactive terminal.
-    fn print_only(&self) -> bool {
-        self.json || self.quiet || self.no_save || self.continue_recovery
-    }
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Play an asciicast v2 terminal tape.
-    Replay { tape: std::path::PathBuf, #[arg(long, default_value_t = 1.0)] speed: f64 },
-    /// List saved conversations from this directory (newest first).
-    Sessions {
-        /// Include every directory.
-        #[arg(long)]
-        all: bool,
-        /// Show at most this many (1-100).
-        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=100))]
-        limit: Option<u16>,
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Resume a saved conversation (same as -r): an id, a unique prefix, or `last`.
-    Resume { which: Option<String> },
-    /// Answer one prompt and exit (same as -p). Reads stdin when no prompt is given.
-    Ask {
-        /// The request. When omitted, nyq reads stdin.
-        prompt: Vec<String>,
-        #[command(flatten)]
-        opts: AskOpts,
-    },
-    /// Inspect, resume, or delete a saved conversation (`nyq session ID` shows one).
-    Session {
-        #[command(subcommand)]
-        action: Option<SessionCommand>,
-    },
-    /// List, add, or remove additional workspace directories.
-    Workspace {
-        #[command(subcommand)]
-        action: Option<WorkspaceCommand>,
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Summarize recorded usage (default: 30 days).
-    Usage {
-        #[arg(long, value_enum, default_value = "30d")]
-        period: usage::Period,
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show configuration and runtime status without contacting providers.
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Print the permission mode and persistent rules.
-    Permissions {
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Check authentication, endpoint, sandbox and local environment health.
-    Doctor {
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the same provider model catalog as the interactive picker.
-    Models {
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Sign in: ChatGPT subscription (default, Codex models), a Grok
-    /// subscription, or store an API key for anthropic, opencode-go, opencode or xai.
-    Login {
-        /// codex (default), grok, anthropic, opencode-go, opencode or xai.
-        provider: Option<String>,
-    },
-    /// Remove nyq's stored login for a provider, or every stored login.
-    Logout {
-        /// codex, grok, anthropic, opencode-go, opencode or xai [default: all of them].
-        provider: Option<String>,
-    },
-    /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
-    Acp {
-        /// Append request and error logs to this file (stdout carries the protocol).
-        #[arg(long, value_name = "PATH")]
-        log_file: Option<std::path::PathBuf>,
-    },
-    /// Draft a pull request for the current branch with the model; publish it with gh.
-    Pr {
-        /// Publish without asking (the branch is still pushed only after confirmation).
-        #[arg(long, alias = "create")]
-        publish: bool,
-        /// Open the pull request as a draft.
-        #[arg(long)]
-        draft: bool,
-        /// Base branch [default: the repository's default branch].
-        #[arg(long, value_name = "BRANCH")]
-        base: Option<String>,
-        /// Extra context for the draft.
-        context: Vec<String>,
-    },
-    /// Draft a GitHub issue from the context and repository state; publish it with gh.
-    Issue {
-        /// Publish without asking.
-        #[arg(long, alias = "create")]
-        publish: bool,
-        /// What the issue is about.
-        context: Vec<String>,
-    },
-    /// Upgrade nyq to the newest release (verifies SHA256SUMS).
-    Upgrade {
-        /// Release channel; remembered for later upgrades [default: stable].
-        #[arg(long, value_enum)]
-        channel: Option<upgrade::Channel>,
-        /// Only report whether an update is available.
-        #[arg(long)]
-        check: bool,
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Choose the default provider (codex, grok, anthropic, opencode-go, opencode, xai, openai, ollama).
-    Provider { name: Option<String> },
-    /// Show sign-in status per provider and the default; on a terminal, set them up.
-    Setup,
-    /// Manage MCP servers and project trust without opening the interactive shell.
-    Mcp {
-        #[command(subcommand)]
-        action: mcp_cli::McpCommand,
-    },
-    /// List, install or remove extensions (alias: ext).
-    #[command(alias = "ext")]
-    Extensions {
-        #[command(subcommand)]
-        action: extensions::cli::ExtCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum SessionCommand {
-    /// Copy readable items to a new session, skipping broken lines.
-    Recover {
-        which: String,
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Add the current format version to an older session.
-    Migrate {
-        which: String,
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Print a transcript summary.
-    Show {
-        /// Session id, a unique prefix, or `last`.
-        #[arg(default_value = "last")]
-        which: String,
-        /// Print the metadata and stored items as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Resume a saved conversation (same as -r).
-    Resume {
-        /// Session id, a unique prefix, or `last`. Omit to pick one.
-        which: Option<String>,
-    },
-    /// Delete a saved conversation.
-    Delete {
-        /// Session id, a unique prefix, or `last`.
-        which: String,
-    },
-    /// `nyq session ID`: show that conversation.
-    #[command(external_subcommand)]
-    Other(Vec<String>),
-}
-
-#[derive(Subcommand)]
-enum WorkspaceCommand {
-    /// List the primary directory and additional directories.
-    List,
-    /// Persist an existing directory for this workspace.
-    Add { path: std::path::PathBuf },
-    /// Remove a saved or launch-only additional directory.
-    Remove { path: std::path::PathBuf },
-    /// Remove every saved additional directory for this workspace.
-    Clear,
-}
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
@@ -435,7 +154,10 @@ fn main() {
         }
         if JSON_ERRORS.load(std::sync::atomic::Ordering::Relaxed) {
             // `ask --json` failed before it ran: still one JSON object.
-            println!("{}", ask_json(None, 1, None, None, 0, Some(format!("{e:#}"))));
+            println!(
+                "{}",
+                ask_json(None, 1, None, None, 0, Some(format!("{e:#}")))
+            );
         } else {
             ui::error(&format!("{e:#}"));
         }
@@ -491,20 +213,10 @@ fn env_permission_mode() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Saved Yolo is only for interactive terminal sessions.
-fn noninteractive_mode(mode: permissions::Mode, explicit: bool) -> permissions::Mode {
-    if mode.is_yolo() && !explicit {
-        eprintln!("note: the saved yolo permission mode does not apply here; pass --yolo to allow changes");
-        permissions::Mode::Ask
-    } else {
-        mode
-    }
-}
-
 async fn run() -> Result<()> {
     // Kept for relaunching after an auto-upgrade (Ctrl+G).
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let ask = match &cli.command {
         Some(Command::Ask { opts, .. }) => opts.clone(),
         _ => cli.ask.clone(),
@@ -535,153 +247,6 @@ async fn run() -> Result<()> {
     }
 
     let explicit_mode = cli.permission_mode.is_some() || cli.yolo || env_mode.is_some();
-    match &cli.command {
-        Some(Command::Replay { tape, speed }) => return record_tape::replay(tape, *speed).await,
-        Some(Command::Session { action: Some(SessionCommand::Recover { which, json }) }) => {
-            let (id, kept, skipped) = session::recover(&sessions_dir, which, &cwd)?;
-            if *json {
-                println!("{}", serde_json::json!({"id": id, "kept": kept, "skipped": skipped}));
-            } else {
-                println!("Recovered {id}: {kept} items, {skipped} broken lines skipped");
-            }
-            return Ok(());
-        }
-        Some(Command::Session { action: Some(SessionCommand::Migrate { which, json }) }) => {
-            let changed = session::migrate(&sessions_dir, which, &cwd)?;
-            if *json {
-                println!("{}", serde_json::json!({"migrated": changed}));
-            } else {
-                println!("{}", if changed { "Session migrated" } else { "Session already current" });
-            }
-            return Ok(());
-        }
-        Some(Command::Usage { period, json }) => return usage::show(&home, *period, *json),
-        Some(Command::Models { json }) => return doctor::models(&home, *json).await,
-        Some(Command::Status { json }) => {
-            let provider =
-                config::provider(&home, cli.provider.as_deref(), cli.model.as_deref()).ok();
-            let policy = sandbox::Policy {
-                mode: cli.sandbox.unwrap_or_default(),
-                network: cli.allow_network,
-                writable: extra_dirs(&home, &cwd, &cli),
-            };
-            return doctor::cli_status(&home, &cwd, provider.as_deref(), &policy, *json);
-        }
-        Some(Command::Doctor { json }) => {
-            let provider =
-                config::provider(&home, cli.provider.as_deref(), cli.model.as_deref()).ok();
-            let policy = sandbox::Policy {
-                mode: cli.sandbox.unwrap_or_default(),
-                network: cli.allow_network,
-                writable: extra_dirs(&home, &cwd, &cli),
-            };
-            let facts = doctor::Facts { permission_mode, sessions_dir: &sessions_dir };
-            return doctor::doctor(&home, &cwd, provider.as_deref(), &policy, &facts, *json).await;
-        }
-        Some(Command::Session { action: None }) => {
-            return session::print_summary(&sessions_dir, "last", &cwd, false);
-        }
-        Some(Command::Session { action: Some(SessionCommand::Show { which, json }) }) => {
-            return session::print_summary(&sessions_dir, which, &cwd, *json);
-        }
-        Some(Command::Session { action: Some(SessionCommand::Other(args)) }) => {
-            let (which, json) = match args.as_slice() {
-                [which] => (which, false),
-                [which, flag] if flag == "--json" => (which, true),
-                _ => bail!("usage: nyq session <ID|last> [--json] (see nyq session --help)"),
-            };
-            return session::print_summary(&sessions_dir, which, &cwd, json);
-        }
-        Some(Command::Session { action: Some(SessionCommand::Delete { which }) }) => {
-            let meta = session::delete(&sessions_dir, which, &cwd)?;
-            println!("Deleted {} ({})", meta.id, meta.title);
-            return Ok(());
-        }
-        Some(Command::Workspace { action, json }) => {
-            let request = match action {
-                None | Some(WorkspaceCommand::List) => workspace::CliRequest::List,
-                Some(WorkspaceCommand::Add { path }) => workspace::CliRequest::Add(path),
-                Some(WorkspaceCommand::Remove { path }) => workspace::CliRequest::Remove(path),
-                Some(WorkspaceCommand::Clear) => workspace::CliRequest::Clear,
-            };
-            return workspace::run_cli(&home, &cwd, request, *json);
-        }
-        Some(Command::Provider { name }) => return account::cli_provider(&home, name.as_deref()),
-        Some(Command::Setup) => return account::cli_setup(&home).await,
-        Some(Command::Permissions { json }) => {
-            return account::cli_permissions(&home, &cwd, permission_mode, *json)
-        }
-        Some(Command::Sessions { all, limit, json }) => {
-            return list_sessions(&sessions_dir, (!*all).then_some(cwd.as_path()), *limit, *json)
-        }
-        _ => {}
-    }
-    match cli.command {
-        Some(Command::Login { provider }) => {
-            let msg = match provider.as_deref().filter(|p| !p.eq_ignore_ascii_case("codex")) {
-                Some(name) if name.eq_ignore_ascii_case("grok") => {
-                    login::login_grok(&home, provider::grok::stdin_code()).await?
-                }
-                Some(name) => {
-                    let service = provider::hosted::Service::parse(name).with_context(|| {
-                        format!("unknown provider `{name}` (expected codex, grok, anthropic, opencode-go, opencode or xai)")
-                    })?;
-                    login::login_key(&home, service).await?
-                }
-                None => {
-                    login::login(&home, |url| {
-                        eprintln!("{}", login::sign_in_prompt(url));
-                        login::open_browser(url);
-                    })
-                    .await?
-                }
-            };
-            println!("{msg}");
-            return Ok(());
-        }
-        Some(Command::Logout { provider }) => {
-            let msg = match provider {
-                Some(p) => login::logout(&home, &p).await?,
-                None => login::logout_all(&home).await?,
-            };
-            println!("{msg}");
-            return Ok(());
-        }
-        Some(Command::Mcp { action }) => return mcp_cli::run(&home, &cwd, action).await,
-        Some(Command::Extensions { action }) => return extensions::cli::run(&home, &cwd, action).await,
-        Some(Command::Acp { log_file }) => {
-            let permission_mode = noninteractive_mode(permission_mode, explicit_mode);
-            let opts = acp::Options {
-                yolo: permission_mode.is_yolo(),
-                permission_mode,
-                sandbox: cli.sandbox,
-                allow_network: cli.allow_network,
-                model: cli.model,
-                provider: cli.provider,
-                add_dirs: cli.add_dir,
-                no_additional_dirs: cli.no_additional_dirs,
-                log_file,
-            };
-            let result = acp::run(opts).await;
-            tools::background::kill_all();
-            return result;
-        }
-        Some(Command::Upgrade { channel, check, json }) => {
-            return upgrade::run(&home, channel, check, json).await
-        }
-        Some(Command::Pr { publish, draft, base, context }) => {
-            let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
-            let opts = github::Options { context: context.join(" "), publish, draft, base };
-            return github::run(&cwd, &home, provider.as_ref(), github::Workflow::PullRequest, opts).await;
-        }
-        Some(Command::Issue { publish, context }) => {
-            let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
-            let opts = github::Options { context: context.join(" "), publish, ..Default::default() };
-            return github::run(&cwd, &home, provider.as_ref(), github::Workflow::Issue, opts).await;
-        }
-        _ => {}
-    }
-
     let print = cli.print || matches!(cli.command, Some(Command::Ask { .. })) || ask.print_only();
     let prompt = match &cli.command {
         Some(Command::Ask { prompt, .. }) => prompt.clone(),
@@ -709,6 +274,21 @@ async fn run() -> Result<()> {
         prompt::set_base(system.clone());
     }
 
+    // Subcommands that run and exit are handled in `cli`; the rest continue
+    // into the interactive or print path below.
+    let command = cli.command.take();
+    let ctx = Ctx {
+        cli: &cli,
+        home: &home,
+        sessions_dir: &sessions_dir,
+        cwd: &cwd,
+        permission_mode,
+        explicit_mode,
+    };
+    if ctx.dispatch(command).await? {
+        return Ok(());
+    }
+
     let provider = config::provider(&home, cli.provider.as_deref(), cli.model.as_deref())?;
     let prepared = workspace::Runtime::prepare(&home, &cwd, &cli.add_dir, cli.no_additional_dirs)?;
     for warning in &prepared.warnings {
@@ -725,7 +305,11 @@ async fn run() -> Result<()> {
     let terminal = !print
         && std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let ext_mode = if terminal { extensions::Mode::Tui } else { extensions::Mode::Print };
+    let ext_mode = if terminal {
+        extensions::Mode::Tui
+    } else {
+        extensions::Mode::Print
+    };
     if terminal {
         let (keys, key_warnings) = ui::keys::load(&home);
         ui::keys::install(keys);
@@ -766,7 +350,8 @@ async fn run() -> Result<()> {
         sandbox,
         undo: Default::default(),
     };
-    agent.context_window = config::context_window_for(agent.provider.name(), agent.provider.context_window());
+    agent.context_window =
+        config::context_window_for(agent.provider.name(), agent.provider.context_window());
     let mut skills = skills::discover(&home, &cwd);
     commands::sync_prompt(&mut agent, &skills);
     skills::register(&mut agent.tools, skills.clone(), &home, &cwd);
@@ -798,9 +383,12 @@ async fn run() -> Result<()> {
     // A yolo saved from the settings menu never carries over to print mode or
     // piped input: scripts get mutations only when they ask on the command line.
     if !interactive {
-        agent.permission_mode = noninteractive_mode(agent.permission_mode, explicit_mode);
+        agent.permission_mode = cli::noninteractive_mode(agent.permission_mode, explicit_mode);
     }
-    anyhow::ensure!(!cli.record || interactive, "--record requires an interactive terminal");
+    anyhow::ensure!(
+        !cli.record || interactive,
+        "--record requires an interactive terminal"
+    );
     // NYQ_RECORD names the tape file, with or without --record.
     let tape = record_tape::env_path();
     let _capture = if interactive && (cli.record || tape.is_some()) {
@@ -811,7 +399,10 @@ async fn run() -> Result<()> {
     };
     commands::apply_startup(&home, &mut agent);
     // A resumed session keeps its model unless one is given on the command line.
-    if let Some(meta) = resumed.as_ref().filter(|_| cli.model.is_none() && cli.provider.is_none()) {
+    if let Some(meta) = resumed
+        .as_ref()
+        .filter(|_| cli.model.is_none() && cli.provider.is_none())
+    {
         commands::restore_prefs(&home, &mut agent, meta.prefs.as_ref());
     }
     if !interactive {
@@ -819,7 +410,16 @@ async fn run() -> Result<()> {
             !pick,
             "-r without an id needs a terminal to pick a session; pass -r ID or -c"
         );
-        return print_mode(&mut agent, &mut mcp, &servers, &ext, &ask, &mut text, resumed.as_ref()).await;
+        return print_mode(
+            &mut agent,
+            &mut mcp,
+            &servers,
+            &ext,
+            &ask,
+            &mut text,
+            resumed.as_ref(),
+        )
+        .await;
     }
     let footer = Footer {
         cwd: cwd.display().to_string(),
@@ -853,10 +453,14 @@ async fn run() -> Result<()> {
         .collect();
     // Developer-only commands still run (and say how to get them), but only
     // `--debug` lists them in the `/` menu, `/help` and completion.
-    let commands: Vec<(String, String)> =
-        commands.into_iter().filter(|(c, _)| config::debug() || !DEBUG_COMMANDS.contains(&c.as_str())).collect();
+    let commands: Vec<(String, String)> = commands
+        .into_iter()
+        .filter(|(c, _)| config::debug() || !DEBUG_COMMANDS.contains(&c.as_str()))
+        .collect();
     let mut tui = Tui::start(footer, home.clone(), commands)?;
-    tui.screen().editor.set_skills(skill_invoke::entries(&skills));
+    tui.screen()
+        .editor
+        .set_skills(skill_invoke::entries(&skills));
     sync_footer(&tui, &agent, None);
     ui::banner(env!("CARGO_PKG_VERSION"));
     let exe = upgrade::current_exe().ok();
@@ -872,7 +476,11 @@ async fn run() -> Result<()> {
     let screen = tui.screen.clone();
     mcp.on_change(move |mcp| {
         let commands = mcp_features::prompt_commands(mcp);
-        screen.lock().unwrap_or_else(|e| e.into_inner()).editor.set_mcp_commands(commands);
+        screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .editor
+            .set_mcp_commands(commands);
     });
     // Extensions start in the background; their commands and status
     // segments appear as they come up.
@@ -885,7 +493,8 @@ async fn run() -> Result<()> {
         s.redraw();
     });
     ext.start();
-    if let Err(e) = mcp_slash::connect_profile_servers(&mut mcp, &mut agent, &servers, false).await {
+    if let Err(e) = mcp_slash::connect_profile_servers(&mut mcp, &mut agent, &servers, false).await
+    {
         drop(tui);
         mcp.shutdown().await;
         ext.shutdown().await;
@@ -963,17 +572,19 @@ async fn run() -> Result<()> {
                 commands::set_permission_mode(&home, &mut agent, &mode);
                 continue;
             }
-            Some(UiCommand::ApplyUpgrade) => match prepare_relaunch(&tui, &mut agent, &raw_args, &cwd) {
-                Ok(r) => {
-                    relaunch = Some(r);
-                    break;
+            Some(UiCommand::ApplyUpgrade) => {
+                match prepare_relaunch(&tui, &mut agent, &raw_args, &cwd) {
+                    Ok(r) => {
+                        relaunch = Some(r);
+                        break;
+                    }
+                    Err(notice) => {
+                        tui.screen().set_hint(None);
+                        ui::error(&notice);
+                        continue;
+                    }
                 }
-                Err(notice) => {
-                    tui.screen().set_hint(None);
-                    ui::error(&notice);
-                    continue;
-                }
-            },
+            }
             Some(UiCommand::Exit) | None => break,
         };
         let line = line.trim().to_string();
@@ -1072,7 +683,9 @@ async fn run() -> Result<()> {
                     .set_mcp_commands(mcp_features::prompt_commands(&mcp));
             }
             if line.starts_with("/skills") {
-                tui.screen().editor.set_skills(skill_invoke::entries(&skills));
+                tui.screen()
+                    .editor
+                    .set_skills(skill_invoke::entries(&skills));
             }
             match result {
                 Ok(true) => continue,
@@ -1153,7 +766,12 @@ async fn run() -> Result<()> {
     }
     drop(tui);
     if relaunch.is_none() {
-        if let Some(id) = agent.session.as_ref().filter(|s| s.is_saved()).map(|s| s.id.clone()) {
+        if let Some(id) = agent
+            .session
+            .as_ref()
+            .filter(|s| s.is_saved())
+            .map(|s| s.id.clone())
+        {
             eprintln!("Resume with: nyq -r {id}");
         }
     }
@@ -1165,7 +783,11 @@ async fn run() -> Result<()> {
     ext.shutdown().await;
     if let Some(r) = relaunch {
         // Close the session (and its lock) and the tape before handing over.
-        let resume = agent.session.take().filter(|s| s.is_saved()).map(|s| s.id.clone());
+        let resume = agent
+            .session
+            .take()
+            .filter(|s| s.is_saved())
+            .map(|s| s.id.clone());
         drop(_capture);
         let e = auto_upgrade::relaunch(&r);
         ui::error(&format!(
@@ -1222,14 +844,6 @@ fn load_permissions(home: &Path, cwd: &Path) -> permissions::Permissions {
     perms
 }
 
-/// Additional workspace directories for `nyq status` / `nyq doctor`, which
-/// report the configuration without failing on a bad directory.
-fn extra_dirs(home: &Path, cwd: &Path, cli: &Cli) -> Vec<std::path::PathBuf> {
-    workspace::Runtime::prepare(home, cwd, &cli.add_dir, cli.no_additional_dirs)
-        .map(|p| p.active)
-        .unwrap_or_default()
-}
-
 fn sandbox_label(policy: &sandbox::Policy) -> String {
     match policy.mode {
         sandbox::Mode::Off => "no sandbox".into(),
@@ -1254,7 +868,8 @@ async fn model_command(
 ) -> Result<()> {
     let wanted = models::parse_args(args);
     let cancel = CancellationToken::new();
-    tui.screen().set_busy(Some("Listing models"), Some(cancel.clone()));
+    tui.screen()
+        .set_busy(Some("Listing models"), Some(cancel.clone()));
     let listed = tokio::select! {
         r = models::list(home) => Some(r),
         _ = cancel.cancelled() => None,
@@ -1278,15 +893,25 @@ async fn model_command(
             models::check_options(&choice, wanted.effort.as_deref(), None)?;
             agent.provider.set_model(choice.model.clone());
             agent.suppress_auto_compact = false;
-            ui::info(&format!("  Model set to {} (not in the model list).", choice.model));
+            ui::info(&format!(
+                "  Model set to {} (not in the model list).",
+                choice.model
+            ));
             apply_model_options(home, agent, None, &wanted);
             return Ok(());
         }
         [] => anyhow::bail!("no model matches `{}`", wanted.query),
         _ if !ui::menus_available() => {
-            let names: Vec<String> = choices.iter().map(|c| format!("  {} · {}", c.provider, c.model)).collect();
+            let names: Vec<String> = choices
+                .iter()
+                .map(|c| format!("  {} · {}", c.provider, c.model))
+                .collect();
             ui::list(&names);
-            anyhow::bail!("`{}` matches {} models; name one exactly", wanted.query, choices.len())
+            anyhow::bail!(
+                "`{}` matches {} models; name one exactly",
+                wanted.query,
+                choices.len()
+            )
         }
         _ => {
             tui.screen().show_models(choices, warnings, &wanted.query);
@@ -1303,13 +928,24 @@ async fn model_command(
     Ok(())
 }
 
-fn apply_model_options(home: &std::path::Path, agent: &mut Agent, current: Option<&models::ModelChoice>, wanted: &models::ModelArgs) {
+fn apply_model_options(
+    home: &std::path::Path,
+    agent: &mut Agent,
+    current: Option<&models::ModelChoice>,
+    wanted: &models::ModelArgs,
+) {
     if let Some(effort) = &wanted.effort {
         commands::apply_setting(home, agent, current, settings::Id::Effort, effort);
         ui::info(&format!("  Reasoning effort: {effort}."));
     }
     if let Some(fast) = wanted.fast {
-        commands::apply_setting(home, agent, current, settings::Id::Fast, if fast { "on" } else { "off" });
+        commands::apply_setting(
+            home,
+            agent,
+            current,
+            settings::Id::Fast,
+            if fast { "on" } else { "off" },
+        );
     }
 }
 
@@ -1446,7 +1082,15 @@ async fn print_mode(
         mcp_features::sync(agent, mcp);
         // A single answer: wait for the extensions' tools and handlers first.
         ext.wait_ready(extensions::STARTUP_TIMEOUT).await;
-        hooks::session_start(agent, if resumed.is_some() { "resume" } else { "startup" }).await;
+        hooks::session_start(
+            agent,
+            if resumed.is_some() {
+                "resume"
+            } else {
+                "startup"
+            },
+        )
+        .await;
         if ask.continue_recovery {
             agent.continue_turn(&mut plain, cancel.clone()).await
         } else if let Some(msg) = hooks::prompt_submit(agent, text, &cancel).await {
@@ -1456,7 +1100,10 @@ async fn print_mode(
             if let Some(warning) = warning {
                 ui::error(&warning);
             }
-            if let types::Item::User { images: attached, .. } = &mut item {
+            if let types::Item::User {
+                images: attached, ..
+            } = &mut item
+            {
                 attached.extend(images);
             }
             agent.turn(item, &mut plain, cancel.clone()).await
@@ -1488,7 +1135,11 @@ async fn print_mode(
             result.as_ref().err().map(|e| format!("{e:#}")),
         );
         println!("{value}");
-        return if code == 0 { Ok(()) } else { Err(Exit(code).into()) };
+        return if code == 0 {
+            Ok(())
+        } else {
+            Err(Exit(code).into())
+        };
     }
     match result {
         Ok(TurnEnd::Done) => Ok(()),
@@ -1518,7 +1169,10 @@ async fn read_print_input(
 /// A token that fires on Ctrl-C or SIGTERM, and the exit status the signal
 /// calls for (130 or 143; 0 until one arrives). Cancel the token yourself to
 /// stop listening.
-fn cancel_on_signal() -> (CancellationToken, std::sync::Arc<std::sync::atomic::AtomicI32>) {
+fn cancel_on_signal() -> (
+    CancellationToken,
+    std::sync::Arc<std::sync::atomic::AtomicI32>,
+) {
     use std::sync::atomic::{AtomicI32, Ordering};
     let token = CancellationToken::new();
     let code = std::sync::Arc::new(AtomicI32::new(0));
@@ -1572,7 +1226,7 @@ fn session_lines(dir: &std::path::Path) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-fn format_sessions(all: &[session::Meta]) -> Vec<String> {
+pub(crate) fn format_sessions(all: &[session::Meta]) -> Vec<String> {
     if all.is_empty() {
         return vec!["No saved conversations.".into()];
     }
@@ -1639,32 +1293,6 @@ fn open_sessions(tui: &Tui, sessions_dir: &std::path::Path, agent: &Agent) -> Re
     Ok(())
 }
 
-/// `nyq sessions`: this directory's conversations (or every one when `cwd`
-/// is None), newest first.
-fn list_sessions(dir: &Path, cwd: Option<&Path>, limit: Option<u16>, json: bool) -> Result<()> {
-    let (mut all, skipped) = session::list_report(dir)?;
-    if let Some(warning) = session::skipped_warning(skipped.len()) {
-        eprintln!("{warning}");
-    }
-    if let Some(cwd) = cwd {
-        all.retain(|m| session::same_cwd(&m.cwd, cwd));
-    }
-    if let Some(n) = limit {
-        all.truncate(n.into());
-    }
-    if json {
-        let list: Vec<_> = all.iter().map(session::Meta::to_json).collect();
-        println!("{}", serde_json::to_string_pretty(&list)?);
-    } else if all.is_empty() && cwd.is_some() {
-        println!("No saved conversations in this directory (nyq sessions --all lists every one).");
-    } else {
-        for l in format_sessions(&all) {
-            println!("{l}");
-        }
-    }
-    Ok(())
-}
-
 /// Handle a slash command. Returns Ok(false) to quit.
 #[allow(clippy::too_many_arguments)]
 async fn slash(
@@ -1686,8 +1314,13 @@ async fn slash(
             if ui::menus_available() {
                 tui.screen().open_help();
             } else {
-                let lines: Vec<String> =
-                    tui.screen().editor.commands().iter().map(|(c, d)| format!("{c:<14} {d}")).collect();
+                let lines: Vec<String> = tui
+                    .screen()
+                    .editor
+                    .commands()
+                    .iter()
+                    .map(|(c, d)| format!("{c:<14} {d}"))
+                    .collect();
                 ui::list(&lines);
             }
             let k = ui::keys::current();
@@ -1721,7 +1354,10 @@ async fn slash(
         "/workspace" => commands::workspace_cmd(agent, skills, ws, &arg.join(" "))?,
         "/sessions" => ui::list(&session_lines(sessions_dir)?),
         "/skills" => skill_install::command(agent, tui, skills, &arg).await?,
-        "/agents" => ui::list(&subagents::command(agent.session.as_ref().map(|s| s.path.as_path()), &arg)?),
+        "/agents" => ui::list(&subagents::command(
+            agent.session.as_ref().map(|s| s.path.as_path()),
+            &arg,
+        )?),
         "/memory" => tools::memory::slash(&config::home(), &arg, &mut agent.system),
         "/background" => tools::background::slash(&arg).await,
         "/undo" if agent.undo.is_empty() => ui::info("  Nothing to undo."),
@@ -1789,7 +1425,11 @@ async fn slash(
         }
         "/login" | "/logout" | "/setup" => account::slash(cmd, &arg, agent, tui).await?,
         "/yolo" => commands::toggle_yolo(&config::home(), agent),
-        "/usage" | "/cost" => usage::slash(&config::home(), &arg, agent.session.as_ref().map(|s| s.id.as_str()))?,
+        "/usage" | "/cost" => usage::slash(
+            &config::home(),
+            &arg,
+            agent.session.as_ref().map(|s| s.id.as_str()),
+        )?,
         "/stats" => agent.stats.show(agent.usage),
         "/status" => doctor::show_agent_status(agent, mcp, servers, skills.len())?,
         "/version" => doctor::version(),
@@ -1857,10 +1497,26 @@ mod tests {
             ready.await.unwrap();
             token.cancel();
         });
-        let result = read_print_input(WaitingInput { started: Some(started), release: wait }, &cancel).await;
+        let result = read_print_input(
+            WaitingInput {
+                started: Some(started),
+                release: wait,
+            },
+            &cancel,
+        )
+        .await;
         release.send(()).unwrap();
         assert!(result.unwrap().is_none());
-        assert_eq!(read_print_input(std::io::Cursor::new("hello\nworld"), &CancellationToken::new()).await.unwrap().as_deref(), Some("hello\nworld"));
+        assert_eq!(
+            read_print_input(
+                std::io::Cursor::new("hello\nworld"),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("hello\nworld")
+        );
     }
 
     #[test]
@@ -1892,13 +1548,36 @@ mod tests {
         );
         // Ask options and -r/-c work after the subcommand, and on -p.
         match parse(&[
-            "nyq", "ask", "-r", "abc", "--json", "--quiet", "--no-save", "--prompt-permissions",
-            "--system", "be brief", "--image", "a.png", "--image=b.png", "--continue-recovery", "go",
+            "nyq",
+            "ask",
+            "-r",
+            "abc",
+            "--json",
+            "--quiet",
+            "--no-save",
+            "--prompt-permissions",
+            "--system",
+            "be brief",
+            "--image",
+            "a.png",
+            "--image=b.png",
+            "--continue-recovery",
+            "go",
         ]) {
-            Cli { resume, command: Some(Command::Ask { prompt, opts }), .. } => {
+            Cli {
+                resume,
+                command: Some(Command::Ask { prompt, opts }),
+                ..
+            } => {
                 assert_eq!(resume.as_deref(), Some("abc"));
                 assert_eq!(prompt, ["go"]);
-                assert!(opts.json && opts.quiet && opts.no_save && opts.prompt_permissions && opts.continue_recovery);
+                assert!(
+                    opts.json
+                        && opts.quiet
+                        && opts.no_save
+                        && opts.prompt_permissions
+                        && opts.continue_recovery
+                );
                 assert_eq!(opts.system.as_deref(), Some("be brief"));
                 assert_eq!(opts.image.len(), 2);
             }
@@ -1908,7 +1587,14 @@ mod tests {
         let print = parse(&["nyq", "-p", "--json", "hi"]);
         assert!(print.print && print.ask.json && print.ask.print_only());
         assert_eq!(
-            parse(&["nyq", "--context-limit", "skill_catalog_bytes=off", "ask", "x"]).context_limit,
+            parse(&[
+                "nyq",
+                "--context-limit",
+                "skill_catalog_bytes=off",
+                "ask",
+                "x"
+            ])
+            .context_limit,
             ["skill_catalog_bytes=off"]
         );
         let dirs = parse(&[
@@ -1957,57 +1643,121 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["nyq", "sessions", "--all", "--limit", "5", "--json"]).command,
-            Some(Command::Sessions { all: true, limit: Some(5), json: true })
+            Some(Command::Sessions {
+                all: true,
+                limit: Some(5),
+                json: true
+            })
         ));
         assert!(Cli::try_parse_from(["nyq", "sessions", "--limit", "0"]).is_err());
-        assert!(matches!(parse(&["nyq", "logout"]).command, Some(Command::Logout { provider: None })));
+        assert!(matches!(
+            parse(&["nyq", "logout"]).command,
+            Some(Command::Logout { provider: None })
+        ));
         assert!(matches!(
             parse(&["nyq", "acp", "--log-file", "/tmp/x.log"]).command,
             Some(Command::Acp { log_file: Some(_) })
         ));
         assert!(matches!(
             parse(&["nyq", "workspace"]).command,
-            Some(Command::Workspace { action: None, json: false })
+            Some(Command::Workspace {
+                action: None,
+                json: false
+            })
         ));
         assert!(matches!(
             parse(&["nyq", "workspace", "--json"]).command,
-            Some(Command::Workspace { action: None, json: true })
+            Some(Command::Workspace {
+                action: None,
+                json: true
+            })
         ));
         assert!(matches!(
             parse(&["nyq", "workspace", "add", "lib"]).command,
             Some(Command::Workspace {
-                action: Some(WorkspaceCommand::Add { .. }),
+                action: Some(crate::cli::WorkspaceCommand::Add { .. }),
                 ..
             })
         ));
-        for args in [["nyq", "doctor", "--json"], ["nyq", "models", "--json"], ["nyq", "usage", "--json"]] {
+        for args in [
+            ["nyq", "doctor", "--json"],
+            ["nyq", "models", "--json"],
+            ["nyq", "usage", "--json"],
+        ] {
             assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
         }
         assert!(matches!(
             parse(&["nyq", "mcp", "list", "--connect", "--json"]).command,
-            Some(Command::Mcp { action: mcp_cli::McpCommand::List { connect: true, json: true } })
+            Some(Command::Mcp {
+                action: mcp_cli::McpCommand::List {
+                    connect: true,
+                    json: true
+                }
+            })
         ));
-        match parse(&["nyq", "mcp", "add", "--transport", "http", "web", "https://x.test/mcp"]).command {
-            Some(Command::Mcp { action: mcp_cli::McpCommand::Add { transport, command, .. } }) => {
-                assert_eq!((transport.as_deref(), command), (Some("http"), vec!["https://x.test/mcp".to_string()]));
+        match parse(&[
+            "nyq",
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            "web",
+            "https://x.test/mcp",
+        ])
+        .command
+        {
+            Some(Command::Mcp {
+                action:
+                    mcp_cli::McpCommand::Add {
+                        transport, command, ..
+                    },
+            }) => {
+                assert_eq!(
+                    (transport.as_deref(), command),
+                    (Some("http"), vec!["https://x.test/mcp".to_string()])
+                );
             }
             _ => panic!("mcp add --transport did not parse"),
         }
         assert!(matches!(
             parse(&["nyq", "mcp", "auth", "web"]).command,
-            Some(Command::Mcp { action: mcp_cli::McpCommand::Login { .. } })
+            Some(Command::Mcp {
+                action: mcp_cli::McpCommand::Login { .. }
+            })
         ));
         assert!(Cli::try_parse_from(["nyq", "workspace", "add"]).is_err());
-        assert!(matches!(parse(&["nyq", "provider", "xai"]).command, Some(Command::Provider { name: Some(n) }) if n == "xai"));
-        match parse(&["nyq", "mcp", "add", "fs", "--env", "A=1", "--", "npx", "-y", "srv"]).command {
-            Some(Command::Mcp { action: mcp_cli::McpCommand::Add { name, env, command, .. } }) => {
-                assert_eq!((name.as_str(), env, command), ("fs", vec!["A=1".to_string()], vec!["npx".to_string(), "-y".into(), "srv".into()]));
+        assert!(
+            matches!(parse(&["nyq", "provider", "xai"]).command, Some(Command::Provider { name: Some(n) }) if n == "xai")
+        );
+        match parse(&[
+            "nyq", "mcp", "add", "fs", "--env", "A=1", "--", "npx", "-y", "srv",
+        ])
+        .command
+        {
+            Some(Command::Mcp {
+                action:
+                    mcp_cli::McpCommand::Add {
+                        name, env, command, ..
+                    },
+            }) => {
+                assert_eq!(
+                    (name.as_str(), env, command),
+                    (
+                        "fs",
+                        vec!["A=1".to_string()],
+                        vec!["npx".to_string(), "-y".into(), "srv".into()]
+                    )
+                );
             }
             _ => panic!("mcp add did not parse"),
         }
         assert!(matches!(
             parse(&["nyq", "mcp", "trust", "approve", "x"]).command,
-            Some(Command::Mcp { action: mcp_cli::McpCommand::Trust { action: Some(mcp_cli::TrustAction::Approve { .. }) } })
+            Some(Command::Mcp {
+                action: mcp_cli::McpCommand::Trust {
+                    action: Some(mcp_cli::TrustAction::Approve { .. })
+                }
+            })
         ));
         assert!(Cli::try_parse_from(["nyq", "session", "delete"]).is_err());
     }
@@ -2022,9 +1772,17 @@ mod tests {
             if long == "--resume" {
                 continue;
             }
-            assert_eq!(auto_upgrade::VALUE_LONG.contains(&long.as_str()), takes, "{long}");
+            assert_eq!(
+                auto_upgrade::VALUE_LONG.contains(&long.as_str()),
+                takes,
+                "{long}"
+            );
             if let Some(short) = arg.get_short() {
-                assert_eq!(auto_upgrade::VALUE_SHORT.contains(&short), takes, "-{short}");
+                assert_eq!(
+                    auto_upgrade::VALUE_SHORT.contains(&short),
+                    takes,
+                    "-{short}"
+                );
             }
         }
     }

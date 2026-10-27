@@ -23,7 +23,11 @@ pub enum MenuAction {
 
 impl SettingsMenu {
     pub fn new(category: Category) -> Self {
-        Self { category, filter: String::new(), selected: 0 }
+        Self {
+            category,
+            filter: String::new(),
+            selected: 0,
+        }
     }
 
     pub fn items(&self, s: &Settings, live: &Live) -> Vec<Spec> {
@@ -40,17 +44,31 @@ impl SettingsMenu {
     pub fn on_key(&mut self, key: KeyEvent, s: &Settings, live: &Live) -> MenuAction {
         let items = self.items(s, live);
         let count = items.len();
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
-        let change = |delta: i32, selected: usize| match items.get(selected.min(count.saturating_sub(1))) {
-            Some(spec) if spec.id == Id::Model => MenuAction::OpenModels,
-            Some(spec) => cfg::cycle(spec.id, s, live, delta).map_or(MenuAction::None, |v| MenuAction::Change(spec.id, v)),
-            None => MenuAction::None,
-        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        let change =
+            |delta: i32, selected: usize| match items.get(selected.min(count.saturating_sub(1))) {
+                Some(spec) if spec.id == Id::Model => MenuAction::OpenModels,
+                Some(spec) => cfg::cycle(spec.id, s, live, delta)
+                    .map_or(MenuAction::None, |v| MenuAction::Change(spec.id, v)),
+                None => MenuAction::None,
+            };
         match key.code {
             KeyCode::Esc => return MenuAction::Close,
             KeyCode::Char('c') if ctrl => return MenuAction::Close,
-            KeyCode::Up => self.selected = self.selected.checked_sub(1).unwrap_or(count.saturating_sub(1)),
-            KeyCode::Down => self.selected = if count == 0 { 0 } else { (self.selected + 1) % count },
+            KeyCode::Up => {
+                self.selected = self
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(count.saturating_sub(1))
+            }
+            KeyCode::Down => {
+                self.selected = if count == 0 {
+                    0
+                } else {
+                    (self.selected + 1) % count
+                }
+            }
             KeyCode::Tab => self.step_category(1),
             KeyCode::BackTab => self.step_category(-1),
             KeyCode::Enter | KeyCode::Right => return change(1, self.selected),
@@ -81,15 +99,31 @@ mod tests {
     #[test]
     fn navigates_and_changes() {
         let s = Settings::default();
-        let live = Live { model: "m".into(), efforts: vec!["low".into()], ..Live::default() };
+        let live = Live {
+            model: "m".into(),
+            efforts: vec!["low".into()],
+            ..Live::default()
+        };
         let mut m = SettingsMenu::new(Category::All);
-        assert_eq!(m.on_key(key(KeyCode::Enter), &s, &live), MenuAction::OpenModels);
+        assert_eq!(
+            m.on_key(key(KeyCode::Enter), &s, &live),
+            MenuAction::OpenModels
+        );
         assert_eq!(m.on_key(key(KeyCode::Down), &s, &live), MenuAction::None);
-        assert_eq!(m.on_key(key(KeyCode::Enter), &s, &live), MenuAction::Change(Id::Effort, "low".into()));
-        assert_eq!(m.on_key(key(KeyCode::Left), &s, &live), MenuAction::Change(Id::Effort, "low".into()));
+        assert_eq!(
+            m.on_key(key(KeyCode::Enter), &s, &live),
+            MenuAction::Change(Id::Effort, "low".into())
+        );
+        assert_eq!(
+            m.on_key(key(KeyCode::Left), &s, &live),
+            MenuAction::Change(Id::Effort, "low".into())
+        );
         m.on_key(key(KeyCode::Tab), &s, &live);
         assert_eq!(m.category, Category::StatusLine);
-        assert_eq!(m.on_key(key(KeyCode::Enter), &s, &live), MenuAction::Change(Id::Segment(Segment::Model), "off".into()));
+        assert_eq!(
+            m.on_key(key(KeyCode::Enter), &s, &live),
+            MenuAction::Change(Id::Segment(Segment::Model), "off".into())
+        );
         m.on_key(key(KeyCode::BackTab), &s, &live);
         m.on_key(key(KeyCode::BackTab), &s, &live);
         assert_eq!(m.category, Category::Advanced);

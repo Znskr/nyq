@@ -21,10 +21,17 @@ const MAX_STEPS: usize = 100;
 /// settings, else [`MAX_STEPS`], with where it came from.
 pub fn step_limit() -> (usize, &'static str) {
     let parse = |v: &str| v.trim().parse::<usize>().ok().filter(|n| *n > 0);
-    if let Some(n) = std::env::var("NYQ_MAX_AGENT_STEPS").ok().as_deref().and_then(parse) {
+    if let Some(n) = std::env::var("NYQ_MAX_AGENT_STEPS")
+        .ok()
+        .as_deref()
+        .and_then(parse)
+    {
         return (n, "NYQ_MAX_AGENT_STEPS");
     }
-    match crate::settings::current().max_agent_steps.filter(|n| *n > 0) {
+    match crate::settings::current()
+        .max_agent_steps
+        .filter(|n| *n > 0)
+    {
         Some(n) => (n, "settings"),
         None => (MAX_STEPS, "default"),
     }
@@ -134,7 +141,11 @@ pub trait Approver: Send + Sync {
     /// `origin` names who is asking, e.g. "subagent: Count Rust files".
     async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval;
     /// Like `approve`, with the note the user attached to the answer.
-    async fn approve_noted(&self, origin: &str, req: &ApprovalRequest<'_>) -> (Approval, Option<String>) {
+    async fn approve_noted(
+        &self,
+        origin: &str,
+        req: &ApprovalRequest<'_>,
+    ) -> (Approval, Option<String>) {
         (self.approve(origin, req).await, None)
     }
 }
@@ -187,7 +198,11 @@ impl crate::tools::Tool for AskUserTool {
         }
     }
     fn summary(&self, args: &Value) -> String {
-        questions(args).into_iter().next().map(|(q, _)| q).unwrap_or_default()
+        questions(args)
+            .into_iter()
+            .next()
+            .map(|(q, _)| q)
+            .unwrap_or_default()
     }
     async fn run(&self, _args: Value, _ctx: &ToolCtx) -> ToolOutput {
         ToolOutput::err("ask_user_question is answered by the user interface")
@@ -226,7 +241,10 @@ fn runs_in_parallel(name: &str, arguments: &str) -> bool {
         return false;
     }
     let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-    matches!(args.get("action").and_then(Value::as_str), None | Some("run"))
+    matches!(
+        args.get("action").and_then(Value::as_str),
+        None | Some("run")
+    )
 }
 
 /// An approved call, ready to run.
@@ -254,7 +272,12 @@ fn with_trailing_note<'a>(items: &'a [Item], note: &str) -> std::borrow::Cow<'a,
     // Only on the newest item: a note on an older one would change the
     // prefix the provider already cached (e.g. when continuing a reply).
     let last = items.len().wrapping_sub(1);
-    if note.is_empty() || !matches!(items.last(), Some(Item::User { .. } | Item::ToolResult { .. })) {
+    if note.is_empty()
+        || !matches!(
+            items.last(),
+            Some(Item::User { .. } | Item::ToolResult { .. })
+        )
+    {
         return std::borrow::Cow::Borrowed(items);
     }
     let at = last;
@@ -294,7 +317,10 @@ fn questions(args: &Value) -> Vec<(String, Vec<(String, String)>)> {
         Value::String(s) => Some((s.clone(), String::new())),
         _ => Some((
             o.get("label")?.as_str()?.to_string(),
-            o.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
+            o.get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         )),
     };
     let one = |q: &Value| {
@@ -318,24 +344,39 @@ const MAX_QUESTIONS: usize = 4;
 async fn ask_user(args: &Value, ui: &mut dyn Ui, cancel: &CancellationToken) -> ToolOutput {
     let asked = questions(args);
     if asked.is_empty() {
-        return ToolOutput::err("ask_user_question: give `questions`, each with a `question` and `options`.");
+        return ToolOutput::err(
+            "ask_user_question: give `questions`, each with a `question` and `options`.",
+        );
     }
     let mut answers = Vec::new();
     for (question, options) in &asked {
         let shown: Vec<String> = options
             .iter()
-            .map(|(label, about)| if about.is_empty() { label.clone() } else { format!("{label} — {about}") })
+            .map(|(label, about)| {
+                if about.is_empty() {
+                    label.clone()
+                } else {
+                    format!("{label} — {about}")
+                }
+            })
             .collect();
         let answer = tokio::select! {
             a = ui.ask(question, &shown) => a,
             _ = cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
         };
         // A picked option is reported by its label.
-        let answer = answer.map(|a| shown.iter().position(|s| *s == a).map_or(a, |i| options[i].0.clone()));
+        let answer = answer.map(|a| {
+            shown
+                .iter()
+                .position(|s| *s == a)
+                .map_or(a, |i| options[i].0.clone())
+        });
         answers.push((question, answer));
     }
     if answers.iter().all(|(_, a)| a.is_none()) {
-        return ToolOutput::ok("The user skipped the question. Use your best judgment or ask in your reply.");
+        return ToolOutput::ok(
+            "The user skipped the question. Use your best judgment or ask in your reply.",
+        );
     }
     if let [(_, Some(a))] = answers.as_slice() {
         return ToolOutput::ok(format!("The user answered: {a}"));
@@ -491,8 +532,12 @@ impl Agent {
     /// Run extensions' `user_prompt` handlers: they may block the prompt
     /// (None), rewrite its text, or add context before it.
     async fn extension_prompt(&mut self, mut input: Item, ui: &mut dyn Ui) -> Option<Item> {
-        let Some(ext) = self.hooks.extensions().cloned() else { return Some(input) };
-        let Item::User { text, .. } = &mut input else { return Some(input) };
+        let Some(ext) = self.hooks.extensions().cloned() else {
+            return Some(input);
+        };
+        let Item::User { text, .. } = &mut input else {
+            return Some(input);
+        };
         let edit = ext.user_prompt(text).await;
         if let Some(msg) = edit.blocked {
             ui.notice(&msg);
@@ -513,7 +558,10 @@ impl Agent {
         let mut items = ui.take_steering();
         if let Some(ext) = self.hooks.extensions() {
             for text in ext.take_queued(true) {
-                ui.notice(&format!("An extension steers: {}", text.lines().next().unwrap_or("")));
+                ui.notice(&format!(
+                    "An extension steers: {}",
+                    text.lines().next().unwrap_or("")
+                ));
                 items.push(Item::user(text));
             }
         }
@@ -553,7 +601,8 @@ impl Agent {
             // The system prompt stays stable between requests (so providers
             // can cache it); per-request state goes in a trailing note.
             let mut system = self.system.clone();
-            if let Some(section) = crate::tools::mcp_search::notes_section(&self.tools.mcp_notes()) {
+            if let Some(section) = crate::tools::mcp_search::notes_section(&self.tools.mcp_notes())
+            {
                 system.push_str("\n\n");
                 system.push_str(&section);
             }
@@ -653,7 +702,10 @@ impl Agent {
                 if queued.is_empty() {
                     if let Some(ext) = self.hooks.extensions() {
                         for text in ext.take_queued(false) {
-                            ui.notice(&format!("An extension follows up: {}", text.lines().next().unwrap_or("")));
+                            ui.notice(&format!(
+                                "An extension follows up: {}",
+                                text.lines().next().unwrap_or("")
+                            ));
                             queued.push(Item::user(text));
                         }
                     }
@@ -764,7 +816,11 @@ impl Agent {
     /// The tools offered on the next request: `vision` replaces `view_image`
     /// for a text-only model.
     fn advertised(&self) -> Vec<crate::types::ToolSpec> {
-        let hidden = if self.text_only() { "view_image" } else { crate::tools::image::VISION };
+        let hidden = if self.text_only() {
+            "view_image"
+        } else {
+            crate::tools::image::VISION
+        };
         let mut specs = self.tools.advertised();
         specs.retain(|s| s.name != hidden);
         specs
@@ -772,13 +828,19 @@ impl Agent {
 
     /// Store a tool result in the transcript (credentials scrubbed, large
     /// output spilled) and return the images it carried.
-    fn record_result(&mut self, id: &str, name: &str, mut out: ToolOutput) -> Vec<crate::types::Image> {
+    fn record_result(
+        &mut self,
+        id: &str,
+        name: &str,
+        mut out: ToolOutput,
+    ) -> Vec<crate::types::Image> {
         // Credentials never reach the model or the session file.
         if let std::borrow::Cow::Owned(clean) = crate::tools::redact::scrub(&out.content) {
             out.content = clean;
         }
         // Oversized output is stored; the model gets head, tail and an id.
-        let key = crate::tools::artifacts::session_key(self.session.as_ref().map(|s| s.id.as_str()));
+        let key =
+            crate::tools::artifacts::session_key(self.session.as_ref().map(|s| s.id.as_str()));
         out.content = crate::tools::artifacts::spill(
             &crate::config::home(),
             &key,
@@ -865,7 +927,9 @@ impl Agent {
                 if candidate == full || !candidate.is_file() {
                     continue;
                 }
-                let shown = crate::tools::slash_path(candidate.strip_prefix(&self.cwd).unwrap_or(&candidate));
+                let shown = crate::tools::slash_path(
+                    candidate.strip_prefix(&self.cwd).unwrap_or(&candidate),
+                );
                 let marker = format!("[Instructions from {shown}");
                 let seen = self.items.iter().any(|item| match item {
                     Item::ToolResult { output, .. } => output.contains(&marker),
@@ -912,7 +976,9 @@ impl Agent {
             .filter(|_| crate::tools::mcp_search::is_mcp(name))
             .map(|t| t.spec().parameters.to_string());
         let mut provider = self.provider.fork();
-        if let Some(model) = crate::settings::classifier_model().or_else(|| provider.reviewer_model()) {
+        if let Some(model) =
+            crate::settings::classifier_model().or_else(|| provider.reviewer_model())
+        {
             provider.set_model(model);
         }
         provider.set_effort(None);
@@ -1051,7 +1117,8 @@ impl Agent {
     async fn settle(&mut self, ready: &Ready, out: &mut ToolOutput, cancel: &CancellationToken) {
         self.undo.append(std::mem::take(&mut out.undo));
         if matches!(ready.name.as_str(), "write_file" | "edit_file") && !out.is_error {
-            self.stats.file_change(&ready.name, &ready.args, out.display.as_deref());
+            self.stats
+                .file_change(&ready.name, &ready.args, out.display.as_deref());
         }
         crate::trace::log("tool", || {
             format!(
@@ -1062,8 +1129,9 @@ impl Agent {
             )
         });
         if let Some(note) = &ready.note {
-            out.content
-                .push_str(&format!("\n\n[The user approved this call with a note: {note}]"));
+            out.content.push_str(&format!(
+                "\n\n[The user approved this call with a note: {note}]"
+            ));
         }
         if ready.name == "memory" && !out.is_error {
             crate::tools::memory::refresh_section(&mut self.system, &crate::config::home());
@@ -1080,7 +1148,14 @@ impl Agent {
         self.hooks.tool_result(&ready.name, &ready.args, out).await;
         if let Some(args) = &ready.hook_args {
             self.hooks
-                .post_tool_use(&ready.name, args, out, &self.cwd, ready.ctx.session_id.as_deref(), cancel)
+                .post_tool_use(
+                    &ready.name,
+                    args,
+                    out,
+                    &self.cwd,
+                    ready.ctx.session_id.as_deref(),
+                    cancel,
+                )
                 .await;
         }
     }
@@ -1113,7 +1188,9 @@ impl Agent {
             arguments
         }) {
             Ok(v) => v,
-            Err(e) => return Prepared::Done(ToolOutput::err(format!("Invalid JSON arguments: {e}"))),
+            Err(e) => {
+                return Prepared::Done(ToolOutput::err(format!("Invalid JSON arguments: {e}")))
+            }
         };
         let ctx = ToolCtx {
             cwd: self.cwd.clone(),
@@ -1133,7 +1210,10 @@ impl Agent {
                 .map(|s| s.id.clone())
                 .or_else(|| self.usage_session_id.clone()),
             hooks: self.hooks.clone(),
-            subagent_dir: self.session.as_ref().map(|s| crate::subagents::store_dir(&s.path)),
+            subagent_dir: self
+                .session
+                .as_ref()
+                .map(|s| crate::subagents::store_dir(&s.path)),
             shared_tools: self.tools.shared(),
         };
         let summary_of = |args: &Value| {
@@ -1191,11 +1271,15 @@ impl Agent {
         // known reversible dev commands.
         let command = (name == "bash"
             && args.get("run_in_background").and_then(Value::as_bool) != Some(true))
-        .then(|| args.get("command").and_then(Value::as_str).map(str::to_string))
+        .then(|| {
+            args.get("command")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .flatten();
-        let read_only = command.as_deref().and_then(|c| {
-            crate::command_effect::read_only(c, &self.cwd, &self.sandbox.writable)
-        });
+        let read_only = command
+            .as_deref()
+            .and_then(|c| crate::command_effect::read_only(c, &self.cwd, &self.sandbox.writable));
         if read_only.is_some() {
             needs_approval = false;
         }
@@ -1269,7 +1353,10 @@ impl Agent {
         if let Some(msg) = self.tools.deferred_block(name) {
             return done(ui, name, &summary, ToolOutput::err(msg));
         }
-        let preview = self.tools.get(name).and_then(|tool| tool.preview(&args, &ctx));
+        let preview = self
+            .tools
+            .get(name)
+            .and_then(|tool| tool.preview(&args, &ctx));
         let mut note = None;
         let asked = forced.is_some();
         if let Some(forced) = forced {
@@ -1325,11 +1412,10 @@ impl Agent {
                 }
                 Approval::No => {
                     let out = ToolOutput::err(match &note {
-                        Some(note) => format!(
-                            "The user denied this tool call and said: {note}"
-                        ),
-                        None => "The user denied this tool call. Ask what they want instead."
-                            .into(),
+                        Some(note) => format!("The user denied this tool call and said: {note}"),
+                        None => {
+                            "The user denied this tool call. Ask what they want instead.".into()
+                        }
                     });
                     ui.tool_end(name, &out);
                     return Prepared::Done(out);
@@ -1339,7 +1425,10 @@ impl Agent {
         // The user approved the diff they saw. If the file changed while the
         // prompt was open, applying the call now would write something else.
         if asked && is_file_tool(name) && preview.is_some() {
-            let now = self.tools.get(name).and_then(|tool| tool.preview(&args, &ctx));
+            let now = self
+                .tools
+                .get(name)
+                .and_then(|tool| tool.preview(&args, &ctx));
             if now != preview {
                 return done(
                     ui,
@@ -1357,10 +1446,14 @@ impl Agent {
         }
 
         if meta {
-            let hook_args = self.hooks.observes_post_tool_use(name).then(|| args.clone());
-            let out = self.tools.handle_meta(name, arguments).unwrap_or_else(|| {
-                ToolOutput::err(format!("`{name}` is not available."))
-            });
+            let hook_args = self
+                .hooks
+                .observes_post_tool_use(name)
+                .then(|| args.clone());
+            let out = self
+                .tools
+                .handle_meta(name, arguments)
+                .unwrap_or_else(|| ToolOutput::err(format!("`{name}` is not available.")));
             ui.tool_start(name, &summary);
             ui.tool_end(name, &out);
             if let Some(args) = hook_args {
@@ -1370,7 +1463,10 @@ impl Agent {
             }
             return Prepared::Done(out);
         }
-        let hook_args = self.hooks.observes_post_tool_use(name).then(|| args.clone());
+        let hook_args = self
+            .hooks
+            .observes_post_tool_use(name)
+            .then(|| args.clone());
         Prepared::Run(Box::new(Ready {
             name: name.to_string(),
             args,
@@ -1410,7 +1506,9 @@ impl Agent {
         let mut prompt = COMPACT_PROMPT.to_string();
         if let Some(ext) = self.hooks.extensions() {
             for extra in ext.before_compact().await {
-                prompt.push_str(&format!("\n\nAdditional instructions for this summary:\n{extra}"));
+                prompt.push_str(&format!(
+                    "\n\nAdditional instructions for this summary:\n{extra}"
+                ));
             }
         }
         items.push(Item::user(prompt));
@@ -1623,7 +1721,9 @@ impl Agent {
         // A text-only model gets attached images as files for `vision`.
         if let Item::User { text, images } = &mut item {
             if !images.is_empty() && self.text_only() {
-                let key = crate::tools::artifacts::session_key(self.session.as_ref().map(|s| s.id.as_str()));
+                let key = crate::tools::artifacts::session_key(
+                    self.session.as_ref().map(|s| s.id.as_str()),
+                );
                 let note = crate::tools::image::park_images(&crate::config::home(), &key, images);
                 text.push_str(&format!("\n\n{note}"));
                 images.clear();
@@ -1948,7 +2048,12 @@ pub(crate) fn subagent_mode(args: &Value) -> &'static str {
 /// The rule "always" would grant for this call (no workspace context).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn grant_rule(tool: &str, args: &Value) -> Option<String> {
-    grant_rule_in(tool, args, &std::env::current_dir().unwrap_or_default(), &[])
+    grant_rule_in(
+        tool,
+        args,
+        &std::env::current_dir().unwrap_or_default(),
+        &[],
+    )
 }
 
 /// The rule "always" would grant for this call, as stored in
@@ -1996,7 +2101,9 @@ pub fn grant_rule_in(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) ->
         dir.parent()?;
         return Some(format!(
             "{tool}:{}/**",
-            dir.to_string_lossy().replace('\\', "/").trim_end_matches('/')
+            dir.to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
         ));
     }
     Some(tool.to_string())
@@ -2063,7 +2170,9 @@ pub(crate) fn resolved(base: &Path, path: &str) -> Option<PathBuf> {
             .ancestors()
             .find_map(|a| std::fs::canonicalize(a).ok().map(|real| (a, real)))
         {
-            Some((existing, real)) => real.join(full.strip_prefix(existing).unwrap_or(Path::new(""))),
+            Some((existing, real)) => {
+                real.join(full.strip_prefix(existing).unwrap_or(Path::new("")))
+            }
             None => full.clone(),
         },
     )
@@ -2219,14 +2328,17 @@ pub fn is_allowed_in(
     if tool == "web_fetch" {
         let url = args.get("url").and_then(Value::as_str).unwrap_or("");
         let norm = normalize_url(url);
-        return allowed.iter().filter_map(|r| r.strip_prefix("web_fetch:")).any(|p| {
-            // A site grant must match the parsed URL, so `https://a.com/*`
-            // never covers `https://a.com.evil/` or `https://a.com@evil/`.
-            match &norm {
-                Some(n) => crate::permissions::glob(p, n),
-                None => p == url,
-            }
-        });
+        return allowed
+            .iter()
+            .filter_map(|r| r.strip_prefix("web_fetch:"))
+            .any(|p| {
+                // A site grant must match the parsed URL, so `https://a.com/*`
+                // never covers `https://a.com.evil/` or `https://a.com@evil/`.
+                match &norm {
+                    Some(n) => crate::permissions::glob(p, n),
+                    None => p == url,
+                }
+            });
     }
     if crate::permissions::is_read_tool(tool) {
         return tree();
@@ -2269,7 +2381,9 @@ impl Provider for ScriptedTurns {
 #[cfg(test)]
 pub(crate) fn test_agent() -> Agent {
     Agent {
-        provider: Box::new(ScriptedTurns { left: Default::default() }),
+        provider: Box::new(ScriptedTurns {
+            left: Default::default(),
+        }),
         tools: Registry::builtin(),
         system: String::new(),
         items: Vec::new(),
@@ -2383,7 +2497,10 @@ mod tests {
         let id = a.session.as_ref().unwrap().id.clone();
         let meta = crate::session::find(dir.path(), &id, dir.path()).unwrap();
         let saved = meta.prefs.clone().unwrap();
-        assert_eq!((saved.provider.as_str(), saved.model.as_str(), saved.fast), ("fake", "fake", false));
+        assert_eq!(
+            (saved.provider.as_str(), saved.model.as_str(), saved.fast),
+            ("fake", "fake", false)
+        );
 
         let prefs = crate::session::Prefs {
             provider: "ollama".into(),
@@ -2391,14 +2508,21 @@ mod tests {
             ..Default::default()
         };
         crate::commands::restore_prefs(dir.path(), &mut a, Some(&prefs));
-        assert_eq!((a.provider.name(), a.provider.model()), ("ollama", "llama3"));
+        assert_eq!(
+            (a.provider.name(), a.provider.model()),
+            ("ollama", "llama3")
+        );
         a.sync_prefs();
         drop(a);
         let meta = crate::session::find(dir.path(), &id, dir.path()).unwrap();
         assert_eq!(meta.prefs, Some(prefs));
         // An unusable provider keeps the current model.
         let mut b = agent(Response::default(), None);
-        let bad = crate::session::Prefs { provider: "nope".into(), model: "x".into(), ..Default::default() };
+        let bad = crate::session::Prefs {
+            provider: "nope".into(),
+            model: "x".into(),
+            ..Default::default()
+        };
         crate::commands::restore_prefs(dir.path(), &mut b, Some(&bad));
         assert_eq!(b.provider.name(), "fake");
     }
@@ -2600,7 +2724,14 @@ mod tests {
                 },
             ],
         ] {
-            let mut agent = agent(Response { items, usage: None, truncated: false }, None);
+            let mut agent = agent(
+                Response {
+                    items,
+                    usage: None,
+                    truncated: false,
+                },
+                None,
+            );
             let before = agent.items.clone();
             assert!(agent
                 .compact(&mut QuietUi, &CancellationToken::new())
@@ -2698,10 +2829,27 @@ mod tests {
     #[test]
     fn bash_grants_reject_dynamic_extra_arguments() {
         let allowed = ["bash:git status".to_string()].into();
-        for arg in ["$'--short'", "$'\\x2d\\x2dshort'", "$\"--short\"", "$", "$FLAGS", "${FLAGS}", "`echo --short`", "$(echo --short)"] {
+        for arg in [
+            "$'--short'",
+            "$'\\x2d\\x2dshort'",
+            "$\"--short\"",
+            "$",
+            "$FLAGS",
+            "${FLAGS}",
+            "`echo --short`",
+            "$(echo --short)",
+        ] {
             let cmd = format!("git status {arg}");
             assert!(!bash_matches("git status", &cmd), "{cmd}");
-            assert!(!is_allowed(&allowed, "bash", &serde_json::json!({"command": cmd}), Path::new("/tmp")), "{cmd}");
+            assert!(
+                !is_allowed(
+                    &allowed,
+                    "bash",
+                    &serde_json::json!({"command": cmd}),
+                    Path::new("/tmp")
+                ),
+                "{cmd}"
+            );
             assert!(bash_prefix(&cmd).is_none(), "{cmd}");
         }
         assert!(bash_matches("git status", "git status --short"));
@@ -2827,8 +2975,15 @@ mod tests {
         // A site grant covers the whole site, however the URL is spelled,
         // and nothing else.
         let site: HashSet<String> = ["web_fetch:https://example.com/*".into()].into();
-        for url in ["https://example.com/a?x=1", "https://EXAMPLE.com", "https://example.com/b/c"] {
-            assert!(is_allowed(&site, "web_fetch", &json!({ "url": url }), cwd), "{url}");
+        for url in [
+            "https://example.com/a?x=1",
+            "https://EXAMPLE.com",
+            "https://example.com/b/c",
+        ] {
+            assert!(
+                is_allowed(&site, "web_fetch", &json!({ "url": url }), cwd),
+                "{url}"
+            );
         }
         for url in [
             "https://example.com.evil.net/",
@@ -2837,7 +2992,10 @@ mod tests {
             "https://example.com:8443/",
             "https://sub.example.com/",
         ] {
-            assert!(!is_allowed(&site, "web_fetch", &json!({ "url": url }), cwd), "{url}");
+            assert!(
+                !is_allowed(&site, "web_fetch", &json!({ "url": url }), cwd),
+                "{url}"
+            );
         }
         // An exact-URL rule (as saved before) still matches only that URL.
         assert!(!is_allowed(
@@ -3387,7 +3545,11 @@ mod tests {
     async fn auto_mode_follows_the_classifier() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         fn response(items: Vec<Item>) -> crate::types::Response {
-            crate::types::Response { items, usage: None, truncated: false }
+            crate::types::Response {
+                items,
+                usage: None,
+                truncated: false,
+            }
         }
         fn call() -> crate::types::Response {
             response(vec![Item::ToolCall {
@@ -3794,7 +3956,13 @@ mod tests {
         assert!(!ok("write_file", &file), "a read grant never covers edits");
 
         // Edits outside the workspace: the file's directory tree, not .git.
-        let rule = grant_rule_in("write_file", &json!({ "path": format!("{root}/sub/a.txt") }), cwd, &[]).unwrap();
+        let rule = grant_rule_in(
+            "write_file",
+            &json!({ "path": format!("{root}/sub/a.txt") }),
+            cwd,
+            &[],
+        )
+        .unwrap();
         assert_eq!(rule, format!("write_file:{root}/sub/**"));
         let granted: HashSet<String> = [rule].into();
         let ok = |tool: &str, path: &str| is_allowed(&granted, tool, &json!({ "path": path }), cwd);
@@ -3802,7 +3970,12 @@ mod tests {
         assert!(!ok("edit_file", &format!("{root}/c.txt")));
         assert!(!ok("write_file", &format!("{root}/sub/.git/config")));
         assert_eq!(
-            grant_rule_in("write_file", &json!({ "path": format!("{root}/.git/x") }), cwd, &[]),
+            grant_rule_in(
+                "write_file",
+                &json!({ "path": format!("{root}/.git/x") }),
+                cwd,
+                &[]
+            ),
             None
         );
         // Inside the workspace a write grant stays the plain tool grant; the
@@ -3812,7 +3985,10 @@ mod tests {
             Some("write_file")
         );
         #[cfg(unix)]
-        assert_eq!(grant_rule_in("list_dir", &json!({"path": "/"}), cwd, &[]), None);
+        assert_eq!(
+            grant_rule_in("list_dir", &json!({"path": "/"}), cwd, &[]),
+            None
+        );
     }
 
     #[tokio::test]
@@ -4000,7 +4176,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // Serializes NYQ_HOME with other env-mutating tests.
     async fn memory_tool_refreshes_the_system_prompt() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let old = std::env::var_os("NYQ_HOME");
         std::env::set_var("NYQ_HOME", home.path());
@@ -4053,16 +4231,13 @@ mod tests {
         agent.items.clear();
         agent.session = None;
         agent.usage_session_id = Some("parent-1".into());
-        agent.permissions = std::sync::Arc::new(
-            crate::permissions::Permissions::load(home.path(), home.path()).0,
-        );
+        agent.permissions =
+            std::sync::Arc::new(crate::permissions::Permissions::load(home.path(), home.path()).0);
         let stats_id = agent.stats.id.clone();
         agent.provider = Box::new(ScriptedTurns {
             left: std::sync::Arc::new(std::sync::Mutex::new(vec![Response {
                 truncated: false,
-                items: vec![Item::Assistant {
-                    text: "ok".into(),
-                }],
+                items: vec![Item::Assistant { text: "ok".into() }],
                 usage: Some(Usage {
                     input_tokens: 9,
                     output_tokens: 2,
@@ -4119,9 +4294,8 @@ mod tests {
         agent.context_window = 0;
         agent.items.clear();
         agent.permission_mode = crate::permissions::Mode::Yolo;
-        agent.permissions = std::sync::Arc::new(
-            crate::permissions::Permissions::load(home.path(), home.path()).0,
-        );
+        agent.permissions =
+            std::sync::Arc::new(crate::permissions::Permissions::load(home.path(), home.path()).0);
         for i in 0..41 {
             agent.tools.add(Box::new(McpStub {
                 name: format!("mcp__s__t{i}"),
@@ -4220,7 +4394,11 @@ mod tests {
     fn shell_agent(
         commands: &[&str],
         mode: crate::permissions::Mode,
-    ) -> (Agent, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tempfile::TempDir) {
+    ) -> (
+        Agent,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tempfile::TempDir,
+    ) {
         let ran = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let dir = tempfile::tempdir().unwrap();
         let mut script: Vec<Response> = commands
@@ -4269,7 +4447,8 @@ mod tests {
         assert_eq!(ui.asked.len(), 1, "only rm asks");
         let ran = ran.lock().unwrap().clone();
         assert!(
-            ran[0].starts_with("git --no-pager -c core.fsmonitor=false") && ran[0].ends_with("status --short"),
+            ran[0].starts_with("git --no-pager -c core.fsmonitor=false")
+                && ran[0].ends_with("status --short"),
             "{ran:?}"
         );
         assert_eq!(ran[1], "rm -rf x");
@@ -4300,7 +4479,10 @@ mod tests {
         // The script has no classifier answer: consulting it would fall back
         // to asking.
         let (mut agent, ran, _dir) = shell_agent(
-            &["cargo build && cargo test -p nyq 2>&1", "git fetch origin && npm ci"],
+            &[
+                "cargo build && cargo test -p nyq 2>&1",
+                "git fetch origin && npm ci",
+            ],
             crate::permissions::Mode::Auto,
         );
         let mut ui = ScriptUi {
@@ -4308,13 +4490,20 @@ mod tests {
             asked: Vec::new(),
         };
         agent
-            .turn(Item::user("Run the tests."), &mut ui, CancellationToken::new())
+            .turn(
+                Item::user("Run the tests."),
+                &mut ui,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(ui.asked.is_empty());
         assert_eq!(
             *ran.lock().unwrap(),
-            ["cargo build && cargo test -p nyq 2>&1", "git fetch origin && npm ci"]
+            [
+                "cargo build && cargo test -p nyq 2>&1",
+                "git fetch origin && npm ci"
+            ]
         );
     }
 
@@ -4335,13 +4524,25 @@ mod tests {
             }
         }
         for (answer, ran, expect) in [
-            (Approval::No, 0, "The user denied this tool call and said: use the staging wiki"),
-            (Approval::Yes, 1, "answer\n\n[The user approved this call with a note: use the staging wiki]"),
+            (
+                Approval::No,
+                0,
+                "The user denied this tool call and said: use the staging wiki",
+            ),
+            (
+                Approval::Yes,
+                1,
+                "answer\n\n[The user approved this call with a note: use the staging wiki]",
+            ),
         ] {
             let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut agent = calling_agent(&runs, 1);
             agent
-                .turn(Item::user("go"), &mut NoteUi(answer), CancellationToken::new())
+                .turn(
+                    Item::user("go"),
+                    &mut NoteUi(answer),
+                    CancellationToken::new(),
+                )
                 .await
                 .unwrap();
             assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), ran);
@@ -4371,9 +4572,10 @@ mod tests {
             .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
             .await
             .unwrap();
-        assert!(agent.items.iter().any(
-            |i| matches!(i, Item::User { text, .. } if text.contains("run the tests first"))
-        ));
+        assert!(agent
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::User { text, .. } if text.contains("run the tests first"))));
         assert!(matches!(agent.items.last(), Some(Item::Assistant { text }) if text == "second"));
     }
 
@@ -4458,7 +4660,10 @@ mod tests {
         }
     }
 
-    fn probe(name: &'static str, fail: bool) -> (Probe, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    fn probe(
+        name: &'static str,
+        fail: bool,
+    ) -> (Probe, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tool = Probe {
             name,
@@ -4481,7 +4686,9 @@ mod tests {
                 call("c", "grep", serde_json::json!({"n": 3})),
                 call("d", "mcp__x__write", serde_json::json!({"n": 4})),
             ]),
-            reply(vec![Item::Assistant { text: "done".into() }]),
+            reply(vec![Item::Assistant {
+                text: "done".into(),
+            }]),
         ]);
         agent.tools.add(Box::new(grep));
         agent.tools.add(Box::new(other));
@@ -4490,9 +4697,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert_eq!(results(&agent), ["result 1", "result 2", "result 3", "result 4"]);
+        assert_eq!(
+            results(&agent),
+            ["result 1", "result 2", "result 3", "result 4"]
+        );
         assert!(runs_in_parallel("subagent", r#"{"task": "x"}"#));
-        assert!(!runs_in_parallel("subagent", r#"{"action": "stop", "name": "x"}"#));
+        assert!(!runs_in_parallel(
+            "subagent",
+            r#"{"action": "stop", "name": "x"}"#
+        ));
         assert!(!runs_in_parallel("bash", "{}"));
     }
 
@@ -4500,7 +4713,12 @@ mod tests {
     async fn a_call_that_keeps_failing_gets_a_nudge() {
         let (tool, _) = probe("mcp__x__go", true);
         let same = || reply(vec![call("a", "mcp__x__go", serde_json::json!({}))]);
-        let mut agent = scripted(vec![same(), same(), same(), reply(vec![Item::Assistant { text: "ok".into() }])]);
+        let mut agent = scripted(vec![
+            same(),
+            same(),
+            same(),
+            reply(vec![Item::Assistant { text: "ok".into() }]),
+        ]);
         agent.tools.add(Box::new(tool));
         agent
             .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
@@ -4508,19 +4726,32 @@ mod tests {
             .unwrap();
         let results = results(&agent);
         assert!(!results[1].contains("failed"), "{}", results[1]);
-        assert!(results[2].contains("has now failed 3 times"), "{}", results[2]);
+        assert!(
+            results[2].contains("has now failed 3 times"),
+            "{}",
+            results[2]
+        );
     }
 
     #[tokio::test]
     async fn the_step_limit_ends_the_turn_with_a_notice() {
         let (tool, _) = probe("mcp__x__go", false);
-        let script = (0..MAX_STEPS).map(|_| reply(vec![call("a", "mcp__x__go", serde_json::json!({}))])).collect();
+        let script = (0..MAX_STEPS)
+            .map(|_| reply(vec![call("a", "mcp__x__go", serde_json::json!({}))]))
+            .collect();
         let mut agent = scripted(script);
         agent.tools.add(Box::new(tool));
         let mut ui = NoticeCatch(Vec::new());
-        let end = agent.turn(Item::user("go"), &mut ui, CancellationToken::new()).await.unwrap();
+        let end = agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
         assert!(matches!(end, TurnEnd::Done));
-        assert!(ui.0.iter().any(|n| n.contains("Stopped after")), "{:?}", ui.0);
+        assert!(
+            ui.0.iter().any(|n| n.contains("Stopped after")),
+            "{:?}",
+            ui.0
+        );
     }
 
     #[tokio::test]
@@ -4551,7 +4782,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             later.cancel();
         });
-        let end = agent.turn(Item::user("go"), &mut QuietUi, cancel).await.unwrap();
+        let end = agent
+            .turn(Item::user("go"), &mut QuietUi, cancel)
+            .await
+            .unwrap();
         assert!(matches!(end, TurnEnd::Cancelled));
         assert_eq!(
             agent.items.last(),
@@ -4605,7 +4839,11 @@ mod tests {
         let content = std::sync::Arc::new(std::sync::Mutex::new("old".to_string()));
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut agent = scripted(vec![
-            reply(vec![call("a", "edit_file", serde_json::json!({"path": "x"}))]),
+            reply(vec![call(
+                "a",
+                "edit_file",
+                serde_json::json!({"path": "x"}),
+            )]),
             reply(vec![Item::Assistant { text: "ok".into() }]),
         ]);
         agent.permission_mode = crate::permissions::Mode::Ask;
@@ -4614,7 +4852,11 @@ mod tests {
             ran: ran.clone(),
         }));
         agent
-            .turn(Item::user("go"), &mut Meddler(content), CancellationToken::new())
+            .turn(
+                Item::user("go"),
+                &mut Meddler(content),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
@@ -4642,15 +4884,25 @@ mod tests {
             {"question": "Which DB?", "options": [{"label": "SQLite", "description": "simplest, one file"}, {"label": "Postgres"}]},
             {"question": "Add tests?", "options": [{"label": "Yes"}, {"label": "No"}]}
         ]});
-        let mut ui = Answers(vec![Some("SQLite — simplest, one file".into()), None], Vec::new());
+        let mut ui = Answers(
+            vec![Some("SQLite — simplest, one file".into()), None],
+            Vec::new(),
+        );
         let out = ask_user(&args, &mut ui, &CancellationToken::new()).await;
-        assert_eq!(out.content, "The user answered:\n- Which DB? → SQLite\n- Add tests? → (skipped)");
+        assert_eq!(
+            out.content,
+            "The user answered:\n- Which DB? → SQLite\n- Add tests? → (skipped)"
+        );
         assert_eq!(ui.1[0], ["SQLite — simplest, one file", "Postgres"]);
         let legacy = serde_json::json!({"question": "Go?", "options": ["yes", "no"]});
         let mut ui = Answers(vec![Some("typed answer".into())], Vec::new());
         let out = ask_user(&legacy, &mut ui, &CancellationToken::new()).await;
         assert_eq!(out.content, "The user answered: typed answer");
-        assert!(ask_user(&serde_json::json!({}), &mut ui, &CancellationToken::new()).await.is_error);
+        assert!(
+            ask_user(&serde_json::json!({}), &mut ui, &CancellationToken::new())
+                .await
+                .is_error
+        );
     }
 
     #[tokio::test]
@@ -4659,8 +4911,18 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
         std::fs::write(dir.path().join("sub/AGENTS.md"), "Use tabs in sub.\n").unwrap();
         let (tool, _) = probe("read_file", false);
-        let touch = |id: &str| reply(vec![call(id, "read_file", serde_json::json!({"path": "sub/deep/x.rs"}))]);
-        let mut agent = scripted(vec![touch("a"), touch("b"), reply(vec![Item::Assistant { text: "ok".into() }])]);
+        let touch = |id: &str| {
+            reply(vec![call(
+                id,
+                "read_file",
+                serde_json::json!({"path": "sub/deep/x.rs"}),
+            )])
+        };
+        let mut agent = scripted(vec![
+            touch("a"),
+            touch("b"),
+            reply(vec![Item::Assistant { text: "ok".into() }]),
+        ]);
         agent.cwd = dir.path().to_path_buf();
         agent.tools.add(Box::new(tool));
         agent
@@ -4668,7 +4930,12 @@ mod tests {
             .await
             .unwrap();
         let results = results(&agent);
-        assert!(results[0].contains("[Instructions from sub/AGENTS.md, which apply to files under sub/"), "{}", results[0]);
+        assert!(
+            results[0]
+                .contains("[Instructions from sub/AGENTS.md, which apply to files under sub/"),
+            "{}",
+            results[0]
+        );
         assert!(results[0].ends_with("Use tabs in sub."), "{}", results[0]);
         assert!(!results[1].contains("Instructions"), "{}", results[1]);
     }
@@ -4703,7 +4970,9 @@ mod tests {
                 anyhow::bail!("unused")
             }
         }
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let doc = serde_json::json!({"textonly-test": {"models": {"t1": {"modalities": {"input": ["text"], "output": ["text"]}}}}});
         std::fs::write(home.path().join("models.json"), doc.to_string()).unwrap();
@@ -4712,19 +4981,34 @@ mod tests {
         let mut subject = agent(Response::default(), None);
         subject.tools = Registry::builtin();
         let names: Vec<String> = subject.advertised().into_iter().map(|s| s.name).collect();
-        assert!(!names.contains(&"vision".to_string()) && names.contains(&"view_image".to_string()));
+        assert!(
+            !names.contains(&"vision".to_string()) && names.contains(&"view_image".to_string())
+        );
 
         let mut agent = subject;
         agent.provider = Box::new(TextOnly);
         let names: Vec<String> = agent.advertised().into_iter().map(|s| s.name).collect();
-        assert!(names.contains(&"vision".to_string()) && !names.contains(&"view_image".to_string()));
-        let png = crate::types::Image { media_type: "image/png".into(), data: "iVBORw0KGgo=".into() };
-        agent.push_counted(Item::User { text: "look".into(), images: vec![png] });
+        assert!(
+            names.contains(&"vision".to_string()) && !names.contains(&"view_image".to_string())
+        );
+        let png = crate::types::Image {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        };
+        agent.push_counted(Item::User {
+            text: "look".into(),
+            images: vec![png],
+        });
         match old {
             Some(v) => std::env::set_var("NYQ_HOME", v),
             None => std::env::remove_var("NYQ_HOME"),
         }
-        let Some(Item::User { text, images }) = agent.items.last() else { panic!() };
-        assert!(images.is_empty() && text.starts_with("look\n\n[Image(s) attached: "), "{text}");
+        let Some(Item::User { text, images }) = agent.items.last() else {
+            panic!()
+        };
+        assert!(
+            images.is_empty() && text.starts_with("look\n\n[Image(s) attached: "),
+            "{text}"
+        );
     }
 }

@@ -5,9 +5,9 @@
 use std::time::Duration;
 
 use rmcp::model::{
-    ClientCapabilities, ClientConfig, CustomNotification, ElicitRequestParams, ElicitResult, ElicitationAction,
-    ElicitationCapability, ErrorData, FormElicitationCapability, Implementation, ProgressNotificationParam,
-    UrlElicitationCapability,
+    ClientCapabilities, ClientConfig, CustomNotification, ElicitRequestParams, ElicitResult,
+    ElicitationAction, ElicitationCapability, ErrorData, FormElicitationCapability, Implementation,
+    ProgressNotificationParam, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{ClientHandler, RoleClient};
@@ -52,13 +52,17 @@ impl Elicitor for TerminalElicitor {
     }
 
     async fn url(&self, server: &str, message: &str, url: &str, _id: &str) -> Elicited {
-        let question = format!("MCP server {server} asks you to open a page in your browser:\n{message}\n\n{url}");
+        let question = format!(
+            "MCP server {server} asks you to open a page in your browser:\n{message}\n\n{url}"
+        );
         let options = ["Open in browser".to_string(), "Decline".to_string()];
         match crate::ui::tui::ask_active(&question, &options).await {
             None => Elicited::Decline,
             Some(None) => Elicited::Cancel,
             Some(Some(a)) if a == options[0] => {
-                crate::ui::info(&format!("Opening {url} (nyq waits up to 10 minutes for {server} to finish)"));
+                crate::ui::info(&format!(
+                    "Opening {url} (nyq waits up to 10 minutes for {server} to finish)"
+                ));
                 crate::mcp::open_browser(url);
                 Elicited::Accept(Value::Object(Map::new()))
             }
@@ -70,12 +74,20 @@ impl Elicitor for TerminalElicitor {
 /// One form field: its question and, for choices, label → value pairs.
 fn choices(prop: &Value) -> Vec<(String, Value)> {
     let values = |v: &Value| v.as_array().cloned().unwrap_or_default();
-    if let Some(one_of) = prop.get("oneOf").or_else(|| prop.get("anyOf")).and_then(Value::as_array) {
+    if let Some(one_of) = prop
+        .get("oneOf")
+        .or_else(|| prop.get("anyOf"))
+        .and_then(Value::as_array)
+    {
         let titled: Vec<(String, Value)> = one_of
             .iter()
             .filter_map(|o| {
                 let c = o.get("const")?;
-                let label = o.get("title").and_then(Value::as_str).map(String::from).unwrap_or_else(|| label_of(c));
+                let label = o
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or_else(|| label_of(c));
                 Some((label, c.clone()))
             })
             .collect();
@@ -88,17 +100,31 @@ fn choices(prop: &Value) -> Vec<(String, Value)> {
         return values(e)
             .into_iter()
             .enumerate()
-            .map(|(i, v)| (names.get(i).and_then(Value::as_str).map(String::from).unwrap_or_else(|| label_of(&v)), v))
+            .map(|(i, v)| {
+                (
+                    names
+                        .get(i)
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                        .unwrap_or_else(|| label_of(&v)),
+                    v,
+                )
+            })
             .collect();
     }
     if prop.get("type").and_then(Value::as_str) == Some("boolean") {
-        return vec![("yes".into(), Value::Bool(true)), ("no".into(), Value::Bool(false))];
+        return vec![
+            ("yes".into(), Value::Bool(true)),
+            ("no".into(), Value::Bool(false)),
+        ];
     }
     Vec::new()
 }
 
 fn label_of(v: &Value) -> String {
-    v.as_str().map(String::from).unwrap_or_else(|| v.to_string())
+    v.as_str()
+        .map(String::from)
+        .unwrap_or_else(|| v.to_string())
 }
 
 /// Turn a typed or chosen answer into the JSON the field's schema asks for.
@@ -113,13 +139,24 @@ fn coerce(prop: &Value, options: &[(String, Value)], text: &str) -> Result<Value
                 "n" | "no" | "false" | "0" => Value::Bool(false),
                 _ => return Err("Please answer yes or no.".into()),
             },
-            Some("integer") => text.parse::<i64>().map(Value::from).map_err(|_| "Please enter a whole number.".to_string())?,
+            Some("integer") => text
+                .parse::<i64>()
+                .map(Value::from)
+                .map_err(|_| "Please enter a whole number.".to_string())?,
             Some("number") => {
-                let n: f64 = text.parse().map_err(|_| "Please enter a number.".to_string())?;
-                serde_json::Number::from_f64(n).map(Value::Number).ok_or("Please enter a finite number.")?
+                let n: f64 = text
+                    .parse()
+                    .map_err(|_| "Please enter a number.".to_string())?;
+                serde_json::Number::from_f64(n)
+                    .map(Value::Number)
+                    .ok_or("Please enter a finite number.")?
             }
             Some("array") => Value::Array(
-                text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| Value::String(s.into())).collect(),
+                text.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| Value::String(s.into()))
+                    .collect(),
             ),
             _ if !options.is_empty() => {
                 let labels: Vec<&str> = options.iter().map(|(l, _)| l.as_str()).collect();
@@ -129,7 +166,10 @@ fn coerce(prop: &Value, options: &[(String, Value)], text: &str) -> Result<Value
         }
     };
     match crate::mcp_schema::check(prop, &value).first() {
-        Some(problem) => Err(format!("Not accepted: {}.", problem.replace("arguments", "the answer"))),
+        Some(problem) => Err(format!(
+            "Not accepted: {}.",
+            problem.replace("arguments", "the answer")
+        )),
         None => Ok(value),
     }
 }
@@ -141,11 +181,24 @@ where
     F: FnMut(String, Vec<String>) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
-    let props = schema.get("properties").and_then(Value::as_object).cloned().unwrap_or_default();
-    let required: Vec<&str> = schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
     let intro = format!("MCP server {server} asks: {message}");
     if props.is_empty() {
-        return match ask(intro, vec!["Accept".into(), "Decline".into()]).await.as_deref() {
+        return match ask(intro, vec!["Accept".into(), "Decline".into()])
+            .await
+            .as_deref()
+        {
             Some("Accept") => Elicited::Accept(Value::Object(Map::new())),
             Some(_) => Elicited::Decline,
             None => Elicited::Cancel,
@@ -155,8 +208,19 @@ where
     for (name, prop) in &props {
         let is_required = required.contains(&name.as_str());
         let title = prop.get("title").and_then(Value::as_str).unwrap_or(name);
-        let mut question = format!("{intro}\n\n{title}{}", if is_required { " (required)" } else { " (optional; Esc to skip)" });
-        if let Some(d) = prop.get("description").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+        let mut question = format!(
+            "{intro}\n\n{title}{}",
+            if is_required {
+                " (required)"
+            } else {
+                " (optional; Esc to skip)"
+            }
+        );
+        if let Some(d) = prop
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+        {
             question.push_str(&format!("\n{d}"));
         }
         let options = choices(prop);
@@ -230,16 +294,30 @@ impl ClientHandler for Client {
         request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> Result<ElicitResult, ErrorData> {
-        let Some(mcp) = self.mcp.upgrade() else { return Ok(Self::result(Elicited::Cancel)) };
+        let Some(mcp) = self.mcp.upgrade() else {
+            return Ok(Self::result(Elicited::Cancel));
+        };
         let elicitor = mcp.elicitor();
         Ok(Self::result(match request {
-            ElicitRequestParams::FormElicitationParams { message, requested_schema, .. } => {
+            ElicitRequestParams::FormElicitationParams {
+                message,
+                requested_schema,
+                ..
+            } => {
                 let schema = serde_json::to_value(&requested_schema).unwrap_or_default();
                 elicitor.form(&self.server, &message, &schema).await
             }
-            ElicitRequestParams::UrlElicitationParams { message, url, elicitation_id, .. } => {
+            ElicitRequestParams::UrlElicitationParams {
+                message,
+                url,
+                elicitation_id,
+                ..
+            } => {
                 let waiter = mcp.expect_elicitation(&elicitation_id);
-                match elicitor.url(&self.server, &message, &url, &elicitation_id).await {
+                match elicitor
+                    .url(&self.server, &message, &url, &elicitation_id)
+                    .await
+                {
                     Elicited::Accept(v) => match tokio::time::timeout(URL_TIMEOUT, waiter).await {
                         Ok(_) => Elicited::Accept(v),
                         Err(_) => {
@@ -258,7 +336,11 @@ impl ClientHandler for Client {
         }))
     }
 
-    async fn on_progress(&self, params: ProgressNotificationParam, _context: NotificationContext<RoleClient>) {
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
         if let Some(mcp) = self.mcp.upgrade() {
             mcp.progress(&self.server, &params);
         }
@@ -276,11 +358,19 @@ impl ClientHandler for Client {
         self.refresh(Refresh::Resources);
     }
 
-    async fn on_custom_notification(&self, notification: CustomNotification, _context: NotificationContext<RoleClient>) {
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _context: NotificationContext<RoleClient>,
+    ) {
         if notification.method != "notifications/elicitation/complete" {
             return;
         }
-        let id = notification.params.as_ref().and_then(|p| p.get("elicitationId")).and_then(Value::as_str);
+        let id = notification
+            .params
+            .as_ref()
+            .and_then(|p| p.get("elicitationId"))
+            .and_then(Value::as_str);
         if let (Some(mcp), Some(id)) = (self.mcp.upgrade(), id) {
             mcp.complete_elicitation(id);
         }
@@ -290,7 +380,9 @@ impl ClientHandler for Client {
 impl Client {
     /// Re-list in the background: the handler must not block the connection.
     fn refresh(&self, what: Refresh) {
-        let Some(mcp) = self.mcp.upgrade() else { return };
+        let Some(mcp) = self.mcp.upgrade() else {
+            return;
+        };
         let server = self.server.clone();
         tokio::spawn(async move { mcp.refresh(&server, what).await });
     }
@@ -301,8 +393,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    async fn run(schema: Value, answers: &[Option<&str>]) -> (Elicited, Vec<(String, Vec<String>)>) {
-        let answers = std::sync::Mutex::new(answers.iter().map(|a| a.map(String::from)).collect::<std::collections::VecDeque<_>>());
+    async fn run(
+        schema: Value,
+        answers: &[Option<&str>],
+    ) -> (Elicited, Vec<(String, Vec<String>)>) {
+        let answers = std::sync::Mutex::new(
+            answers
+                .iter()
+                .map(|a| a.map(String::from))
+                .collect::<std::collections::VecDeque<_>>(),
+        );
         let asked = std::sync::Mutex::new(Vec::new());
         let out = fill_form("srv", "Need details", &schema, |q, o| {
             asked.lock().unwrap().push((q, o));
@@ -326,10 +426,37 @@ mod tests {
             },
             "required": ["name", "age"]
         });
-        let (out, asked) = run(schema.clone(), &[Some("x"), Some("Ada"), Some("old"), Some("36"), Some("Green"), Some("yes"), None]).await;
-        assert_eq!(out, Elicited::Accept(json!({"name": "Ada", "age": 36, "color": "g", "subscribe": true})));
-        assert!(asked[0].0.starts_with("MCP server srv asks: Need details\n\nYour name (required)"), "{}", asked[0].0);
-        assert!(asked[1].0.starts_with("Not accepted: the answer must be at least 2 characters."), "{}", asked[1].0);
+        let (out, asked) = run(
+            schema.clone(),
+            &[
+                Some("x"),
+                Some("Ada"),
+                Some("old"),
+                Some("36"),
+                Some("Green"),
+                Some("yes"),
+                None,
+            ],
+        )
+        .await;
+        assert_eq!(
+            out,
+            Elicited::Accept(json!({"name": "Ada", "age": 36, "color": "g", "subscribe": true}))
+        );
+        assert!(
+            asked[0]
+                .0
+                .starts_with("MCP server srv asks: Need details\n\nYour name (required)"),
+            "{}",
+            asked[0].0
+        );
+        assert!(
+            asked[1]
+                .0
+                .starts_with("Not accepted: the answer must be at least 2 characters."),
+            "{}",
+            asked[1].0
+        );
         assert!(asked[3].0.starts_with("Please enter a whole number."));
         assert_eq!(asked[4].1, ["Red", "Green"]);
         assert_eq!(asked[5].1, ["yes", "no"]);
@@ -337,16 +464,30 @@ mod tests {
 
         // Skipping a required field cancels; repeated bad answers decline.
         assert_eq!(run(schema.clone(), &[None]).await.0, Elicited::Cancel);
-        assert_eq!(run(schema, &[Some("Ada"), Some("a"), Some("b"), Some("c")]).await.0, Elicited::Decline);
+        assert_eq!(
+            run(schema, &[Some("Ada"), Some("a"), Some("b"), Some("c")])
+                .await
+                .0,
+            Elicited::Decline
+        );
         // A form without fields is a plain yes/no.
-        assert_eq!(run(json!({"type": "object"}), &[Some("Accept")]).await.0, Elicited::Accept(json!({})));
-        assert_eq!(run(json!({"type": "object"}), &[Some("Decline")]).await.0, Elicited::Decline);
+        assert_eq!(
+            run(json!({"type": "object"}), &[Some("Accept")]).await.0,
+            Elicited::Accept(json!({}))
+        );
+        assert_eq!(
+            run(json!({"type": "object"}), &[Some("Decline")]).await.0,
+            Elicited::Decline
+        );
     }
 
     #[test]
     fn capabilities_announce_elicitation() {
         let v = serde_json::to_value(client_info()).unwrap();
-        assert_eq!(v["capabilities"]["elicitation"], json!({"form": {"schemaValidation": true}, "url": {}}));
+        assert_eq!(
+            v["capabilities"]["elicitation"],
+            json!({"form": {"schemaValidation": true}, "url": {}})
+        );
         assert_eq!(v["clientInfo"]["name"], "nyq");
     }
 }

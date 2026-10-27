@@ -16,13 +16,14 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientRequest, ContentBlock,
-    ProgressNotificationParam, ProgressToken, ResourceContents, ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
+    ClientRequest, ContentBlock, ProgressNotificationParam, ProgressToken, ResourceContents,
+    ServerResult,
 };
 use rmcp::service::{ClientInitializeError, PeerRequestOptions, RunningService};
 use rmcp::transport::auth::{
-    AuthClient, AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession, CredentialStore,
-    StoredCredentials, WWWAuthenticateParams,
+    AuthClient, AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession,
+    CredentialStore, StoredCredentials, WWWAuthenticateParams,
 };
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{IntoTransport, StreamableHttpClientTransport, TokioChildProcess};
@@ -78,17 +79,33 @@ pub enum Scope {
 
 #[derive(Clone)]
 pub enum Transport {
-    Stdio { command: String, args: Vec<String>, env: BTreeMap<String, String>, cwd: Option<PathBuf> },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: Option<PathBuf>,
+    },
     /// Streamable HTTP. `headers` are already env-expanded and may hold secrets.
-    Http { url: String, headers: BTreeMap<String, String> },
+    Http {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
     /// The legacy HTTP+SSE transport (an event stream plus a POST endpoint).
-    Sse { url: String, headers: BTreeMap<String, String> },
+    Sse {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
 }
 
 impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Transport::Stdio { command, args, cwd, env } => f
+            Transport::Stdio {
+                command,
+                args,
+                cwd,
+                env,
+            } => f
                 .debug_struct("Stdio")
                 .field("command", command)
                 .field("args", args)
@@ -96,7 +113,11 @@ impl std::fmt::Debug for Transport {
                 .field("cwd", cwd)
                 .finish(),
             Transport::Http { url, headers } | Transport::Sse { url, headers } => f
-                .debug_struct(if matches!(self, Transport::Sse { .. }) { "Sse" } else { "Http" })
+                .debug_struct(if matches!(self, Transport::Sse { .. }) {
+                    "Sse"
+                } else {
+                    "Http"
+                })
                 .field("url", url)
                 .field("headers", &headers.keys().collect::<Vec<_>>())
                 .finish(),
@@ -154,7 +175,12 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn new(name: impl Into<String>, transport: Transport, scope: Scope) -> Self {
-        Self { name: name.into(), transport, scope, options: ServerOptions::default() }
+        Self {
+            name: name.into(),
+            transport,
+            scope,
+            options: ServerOptions::default(),
+        }
     }
 }
 
@@ -169,7 +195,10 @@ impl ServerConfig {
 pub fn load_configs(home: &Path, cwd: &Path) -> (Vec<ServerConfig>, Vec<String>) {
     let mut servers = Vec::new();
     let mut warnings = Vec::new();
-    for (path, scope) in [(home.join("mcp.json"), Scope::Profile), (cwd.join(".mcp.json"), Scope::Project)] {
+    for (path, scope) in [
+        (home.join("mcp.json"), Scope::Profile),
+        (cwd.join(".mcp.json"), Scope::Project),
+    ] {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -199,7 +228,10 @@ pub fn server_entries(root: &Map<String, Value>) -> Result<Option<&Map<String, V
         (None, Some(e)) => ("mcp", e),
         (None, None) => return Ok(None),
     };
-    entries.as_object().map(Some).ok_or_else(|| anyhow!("\"{key}\" must be an object"))
+    entries
+        .as_object()
+        .map(Some)
+        .ok_or_else(|| anyhow!("\"{key}\" must be an object"))
 }
 
 fn parse_file(
@@ -211,19 +243,39 @@ fn parse_file(
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let root: Value = serde_json::from_str(text).context("invalid JSON")?;
-    let root = root.as_object().ok_or_else(|| anyhow!("must contain a JSON object"))?;
+    let root = root
+        .as_object()
+        .ok_or_else(|| anyhow!("must contain a JSON object"))?;
     for key in root.keys() {
         let folded = key.to_ascii_lowercase().replace(['_', '-'], "");
-        if key != "mcpServers" && matches!(folded.as_str(), "servers" | "mcpservers" | "mcpserver" | "mcpserverconfig") {
-            warnings.push(format!("{}: \"{key}\" is not read; did you mean \"mcpServers\"?", path.display()));
+        if key != "mcpServers"
+            && matches!(
+                folded.as_str(),
+                "servers" | "mcpservers" | "mcpserver" | "mcpserverconfig"
+            )
+        {
+            warnings.push(format!(
+                "{}: \"{key}\" is not read; did you mean \"mcpServers\"?",
+                path.display()
+            ));
         }
     }
-    let Some(entries) = server_entries(root)? else { return Ok(()) };
+    let Some(entries) = server_entries(root)? else {
+        return Ok(());
+    };
     let base = path.parent().unwrap_or(Path::new("."));
     for (name, entry) in entries {
-        let env = Env { trusted: scope == Scope::Profile || trusted.contains(name), name };
+        let env = Env {
+            trusted: scope == Scope::Profile || trusted.contains(name),
+            name,
+        };
         match parse_server(entry, base, &env) {
-            Ok((transport, options)) => servers.push(ServerConfig { name: name.clone(), transport, scope, options }),
+            Ok((transport, options)) => servers.push(ServerConfig {
+                name: name.clone(),
+                transport,
+                scope,
+                options,
+            }),
             Err(e) => warnings.push(format!("{}: server '{name}': {e:#}", path.display())),
         }
     }
@@ -265,10 +317,14 @@ fn parse_server(v: &Value, base: &Path, env: &Env) -> Result<(Transport, ServerO
     let options = parse_options(obj)?;
     let transport = match obj.get("type").and_then(Value::as_str) {
         Some("sse") => parse_http(obj, env, true)?,
-        Some("http" | "streamable-http" | "streamable_http" | "streamableHttp" | "remote") => parse_http(obj, env, false)?,
+        Some("http" | "streamable-http" | "streamable_http" | "streamableHttp" | "remote") => {
+            parse_http(obj, env, false)?
+        }
         None if obj.contains_key("url") => parse_http(obj, env, false)?,
         None | Some("stdio" | "local") => parse_stdio(obj, base, env)?,
-        Some(other) => bail!("skipped: unknown transport type \"{other}\" (use stdio, http or sse)"),
+        Some(other) => {
+            bail!("skipped: unknown transport type \"{other}\" (use stdio, http or sse)")
+        }
     };
     Ok((transport, options))
 }
@@ -282,11 +338,17 @@ fn parse_options(obj: &Map<String, Value>) -> Result<ServerOptions> {
     };
     let count = |k: &str| match obj.get(k) {
         None | Some(Value::Null) => Ok(None),
-        Some(v) => v.as_u64().map(Some).ok_or_else(|| anyhow!("\"{k}\" must be a non-negative whole number")),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow!("\"{k}\" must be a non-negative whole number")),
     };
     o.enabled = flag("enabled")?.unwrap_or(true);
     o.required = flag("required")?.unwrap_or(false);
-    for (key, slot) in [("startup_timeout_ms", &mut o.startup_timeout), ("operation_timeout_ms", &mut o.operation_timeout)] {
+    for (key, slot) in [
+        ("startup_timeout_ms", &mut o.startup_timeout),
+        ("operation_timeout_ms", &mut o.operation_timeout),
+    ] {
         if let Some(ms) = count(key)? {
             anyhow::ensure!(ms > 0, "\"{key}\" must be at least 1");
             *slot = Duration::from_millis(ms);
@@ -314,7 +376,11 @@ fn parse_options(obj: &Map<String, Value>) -> Result<ServerOptions> {
                 Some(Value::String(s)) => s.split_whitespace().map(String::from).collect(),
                 Some(Value::Array(a)) => a
                     .iter()
-                    .map(|x| x.as_str().map(String::from).ok_or_else(|| anyhow!("\"oauth.scopes\" must be strings")))
+                    .map(|x| {
+                        x.as_str()
+                            .map(String::from)
+                            .ok_or_else(|| anyhow!("\"oauth.scopes\" must be strings"))
+                    })
                     .collect::<Result<_>>()?,
                 Some(_) => bail!("\"oauth.scopes\" must be an array of strings"),
             };
@@ -325,7 +391,13 @@ fn parse_options(obj: &Map<String, Value>) -> Result<ServerOptions> {
 }
 
 fn strings(v: &[Value], what: &str) -> Result<Vec<String>> {
-    v.iter().map(|x| x.as_str().map(String::from).ok_or_else(|| anyhow!("\"{what}\" must be strings"))).collect()
+    v.iter()
+        .map(|x| {
+            x.as_str()
+                .map(String::from)
+                .ok_or_else(|| anyhow!("\"{what}\" must be strings"))
+        })
+        .collect()
 }
 
 fn parse_stdio(obj: &Map<String, Value>, base: &Path, env: &Env) -> Result<Transport> {
@@ -359,7 +431,10 @@ fn parse_stdio(obj: &Map<String, Value>, base: &Path, env: &Env) -> Result<Trans
                     Value::Number(_) | Value::Bool(_) => x.to_string(),
                     _ => bail!("\"{key}.{k}\" must be a string"),
                 };
-                vars_out.insert(k.clone(), env.expand(&raw).with_context(|| format!("\"{key}.{k}\""))?);
+                vars_out.insert(
+                    k.clone(),
+                    env.expand(&raw).with_context(|| format!("\"{key}.{k}\""))?,
+                );
             }
         }
         _ => bail!("\"{key}\" must be an object"),
@@ -370,12 +445,23 @@ fn parse_stdio(obj: &Map<String, Value>, base: &Path, env: &Env) -> Result<Trans
         Some(_) => bail!("\"cwd\" must be a string"),
     };
     let command = env.expand(&command).context("\"command\"")?;
-    let args = args.iter().map(|a| env.expand(a).context("\"args\"")).collect::<Result<_>>()?;
-    Ok(Transport::Stdio { command, args, env: vars_out, cwd })
+    let args = args
+        .iter()
+        .map(|a| env.expand(a).context("\"args\""))
+        .collect::<Result<_>>()?;
+    Ok(Transport::Stdio {
+        command,
+        args,
+        env: vars_out,
+        cwd,
+    })
 }
 
 fn parse_http(obj: &Map<String, Value>, env: &Env, sse: bool) -> Result<Transport> {
-    let raw = obj.get("url").and_then(Value::as_str).ok_or_else(|| anyhow!("missing \"url\""))?;
+    let raw = obj
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing \"url\""))?;
     let url = env.expand(raw).context("\"url\"")?;
     let parsed = reqwest::Url::parse(&url).map_err(|e| anyhow!("invalid \"url\": {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -392,11 +478,17 @@ fn parse_http(obj: &Map<String, Value>, env: &Env, sse: bool) -> Result<Transpor
         None | Some(Value::Null) => {}
         Some(Value::Object(m)) => {
             for (k, x) in m {
-                let raw = x.as_str().ok_or_else(|| anyhow!("\"headers.{k}\" must be a string"))?;
+                let raw = x
+                    .as_str()
+                    .ok_or_else(|| anyhow!("\"headers.{k}\" must be a string"))?;
                 if k.eq_ignore_ascii_case("authorization") {
                     env.secret("an Authorization header")?;
                 }
-                add(k, env.expand(raw).with_context(|| format!("\"headers.{k}\""))?)?;
+                add(
+                    k,
+                    env.expand(raw)
+                        .with_context(|| format!("\"headers.{k}\""))?,
+                )?;
             }
         }
         Some(_) => bail!("\"headers\" must be an object"),
@@ -406,8 +498,12 @@ fn parse_http(obj: &Map<String, Value>, env: &Env, sse: bool) -> Result<Transpor
         Some(Value::Object(m)) => {
             env.secret("\"header_env\"")?;
             for (k, x) in m {
-                let var = x.as_str().ok_or_else(|| anyhow!("\"header_env.{k}\" must name an environment variable"))?;
-                let value = std::env::var(var).map_err(|_| anyhow!("environment variable {var} (for header {k}) is not set"))?;
+                let var = x.as_str().ok_or_else(|| {
+                    anyhow!("\"header_env.{k}\" must name an environment variable")
+                })?;
+                let value = std::env::var(var).map_err(|_| {
+                    anyhow!("environment variable {var} (for header {k}) is not set")
+                })?;
                 add(k, value)?;
             }
         }
@@ -417,13 +513,18 @@ fn parse_http(obj: &Map<String, Value>, env: &Env, sse: bool) -> Result<Transpor
         None | Some(Value::Null) => {}
         Some(Value::String(var)) => {
             env.secret("\"bearer_token_env\"")?;
-            let token = std::env::var(var).map_err(|_| anyhow!("environment variable {var} is not set"))?;
+            let token =
+                std::env::var(var).map_err(|_| anyhow!("environment variable {var} is not set"))?;
             headers.retain(|k, _| !k.eq_ignore_ascii_case("authorization"));
             headers.insert("Authorization".into(), format!("Bearer {}", token.trim()));
         }
         Some(_) => bail!("\"bearer_token_env\" must be a string"),
     }
-    Ok(if sse { Transport::Sse { url, headers } } else { Transport::Http { url, headers } })
+    Ok(if sse {
+        Transport::Sse { url, headers }
+    } else {
+        Transport::Http { url, headers }
+    })
 }
 
 /// Replace `${VAR}` with the environment variable's value, or with `default`
@@ -433,14 +534,19 @@ fn expand_env(s: &str) -> Result<String> {
     let mut out = String::new();
     let mut rest = s;
     while let Some(start) = rest.find("${") {
-        let end = rest[start..].find('}').ok_or_else(|| anyhow!("unterminated ${{...}} in \"{s}\""))? + start;
+        let end = rest[start..]
+            .find('}')
+            .ok_or_else(|| anyhow!("unterminated ${{...}} in \"{s}\""))?
+            + start;
         let inner = &rest[start + 2..end];
         let (var, default) = match inner.split_once(":-") {
             Some((v, d)) => (v, Some(d)),
             None => (inner, None),
         };
         if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            bail!("invalid variable name \"{var}\" in \"{s}\" (use ${{NAME}} or ${{NAME:-default}})");
+            bail!(
+                "invalid variable name \"{var}\" in \"{s}\" (use ${{NAME}} or ${{NAME:-default}})"
+            );
         }
         let value = match (std::env::var(var), default) {
             (Ok(v), Some(d)) if v.is_empty() => d.to_string(),
@@ -471,13 +577,27 @@ fn docker_run(program: &Path, args: &[String]) -> Option<(Vec<String>, Docker)> 
     if !stem.eq_ignore_ascii_case("docker") || args.first().map(String::as_str) != Some("run") {
         return None;
     }
-    if args.iter().any(|a| a == "--cidfile" || a.starts_with("--cidfile=")) {
+    if args
+        .iter()
+        .any(|a| a == "--cidfile" || a.starts_with("--cidfile="))
+    {
         return None;
     }
-    let cidfile = std::env::temp_dir().join(format!("nyq-mcp-{}.cid", uuid::Uuid::new_v4().simple()));
-    let mut out = vec!["run".to_string(), "--cidfile".to_string(), cidfile.display().to_string()];
+    let cidfile =
+        std::env::temp_dir().join(format!("nyq-mcp-{}.cid", uuid::Uuid::new_v4().simple()));
+    let mut out = vec![
+        "run".to_string(),
+        "--cidfile".to_string(),
+        cidfile.display().to_string(),
+    ];
     out.extend(args[1..].iter().cloned());
-    Some((out, Docker { program: program.to_path_buf(), cidfile }))
+    Some((
+        out,
+        Docker {
+            program: program.to_path_buf(),
+            cidfile,
+        },
+    ))
 }
 
 impl Docker {
@@ -655,7 +775,10 @@ impl McpManager {
 
     /// Tool names currently registered for `name` (empty when it is not connected).
     pub fn registered_names(&self, name: &str) -> Vec<String> {
-        lock(&self.shared.servers).get(name).map(|s| s.names.clone()).unwrap_or_default()
+        lock(&self.shared.servers)
+            .get(name)
+            .map(|s| s.names.clone())
+            .unwrap_or_default()
     }
 
     fn is_connected(&self, name: &str) -> bool {
@@ -698,7 +821,14 @@ impl McpManager {
             let status = if text.contains("needs sign-in") {
                 Status::NeedsAuth
             } else {
-                Status::Failed(text.lines().next().unwrap_or("").chars().take(200).collect())
+                Status::Failed(
+                    text.lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect(),
+                )
             };
             self.set_status(&cfg.name, status);
         }
@@ -723,7 +853,9 @@ impl McpManager {
                 match mcp.connect(&cfg).await {
                     Ok(tools) => {
                         let n = tools.len();
-                        mcp.shared.live.push(mcp.install_patch(&cfg.name, Vec::new(), tools));
+                        mcp.shared
+                            .live
+                            .push(mcp.install_patch(&cfg.name, Vec::new(), tools));
                         if announce {
                             crate::ui::info(&format!("MCP {}: {n} tools", cfg.name));
                         }
@@ -736,7 +868,12 @@ impl McpManager {
 
     /// A patch replacing `server`'s tools with `tools` (and the resource and
     /// prompt tools); a no-op once the server is disconnected.
-    fn install_patch(&self, server: &str, old: Vec<String>, tools: Vec<Box<dyn Tool>>) -> ToolPatch {
+    fn install_patch(
+        &self,
+        server: &str,
+        old: Vec<String>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> ToolPatch {
         let (server, mcp) = (server.to_string(), self.clone());
         Box::new(move |reg| {
             reg.remove_names(&old);
@@ -752,20 +889,36 @@ impl McpManager {
         })
     }
 
-    async fn open(&self, cfg: &ServerConfig) -> Result<(RunningService<RoleClient, Client>, Option<Docker>)> {
-        let client = Client { server: cfg.name.clone(), mcp: self.downgrade() };
+    async fn open(
+        &self,
+        cfg: &ServerConfig,
+    ) -> Result<(RunningService<RoleClient, Client>, Option<Docker>)> {
+        let client = Client {
+            server: cfg.name.clone(),
+            mcp: self.downgrade(),
+        };
         let timeout = cfg.options.startup_timeout;
         match &cfg.transport {
-            Transport::Stdio { command, args, env, cwd } => {
+            Transport::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
                 #[cfg(windows)]
                 let program = {
-                    let variable = |name: &str| env.iter().find(|(k, _)| k.eq_ignore_ascii_case(name))
-                        .map(|(_, v)| v.clone()).or_else(|| std::env::var(name).ok());
+                    let variable = |name: &str| {
+                        env.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                            .map(|(_, v)| v.clone())
+                            .or_else(|| std::env::var(name).ok())
+                    };
                     let path = variable("PATH").unwrap_or_default();
                     let base = cwd.clone().unwrap_or(std::env::current_dir()?);
-                    let paths: Vec<PathBuf> = std::env::split_paths(&path).map(|p| base.join(p)).collect();
-                    let extensions = variable("PATHEXT")
-                        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+                    let paths: Vec<PathBuf> =
+                        std::env::split_paths(&path).map(|p| base.join(p)).collect();
+                    let extensions =
+                        variable("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
                     resolve_launcher(command, &paths, &extensions)
                 };
                 #[cfg(not(windows))]
@@ -793,12 +946,16 @@ impl McpManager {
                     }
                 }
             }
-            Transport::Http { url, headers } => Ok((self.connect_http(cfg, client, url, headers).await?, None)),
+            Transport::Http { url, headers } => {
+                Ok((self.connect_http(cfg, client, url, headers).await?, None))
+            }
             Transport::Sse { url, headers } => {
                 let transport = crate::mcp_sse::SseTransport::connect(url, headers, timeout)
                     .await
                     .map_err(|e| anyhow!("MCP server '{}': {e}", cfg.name))?;
-                let service = initialize(client, transport, timeout).await.map_err(|e| init_error(&cfg.name, e, false, timeout))?;
+                let service = initialize(client, transport, timeout)
+                    .await
+                    .map_err(|e| init_error(&cfg.name, e, false, timeout))?;
                 Ok((service, None))
             }
         }
@@ -813,8 +970,12 @@ impl McpManager {
     ) -> Result<RunningService<RoleClient, Client>> {
         let (name, timeout) = (cfg.name.as_str(), cfg.options.startup_timeout);
         let config = http_config(url, headers)?;
-        let explicit = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
-        let endpoint = reqwest::Url::parse(url).with_context(|| format!("MCP server '{name}': invalid url"))?.to_string();
+        let explicit = headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization"));
+        let endpoint = reqwest::Url::parse(url)
+            .with_context(|| format!("MCP server '{name}': invalid url"))?
+            .to_string();
         let store = self.claim_store(name, &endpoint)?;
         let result = if !explicit && store.path.exists() {
             let mut manager = AuthorizationManager::new(url).await?;
@@ -825,12 +986,27 @@ impl McpManager {
                 .with_context(|| format!("MCP server '{name}': loading saved sign-in"))?;
             if signed_in {
                 let auth = AuthClient::new(crate::http::client(), manager);
-                initialize(client, StreamableHttpClientTransport::with_client(auth, config), timeout).await
+                initialize(
+                    client,
+                    StreamableHttpClientTransport::with_client(auth, config),
+                    timeout,
+                )
+                .await
             } else {
-                initialize(client, StreamableHttpClientTransport::with_client(crate::http::client(), config), timeout).await
+                initialize(
+                    client,
+                    StreamableHttpClientTransport::with_client(crate::http::client(), config),
+                    timeout,
+                )
+                .await
             }
         } else {
-            initialize(client, StreamableHttpClientTransport::with_client(crate::http::client(), config), timeout).await
+            initialize(
+                client,
+                StreamableHttpClientTransport::with_client(crate::http::client(), config),
+                timeout,
+            )
+            .await
         };
         result.map_err(|e| init_error(name, e, explicit, timeout))
     }
@@ -845,7 +1021,11 @@ impl McpManager {
         let listed = match tokio::time::timeout(timeout, service.list_all_tools()).await {
             Ok(Ok(t)) => self.build_tools(&cfg.name, t),
             Ok(Err(e)) => Err(anyhow!("listing tools of MCP server '{}': {e}", cfg.name)),
-            Err(_) => Err(anyhow!("MCP server '{}' did not list its tools within {}", cfg.name, secs(timeout))),
+            Err(_) => Err(anyhow!(
+                "MCP server '{}' did not list its tools within {}",
+                cfg.name,
+                secs(timeout)
+            )),
         };
         let (tools, names) = match listed {
             Ok(t) => t,
@@ -865,12 +1045,22 @@ impl McpManager {
         };
         let peer = service.peer().clone();
         let info = peer.peer_info();
-        let caps = info.as_ref().map(|i| i.capabilities.clone()).unwrap_or_default();
+        let caps = info
+            .as_ref()
+            .map(|i| i.capabilities.clone())
+            .unwrap_or_default();
         let prompts = match caps.prompts {
-            Some(_) => tokio::time::timeout(timeout, peer.list_all_prompts()).await.ok().and_then(|r| r.ok()).unwrap_or_default(),
+            Some(_) => tokio::time::timeout(timeout, peer.list_all_prompts())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default(),
             None => Vec::new(),
         };
-        self.shared.live.set_note(&cfg.name, info.as_ref().and_then(|i| i.instructions.clone()));
+        self.shared.live.set_note(
+            &cfg.name,
+            info.as_ref().and_then(|i| i.instructions.clone()),
+        );
         let server = Server {
             service,
             names,
@@ -892,7 +1082,10 @@ impl McpManager {
         for t in listed {
             let name = tool_name(server, &t.name);
             if let Some(other) = seen.insert(name.clone(), t.name.to_string()) {
-                bail!("MCP server '{server}': tools `{other}` and `{}` both map to `{name}`", t.name);
+                bail!(
+                    "MCP server '{server}': tools `{other}` and `{}` both map to `{name}`",
+                    t.name
+                );
             }
             let mut schema = Value::Object(t.input_schema.as_ref().clone());
             if let Value::Object(m) = &mut schema {
@@ -915,26 +1108,41 @@ impl McpManager {
 
     /// Re-read what a `list_changed` notification says has changed.
     pub(crate) async fn refresh(&self, server: &str, what: Refresh) {
-        let Some(peer) = self.peer(server) else { return };
+        let Some(peer) = self.peer(server) else {
+            return;
+        };
         match what {
             Refresh::Tools => {
-                let listed = match tokio::time::timeout(REFRESH_TIMEOUT, peer.list_all_tools()).await {
-                    Ok(Ok(t)) => t,
-                    _ => return crate::ui::error(&format!("MCP {server}: could not re-list its changed tools")),
-                };
+                let listed =
+                    match tokio::time::timeout(REFRESH_TIMEOUT, peer.list_all_tools()).await {
+                        Ok(Ok(t)) => t,
+                        _ => {
+                            return crate::ui::error(&format!(
+                                "MCP {server}: could not re-list its changed tools"
+                            ))
+                        }
+                    };
                 let (tools, names) = match self.build_tools(server, listed) {
                     Ok(t) => t,
                     Err(e) => return crate::ui::error(&format!("{e:#}")),
                 };
                 let old = {
                     let mut servers = lock(&self.shared.servers);
-                    let Some(s) = servers.get_mut(server) else { return };
+                    let Some(s) = servers.get_mut(server) else {
+                        return;
+                    };
                     std::mem::replace(&mut s.names, names)
                 };
-                self.shared.live.push(self.install_patch(server, old, tools));
+                self.shared
+                    .live
+                    .push(self.install_patch(server, old, tools));
             }
             Refresh::Prompts => {
-                let Ok(Ok(prompts)) = tokio::time::timeout(REFRESH_TIMEOUT, peer.list_all_prompts()).await else { return };
+                let Ok(Ok(prompts)) =
+                    tokio::time::timeout(REFRESH_TIMEOUT, peer.list_all_prompts()).await
+                else {
+                    return;
+                };
                 if let Some(s) = lock(&self.shared.servers).get_mut(server) {
                     s.prompts = prompts;
                 }
@@ -947,7 +1155,9 @@ impl McpManager {
 
     fn sync_features(&self) {
         let mcp = self.clone();
-        self.shared.live.push(Box::new(move |reg| crate::mcp_features::sync_tools(reg, &mcp)));
+        self.shared.live.push(Box::new(move |reg| {
+            crate::mcp_features::sync_tools(reg, &mcp)
+        }));
     }
 
     /// The server's peer, restarting it first when it has exited (up to its
@@ -968,15 +1178,23 @@ impl McpManager {
         if let Some(peer) = self.peer(server).filter(|p| !p.is_transport_closed()) {
             return Ok(peer); // restarted meanwhile
         }
-        let cfg = lock(&self.shared.configs).get(server).cloned().ok_or_else(|| anyhow!("MCP server '{server}' is not connected"))?;
-        let tries = *lock(&self.shared.restarts).entry(server.to_string()).and_modify(|n| *n += 1).or_insert(1);
+        let cfg = lock(&self.shared.configs)
+            .get(server)
+            .cloned()
+            .ok_or_else(|| anyhow!("MCP server '{server}' is not connected"))?;
+        let tries = *lock(&self.shared.restarts)
+            .entry(server.to_string())
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
         if tries > cfg.options.restart_limit {
             let names = self.registered_names(server);
             let dead = lock(&self.shared.servers).remove(server);
             if let Some(dead) = dead {
                 close(dead).await;
             }
-            self.shared.live.push(self.install_patch(server, names, Vec::new()));
+            self.shared
+                .live
+                .push(self.install_patch(server, names, Vec::new()));
             self.set_status(server, Status::Failed("the server exited".into()));
             self.changed();
             bail!("MCP server '{server}' exited (restart limit reached); reconnect it with /mcp connect {server}");
@@ -984,12 +1202,17 @@ impl McpManager {
         crate::ui::info(&format!("MCP {server}: the server exited; restarting it"));
         let old = self.registered_names(server);
         let tools = self.connect_inner(&cfg).await?;
-        self.shared.live.push(self.install_patch(server, old, tools));
-        self.peer(server).ok_or_else(|| anyhow!("MCP server '{server}' is not connected"))
+        self.shared
+            .live
+            .push(self.install_patch(server, old, tools));
+        self.peer(server)
+            .ok_or_else(|| anyhow!("MCP server '{server}' is not connected"))
     }
 
     fn operation_timeout(&self, server: &str) -> Duration {
-        lock(&self.shared.servers).get(server).map_or(OPERATION_TIMEOUT, |s| s.operation_timeout)
+        lock(&self.shared.servers)
+            .get(server)
+            .map_or(OPERATION_TIMEOUT, |s| s.operation_timeout)
     }
 
     /// Timeout for resource and prompt requests: the server's operation
@@ -999,14 +1222,24 @@ impl McpManager {
     }
 
     fn watch_progress(&self, server: &str, token: &ProgressToken) -> ProgressWatch {
-        let key = (server.to_string(), serde_json::to_string(&token.0).unwrap_or_default());
+        let key = (
+            server.to_string(),
+            serde_json::to_string(&token.0).unwrap_or_default(),
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         lock(&self.shared.progress).insert(key.clone(), tx);
-        ProgressWatch { rx, key, mcp: self.downgrade() }
+        ProgressWatch {
+            rx,
+            key,
+            mcp: self.downgrade(),
+        }
     }
 
     pub(crate) fn progress(&self, server: &str, p: &ProgressNotificationParam) {
-        let key = (server.to_string(), serde_json::to_string(&p.progress_token.0).unwrap_or_default());
+        let key = (
+            server.to_string(),
+            serde_json::to_string(&p.progress_token.0).unwrap_or_default(),
+        );
         if let Some(tx) = lock(&self.shared.progress).get(&key) {
             let _ = tx.send(progress_text(p));
         }
@@ -1038,7 +1271,13 @@ impl McpManager {
 
     /// Suggestions for a prompt argument (`completion/complete`), when the
     /// server supports completion; empty otherwise.
-    pub async fn complete_prompt_argument(&self, server: &str, prompt: &str, argument: &str, value: &str) -> Vec<String> {
+    pub async fn complete_prompt_argument(
+        &self,
+        server: &str,
+        prompt: &str,
+        argument: &str,
+        value: &str,
+    ) -> Vec<String> {
         let peer = match lock(&self.shared.servers).get(server) {
             Some(s) if s.completions => s.service.peer().clone(),
             _ => return Vec::new(),
@@ -1054,7 +1293,12 @@ impl McpManager {
     /// registration as "nyq" or the configured client, PKCE, loopback
     /// redirect), save the credentials and connect. `open` receives the
     /// authorization URL to show the user.
-    pub async fn login(&self, cfg: &ServerConfig, cancel: Option<&CancellationToken>, open: impl FnOnce(&str)) -> Result<Vec<Box<dyn Tool>>> {
+    pub async fn login(
+        &self,
+        cfg: &ServerConfig,
+        cancel: Option<&CancellationToken>,
+        open: impl FnOnce(&str),
+    ) -> Result<Vec<Box<dyn Tool>>> {
         tokio::select! {
             biased;
             _ = async {
@@ -1067,24 +1311,43 @@ impl McpManager {
         }
     }
 
-    async fn login_inner(&self, cfg: &ServerConfig, open: impl FnOnce(&str)) -> Result<Vec<Box<dyn Tool>>> {
+    async fn login_inner(
+        &self,
+        cfg: &ServerConfig,
+        open: impl FnOnce(&str),
+    ) -> Result<Vec<Box<dyn Tool>>> {
         let Transport::Http { url, headers } = &cfg.transport else {
-            bail!("MCP server '{}' is not a streamable HTTP server; only those support sign-in", cfg.name);
+            bail!(
+                "MCP server '{}' is not a streamable HTTP server; only those support sign-in",
+                cfg.name
+            );
         };
         if self.is_connected(&cfg.name) {
             self.disconnect(&cfg.name).await?;
         }
         // Probe without saved credentials to learn the server's auth challenge.
         let timeout = cfg.options.startup_timeout;
-        let client = Client { server: cfg.name.clone(), mcp: self.downgrade() };
-        let probe = initialize(client, StreamableHttpClientTransport::with_client(crate::http::client(), http_config(url, headers)?), timeout);
+        let client = Client {
+            server: cfg.name.clone(),
+            mcp: self.downgrade(),
+        };
+        let probe = initialize(
+            client,
+            StreamableHttpClientTransport::with_client(
+                crate::http::client(),
+                http_config(url, headers)?,
+            ),
+            timeout,
+        );
         let challenge = match probe.await {
             Ok(service) => return self.register(cfg, service, None).await, // no sign-in needed
             Err(Init::Failed(e)) if is_unauthorized(&e) => e.auth_challenge().map(String::from),
             Err(e) => return Err(init_error(&cfg.name, e, false, timeout)),
         };
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.context("opening the sign-in callback listener")?;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("opening the sign-in callback listener")?;
         let port = listener.local_addr()?.port();
         let redirect = format!("http://127.0.0.1:{port}/callback");
         let mut manager = AuthorizationManager::new(url.as_str()).await?;
@@ -1092,7 +1355,13 @@ impl McpManager {
         let store = self.claim_store(&cfg.name, &endpoint)?;
         let step_up = lock(&self.shared.step_up).get(&cfg.name).cloned();
         let granted = match step_up {
-            Some(_) => store.load().await.ok().flatten().map(|c| c.granted_scopes).unwrap_or_default(),
+            Some(_) => store
+                .load()
+                .await
+                .ok()
+                .flatten()
+                .map(|c| c.granted_scopes)
+                .unwrap_or_default(),
             None => Vec::new(),
         };
         manager.set_credential_store(store);
@@ -1102,14 +1371,22 @@ impl McpManager {
             .context("discovering the server's OAuth configuration")?;
         manager.set_metadata(metadata.metadata);
         let mut request = AuthorizationRequest::new(&redirect).with_client_name("nyq");
-        let scopes = login_scopes(&cfg.options.oauth.scopes, &granted, step_up.as_deref(), challenge.as_deref(), url);
+        let scopes = login_scopes(
+            &cfg.options.oauth.scopes,
+            &granted,
+            step_up.as_deref(),
+            challenge.as_deref(),
+            url,
+        );
         if !scopes.is_empty() {
             request = request.with_scopes(scopes);
         }
         if let Some(id) = &cfg.options.oauth.client_id {
             request = request.with_preregistered_client(id);
             if let Some(var) = &cfg.options.oauth.client_secret_env {
-                let secret = std::env::var(var).map_err(|_| anyhow!("environment variable {var} (the OAuth client secret) is not set"))?;
+                let secret = std::env::var(var).map_err(|_| {
+                    anyhow!("environment variable {var} (the OAuth client secret) is not set")
+                })?;
                 request = request.with_client_secret(secret);
             }
         }
@@ -1121,7 +1398,10 @@ impl McpManager {
             .await
             .map_err(|_| anyhow!("sign-in timed out after 5 minutes"))??;
         drop(listener);
-        session.handle_callback_url(&callback).await.context("completing sign-in")?;
+        session
+            .handle_callback_url(&callback)
+            .await
+            .context("completing sign-in")?;
         lock(&self.shared.step_up).remove(&cfg.name);
         self.connect(cfg).await
     }
@@ -1138,7 +1418,9 @@ impl McpManager {
         let store = FileCredentialStore::new(path);
         if let (Ok(Some(saved)), false) = (store.load().await, endpoint.is_empty()) {
             match tokio::time::timeout(Duration::from_secs(15), revoke(endpoint, &saved)).await {
-                Ok(Err(e)) => crate::ui::error(&format!("MCP {name}: could not revoke the sign-in: {e:#}")),
+                Ok(Err(e)) => {
+                    crate::ui::error(&format!("MCP {name}: could not revoke the sign-in: {e:#}"))
+                }
                 Err(_) => crate::ui::error(&format!("MCP {name}: revoking the sign-in timed out")),
                 Ok(Ok(())) => {}
             }
@@ -1149,7 +1431,9 @@ impl McpManager {
     }
 
     pub async fn disconnect(&self, name: &str) -> Result<()> {
-        let server = lock(&self.shared.servers).remove(name).ok_or_else(|| anyhow!("MCP server '{name}' is not connected"))?;
+        let server = lock(&self.shared.servers)
+            .remove(name)
+            .ok_or_else(|| anyhow!("MCP server '{name}' is not connected"))?;
         lock(&self.shared.status).remove(name);
         self.shared.live.set_note(name, None);
         close(server).await;
@@ -1159,7 +1443,10 @@ impl McpManager {
 
     /// (server name, tool count) for connected servers.
     pub fn connected(&self) -> Vec<(String, usize)> {
-        lock(&self.shared.servers).iter().map(|(n, s)| (n.clone(), s.names.len())).collect()
+        lock(&self.shared.servers)
+            .iter()
+            .map(|(n, s)| (n.clone(), s.names.len()))
+            .collect()
     }
 
     /// Connected servers that offer resources, with a handle to each.
@@ -1173,11 +1460,16 @@ impl McpManager {
 
     /// Every prompt of every connected server, with the server's name.
     pub fn prompts(&self) -> Vec<(String, rmcp::model::Prompt)> {
-        lock(&self.shared.servers).iter().flat_map(|(n, s)| s.prompts.iter().map(move |p| (n.clone(), p.clone()))).collect()
+        lock(&self.shared.servers)
+            .iter()
+            .flat_map(|(n, s)| s.prompts.iter().map(move |p| (n.clone(), p.clone())))
+            .collect()
     }
 
     pub fn peer(&self, name: &str) -> Option<Peer<RoleClient>> {
-        lock(&self.shared.servers).get(name).map(|s| s.service.peer().clone())
+        lock(&self.shared.servers)
+            .get(name)
+            .map(|s| s.service.peer().clone())
     }
 
     pub async fn shutdown(&self) {
@@ -1207,10 +1499,17 @@ impl Drop for ProgressWatch {
 
 fn progress_text(p: &ProgressNotificationParam) -> String {
     let amount = match p.total {
-        Some(total) if total > 0.0 => format!("{:.0}%", (p.progress / total * 100.0).clamp(0.0, 100.0)),
+        Some(total) if total > 0.0 => {
+            format!("{:.0}%", (p.progress / total * 100.0).clamp(0.0, 100.0))
+        }
         _ => format!("{}", p.progress),
     };
-    match p.message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+    match p
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
         Some(m) => format!("{amount} · {m}"),
         None => amount,
     }
@@ -1226,18 +1525,39 @@ fn secs(d: Duration) -> String {
 /// Scopes to ask for at sign-in: the configured ones, plus — when a server
 /// asked for more access — those granted before and those it asked for, plus
 /// the challenge's. Empty lets the SDK pick.
-fn login_scopes(configured: &[String], granted: &[String], step_up: Option<&str>, challenge: Option<&str>, url: &str) -> Vec<String> {
+fn login_scopes(
+    configured: &[String],
+    granted: &[String],
+    step_up: Option<&str>,
+    challenge: Option<&str>,
+    url: &str,
+) -> Vec<String> {
     // Without either, the SDK picks from the challenge and server metadata.
     if configured.is_empty() && step_up.is_none() {
         return Vec::new();
     }
     let challenged = challenge
-        .and_then(|c| reqwest::Url::parse(url).ok().map(|u| WWWAuthenticateParams::parse(c, &u)))
+        .and_then(|c| {
+            reqwest::Url::parse(url)
+                .ok()
+                .map(|u| WWWAuthenticateParams::parse(c, &u))
+        })
         .and_then(|p| p.scope)
         .unwrap_or_default();
-    let more = step_up.map(|s| granted.iter().map(String::as_str).chain(s.split_whitespace()).collect::<Vec<_>>());
+    let more = step_up.map(|s| {
+        granted
+            .iter()
+            .map(String::as_str)
+            .chain(s.split_whitespace())
+            .collect::<Vec<_>>()
+    });
     let mut out: Vec<String> = Vec::new();
-    for s in configured.iter().map(String::as_str).chain(more.unwrap_or_default()).chain(challenged.split_whitespace()) {
+    for s in configured
+        .iter()
+        .map(String::as_str)
+        .chain(more.unwrap_or_default())
+        .chain(challenged.split_whitespace())
+    {
         if !out.iter().any(|o| o == s) {
             out.push(s.to_string());
         }
@@ -1248,34 +1568,59 @@ fn login_scopes(configured: &[String], granted: &[String], step_up: Option<&str>
 /// Revoke saved tokens (RFC 7009) when the authorization server lists a
 /// `revocation_endpoint`.
 async fn revoke(url: &str, saved: &StoredCredentials) -> Result<()> {
-    let Some(token) = &saved.token_response else { return Ok(()) };
+    let Some(token) = &saved.token_response else {
+        return Ok(());
+    };
     let token = serde_json::to_value(token)?;
     let manager = AuthorizationManager::new(url).await?;
     let metadata = manager.resolve_metadata().await?.metadata;
-    let Some(endpoint) = metadata.additional_fields.get("revocation_endpoint").and_then(Value::as_str) else { return Ok(()) };
+    let Some(endpoint) = metadata
+        .additional_fields
+        .get("revocation_endpoint")
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
     let client = crate::http::client();
     for hint in ["refresh_token", "access_token"] {
-        let Some(value) = token.get(hint).and_then(Value::as_str) else { continue };
+        let Some(value) = token.get(hint).and_then(Value::as_str) else {
+            continue;
+        };
         let mut form = reqwest::Url::parse("http://form/")?;
-        form.query_pairs_mut().extend_pairs([("token", value), ("token_type_hint", hint), ("client_id", &saved.client_id)]);
+        form.query_pairs_mut().extend_pairs([
+            ("token", value),
+            ("token_type_hint", hint),
+            ("client_id", &saved.client_id),
+        ]);
         let status = client
             .post(endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
             .body(form.query().unwrap_or_default().to_string())
             .send()
             .await?
             .status();
-        anyhow::ensure!(status.is_success(), "the revocation endpoint answered HTTP {status}");
+        anyhow::ensure!(
+            status.is_success(),
+            "the revocation endpoint answered HTTP {status}"
+        );
     }
     Ok(())
 }
 
-fn http_config(url: &str, headers: &BTreeMap<String, String>) -> Result<StreamableHttpClientTransportConfig> {
+fn http_config(
+    url: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<StreamableHttpClientTransportConfig> {
     let custom: HashMap<HeaderName, HeaderValue> = headers
         .iter()
         .map(|(k, v)| {
-            let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| anyhow!("invalid header name \"{k}\""))?;
-            let mut value = HeaderValue::from_str(v).map_err(|_| anyhow!("invalid value for header \"{k}\""))?;
+            let name = HeaderName::from_bytes(k.as_bytes())
+                .map_err(|_| anyhow!("invalid header name \"{k}\""))?;
+            let mut value = HeaderValue::from_str(v)
+                .map_err(|_| anyhow!("invalid value for header \"{k}\""))?;
             value.set_sensitive(true);
             Ok((name, value))
         })
@@ -1288,7 +1633,11 @@ enum Init {
     Failed(Box<ClientInitializeError>),
 }
 
-async fn initialize<T, E, A>(client: Client, transport: T, timeout: Duration) -> std::result::Result<RunningService<RoleClient, Client>, Init>
+async fn initialize<T, E, A>(
+    client: Client,
+    transport: T,
+    timeout: Duration,
+) -> std::result::Result<RunningService<RoleClient, Client>, Init>
 where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
@@ -1321,7 +1670,10 @@ fn is_unauthorized(e: &ClientInitializeError) -> bool {
                 return true;
             }
         }
-        if matches!(err.downcast_ref::<AuthError>(), Some(AuthError::AuthorizationRequired)) {
+        if matches!(
+            err.downcast_ref::<AuthError>(),
+            Some(AuthError::AuthorizationRequired)
+        ) {
             return true;
         }
         source = err.source();
@@ -1358,7 +1710,10 @@ impl CredentialStore for FileCredentialStore {
     async fn save(&self, credentials: StoredCredentials) -> std::result::Result<(), AuthError> {
         let path = self.path.clone();
         let bytes = serde_json::to_vec_pretty(&credentials).map_err(store_err)?;
-        tokio::task::spawn_blocking(move || write_private(&path, &bytes)).await.map_err(store_err)?.map_err(store_err)
+        tokio::task::spawn_blocking(move || write_private(&path, &bytes))
+            .await
+            .map_err(store_err)?
+            .map_err(store_err)
     }
 
     async fn clear(&self) -> std::result::Result<(), AuthError> {
@@ -1389,14 +1744,21 @@ enum Callback {
 /// Classify the request line of an HTTP request hitting the loopback listener.
 fn parse_callback(request_line: &str) -> Callback {
     let mut parts = request_line.split_whitespace();
-    let (Some("GET"), Some(target)) = (parts.next(), parts.next()) else { return Callback::Other };
-    let Ok(url) = reqwest::Url::parse(&format!("http://127.0.0.1{target}")) else { return Callback::Other };
+    let (Some("GET"), Some(target)) = (parts.next(), parts.next()) else {
+        return Callback::Other;
+    };
+    let Ok(url) = reqwest::Url::parse(&format!("http://127.0.0.1{target}")) else {
+        return Callback::Other;
+    };
     if url.path() != "/callback" {
         return Callback::Other;
     }
     let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
     if let Some(err) = q.get("error") {
-        let desc = q.get("error_description").map(|d| format!(": {d}")).unwrap_or_default();
+        let desc = q
+            .get("error_description")
+            .map(|d| format!(": {d}"))
+            .unwrap_or_default();
         return Callback::Denied(format!("{err}{desc}"));
     }
     if q.contains_key("code") && q.contains_key("state") {
@@ -1435,7 +1797,11 @@ async fn wait_for_callback(listener: &TcpListener, port: u16) -> Result<String> 
                 "Signed in to the MCP server. You can close this tab and return to nyq.",
                 Some(Ok(format!("http://127.0.0.1:{port}{target}"))),
             ),
-            Callback::Denied(msg) => ("400 Bad Request", "Sign-in failed. Return to nyq for details.", Some(Err(msg))),
+            Callback::Denied(msg) => (
+                "400 Bad Request",
+                "Sign-in failed. Return to nyq for details.",
+                Some(Err(msg)),
+            ),
             Callback::Other => ("404 Not Found", "Not found.", None),
         };
         let html = format!("<!doctype html><html><body style=\"font-family:sans-serif\"><p>{body}</p></body></html>");
@@ -1454,7 +1820,10 @@ async fn wait_for_callback(listener: &TcpListener, port: u16) -> Result<String> 
 }
 
 async fn close(mut server: Server) {
-    let _ = server.service.close_with_timeout(Duration::from_secs(3)).await;
+    let _ = server
+        .service
+        .close_with_timeout(Duration::from_secs(3))
+        .await;
     if let Some(docker) = &server.docker {
         docker.remove().await;
     }
@@ -1466,7 +1835,15 @@ pub fn tool_prefix(server: &str) -> String {
 }
 
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// `mcp__<server>__<tool>`, restricted to `[A-Za-z0-9_-]`. Names that would
@@ -1494,9 +1871,9 @@ fn fnv64(bytes: &[u8]) -> u64 {
 /// Canonical identity of a server's credential file. Stdio has no endpoint.
 pub fn canonical_endpoint(transport: &Transport) -> Result<String> {
     match transport {
-        Transport::Http { url, .. } | Transport::Sse { url, .. } => {
-            Ok(reqwest::Url::parse(url).with_context(|| format!("invalid MCP url {url}"))?.to_string())
-        }
+        Transport::Http { url, .. } | Transport::Sse { url, .. } => Ok(reqwest::Url::parse(url)
+            .with_context(|| format!("invalid MCP url {url}"))?
+            .to_string()),
         Transport::Stdio { .. } => Ok(String::new()),
     }
 }
@@ -1528,7 +1905,6 @@ fn encode_ident(key: &str) -> Result<String> {
     Ok(out)
 }
 
-
 struct McpTool {
     name: String,
     description: String,
@@ -1551,7 +1927,11 @@ impl McpTool {
         let server = &self.server;
         if let Some(scope) = insufficient_scope(&error) {
             self.mcp.note_step_up(server, &scope);
-            let what = if scope.is_empty() { String::new() } else { format!(" (scope: {scope})") };
+            let what = if scope.is_empty() {
+                String::new()
+            } else {
+                format!(" (scope: {scope})")
+            };
             return ToolOutput::err(format!(
                 "MCP server '{server}' needs more access for this call{what}. Ask the user to run /mcp login {server} to grant it."
             ));
@@ -1572,7 +1952,11 @@ impl McpTool {
 #[async_trait::async_trait]
 impl Tool for McpTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec { name: self.name.clone(), description: self.description.clone(), parameters: self.schema.clone() }
+        ToolSpec {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            parameters: self.schema.clone(),
+        }
     }
 
     fn needs_approval(&self, _args: &Value) -> bool {
@@ -1596,7 +1980,9 @@ impl Tool for McpTool {
         let arguments = match args {
             Value::Object(m) => m,
             Value::Null => Map::new(),
-            other => return ToolOutput::err(format!("Arguments must be a JSON object, got {other}")),
+            other => {
+                return ToolOutput::err(format!("Arguments must be a JSON object, got {other}"))
+            }
         };
         let problems = crate::mcp_schema::check(&self.schema, &Value::Object(arguments.clone()));
         if !problems.is_empty() {
@@ -1619,7 +2005,9 @@ impl Tool for McpTool {
         };
         let id = handle.id.clone();
         // rmcp sends a progress token with every request; show what arrives for it.
-        let mut progress = self.mcp.watch_progress(&self.server, &handle.progress_token);
+        let mut progress = self
+            .mcp
+            .watch_progress(&self.server, &handle.progress_token);
         let response = handle.await_response();
         tokio::pin!(response);
         loop {
@@ -1652,9 +2040,14 @@ fn convert(r: CallToolResult) -> ToolOutput {
             },
             ContentBlock::Audio(a) => parts.push(format!("[{}]", a.mime_type)),
             ContentBlock::Resource(e) => match &e.resource {
-                ResourceContents::TextResourceContents { uri, text, .. } => parts.push(format!("[resource {uri}]\n{text}")),
+                ResourceContents::TextResourceContents { uri, text, .. } => {
+                    parts.push(format!("[resource {uri}]\n{text}"))
+                }
                 ResourceContents::BlobResourceContents { uri, mime_type, .. } => {
-                    parts.push(format!("[resource {uri} ({})]", mime_type.as_deref().unwrap_or("binary")))
+                    parts.push(format!(
+                        "[resource {uri} ({})]",
+                        mime_type.as_deref().unwrap_or("binary")
+                    ))
                 }
                 #[allow(unreachable_patterns)]
                 _ => parts.push("[resource]".into()),
@@ -1672,13 +2065,23 @@ fn convert(r: CallToolResult) -> ToolOutput {
         content.push_str("Structured content:\n");
         content.push_str(&serde_json::to_string_pretty(s).unwrap_or_else(|_| s.to_string()));
     }
-    ToolOutput { content, is_error: r.is_error.unwrap_or(false), display: None, images, changed: false, ..ToolOutput::default() }
+    ToolOutput {
+        content,
+        is_error: r.is_error.unwrap_or(false),
+        display: None,
+        images,
+        changed: false,
+        ..ToolOutput::default()
+    }
 }
 
 pub(crate) fn image_from_encoded(data: &str, mime: &str) -> Result<crate::types::Image, String> {
     let compact: String = data.chars().filter(|c| !c.is_whitespace()).collect();
-    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, compact.as_bytes())
-        .map_err(|_| "invalid base64".to_string())?;
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        compact.as_bytes(),
+    )
+    .map_err(|_| "invalid base64".to_string())?;
     crate::tools::image::image_from_bytes(&bytes, mime).map_err(|e| e.to_string())
 }
 
@@ -1693,7 +2096,13 @@ mod tests {
         let cfg = http_cfg("cancel", "http://127.0.0.1:1/mcp".into(), &[]);
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let err = manager.login(&cfg, Some(&cancel), |_| panic!("cancelled login opened browser")).await.err().unwrap();
+        let err = manager
+            .login(&cfg, Some(&cancel), |_| {
+                panic!("cancelled login opened browser")
+            })
+            .await
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("sign-in cancelled"));
     }
 
@@ -1705,12 +2114,18 @@ mod tests {
         let paths = [dir.path().to_path_buf()];
         assert_eq!(resolve_launcher("npx", &paths, ".exe;.cmd"), launcher);
         assert_eq!(resolve_launcher("npx.cmd", &paths, ".exe;.cmd"), launcher);
-        assert_eq!(resolve_launcher("missing", &paths, ".cmd"), PathBuf::from("missing"));
+        assert_eq!(
+            resolve_launcher("missing", &paths, ".cmd"),
+            PathBuf::from("missing")
+        );
         // npm's extensionless `npx` script sits next to npx.cmd; the .cmd wins.
         std::fs::write(dir.path().join("npx"), "#!/bin/sh").unwrap();
         assert_eq!(resolve_launcher("npx", &paths, ".exe;.cmd"), launcher);
         // Relative PATH entries are ignored.
-        assert_eq!(resolve_launcher("npx", &[PathBuf::from("rel")], ".cmd"), PathBuf::from("npx"));
+        assert_eq!(
+            resolve_launcher("npx", &[PathBuf::from("rel")], ".cmd"),
+            PathBuf::from("npx")
+        );
     }
 
     #[test]
@@ -1727,13 +2142,23 @@ mod tests {
         assert_eq!(out.images[0].media_type, "image/png");
         assert!(out.images[0].data.starts_with("iVBOR"));
         assert!(out.content.contains("hello"), "{}", out.content);
-        assert!(out.content.contains("Structured content:"), "{}", out.content);
+        assert!(
+            out.content.contains("Structured content:"),
+            "{}",
+            out.content
+        );
         assert!(out.content.contains("\"n\": 1"), "{}", out.content);
 
-        let bad = convert(CallToolResult::success(vec![ContentBlock::image(&data, "image/jpeg")]));
+        let bad = convert(CallToolResult::success(vec![ContentBlock::image(
+            &data,
+            "image/jpeg",
+        )]));
         assert!(bad.images.is_empty());
         assert!(bad.content.contains("image omitted"), "{}", bad.content);
-        let junk = convert(CallToolResult::success(vec![ContentBlock::image("@@@", "image/png")]));
+        let junk = convert(CallToolResult::success(vec![ContentBlock::image(
+            "@@@",
+            "image/png",
+        )]));
         assert!(junk.images.is_empty() && junk.content.contains("image omitted"));
     }
 
@@ -1761,29 +2186,60 @@ mod tests {
         let (servers, warnings) = load_configs(home.path(), cwd.path());
         let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["fs", "legacy", "plain", "web"]);
-        let Transport::Stdio { command, args, env, cwd: dir } = &servers[0].transport else { panic!() };
-        assert_eq!((command.as_str(), servers[0].scope), ("npx", Scope::Profile));
+        let Transport::Stdio {
+            command,
+            args,
+            env,
+            cwd: dir,
+        } = &servers[0].transport
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (command.as_str(), servers[0].scope),
+            ("npx", Scope::Profile)
+        );
         assert_eq!(args, &["-y", "server-fs"]);
         assert_eq!(env["A"], "1");
         assert_eq!(dir.as_deref(), Some(home.path().join("sub").as_path()));
-        let Transport::Sse { url, .. } = &servers[1].transport else { panic!() };
+        let Transport::Sse { url, .. } = &servers[1].transport else {
+            panic!()
+        };
         assert_eq!(url, "https://example.com/sse");
-        let Transport::Http { url, headers } = &servers[3].transport else { panic!() };
+        let Transport::Http { url, headers } = &servers[3].transport else {
+            panic!()
+        };
         assert_eq!(url, "https://example.com/mcp");
         assert_eq!(headers["X-Team"], "team-core!");
         assert_eq!(headers["Authorization"], "Bearer tok123");
-        assert!(!format!("{:?}", servers[3]).contains("tok123"), "Debug must not leak header values");
-        let Transport::Http { headers, .. } = &servers[2].transport else { panic!() };
+        assert!(
+            !format!("{:?}", servers[3]).contains("tok123"),
+            "Debug must not leak header values"
+        );
+        let Transport::Http { headers, .. } = &servers[2].transport else {
+            panic!()
+        };
         assert!(headers.is_empty());
 
         assert_eq!(warnings.len(), 4, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("'unset'") && w.contains("NYQ_MCP_TEST_UNSET_VAR") && w.contains(":-default")));
-        assert!(warnings.iter().any(|w| w.contains("'badurl'") && w.contains("http")));
-        assert!(warnings.iter().any(|w| w.contains("'bad'") && w.contains("command")));
-        assert!(warnings.iter().any(|w| w.contains(".mcp.json") && w.contains("invalid JSON")));
+        assert!(warnings.iter().any(|w| w.contains("'unset'")
+            && w.contains("NYQ_MCP_TEST_UNSET_VAR")
+            && w.contains(":-default")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("'badurl'") && w.contains("http")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("'bad'") && w.contains("command")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains(".mcp.json") && w.contains("invalid JSON")));
 
-        std::fs::write(cwd.path().join(".mcp.json"), r#"{"mcpServers": {"p": {"command": "x"}, "h": {"url": "https://h/mcp"}}}"#)
-            .unwrap();
+        std::fs::write(
+            cwd.path().join(".mcp.json"),
+            r#"{"mcpServers": {"p": {"command": "x"}, "h": {"url": "https://h/mcp"}}}"#,
+        )
+        .unwrap();
         let (servers, _) = load_configs(Path::new("/nonexistent"), cwd.path());
         assert_eq!(servers.len(), 2);
         assert!(servers.iter().all(|s| s.scope == Scope::Project));
@@ -1807,19 +2263,42 @@ mod tests {
         .unwrap();
         let (servers, warnings) = load_configs(home.path(), Path::new("/nonexistent"));
         assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("\"servers\" is not read; did you mean \"mcpServers\"")));
-        assert!(warnings.iter().any(|w| w.contains("'badopt'") && w.contains("startup_timeout_ms")));
-        let Transport::Stdio { command, args, env, .. } = &servers[0].transport else { panic!() };
-        assert_eq!((command.as_str(), args.as_slice(), env["K"].as_str()), ("node", &["srv.js".to_string(), "--x".into()][..], "dflt"));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("\"servers\" is not read; did you mean \"mcpServers\"")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("'badopt'") && w.contains("startup_timeout_ms")));
+        let Transport::Stdio {
+            command, args, env, ..
+        } = &servers[0].transport
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (command.as_str(), args.as_slice(), env["K"].as_str()),
+            ("node", &["srv.js".to_string(), "--x".into()][..], "dflt")
+        );
         assert!(!servers[0].options.enabled);
         let o = &servers[1].options;
-        let Transport::Http { headers, .. } = &servers[1].transport else { panic!() };
+        let Transport::Http { headers, .. } = &servers[1].transport else {
+            panic!()
+        };
         assert_eq!(headers["X-Key"], "h1");
         assert!(o.required && o.enabled);
-        assert_eq!((o.startup_timeout, o.operation_timeout, o.restart_limit), (Duration::from_millis(1500), Duration::from_secs(2), 3));
-        assert_eq!((o.oauth.client_id.as_deref(), o.oauth.scopes.as_slice()), (Some("cid"), &["a".to_string(), "b".into()][..]));
+        assert_eq!(
+            (o.startup_timeout, o.operation_timeout, o.restart_limit),
+            (Duration::from_millis(1500), Duration::from_secs(2), 3)
+        );
+        assert_eq!(
+            (o.oauth.client_id.as_deref(), o.oauth.scopes.as_slice()),
+            (Some("cid"), &["a".to_string(), "b".into()][..])
+        );
         let d = ServerOptions::default();
-        assert_eq!((d.startup_timeout, d.operation_timeout, d.restart_limit), (STARTUP_TIMEOUT, OPERATION_TIMEOUT, 1));
+        assert_eq!(
+            (d.startup_timeout, d.operation_timeout, d.restart_limit),
+            (STARTUP_TIMEOUT, OPERATION_TIMEOUT, 1)
+        );
     }
 
     #[test]
@@ -1835,15 +2314,27 @@ mod tests {
         }}"#;
         std::fs::write(cwd.path().join(".mcp.json"), project).unwrap();
         let (servers, warnings) = load_configs(home.path(), cwd.path());
-        assert_eq!(servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["plain"]);
+        assert_eq!(
+            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["plain"]
+        );
         assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings.iter().all(|w| w.contains("nyq mcp trust approve") && !w.contains("leak")));
+        assert!(warnings
+            .iter()
+            .all(|w| w.contains("nyq mcp trust approve") && !w.contains("leak")));
         // Once trusted, the same entries read the environment.
-        crate::mcp_cli::trust(home.path(), cwd.path(), crate::mcp_cli::TrustAction::ApproveAll).unwrap();
+        crate::mcp_cli::trust(
+            home.path(),
+            cwd.path(),
+            crate::mcp_cli::TrustAction::ApproveAll,
+        )
+        .unwrap();
         let (servers, warnings) = load_configs(home.path(), cwd.path());
         assert!(warnings.is_empty(), "{warnings:?}");
         let envy = servers.iter().find(|s| s.name == "envy").unwrap();
-        let Transport::Stdio { env, .. } = &envy.transport else { panic!() };
+        let Transport::Stdio { env, .. } = &envy.transport else {
+            panic!()
+        };
         assert_eq!(env["T"], "leak");
     }
 
@@ -1851,12 +2342,26 @@ mod tests {
     fn env_expansion() {
         std::env::set_var("NYQ_MCP_TEST_X", "1");
         std::env::set_var("NYQ_MCP_TEST_EMPTY", "");
-        assert_eq!(expand_env("a${NYQ_MCP_TEST_X}b${NYQ_MCP_TEST_X}").unwrap(), "a1b1");
+        assert_eq!(
+            expand_env("a${NYQ_MCP_TEST_X}b${NYQ_MCP_TEST_X}").unwrap(),
+            "a1b1"
+        );
         assert_eq!(expand_env("no vars $X").unwrap(), "no vars $X");
-        assert_eq!(expand_env("${NYQ_MCP_TEST_NOPE_NOPE:-fallback}/x").unwrap(), "fallback/x");
-        assert_eq!(expand_env("${NYQ_MCP_TEST_EMPTY:-d}${NYQ_MCP_TEST_X:-d}").unwrap(), "d1");
-        let err = expand_env("${NYQ_MCP_TEST_NOPE_NOPE}").unwrap_err().to_string();
-        assert!(err.contains("NYQ_MCP_TEST_NOPE_NOPE is not set") && err.contains(":-default"), "{err}");
+        assert_eq!(
+            expand_env("${NYQ_MCP_TEST_NOPE_NOPE:-fallback}/x").unwrap(),
+            "fallback/x"
+        );
+        assert_eq!(
+            expand_env("${NYQ_MCP_TEST_EMPTY:-d}${NYQ_MCP_TEST_X:-d}").unwrap(),
+            "d1"
+        );
+        let err = expand_env("${NYQ_MCP_TEST_NOPE_NOPE}")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NYQ_MCP_TEST_NOPE_NOPE is not set") && err.contains(":-default"),
+            "{err}"
+        );
         assert!(expand_env("${OPEN").is_err());
         assert!(expand_env("${bad name}").is_err());
     }
@@ -1864,7 +2369,8 @@ mod tests {
     #[test]
     fn docker_run_gets_a_cidfile() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let (out, d) = docker_run(Path::new("/usr/bin/docker"), &args(&["run", "-i", "img"])).unwrap();
+        let (out, d) =
+            docker_run(Path::new("/usr/bin/docker"), &args(&["run", "-i", "img"])).unwrap();
         assert_eq!(out[..2], ["run", "--cidfile"]);
         assert_eq!(out[2], d.cidfile.display().to_string());
         assert_eq!(out[3..], ["-i", "img"]);
@@ -1877,13 +2383,28 @@ mod tests {
     fn scopes_for_sign_in() {
         let url = "https://x/mcp";
         let challenge = r#"Bearer error="insufficient_scope", scope="write""#;
-        assert!(login_scopes(&[], &[], None, Some(challenge), url).is_empty(), "the SDK picks by default");
-        assert_eq!(login_scopes(&["read".into()], &[], None, Some(challenge), url), ["read", "write"]);
-        assert_eq!(login_scopes(&[], &["read".into()], Some("admin write"), None, url), ["read", "admin", "write"]);
-        assert_eq!(insufficient_scope("OAuth: Insufficient scope: repo:write").as_deref(), Some("repo:write"));
+        assert!(
+            login_scopes(&[], &[], None, Some(challenge), url).is_empty(),
+            "the SDK picks by default"
+        );
+        assert_eq!(
+            login_scopes(&["read".into()], &[], None, Some(challenge), url),
+            ["read", "write"]
+        );
+        assert_eq!(
+            login_scopes(&[], &["read".into()], Some("admin write"), None, url),
+            ["read", "admin", "write"]
+        );
+        assert_eq!(
+            insufficient_scope("OAuth: Insufficient scope: repo:write").as_deref(),
+            Some("repo:write")
+        );
         assert_eq!(insufficient_scope("Forbidden"), None);
         let p = |progress, total: Option<f64>, message: Option<&str>| {
-            let mut p = ProgressNotificationParam::new(ProgressToken(rmcp::model::NumberOrString::Number(1)), progress);
+            let mut p = ProgressNotificationParam::new(
+                ProgressToken(rmcp::model::NumberOrString::Number(1)),
+                progress,
+            );
             p.total = total;
             p.message = message.map(String::from);
             progress_text(&p)
@@ -1897,7 +2418,10 @@ mod tests {
         assert_eq!(tool_name("my server", "do.it"), "mcp__my_server__do_it");
         assert_eq!(tool_name("s", &"x".repeat(100)).len(), 64);
         assert_eq!(tool_name("s", "a.b"), tool_name("s", "a/b"));
-        assert_ne!(tool_name("s", &"x".repeat(80)), tool_name("s", &format!("{}y", "x".repeat(79))));
+        assert_ne!(
+            tool_name("s", &"x".repeat(80)),
+            tool_name("s", &format!("{}y", "x".repeat(79)))
+        );
         assert_eq!(tool_prefix("my server"), "mcp__my_server__");
     }
 
@@ -1909,8 +2433,13 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.file_name().unwrap().to_string_lossy().contains("_2f"));
         assert!(credential_path(home, &"n".repeat(300), "").is_err());
-        let url = reqwest::Url::parse("https://Example.com/mcp").unwrap().to_string();
-        assert_eq!(credential_path(home, "idp", &url).unwrap(), credential_path(home, "idp", "https://example.com/mcp").unwrap());
+        let url = reqwest::Url::parse("https://Example.com/mcp")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            credential_path(home, "idp", &url).unwrap(),
+            credential_path(home, "idp", "https://example.com/mcp").unwrap()
+        );
     }
 
     const FAKE_SERVER: &str = r#"
@@ -1963,16 +2492,29 @@ for line in sys.stdin:
         assert_eq!(spec.parameters["type"], "object");
         assert!(tools[0].needs_approval(&Value::Null));
 
-        let ctx = ToolCtx { cwd: dir.path().into(), cancel: CancellationToken::new(), ..Default::default() };
+        let ctx = ToolCtx {
+            cwd: dir.path().into(),
+            cancel: CancellationToken::new(),
+            ..Default::default()
+        };
         let out = tools[0].run(serde_json::json!({"text": "hi"}), &ctx).await;
-        assert!(out.content.starts_with("{\"text\": \"hi\"}\n[image omitted"), "{}", out.content);
+        assert!(
+            out.content
+                .starts_with("{\"text\": \"hi\"}\n[image omitted"),
+            "{}",
+            out.content
+        );
         assert!(out.images.is_empty());
         assert!(!out.is_error);
         let out = tools[0].run(serde_json::json!({"fail": true}), &ctx).await;
         assert!(out.is_error);
 
         let cancel = CancellationToken::new();
-        let slow = ToolCtx { cwd: dir.path().into(), cancel: cancel.clone(), ..Default::default() };
+        let slow = ToolCtx {
+            cwd: dir.path().into(),
+            cancel: cancel.clone(),
+            ..Default::default()
+        };
         let started = std::time::Instant::now();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1986,7 +2528,11 @@ for line in sys.stdin:
         let tools = mgr.connect(&cfg).await.unwrap();
         assert_eq!(mgr.connected(), vec![("fake".to_string(), 1)]);
         let out = tools[0].run(serde_json::json!({}), &ctx).await;
-        assert!(out.content.starts_with("{}\n[image omitted"), "{}", out.content);
+        assert!(
+            out.content.starts_with("{}\n[image omitted"),
+            "{}",
+            out.content
+        );
         assert!(out.images.is_empty());
 
         mgr.disconnect("fake").await.unwrap();
@@ -2010,7 +2556,9 @@ for line in sys.stdin:
         let b = base.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((sock, _)) = listener.accept().await else { return };
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let base = b.clone();
                 tokio::spawn(async move {
                     let _ = serve_conn(sock, &base, protected, oauth).await;
@@ -2020,7 +2568,12 @@ for line in sys.stdin:
         base
     }
 
-    async fn serve_conn(mut sock: tokio::net::TcpStream, base: &str, protected: bool, oauth: bool) -> std::io::Result<()> {
+    async fn serve_conn(
+        mut sock: tokio::net::TcpStream,
+        base: &str,
+        protected: bool,
+        oauth: bool,
+    ) -> std::io::Result<()> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let head_end = loop {
@@ -2036,12 +2589,18 @@ for line in sys.stdin:
         let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
         let mut lines = head.lines();
         let mut first = lines.next().unwrap_or("").split_whitespace();
-        let (method, target) = (first.next().unwrap_or("").to_string(), first.next().unwrap_or("").to_string());
+        let (method, target) = (
+            first.next().unwrap_or("").to_string(),
+            first.next().unwrap_or("").to_string(),
+        );
         let headers: HashMap<String, String> = lines
             .filter_map(|l| l.split_once(':'))
             .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
             .collect();
-        let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let len: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         while buf.len() < head_end + len {
             let n = sock.read(&mut chunk).await?;
             if n == 0 {
@@ -2052,8 +2611,17 @@ for line in sys.stdin:
         let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
         let url = reqwest::Url::parse(&format!("{base}{target}")).unwrap();
         let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
-        let json = |v: Value| (200, vec![("Content-Type".to_string(), "application/json".to_string())], v.to_string());
-        let (status, extra, out): (u16, Vec<(String, String)>, String) = match (method.as_str(), url.path()) {
+        let json = |v: Value| {
+            (
+                200,
+                vec![("Content-Type".to_string(), "application/json".to_string())],
+                v.to_string(),
+            )
+        };
+        let (status, extra, out): (u16, Vec<(String, String)>, String) = match (
+            method.as_str(),
+            url.path(),
+        ) {
             ("POST", "/mcp") => {
                 let auth = headers.get("authorization").map(String::as_str);
                 if protected && !matches!(auth, Some("Bearer static-token" | "Bearer good-token")) {
@@ -2062,7 +2630,11 @@ for line in sys.stdin:
                     } else {
                         "Bearer".to_string()
                     };
-                    (401, vec![("WWW-Authenticate".into(), challenge)], String::new())
+                    (
+                        401,
+                        vec![("WWW-Authenticate".into(), challenge)],
+                        String::new(),
+                    )
                 } else {
                     let msg: Value = serde_json::from_str(&body).unwrap_or_default();
                     match msg.get("id") {
@@ -2073,10 +2645,14 @@ for line in sys.stdin:
                                     "protocolVersion": msg["params"]["protocolVersion"],
                                     "capabilities": {"tools": {}},
                                     "serverInfo": {"name": "fake-http", "version": "0.1"}}),
-                                "tools/list" => serde_json::json!({"tools": [{"name": "echo", "description": "Echo",
-                                    "inputSchema": {"type": "object"}}]}),
-                                "tools/call" => serde_json::json!({"content": [{"type": "text", "text": serde_json::json!({
-                                    "args": msg["params"]["arguments"], "x_foo": headers.get("x-foo")}).to_string()}]}),
+                                "tools/list" => {
+                                    serde_json::json!({"tools": [{"name": "echo", "description": "Echo",
+                                    "inputSchema": {"type": "object"}}]})
+                                }
+                                "tools/call" => {
+                                    serde_json::json!({"content": [{"type": "text", "text": serde_json::json!({
+                                    "args": msg["params"]["arguments"], "x_foo": headers.get("x-foo")}).to_string()}]})
+                                }
                                 _ => Value::Null,
                             };
                             json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}))
@@ -2084,29 +2660,42 @@ for line in sys.stdin:
                     }
                 }
             }
-            ("GET", p) if p.starts_with("/.well-known/oauth-protected-resource") && oauth => {
-                json(serde_json::json!({"resource": format!("{base}/mcp"), "authorization_servers": [base]}))
+            ("GET", p) if p.starts_with("/.well-known/oauth-protected-resource") && oauth => json(
+                serde_json::json!({"resource": format!("{base}/mcp"), "authorization_servers": [base]}),
+            ),
+            ("GET", "/.well-known/oauth-authorization-server") if oauth => {
+                json(serde_json::json!({
+                    "issuer": base,
+                    "authorization_endpoint": format!("{base}/authorize"),
+                    "token_endpoint": format!("{base}/token"),
+                    "registration_endpoint": format!("{base}/register"),
+                    "revocation_endpoint": format!("{base}/revoke"),
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
+                }))
             }
-            ("GET", "/.well-known/oauth-authorization-server") if oauth => json(serde_json::json!({
-                "issuer": base,
-                "authorization_endpoint": format!("{base}/authorize"),
-                "token_endpoint": format!("{base}/token"),
-                "registration_endpoint": format!("{base}/register"),
-                "revocation_endpoint": format!("{base}/revoke"),
-                "response_types_supported": ["code"],
-                "code_challenge_methods_supported": ["S256"],
-            })),
             ("POST", "/register") if oauth => {
                 let req: Value = serde_json::from_str(&body).unwrap_or_default();
                 assert_eq!(req["client_name"], "nyq");
-                let mut r = json(serde_json::json!({"client_id": "nyq-client", "redirect_uris": req["redirect_uris"]}));
+                let mut r = json(
+                    serde_json::json!({"client_id": "nyq-client", "redirect_uris": req["redirect_uris"]}),
+                );
                 r.0 = 201;
                 r
             }
             ("GET", "/authorize") if oauth => {
-                assert_eq!(query.get("code_challenge_method").map(String::as_str), Some("S256"));
-                assert_eq!(query.get("client_id").map(String::as_str), Some("nyq-client"));
-                let location = format!("{}?code=the-code&state={}", query["redirect_uri"], query["state"]);
+                assert_eq!(
+                    query.get("code_challenge_method").map(String::as_str),
+                    Some("S256")
+                );
+                assert_eq!(
+                    query.get("client_id").map(String::as_str),
+                    Some("nyq-client")
+                );
+                let location = format!(
+                    "{}?code=the-code&state={}",
+                    query["redirect_uri"], query["state"]
+                );
                 (302, vec![("Location".into(), location)], String::new())
             }
             ("POST", "/revoke") if oauth => {
@@ -2116,22 +2705,34 @@ for line in sys.stdin:
                 (200, vec![], String::new())
             }
             ("POST", "/token") if oauth => {
-                let form: HashMap<String, String> = reqwest::Url::parse(&format!("http://x/?{body}"))
-                    .unwrap()
-                    .query_pairs()
-                    .into_owned()
-                    .collect();
-                if form.get("code").map(String::as_str) == Some("the-code") && form.contains_key("code_verifier") {
-                    json(serde_json::json!({"access_token": "good-token", "token_type": "Bearer",
-                        "expires_in": 3600, "refresh_token": "refresh-1"}))
+                let form: HashMap<String, String> =
+                    reqwest::Url::parse(&format!("http://x/?{body}"))
+                        .unwrap()
+                        .query_pairs()
+                        .into_owned()
+                        .collect();
+                if form.get("code").map(String::as_str) == Some("the-code")
+                    && form.contains_key("code_verifier")
+                {
+                    json(
+                        serde_json::json!({"access_token": "good-token", "token_type": "Bearer",
+                        "expires_in": 3600, "refresh_token": "refresh-1"}),
+                    )
                 } else {
-                    (400, vec![("Content-Type".into(), "application/json".into())], r#"{"error":"invalid_grant"}"#.into())
+                    (
+                        400,
+                        vec![("Content-Type".into(), "application/json".into())],
+                        r#"{"error":"invalid_grant"}"#.into(),
+                    )
                 }
             }
             ("GET" | "DELETE", "/mcp") => (405, vec![], String::new()),
             _ => (404, vec![], String::new()),
         };
-        let mut resp = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n", out.len());
+        let mut resp = format!(
+            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+            out.len()
+        );
         for (k, v) in extra {
             resp.push_str(&format!("{k}: {v}\r\n"));
         }
@@ -2142,14 +2743,26 @@ for line in sys.stdin:
     }
 
     fn http_cfg(name: &str, url: String, headers: &[(&str, &str)]) -> ServerConfig {
-        let headers = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        ServerConfig { name: name.into(), transport: Transport::Http { url, headers }, scope: Scope::Profile, options: Default::default() }
+        let headers = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        ServerConfig {
+            name: name.into(),
+            transport: Transport::Http { url, headers },
+            scope: Scope::Profile,
+            options: Default::default(),
+        }
     }
 
     #[tokio::test]
     async fn http_connect_list_call() {
         let home = tempfile::tempdir().unwrap();
-        let ctx = ToolCtx { cwd: home.path().into(), cancel: CancellationToken::new(), ..Default::default() };
+        let ctx = ToolCtx {
+            cwd: home.path().into(),
+            cancel: CancellationToken::new(),
+            ..Default::default()
+        };
         let mgr = McpManager::new(home.path().into());
 
         let base = fake_http_server(false, false).await;
@@ -2164,14 +2777,32 @@ for line in sys.stdin:
 
         // Protected without credentials: a 401 asks for sign-in.
         let base = fake_http_server(true, false).await;
-        let err = mgr.connect(&http_cfg("locked", format!("{base}/mcp"), &[])).await.err().unwrap();
-        assert!(format!("{err:#}").contains("needs sign-in: run /mcp login locked"), "{err:#}");
+        let err = mgr
+            .connect(&http_cfg("locked", format!("{base}/mcp"), &[]))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{err:#}").contains("needs sign-in: run /mcp login locked"),
+            "{err:#}"
+        );
         // A wrong static bearer is reported as such.
-        let bad = http_cfg("locked", format!("{base}/mcp"), &[("Authorization", "Bearer nope")]);
+        let bad = http_cfg(
+            "locked",
+            format!("{base}/mcp"),
+            &[("Authorization", "Bearer nope")],
+        );
         let err = mgr.connect(&bad).await.err().unwrap();
-        assert!(format!("{err:#}").contains("rejected the configured Authorization"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("rejected the configured Authorization"),
+            "{err:#}"
+        );
         // A correct static bearer works.
-        let good = http_cfg("locked", format!("{base}/mcp"), &[("Authorization", "Bearer static-token")]);
+        let good = http_cfg(
+            "locked",
+            format!("{base}/mcp"),
+            &[("Authorization", "Bearer static-token")],
+        );
         let tools = mgr.connect(&good).await.unwrap();
         assert!(!tools[0].run(serde_json::json!({}), &ctx).await.is_error);
         assert_eq!(mgr.connected().len(), 2);
@@ -2180,7 +2811,12 @@ for line in sys.stdin:
         // Login is only for HTTP servers.
         let stdio = ServerConfig {
             name: "s".into(),
-            transport: Transport::Stdio { command: "true".into(), args: vec![], env: BTreeMap::new(), cwd: None },
+            transport: Transport::Stdio {
+                command: "true".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            },
             scope: Scope::Profile,
             options: Default::default(),
         };
@@ -2190,13 +2826,20 @@ for line in sys.stdin:
     #[tokio::test]
     async fn oauth_login_flow() {
         let home = tempfile::tempdir().unwrap();
-        let ctx = ToolCtx { cwd: home.path().into(), cancel: CancellationToken::new(), ..Default::default() };
+        let ctx = ToolCtx {
+            cwd: home.path().into(),
+            cancel: CancellationToken::new(),
+            ..Default::default()
+        };
         let mgr = McpManager::new(home.path().into());
         let base = fake_http_server(true, true).await;
         let cfg = http_cfg("idp server", format!("{base}/mcp"), &[]);
 
         let err = mgr.connect(&cfg).await.err().unwrap();
-        assert!(format!("{err:#}").contains("needs sign-in: run /mcp login idp server"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("needs sign-in: run /mcp login idp server"),
+            "{err:#}"
+        );
 
         // The "browser" just follows the authorization URL's redirects to the loopback callback.
         let page = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
@@ -2225,8 +2868,18 @@ for line in sys.stdin:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
-            assert_eq!(std::fs::metadata(file.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(file.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
         }
 
         // Saved credentials are used on the next connect.
@@ -2235,7 +2888,10 @@ for line in sys.stdin:
         assert!(!tools[0].run(serde_json::json!({}), &ctx).await.is_error);
 
         assert!(mgr.logout("idp server", &endpoint).await.unwrap());
-        assert!(REVOKED.load(std::sync::atomic::Ordering::SeqCst) >= 1, "logout revokes the tokens");
+        assert!(
+            REVOKED.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "logout revokes the tokens"
+        );
         assert!(mgr.connected().is_empty() && !file.exists());
         assert!(!mgr.logout("idp server", &endpoint).await.unwrap());
         let err = mgr.connect(&cfg).await.err().unwrap();
@@ -2247,22 +2903,53 @@ for line in sys.stdin:
         let dir = tempfile::tempdir().unwrap();
         let store = FileCredentialStore::new(dir.path().join("a/b/s.json"));
         assert!(store.load().await.unwrap().is_none());
-        store.save(StoredCredentials::new("cid".into(), None, vec!["x".into()], Some(7))).await.unwrap();
+        store
+            .save(StoredCredentials::new(
+                "cid".into(),
+                None,
+                vec!["x".into()],
+                Some(7),
+            ))
+            .await
+            .unwrap();
         let back = store.load().await.unwrap().unwrap();
-        assert_eq!((back.client_id.as_str(), back.granted_scopes.as_slice(), back.token_received_at), ("cid", &["x".to_string()][..], Some(7)));
+        assert_eq!(
+            (
+                back.client_id.as_str(),
+                back.granted_scopes.as_slice(),
+                back.token_received_at
+            ),
+            ("cid", &["x".to_string()][..], Some(7))
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777, 0o600);
-            assert_eq!(std::fs::metadata(dir.path().join("a/b")).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(dir.path().join("a/b"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
         }
-        store.save(StoredCredentials::new("cid2".into(), None, vec![], None)).await.unwrap();
+        store
+            .save(StoredCredentials::new("cid2".into(), None, vec![], None))
+            .await
+            .unwrap();
         assert_eq!(store.load().await.unwrap().unwrap().client_id, "cid2");
         store.clear().await.unwrap();
         store.clear().await.unwrap();
         assert!(store.load().await.unwrap().is_none());
         std::fs::write(&store.path, "garbage").unwrap();
-        assert!(matches!(store.load().await, Err(AuthError::CredentialStoreError(_))));
+        assert!(matches!(
+            store.load().await,
+            Err(AuthError::CredentialStoreError(_))
+        ));
     }
 
     #[test]
@@ -2275,9 +2962,15 @@ for line in sys.stdin:
             parse_callback("GET /callback?error=access_denied&error_description=no%20way HTTP/1.1"),
             Callback::Denied("access_denied: no way".into())
         );
-        assert!(matches!(parse_callback("GET /callback?code=abc HTTP/1.1"), Callback::Denied(_)));
+        assert!(matches!(
+            parse_callback("GET /callback?code=abc HTTP/1.1"),
+            Callback::Denied(_)
+        ));
         assert_eq!(parse_callback("GET /favicon.ico HTTP/1.1"), Callback::Other);
-        assert_eq!(parse_callback("POST /callback?code=a&state=b HTTP/1.1"), Callback::Other);
+        assert_eq!(
+            parse_callback("POST /callback?code=a&state=b HTTP/1.1"),
+            Callback::Other
+        );
         assert_eq!(parse_callback(""), Callback::Other);
     }
 
@@ -2286,15 +2979,27 @@ for line in sys.stdin:
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client = tokio::spawn(async move {
-            let miss = reqwest::get(format!("http://127.0.0.1:{port}/favicon.ico")).await.unwrap();
+            let miss = reqwest::get(format!("http://127.0.0.1:{port}/favicon.ico"))
+                .await
+                .unwrap();
             assert_eq!(miss.status(), 404);
-            reqwest::get(format!("http://127.0.0.1:{port}/callback?code=c&state=s")).await.unwrap().text().await.unwrap()
+            reqwest::get(format!("http://127.0.0.1:{port}/callback?code=c&state=s"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
         });
         let url = wait_for_callback(&listener, port).await.unwrap();
-        assert_eq!(url, format!("http://127.0.0.1:{port}/callback?code=c&state=s"));
+        assert_eq!(
+            url,
+            format!("http://127.0.0.1:{port}/callback?code=c&state=s")
+        );
         assert!(client.await.unwrap().contains("close this tab"));
 
-        let client = tokio::spawn(async move { reqwest::get(format!("http://127.0.0.1:{port}/callback?error=denied")).await });
+        let client = tokio::spawn(async move {
+            reqwest::get(format!("http://127.0.0.1:{port}/callback?error=denied")).await
+        });
         let err = wait_for_callback(&listener, port).await.unwrap_err();
         assert!(err.to_string().contains("denied"));
         assert_eq!(client.await.unwrap().unwrap().status(), 400);
@@ -2361,7 +3066,12 @@ for line in sys.stdin:
 
     #[async_trait::async_trait]
     impl Elicitor for Answer {
-        async fn form(&self, server: &str, message: &str, schema: &Value) -> crate::mcp_client::Elicited {
+        async fn form(
+            &self,
+            server: &str,
+            message: &str,
+            schema: &Value,
+        ) -> crate::mcp_client::Elicited {
             assert_eq!((server, message), ("live", "Who?"));
             assert_eq!(schema["properties"]["name"]["type"], "string");
             crate::mcp_client::Elicited::Accept(serde_json::json!({"name": "Ada"}))
@@ -2392,7 +3102,12 @@ for line in sys.stdin:
         std::fs::write(&script, LIVE_SERVER).unwrap();
         let cfg = ServerConfig::new(
             "live",
-            Transport::Stdio { command: python(), args: vec![script.display().to_string()], env: BTreeMap::new(), cwd: None },
+            Transport::Stdio {
+                command: python(),
+                args: vec![script.display().to_string()],
+                env: BTreeMap::new(),
+                cwd: None,
+            },
             Scope::Profile,
         );
         let mgr = McpManager::new(dir.path().into());
@@ -2402,47 +3117,108 @@ for line in sys.stdin:
         mgr.start_background(vec![cfg], false);
         until(|| mgr.status("live") == Some(Status::Ready)).await;
         reg.refresh();
-        let ctx = ToolCtx { cwd: dir.path().into(), cancel: CancellationToken::new(), ..Default::default() };
+        let ctx = ToolCtx {
+            cwd: dir.path().into(),
+            cancel: CancellationToken::new(),
+            ..Default::default()
+        };
 
         // Instructions reach the registry; nyq announces form and URL elicitation.
         let notes = reg.mcp_notes();
         assert!(notes["live"].starts_with("Use echo wisely."), "{notes:?}");
-        assert!(notes["live"].contains(r#""form": {"schemaValidation": true}, "url": {}"#), "{notes:?}");
+        assert!(
+            notes["live"].contains(r#""form": {"schemaValidation": true}, "url": {}"#),
+            "{notes:?}"
+        );
         // Prompt tools come with prompts; completion suggests missing arguments.
         assert!(reg.get("mcp_list_prompts").is_some() && reg.get("mcp_get_prompt").is_some());
-        let err = crate::mcp_features::prompt_turn(&mgr, "/mcp:live:review").await.unwrap_err().to_string();
+        let err = crate::mcp_features::prompt_turn(&mgr, "/mcp:live:review")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("values for lang include: rust, go"), "{err}");
 
         // Arguments are checked against the input schema before the call.
         let echo = reg.get("mcp__live__echo").expect("echo is installed");
         let out = echo.run(serde_json::json!({"text": 5}), &ctx).await;
-        assert!(out.is_error && out.content.contains("`text` must be string (got integer)"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("`text` must be string (got integer)"),
+            "{}",
+            out.content
+        );
         let out = echo.run(serde_json::json!({}), &ctx).await;
-        assert!(out.is_error && out.content.contains("`text` is required"), "{}", out.content);
-        assert_eq!(echo.run(serde_json::json!({"text": "hi"}), &ctx).await.content, r#"{"text": "hi"}"#);
+        assert!(
+            out.is_error && out.content.contains("`text` is required"),
+            "{}",
+            out.content
+        );
+        assert_eq!(
+            echo.run(serde_json::json!({"text": "hi"}), &ctx)
+                .await
+                .content,
+            r#"{"text": "hi"}"#
+        );
 
         // Form elicitation goes to the elicitor and its answer back to the server.
-        let out = reg.get("mcp__live__ask").unwrap().run(serde_json::json!({}), &ctx).await;
-        assert_eq!(out.content, r#"{"action": "accept", "content": {"name": "Ada"}}"#);
+        let out = reg
+            .get("mcp__live__ask")
+            .unwrap()
+            .run(serde_json::json!({}), &ctx)
+            .await;
+        assert_eq!(
+            out.content,
+            r#"{"action": "accept", "content": {"name": "Ada"}}"#
+        );
 
         // tools/list_changed re-lists and patches the registry.
         assert!(reg.get("mcp__live__added").is_none());
-        reg.get("mcp__live__change").unwrap().run(serde_json::json!({}), &ctx).await;
-        until(|| mgr.registered_names("live").iter().any(|n| n == "mcp__live__added")).await;
+        reg.get("mcp__live__change")
+            .unwrap()
+            .run(serde_json::json!({}), &ctx)
+            .await;
+        until(|| {
+            mgr.registered_names("live")
+                .iter()
+                .any(|n| n == "mcp__live__added")
+        })
+        .await;
         reg.refresh();
         assert!(reg.get("mcp__live__added").is_some());
 
         // A crash restarts the server once; the next crash is final.
-        let out = reg.get("mcp__live__crash").unwrap().run(serde_json::json!({}), &ctx).await;
-        assert!(out.is_error && out.content.contains("was restarted"), "{}", out.content);
+        let out = reg
+            .get("mcp__live__crash")
+            .unwrap()
+            .run(serde_json::json!({}), &ctx)
+            .await;
+        assert!(
+            out.is_error && out.content.contains("was restarted"),
+            "{}",
+            out.content
+        );
         reg.refresh();
-        let out = reg.get("mcp__live__echo").unwrap().run(serde_json::json!({"text": "again"}), &ctx).await;
+        let out = reg
+            .get("mcp__live__echo")
+            .unwrap()
+            .run(serde_json::json!({"text": "again"}), &ctx)
+            .await;
         assert_eq!(out.content, r#"{"text": "again"}"#);
-        let out = reg.get("mcp__live__crash").unwrap().run(serde_json::json!({}), &ctx).await;
-        assert!(out.is_error && out.content.contains("restart limit"), "{}", out.content);
+        let out = reg
+            .get("mcp__live__crash")
+            .unwrap()
+            .run(serde_json::json!({}), &ctx)
+            .await;
+        assert!(
+            out.is_error && out.content.contains("restart limit"),
+            "{}",
+            out.content
+        );
         assert!(matches!(mgr.status("live"), Some(Status::Failed(_))));
         reg.refresh();
-        assert!(reg.get("mcp__live__echo").is_none(), "a dead server's tools are removed");
+        assert!(
+            reg.get("mcp__live__echo").is_none(),
+            "a dead server's tools are removed"
+        );
         mgr.shutdown().await;
     }
 
@@ -2466,7 +3242,12 @@ for line in sys.stdin:
         let mgr = McpManager::new(PathBuf::from("/nonexistent"));
         let mut cfg = ServerConfig::new(
             "gone",
-            Transport::Stdio { command: "/nonexistent/nyq-no-such-server".into(), args: vec![], env: BTreeMap::new(), cwd: None },
+            Transport::Stdio {
+                command: "/nonexistent/nyq-no-such-server".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            },
             Scope::Profile,
         );
         cfg.options.startup_timeout = Duration::from_millis(500);
@@ -2495,23 +3276,34 @@ for line in sys.stdin:
         let args = vec!["run".into(), "-i".into(), "img".into()];
         let cfg = ServerConfig::new(
             "boxed",
-            Transport::Stdio { command: docker.display().to_string(), args, env: BTreeMap::new(), cwd: None },
+            Transport::Stdio {
+                command: docker.display().to_string(),
+                args,
+                env: BTreeMap::new(),
+                cwd: None,
+            },
             Scope::Profile,
         );
         let mgr = McpManager::new(dir.path().into());
         assert_eq!(mgr.connect(&cfg).await.unwrap().len(), 1);
         mgr.disconnect("boxed").await.unwrap();
-        assert_eq!(std::fs::read_to_string(dir.path().join("rm.log")).unwrap(), "rm -f cid-42");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("rm.log")).unwrap(),
+            "rm -f cid-42"
+        );
     }
 
     /// A legacy SSE server: `GET /sse` streams events, `POST /messages` takes requests.
     async fn fake_sse_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let stream: std::sync::Arc<tokio::sync::Mutex<Option<tokio::net::TcpStream>>> = Default::default();
+        let stream: std::sync::Arc<tokio::sync::Mutex<Option<tokio::net::TcpStream>>> =
+            Default::default();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let stream = stream.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
@@ -2537,12 +3329,18 @@ for line in sys.stdin:
                         return;
                     }
                     if !head.starts_with("POST /messages") {
-                        let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                            .await;
                         return;
                     }
                     let len: usize = head
                         .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap_or(0))
+                        })
                         .unwrap_or(0);
                     while buf.len() < head_end + len {
                         let n = sock.read(&mut chunk).await.unwrap_or(0);
@@ -2551,18 +3349,26 @@ for line in sys.stdin:
                         }
                         buf.extend_from_slice(&chunk[..n]);
                     }
-                    let _ = sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                        .await;
                     let msg: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or_default();
                     let Some(id) = msg.get("id") else { return };
                     let result = match msg["method"].as_str().unwrap_or("") {
-                        "initialize" => serde_json::json!({"protocolVersion": msg["params"]["protocolVersion"],
-                            "capabilities": {"tools": {}}, "serverInfo": {"name": "sse", "version": "0.1"}}),
-                        "tools/list" => serde_json::json!({"tools": [{"name": "ping", "inputSchema": {"type": "object"}}]}),
+                        "initialize" => {
+                            serde_json::json!({"protocolVersion": msg["params"]["protocolVersion"],
+                            "capabilities": {"tools": {}}, "serverInfo": {"name": "sse", "version": "0.1"}})
+                        }
+                        "tools/list" => {
+                            serde_json::json!({"tools": [{"name": "ping", "inputSchema": {"type": "object"}}]})
+                        }
                         _ => serde_json::json!({"content": [{"type": "text", "text": "pong"}]}),
                     };
                     let reply = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
                     if let Some(s) = stream.lock().await.as_mut() {
-                        let _ = s.write_all(format!("event: message\ndata: {reply}\n\n").as_bytes()).await;
+                        let _ = s
+                            .write_all(format!("event: message\ndata: {reply}\n\n").as_bytes())
+                            .await;
                     }
                 });
             }
@@ -2573,15 +3379,36 @@ for line in sys.stdin:
     #[tokio::test]
     async fn legacy_sse_transport() {
         let base = fake_sse_server().await;
-        let cfg = ServerConfig::new("old", Transport::Sse { url: format!("{base}/sse"), headers: BTreeMap::new() }, Scope::Profile);
+        let cfg = ServerConfig::new(
+            "old",
+            Transport::Sse {
+                url: format!("{base}/sse"),
+                headers: BTreeMap::new(),
+            },
+            Scope::Profile,
+        );
         let dir = tempfile::tempdir().unwrap();
         let mgr = McpManager::new(dir.path().into());
         let tools = mgr.connect(&cfg).await.unwrap();
         assert_eq!(tools[0].spec().name, "mcp__old__ping");
-        let ctx = ToolCtx { cwd: dir.path().into(), cancel: CancellationToken::new(), ..Default::default() };
-        assert_eq!(tools[0].run(serde_json::json!({}), &ctx).await.content, "pong");
+        let ctx = ToolCtx {
+            cwd: dir.path().into(),
+            cancel: CancellationToken::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            tools[0].run(serde_json::json!({}), &ctx).await.content,
+            "pong"
+        );
         mgr.shutdown().await;
-        let bad = ServerConfig::new("bad", Transport::Sse { url: format!("{base}/nothing"), headers: BTreeMap::new() }, Scope::Profile);
+        let bad = ServerConfig::new(
+            "bad",
+            Transport::Sse {
+                url: format!("{base}/nothing"),
+                headers: BTreeMap::new(),
+            },
+            Scope::Profile,
+        );
         assert!(mgr.connect(&bad).await.is_err());
     }
 }

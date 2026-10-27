@@ -35,7 +35,10 @@ fn parse_scopes(value: &str) -> Option<Option<Vec<String>>> {
 /// Start tracing from `NYQ_TRACE` / `NYQ_TRACE_LOG`. Problems opening the
 /// log file are reported once on stderr.
 pub fn init_from_env() {
-    let Some(scopes) = std::env::var("NYQ_TRACE").ok().and_then(|v| parse_scopes(&v)) else {
+    let Some(scopes) = std::env::var("NYQ_TRACE")
+        .ok()
+        .and_then(|v| parse_scopes(&v))
+    else {
         return;
     };
     let log = std::env::var_os("NYQ_TRACE_LOG").filter(|v| !v.is_empty());
@@ -62,7 +65,10 @@ pub fn to_file(path: &Path, scopes: Option<Vec<String>>) -> std::io::Result<()> 
         opts.mode(0o600);
     }
     let file = opts.open(path)?;
-    install(Tracer { scopes, file: Some((path.to_path_buf(), file)) });
+    install(Tracer {
+        scopes,
+        file: Some((path.to_path_buf(), file)),
+    });
     Ok(())
 }
 
@@ -87,7 +93,10 @@ pub fn describe() -> Option<String> {
 pub fn log(scope: &str, msg: impl FnOnce() -> String) {
     let mut guard = TRACER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(t) = guard.as_mut() else { return };
-    if t.scopes.as_ref().is_some_and(|s| !s.iter().any(|x| x == scope)) {
+    if t.scopes
+        .as_ref()
+        .is_some_and(|s| !s.iter().any(|x| x == scope))
+    {
         return;
     }
     let line = format!(

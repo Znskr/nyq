@@ -7,20 +7,30 @@ use serde_json::{json, Value};
 use similar::udiff;
 use similar::Algorithm;
 
-use super::{Tool, ToolCtx, ToolOutput, Registry};
+use super::{Registry, Tool, ToolCtx, ToolOutput};
 use crate::types::ToolSpec;
 
 /// Resolve a possibly relative path against `cwd`.
 fn resolve(cwd: &Path, p: &str) -> PathBuf {
     let path = Path::new(p);
-    if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 /// Path as shown to the user: relative to the process cwd when inside it.
 fn display_path(path: &Path) -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
     path.strip_prefix(&cwd)
-        .map(|r| if r.as_os_str().is_empty() { ".".into() } else { super::slash_path(r) })
+        .map(|r| {
+            if r.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                super::slash_path(r)
+            }
+        })
         .unwrap_or_else(|_| super::slash_path(path))
 }
 
@@ -34,7 +44,13 @@ fn summary_path(args: &Value) -> String {
 fn unified_diff(path: &Path, old: &str, new: &str) -> String {
     let p = display_path(path);
     let (a, b) = (format!("a/{p}"), format!("b/{p}"));
-    udiff::unified_diff(Algorithm::Myers, old, new, 3, Some((a.as_str(), b.as_str())))
+    udiff::unified_diff(
+        Algorithm::Myers,
+        old,
+        new,
+        3,
+        Some((a.as_str(), b.as_str())),
+    )
 }
 
 /// First `n` lines of `text`, with a truncation marker.
@@ -48,7 +64,8 @@ fn head(text: &str, n: usize) -> String {
 }
 
 fn int_arg(args: &Value, name: &str) -> Option<i64> {
-    args.get(name).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+    args.get(name)
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
 }
 
 /// `edit_file` refuses files larger than this rather than rewriting a prefix.
@@ -61,7 +78,10 @@ const DISPLAY_CHARS: usize = 2000;
 fn open_regular(path: &Path) -> Result<fs::File, ToolOutput> {
     // Windows refuses to open a directory at all, so name the problem first.
     if fs::metadata(path).is_ok_and(|m| m.is_dir()) {
-        return Err(ToolOutput::err(format!("read_file: {} is a directory (use list_dir).", display_path(path))));
+        return Err(ToolOutput::err(format!(
+            "read_file: {} is a directory (use list_dir).",
+            display_path(path)
+        )));
     }
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -74,19 +94,38 @@ fn open_regular(path: &Path) -> Result<fs::File, ToolOutput> {
     let file = match options.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolOutput::err(format!("read_file: file not found: {}", display_path(path))));
+            return Err(ToolOutput::err(format!(
+                "read_file: file not found: {}",
+                display_path(path)
+            )));
         }
-        Err(e) => return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path)))),
+        Err(e) => {
+            return Err(ToolOutput::err(format!(
+                "read_file: {e}: {}",
+                display_path(path)
+            )))
+        }
     };
     let meta = match file.metadata() {
         Ok(m) => m,
-        Err(e) => return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path)))),
+        Err(e) => {
+            return Err(ToolOutput::err(format!(
+                "read_file: {e}: {}",
+                display_path(path)
+            )))
+        }
     };
     if meta.is_dir() {
-        return Err(ToolOutput::err(format!("read_file: {} is a directory (use list_dir).", display_path(path))));
+        return Err(ToolOutput::err(format!(
+            "read_file: {} is a directory (use list_dir).",
+            display_path(path)
+        )));
     }
     if !meta.is_file() {
-        return Err(ToolOutput::err(format!("read_file: {} is not a regular file.", display_path(path))));
+        return Err(ToolOutput::err(format!(
+            "read_file: {} is not a regular file.",
+            display_path(path)
+        )));
     }
     Ok(file)
 }
@@ -109,16 +148,28 @@ fn next_line(reader: &mut impl std::io::BufRead, path: &Path) -> Result<ScanLine
     loop {
         let available = match reader.fill_buf() {
             Ok(b) => b,
-            Err(e) => return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path)))),
+            Err(e) => {
+                return Err(ToolOutput::err(format!(
+                    "read_file: {e}: {}",
+                    display_path(path)
+                )))
+            }
         };
         if available.is_empty() {
-            return Ok(if buf.is_empty() { ScanLine::Eof } else { ScanLine::Line(buf) });
+            return Ok(if buf.is_empty() {
+                ScanLine::Eof
+            } else {
+                ScanLine::Line(buf)
+            });
         }
         let room = MAX_LINE_BYTES - buf.len();
         let scan = &available[..available.len().min(room)];
         if let Some(i) = fill_has(scan, 0) {
             if fill_has(&scan[..i], b'\n').is_none() {
-                return Err(ToolOutput::err(format!("read_file: {} is a binary file.", display_path(path))));
+                return Err(ToolOutput::err(format!(
+                    "read_file: {} is a binary file.",
+                    display_path(path)
+                )));
             }
         }
         if let Some(i) = fill_has(scan, b'\n') {
@@ -142,14 +193,22 @@ fn skip_rest(reader: &mut impl std::io::BufRead, path: &Path) -> Result<(), Tool
     loop {
         let available = match reader.fill_buf() {
             Ok(b) => b,
-            Err(e) => return Err(ToolOutput::err(format!("read_file: {e}: {}", display_path(path)))),
+            Err(e) => {
+                return Err(ToolOutput::err(format!(
+                    "read_file: {e}: {}",
+                    display_path(path)
+                )))
+            }
         };
         if available.is_empty() {
             return Ok(());
         }
         if let Some(i) = fill_has(available, 0) {
             if fill_has(&available[..i], b'\n').is_none() {
-                return Err(ToolOutput::err(format!("read_file: {} is a binary file.", display_path(path))));
+                return Err(ToolOutput::err(format!(
+                    "read_file: {} is a binary file.",
+                    display_path(path)
+                )));
             }
         }
         if let Some(i) = fill_has(available, b'\n') {
@@ -166,11 +225,19 @@ fn line_text(bytes: &[u8], path: &Path, cut: bool) -> Result<String, ToolOutput>
     let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     match std::str::from_utf8(bytes) {
         Ok(t) => Ok(t.to_string()),
-        Err(e) if cut && e.error_len().is_none() => match std::str::from_utf8(&bytes[..e.valid_up_to()]) {
-            Ok(t) => Ok(t.to_string()),
-            Err(_) => Err(ToolOutput::err(format!("read_file: {} is not UTF-8 text.", display_path(path)))),
-        },
-        Err(_) => Err(ToolOutput::err(format!("read_file: {} is not UTF-8 text.", display_path(path)))),
+        Err(e) if cut && e.error_len().is_none() => {
+            match std::str::from_utf8(&bytes[..e.valid_up_to()]) {
+                Ok(t) => Ok(t.to_string()),
+                Err(_) => Err(ToolOutput::err(format!(
+                    "read_file: {} is not UTF-8 text.",
+                    display_path(path)
+                ))),
+            }
+        }
+        Err(_) => Err(ToolOutput::err(format!(
+            "read_file: {} is not UTF-8 text.",
+            display_path(path)
+        ))),
     }
 }
 
@@ -230,7 +297,9 @@ impl Tool for ReadFile {
         let offset = int_arg(&args, "offset").unwrap_or(1);
         let limit = int_arg(&args, "limit").unwrap_or(2000);
         if offset < 1 {
-            return ToolOutput::err(format!("read_file: offset must be at least 1, got {offset}."));
+            return ToolOutput::err(format!(
+                "read_file: offset must be at least 1, got {offset}."
+            ));
         }
         if limit < 1 {
             return ToolOutput::err(format!("read_file: limit must be at least 1, got {limit}."));
@@ -281,7 +350,10 @@ impl Tool for ReadFile {
             ));
         }
         if more > 0 {
-            out.push_str(&format!("({more} more lines below — use offset {} to read on)\n", offset + emitted));
+            out.push_str(&format!(
+                "({more} more lines below — use offset {} to read on)\n",
+                offset + emitted
+            ));
         }
         ToolOutput::ok(out)
     }
@@ -296,9 +368,10 @@ impl Tool for ListDir {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "list_dir".into(),
-            description: "List the entries of a directory: sorted, one per line, up to 500 entries, \
+            description:
+                "List the entries of a directory: sorted, one per line, up to 500 entries, \
                 directories suffixed with '/'. Defaults to the workspace root."
-                .into(),
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -324,9 +397,15 @@ impl Tool for ListDir {
         }
         if !path.is_dir() {
             if !path.exists() {
-                return ToolOutput::err(format!("list_dir: no such directory: {}", display_path(&path)));
+                return ToolOutput::err(format!(
+                    "list_dir: no such directory: {}",
+                    display_path(&path)
+                ));
             }
-            return ToolOutput::err(format!("list_dir: {} is not a directory.", display_path(&path)));
+            return ToolOutput::err(format!(
+                "list_dir: {} is not a directory.",
+                display_path(&path)
+            ));
         }
         let entries = match fs::read_dir(&path) {
             Ok(rd) => rd,
@@ -336,7 +415,11 @@ impl Tool for ListDir {
             .filter_map(|e| e.ok())
             .map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { format!("{name}/") } else { name }
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    format!("{name}/")
+                } else {
+                    name
+                }
             })
             .collect();
         names.sort();
@@ -425,7 +508,11 @@ impl Tool for WriteFile {
             return ToolOutput::err(format!("write_file: {e}: {}", display_path(&path)));
         }
         ToolOutput {
-            content: format!("Wrote {} lines to {}.", content.lines().count(), display_path(&path)),
+            content: format!(
+                "Wrote {} lines to {}.",
+                content.lines().count(),
+                display_path(&path)
+            ),
             display: (!preview.is_empty()).then_some(preview),
             ..ToolOutput::default()
         }
@@ -441,11 +528,12 @@ impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".into(),
-            description: "Edit a text file by replacing `old_string` with `new_string` (exact text \
+            description:
+                "Edit a text file by replacing `old_string` with `new_string` (exact text \
                 match). Fails if `old_string` is not found, or if it occurs more than once unless \
                 `replace_all` is true (then all occurrences are replaced). Preserves the file's \
                 existing line endings; the approval prompt shows the resulting diff."
-                .into(),
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -512,16 +600,21 @@ fn sandbox_denied(ctx: &ToolCtx, user_path: &str, path: &Path, tool: &str) -> Op
         crate::sandbox::Mode::ReadOnly => false,
         crate::sandbox::Mode::WorkspaceWrite => {
             crate::agent::inside(&ctx.cwd, user_path)
-                || ctx.sandbox.writable.iter().any(|root| {
-                    crate::agent::inside(root, path.to_str().unwrap_or(""))
-                })
+                || ctx
+                    .sandbox
+                    .writable
+                    .iter()
+                    .any(|root| crate::agent::inside(root, path.to_str().unwrap_or("")))
         }
     };
     if allowed {
         return None;
     }
     Some(match ctx.sandbox.mode {
-        crate::sandbox::Mode::ReadOnly => format!("{tool}: sandbox is read-only; refusing to write {}", display_path(path)),
+        crate::sandbox::Mode::ReadOnly => format!(
+            "{tool}: sandbox is read-only; refusing to write {}",
+            display_path(path)
+        ),
         _ => format!(
             "{tool}: sandbox is workspace-write; refusing to write outside the workspace: {}",
             display_path(path)
@@ -544,8 +637,16 @@ fn write_root<'a>(ctx: &'a ToolCtx, user_path: &str, path: &Path) -> Option<&'a 
 
 fn relative_in(root: &Path, user_path: &str, path: &Path) -> std::io::Result<std::path::PathBuf> {
     super::safeio::relative_under(root, user_path)
-        .or_else(|| path.to_str().and_then(|p| super::safeio::relative_under(root, p)))
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path escapes the sandbox root"))
+        .or_else(|| {
+            path.to_str()
+                .and_then(|p| super::safeio::relative_under(root, p))
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path escapes the sandbox root",
+            )
+        })
 }
 
 /// Replace `path`. Unsandboxed writes may follow a final symlink and then
@@ -561,7 +662,10 @@ fn commit_bytes(ctx: &ToolCtx, user_path: &str, path: &Path, bytes: &[u8]) -> st
 
 fn load_edit_bytes(ctx: &ToolCtx, user_path: &str, path: &Path) -> Result<Vec<u8>, ToolOutput> {
     if path.is_dir() {
-        return Err(ToolOutput::err(format!("edit_file: {} is a directory.", display_path(path))));
+        return Err(ToolOutput::err(format!(
+            "edit_file: {} is a directory.",
+            display_path(path)
+        )));
     }
     let loaded = if ctx.sandbox.mode == crate::sandbox::Mode::Off {
         super::safeio::read_capped(path, MAX_SCAN_BYTES)
@@ -573,48 +677,81 @@ fn load_edit_bytes(ctx: &ToolCtx, user_path: &str, path: &Path) -> Result<Vec<u8
         }
     };
     match loaded {
-        Ok(bytes) if bytes.len() as u64 > MAX_SCAN_BYTES => {
-            Err(ToolOutput::err(format!("edit_file: {} is larger than 8 MiB.", display_path(path))))
-        }
+        Ok(bytes) if bytes.len() as u64 > MAX_SCAN_BYTES => Err(ToolOutput::err(format!(
+            "edit_file: {} is larger than 8 MiB.",
+            display_path(path)
+        ))),
         Ok(bytes) => Ok(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(ToolOutput::err(format!("edit_file: file not found: {}", display_path(path))))
-        }
-        Err(e) => Err(ToolOutput::err(format!("edit_file: {e}: {}", display_path(path)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ToolOutput::err(format!(
+            "edit_file: file not found: {}",
+            display_path(path)
+        ))),
+        Err(e) => Err(ToolOutput::err(format!(
+            "edit_file: {e}: {}",
+            display_path(path)
+        ))),
     }
 }
 
 /// Pure version of an edit: (old content, new content). `Err` is the user-facing error.
-fn apply_edit(ctx: &ToolCtx, user_path: &str, path: &Path, args: &Value) -> Result<(String, String), ToolOutput> {
-    let old_string = args.get("old_string").and_then(Value::as_str).unwrap_or_default();
-    let new_string = args.get("new_string").and_then(Value::as_str).unwrap_or_default();
-    let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+fn apply_edit(
+    ctx: &ToolCtx,
+    user_path: &str,
+    path: &Path,
+    args: &Value,
+) -> Result<(String, String), ToolOutput> {
+    let old_string = args
+        .get("old_string")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let new_string = args
+        .get("new_string")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let replace_all = args
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if old_string.is_empty() {
         return Err(ToolOutput::err("edit_file: old_string is empty."));
     }
     if old_string == new_string {
-        return Err(ToolOutput::err("edit_file: old_string and new_string are identical."));
+        return Err(ToolOutput::err(
+            "edit_file: old_string and new_string are identical.",
+        ));
     }
     let bytes = load_edit_bytes(ctx, user_path, path)?;
     if bytes.contains(&0) {
-        return Err(ToolOutput::err(format!("edit_file: {} is a binary file.", display_path(path))));
+        return Err(ToolOutput::err(format!(
+            "edit_file: {} is a binary file.",
+            display_path(path)
+        )));
     }
     let content = match String::from_utf8(bytes) {
         Ok(t) => t,
-        Err(_) => return Err(ToolOutput::err(format!("edit_file: {} is not UTF-8 text.", display_path(path)))),
+        Err(_) => {
+            return Err(ToolOutput::err(format!(
+                "edit_file: {} is not UTF-8 text.",
+                display_path(path)
+            )))
+        }
     };
 
     // If every newline in the file is CRLF, accept plain-LF old/new strings and
     // rewrite them so the file's line endings are preserved.
     let crlf = content.contains("\r\n") && !content.replace("\r\n", "").contains('\n');
-    let to_crlf =
-        |s: &str| (crlf && s.contains('\n') && !s.contains("\r\n")).then(|| s.replace('\n', "\r\n"));
+    let to_crlf = |s: &str| {
+        (crlf && s.contains('\n') && !s.contains("\r\n")).then(|| s.replace('\n', "\r\n"))
+    };
     let old = to_crlf(old_string).unwrap_or_else(|| old_string.to_string());
     let new = to_crlf(new_string).unwrap_or_else(|| new_string.to_string());
 
     let count = content.matches(&old).count();
     if count == 0 {
-        return Err(ToolOutput::err(format!("edit_file: old_string not found in {}.", display_path(path))));
+        return Err(ToolOutput::err(format!(
+            "edit_file: old_string not found in {}.",
+            display_path(path)
+        )));
     }
     if count > 1 && !replace_all {
         return Err(ToolOutput::err(format!(
@@ -622,7 +759,11 @@ fn apply_edit(ctx: &ToolCtx, user_path: &str, path: &Path, args: &Value) -> Resu
             display_path(path)
         )));
     }
-    let new_content = if replace_all { content.replace(&old, &new) } else { content.replacen(&old, &new, 1) };
+    let new_content = if replace_all {
+        content.replace(&old, &new)
+    } else {
+        content.replacen(&old, &new, 1)
+    };
     Ok((content, new_content))
 }
 
@@ -649,11 +790,16 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let (tx, rx) = std::sync::mpsc::channel();
         let read_path = path.clone();
-        let worker = std::thread::spawn(move || { tx.send(open_regular(&read_path).is_err()).unwrap(); });
+        let worker = std::thread::spawn(move || {
+            tx.send(open_regular(&read_path).is_err()).unwrap();
+        });
         let result = rx.recv_timeout(std::time::Duration::from_secs(2));
         if result.is_err() {
             use std::os::unix::fs::OpenOptionsExt;
-            let _writer = fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(path);
+            let _writer = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path);
             worker.join().unwrap();
             panic!("read_file blocked opening a FIFO");
         }
@@ -664,7 +810,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &Path) -> ToolCtx {
-        ToolCtx { cwd: dir.to_path_buf(), cancel: CancellationToken::new(), ..Default::default() }
+        ToolCtx {
+            cwd: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            ..Default::default()
+        }
     }
 
     fn run(tool: &dyn Tool, args: Value, dir: &Path) -> ToolOutput {
@@ -675,7 +825,11 @@ mod tests {
     fn read_numbering_paging_and_long_lines() {
         let dir = tempfile::tempdir().unwrap();
         let long = "y".repeat(2500);
-        std::fs::write(dir.path().join("f.txt"), format!("one\ntwo\n{long}\nfour\n")).unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            format!("one\ntwo\n{long}\nfour\n"),
+        )
+        .unwrap();
 
         let out = run(&ReadFile, json!({"path": "f.txt"}), dir.path());
         assert!(!out.is_error);
@@ -685,12 +839,20 @@ mod tests {
         assert_eq!(lines[2].chars().count(), 6 + 1 + 2000 + 1); // prefix + 2000 + ellipsis
         assert_eq!(lines[3], "     4\tfour");
 
-        let out = run(&ReadFile, json!({"path": "f.txt", "offset": 3, "limit": 1}), dir.path());
+        let out = run(
+            &ReadFile,
+            json!({"path": "f.txt", "offset": 3, "limit": 1}),
+            dir.path(),
+        );
         assert!(out.content.starts_with("     3\t"));
         assert!(out.content.contains("(1 more lines below"));
         assert!(out.content.contains("use offset 4"));
 
-        let out = run(&ReadFile, json!({"path": "f.txt", "offset": 99}), dir.path());
+        let out = run(
+            &ReadFile,
+            json!({"path": "f.txt", "offset": 99}),
+            dir.path(),
+        );
         assert!(out.is_error);
         assert!(out.content.contains("past the end") && out.content.contains("4 lines"));
 
@@ -718,7 +880,11 @@ mod tests {
         #[cfg(unix)]
         if std::path::Path::new("/dev/zero").exists() {
             let out = run(&ReadFile, json!({"path": "/dev/zero"}), dir.path());
-            assert!(out.is_error && out.content.contains("regular"), "{}", out.content);
+            assert!(
+                out.is_error && out.content.contains("regular"),
+                "{}",
+                out.content
+            );
         }
     }
 
@@ -730,7 +896,10 @@ mod tests {
         std::fs::write(dir.path().join("alpha"), b"a").unwrap();
         let out = run(&ListDir, json!({}), dir.path());
         assert!(!out.is_error);
-        assert_eq!(out.content.lines().collect::<Vec<_>>(), ["alpha", "beta", "zed/"]);
+        assert_eq!(
+            out.content.lines().collect::<Vec<_>>(),
+            ["alpha", "beta", "zed/"]
+        );
 
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
@@ -758,14 +927,20 @@ mod tests {
         let out = run(&WriteFile, args, dir.path());
         assert!(!out.is_error);
         assert!(out.content.contains("2 lines") && out.content.contains("a/b/new.txt"));
-        assert_eq!(std::fs::read_to_string(dir.path().join("a/b/new.txt")).unwrap(), "one\ntwo\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/new.txt")).unwrap(),
+            "one\ntwo\n"
+        );
 
         let args = json!({"path": "a/b/new.txt", "content": "one\ntwo\nthree\n"});
         let out = run(&WriteFile, args, dir.path());
         let display = out.display.unwrap();
         assert!(display.contains("--- a/") && display.contains("new.txt"));
         assert!(display.contains("+++ b/") && display.contains("+three"));
-        assert_eq!(std::fs::read_to_string(dir.path().join("a/b/new.txt")).unwrap(), "one\ntwo\nthree\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/new.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
         assert!(WriteFile.needs_approval(&json!({"path": "a/b/new.txt", "content": "x"})));
 
         let out = run(&WriteFile, json!({"path": "a/b"}), dir.path()); // path is a directory
@@ -781,15 +956,30 @@ mod tests {
         let args = json!({"path": "e.txt", "old_string": "gamma", "new_string": "GAMMA"});
         let preview = EditFile.preview(&args, &ctx(dir.path())).unwrap();
         assert!(preview.contains("-gamma") && preview.contains("+GAMMA"));
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\nbeta\ngamma\nbeta\n"); // no side effects
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nbeta\ngamma\nbeta\n"
+        ); // no side effects
 
         let out = run(&EditFile, args, dir.path());
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\nbeta\nGAMMA\nbeta\n");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nbeta\nGAMMA\nbeta\n"
+        );
 
-        let out = run(&EditFile, json!({"path": "e.txt", "old_string": "beta", "new_string": "x"}), dir.path());
-        assert!(out.is_error && out.content.contains("2 times") && out.content.contains("replace_all"));
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\nbeta\nGAMMA\nbeta\n");
+        let out = run(
+            &EditFile,
+            json!({"path": "e.txt", "old_string": "beta", "new_string": "x"}),
+            dir.path(),
+        );
+        assert!(
+            out.is_error && out.content.contains("2 times") && out.content.contains("replace_all")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nbeta\nGAMMA\nbeta\n"
+        );
 
         let out = run(
             &EditFile,
@@ -797,16 +987,39 @@ mod tests {
             dir.path(),
         );
         assert!(!out.is_error);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\ntwo\nGAMMA\nbeta\n");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\ntwo\nGAMMA\nbeta\n"
+        );
 
-        let out = run(&EditFile, json!({"path": "e.txt", "old_string": "nope", "new_string": "x"}), dir.path());
+        let out = run(
+            &EditFile,
+            json!({"path": "e.txt", "old_string": "nope", "new_string": "x"}),
+            dir.path(),
+        );
         assert!(out.is_error && out.content.contains("not found"));
-        let out =
-            run(&EditFile, json!({"path": "e.txt", "old_string": "beta", "new_string": "beta"}), dir.path());
+        let out = run(
+            &EditFile,
+            json!({"path": "e.txt", "old_string": "beta", "new_string": "beta"}),
+            dir.path(),
+        );
         assert!(out.is_error && out.content.contains("identical"));
-        assert!(run(&EditFile, json!({"path": "e.txt", "old_string": "", "new_string": "x"}), dir.path()).is_error);
-        assert!(run(&EditFile, json!({"path": "no.txt", "old_string": "a", "new_string": "b"}), dir.path())
-            .is_error);
+        assert!(
+            run(
+                &EditFile,
+                json!({"path": "e.txt", "old_string": "", "new_string": "x"}),
+                dir.path()
+            )
+            .is_error
+        );
+        assert!(
+            run(
+                &EditFile,
+                json!({"path": "no.txt", "old_string": "a", "new_string": "b"}),
+                dir.path()
+            )
+            .is_error
+        );
 
         let out = run(
             &EditFile,
@@ -814,7 +1027,10 @@ mod tests {
             dir.path(),
         );
         assert!(!out.is_error);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\ntwo\nGAMMA\nBETA\n");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\ntwo\nGAMMA\nBETA\n"
+        );
         assert!(EditFile.needs_approval(&json!({"path": "e.txt"})));
     }
 
@@ -830,7 +1046,10 @@ mod tests {
             dir.path(),
         );
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(std::fs::read_to_string(dir.path().join("c.txt")).unwrap(), "one\r\nTWO\r\nthree\r\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("c.txt")).unwrap(),
+            "one\r\nTWO\r\nthree\r\n"
+        );
 
         // Multi-line LF search string still matches a CRLF file.
         let out = run(
@@ -839,7 +1058,10 @@ mod tests {
             dir.path(),
         );
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(std::fs::read_to_string(dir.path().join("c.txt")).unwrap(), "uno\r\nthree\r\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("c.txt")).unwrap(),
+            "uno\r\nthree\r\n"
+        );
     }
 
     #[test]
@@ -855,7 +1077,10 @@ mod tests {
         assert_eq!(spec.name, "read_file");
         assert_eq!(spec.parameters["required"][0], "path");
         let spec = EditFile.spec();
-        assert_eq!(spec.parameters["required"], json!(["path", "old_string", "new_string"]));
+        assert_eq!(
+            spec.parameters["required"],
+            json!(["path", "old_string", "new_string"])
+        );
         assert!(!ReadFile.needs_approval(&args));
         assert!(!ListDir.needs_approval(&args));
         assert!(WriteFile.needs_approval(&args));
@@ -865,7 +1090,10 @@ mod tests {
         ToolCtx {
             cwd: dir.to_path_buf(),
             cancel: CancellationToken::new(),
-            sandbox: std::sync::Arc::new(crate::sandbox::Policy { mode, ..Default::default() }),
+            sandbox: std::sync::Arc::new(crate::sandbox::Policy {
+                mode,
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -881,41 +1109,73 @@ mod tests {
         let _ = std::fs::remove_file(&escape);
 
         let ro = ctx_mode(dir.path(), crate::sandbox::Mode::ReadOnly);
-        let out = futures::executor::block_on(WriteFile.run(json!({"path": "a.txt", "content": "hi"}), &ro));
-        assert!(out.is_error && out.content.contains("read-only"), "{}", out.content);
+        let out = futures::executor::block_on(
+            WriteFile.run(json!({"path": "a.txt", "content": "hi"}), &ro),
+        );
+        assert!(
+            out.is_error && out.content.contains("read-only"),
+            "{}",
+            out.content
+        );
         assert!(!dir.path().join("a.txt").exists());
 
         let ww = ctx_mode(dir.path(), crate::sandbox::Mode::WorkspaceWrite);
-        let out = futures::executor::block_on(WriteFile.run(json!({"path": &abs, "content": "hi"}), &ww));
-        assert!(out.is_error && out.content.contains("outside"), "{}", out.content);
+        let out =
+            futures::executor::block_on(WriteFile.run(json!({"path": &abs, "content": "hi"}), &ww));
+        assert!(
+            out.is_error && out.content.contains("outside"),
+            "{}",
+            out.content
+        );
         assert!(!outside_file.exists());
 
-        let out = futures::executor::block_on(
-            WriteFile.run(json!({"path": format!("../{escape_name}"), "content": "nope"}), &ww),
-        );
+        let out = futures::executor::block_on(WriteFile.run(
+            json!({"path": format!("../{escape_name}"), "content": "nope"}),
+            &ww,
+        ));
         assert!(out.is_error, "{}", out.content);
         assert!(!escape.exists(), "write escaped to {}", escape.display());
 
-        let out = futures::executor::block_on(WriteFile.run(json!({"path": "a.txt", "content": "hi"}), &ww));
+        let out = futures::executor::block_on(
+            WriteFile.run(json!({"path": "a.txt", "content": "hi"}), &ww),
+        );
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "hi");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "hi"
+        );
 
         let off = ctx_mode(dir.path(), crate::sandbox::Mode::Off);
-        let out = futures::executor::block_on(WriteFile.run(json!({"path": &abs, "content": "out"}), &off));
+        let out = futures::executor::block_on(
+            WriteFile.run(json!({"path": &abs, "content": "out"}), &off),
+        );
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "out");
 
         std::fs::write(dir.path().join("e.txt"), "one").unwrap();
-        let out = futures::executor::block_on(
-            EditFile.run(json!({"path": &abs, "old_string": "out", "new_string": "OUT"}), &ww),
+        let out = futures::executor::block_on(EditFile.run(
+            json!({"path": &abs, "old_string": "out", "new_string": "OUT"}),
+            &ww,
+        ));
+        assert!(
+            out.is_error && out.content.contains("outside"),
+            "{}",
+            out.content
         );
-        assert!(out.is_error && out.content.contains("outside"), "{}", out.content);
         assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "out");
-        let out = futures::executor::block_on(
-            EditFile.run(json!({"path": "e.txt", "old_string": "one", "new_string": "two"}), &ro),
+        let out = futures::executor::block_on(EditFile.run(
+            json!({"path": "e.txt", "old_string": "one", "new_string": "two"}),
+            &ro,
+        ));
+        assert!(
+            out.is_error && out.content.contains("read-only"),
+            "{}",
+            out.content
         );
-        assert!(out.is_error && out.content.contains("read-only"), "{}", out.content);
-        assert_eq!(std::fs::read_to_string(dir.path().join("e.txt")).unwrap(), "one");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("e.txt")).unwrap(),
+            "one"
+        );
 
         let mut extra_ctx = ctx_mode(dir.path(), crate::sandbox::Mode::WorkspaceWrite);
         let extra = tempfile::tempdir().unwrap();
@@ -925,9 +1185,10 @@ mod tests {
             ..Default::default()
         });
         let dest = extra.path().join("ok.txt");
-        let out = futures::executor::block_on(
-            WriteFile.run(json!({"path": dest.to_str().unwrap(), "content": "ok"}), &extra_ctx),
-        );
+        let out = futures::executor::block_on(WriteFile.run(
+            json!({"path": dest.to_str().unwrap(), "content": "ok"}),
+            &extra_ctx,
+        ));
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "ok");
 
@@ -956,7 +1217,10 @@ mod tests {
             {
                 assert!(!out.is_error, "{}", out.content);
                 assert_eq!(std::fs::read_to_string(&target).unwrap(), "pwned");
-                assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+                assert!(std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
                 let out = futures::executor::block_on(EditFile.run(
                     json!({"path": "alias", "old_string": "pwned", "new_string": "edited"}),
                     &ww,
@@ -966,7 +1230,11 @@ mod tests {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                assert!(out.is_error && out.content.contains("symlink"), "{}", out.content);
+                assert!(
+                    out.is_error && out.content.contains("symlink"),
+                    "{}",
+                    out.content
+                );
                 assert_eq!(std::fs::read_to_string(&target).unwrap(), "real");
             }
 
@@ -991,7 +1259,11 @@ mod tests {
         let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
         perms.set_mode(0o555);
         std::fs::set_permissions(dir.path(), perms).unwrap();
-        let out = run(&WriteFile, json!({"path": "keep.txt", "content": "new"}), dir.path());
+        let out = run(
+            &WriteFile,
+            json!({"path": "keep.txt", "content": "new"}),
+            dir.path(),
+        );
         let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(dir.path(), perms).unwrap();
@@ -1007,11 +1279,23 @@ mod tests {
         big.push('\n');
         big.push_str("after\n");
         std::fs::write(dir.path().join("app.min.js"), &big).unwrap();
-        let out = run(&ReadFile, json!({"path": "app.min.js", "limit": 1}), dir.path());
+        let out = run(
+            &ReadFile,
+            json!({"path": "app.min.js", "limit": 1}),
+            dir.path(),
+        );
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("[line exceeds 1 MiB]"), "{}", out.content);
+        assert!(
+            out.content.contains("[line exceeds 1 MiB]"),
+            "{}",
+            out.content
+        );
         assert!(out.content.contains('…'));
-        let out = run(&ReadFile, json!({"path": "app.min.js", "offset": 2, "limit": 1}), dir.path());
+        let out = run(
+            &ReadFile,
+            json!({"path": "app.min.js", "offset": 2, "limit": 1}),
+            dir.path(),
+        );
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("after"), "{}", out.content);
     }
@@ -1026,7 +1310,11 @@ mod tests {
             file.write_all(&chunk).unwrap();
         }
         file.write_all(b"\nMARKER-TAIL\n").unwrap();
-        let out = run(&ReadFile, json!({"path": "big.txt", "offset": 2, "limit": 1}), dir.path());
+        let out = run(
+            &ReadFile,
+            json!({"path": "big.txt", "offset": 2, "limit": 1}),
+            dir.path(),
+        );
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("MARKER-TAIL"), "{}", out.content);
     }
@@ -1041,7 +1329,9 @@ mod tests {
 
     #[test]
     fn reads_refuse_credential_files() {
-        let _lock = crate::provider::sse::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("NYQ_HOME");
         let old_auth = std::env::var_os("NYQ_CODEX_AUTH");
@@ -1051,23 +1341,59 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("ok.txt"), "hello\n").unwrap();
         let secret = home.path().join("chatgpt-auth.json");
-        let out = run(&ReadFile, json!({"path": secret.to_str().unwrap()}), ws.path());
-        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        let out = run(
+            &ReadFile,
+            json!({"path": secret.to_str().unwrap()}),
+            ws.path(),
+        );
+        assert!(
+            out.is_error && out.content.contains("credential"),
+            "{}",
+            out.content
+        );
         assert!(!out.content.contains("refresh-token"));
-        let out = run(&ListDir, json!({"path": home.path().to_str().unwrap()}), ws.path());
-        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        let out = run(
+            &ListDir,
+            json!({"path": home.path().to_str().unwrap()}),
+            ws.path(),
+        );
+        assert!(
+            out.is_error && out.content.contains("credential"),
+            "{}",
+            out.content
+        );
         let out = run(&ReadFile, json!({"path": "ok.txt"}), ws.path());
-        assert!(!out.is_error && out.content.contains("hello"), "{}", out.content);
+        assert!(
+            !out.is_error && out.content.contains("hello"),
+            "{}",
+            out.content
+        );
         let out = run(&ReadFile, json!({"path": "~/.ssh/id_rsa"}), ws.path());
-        assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("credential"),
+            "{}",
+            out.content
+        );
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&secret, ws.path().join("leak")).unwrap();
             let out = run(&ReadFile, json!({"path": "leak"}), ws.path());
-            assert!(out.is_error && out.content.contains("credential"), "{}", out.content);
+            assert!(
+                out.is_error && out.content.contains("credential"),
+                "{}",
+                out.content
+            );
             assert!(!out.content.contains("refresh-token"));
         }
-        if let Some(v) = old_home { std::env::set_var("NYQ_HOME", v); } else { std::env::remove_var("NYQ_HOME"); }
-        if let Some(v) = old_auth { std::env::set_var("NYQ_CODEX_AUTH", v); } else { std::env::remove_var("NYQ_CODEX_AUTH"); }
+        if let Some(v) = old_home {
+            std::env::set_var("NYQ_HOME", v);
+        } else {
+            std::env::remove_var("NYQ_HOME");
+        }
+        if let Some(v) = old_auth {
+            std::env::set_var("NYQ_CODEX_AUTH", v);
+        } else {
+            std::env::remove_var("NYQ_CODEX_AUTH");
+        }
     }
 }

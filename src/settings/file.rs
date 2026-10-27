@@ -54,7 +54,11 @@ pub fn write_changes(home: &Path, changes: &[Change]) -> Result<()> {
         Ok(t) => match t.parse::<DocumentMut>() {
             Ok(d) => d,
             // Rewriting a broken file would lose what the user wrote.
-            Err(e) => bail!("{} does not parse, fix it first: {}", path.display(), e.to_string().trim_end()),
+            Err(e) => bail!(
+                "{} does not parse, fix it first: {}",
+                path.display(),
+                e.to_string().trim_end()
+            ),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
@@ -69,7 +73,9 @@ pub fn write_changes(home: &Path, changes: &[Change]) -> Result<()> {
 // ------------------------------------------------------------------ TOML -> JSON
 
 fn table_to_json(t: &dyn TableLike) -> Map<String, Value> {
-    t.iter().filter_map(|(k, v)| Some((k.to_string(), item_to_json(v)?))).collect()
+    t.iter()
+        .filter_map(|(k, v)| Some((k.to_string(), item_to_json(v)?)))
+        .collect()
 }
 
 fn item_to_json(item: &Item) -> Option<Value> {
@@ -77,7 +83,9 @@ fn item_to_json(item: &Item) -> Option<Value> {
         Item::None => None,
         Item::Value(v) => Some(value_to_json(v)),
         Item::Table(t) => Some(Value::Object(table_to_json(t))),
-        Item::ArrayOfTables(a) => Some(Value::Array(a.iter().map(|t| Value::Object(table_to_json(t))).collect())),
+        Item::ArrayOfTables(a) => Some(Value::Array(
+            a.iter().map(|t| Value::Object(table_to_json(t))).collect(),
+        )),
     }
 }
 
@@ -125,7 +133,11 @@ fn json_to_value(v: &Value) -> Option<toml_edit::Value> {
             None => n.as_f64()?.into(),
         },
         Value::String(s) => s.as_str().into(),
-        Value::Array(a) => a.iter().filter_map(json_to_value).collect::<toml_edit::Array>().into(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(json_to_value)
+            .collect::<toml_edit::Array>()
+            .into(),
         Value::Object(m) => {
             let mut t = InlineTable::new();
             for (k, v) in m {
@@ -141,7 +153,9 @@ fn json_to_value(v: &Value) -> Option<toml_edit::Value> {
 /// Set (or with `None`, remove) the value at `path`, creating tables on the
 /// way. A replaced value keeps its surrounding whitespace and comments.
 fn set(table: &mut dyn TableLike, path: &[String], new: Option<&Value>, inline: bool) {
-    let Some((key, rest)) = path.split_first() else { return };
+    let Some((key, rest)) = path.split_first() else {
+        return;
+    };
     if rest.is_empty() {
         match new.and_then(|v| json_to_item(v, inline)) {
             None => {
@@ -176,7 +190,9 @@ fn set(table: &mut dyn TableLike, path: &[String], new: Option<&Value>, inline: 
         };
         table.insert(key, item);
     }
-    let Some(child) = table.get_mut(key) else { return };
+    let Some(child) = table.get_mut(key) else {
+        return;
+    };
     let inline = inline || child.is_inline_table();
     if let Some(child) = child.as_table_like_mut() {
         set(child, rest, new, inline);
@@ -223,7 +239,10 @@ mod tests {
         std::fs::write(user_path(dir.path()), "sound = ").unwrap();
         assert!(read_user(dir.path()).is_err());
         assert!(write_changes(dir.path(), &[change(&["sound"], Some(json!("on")))]).is_err());
-        assert_eq!(std::fs::read_to_string(user_path(dir.path())).unwrap(), "sound = ");
+        assert_eq!(
+            std::fs::read_to_string(user_path(dir.path())).unwrap(),
+            "sound = "
+        );
     }
 
     #[test]
@@ -240,23 +259,52 @@ mod tests {
             "workspaces": {"~/src/app": {"sound": "off", "statusline": {"tokens": false}}},
             "a.b": {"c d": {"e": []}}
         });
-        let Value::Object(map) = value.clone() else { unreachable!() };
-        let changes: Vec<Change> = map.iter().map(|(k, v)| change(&[k], Some(v.clone()))).collect();
+        let Value::Object(map) = value.clone() else {
+            unreachable!()
+        };
+        let changes: Vec<Change> = map
+            .iter()
+            .map(|(k, v)| change(&[k], Some(v.clone())))
+            .collect();
         write_changes(dir.path(), &changes).unwrap();
         assert_eq!(Value::Object(read_user(dir.path()).unwrap()), value);
         let text = std::fs::read_to_string(user_path(dir.path())).unwrap();
-        assert!(text.contains("[workspaces.\"~/src/app\"]\nsound = \"off\""), "{text}");
+        assert!(
+            text.contains("[workspaces.\"~/src/app\"]\nsound = \"off\""),
+            "{text}"
+        );
         assert!(!text.contains("[workspaces]"), "{text}");
         // A path key inside an existing inline table stays inline.
-        std::fs::write(user_path(dir.path()), "workspaces = { \"~/src/app\" = { sound = \"off\" } }\n").unwrap();
-        write_changes(dir.path(), &[change(&["workspaces", "~/src/app", "auto_compact"], Some(json!(50)))]).unwrap();
+        std::fs::write(
+            user_path(dir.path()),
+            "workspaces = { \"~/src/app\" = { sound = \"off\" } }\n",
+        )
+        .unwrap();
+        write_changes(
+            dir.path(),
+            &[change(
+                &["workspaces", "~/src/app", "auto_compact"],
+                Some(json!(50)),
+            )],
+        )
+        .unwrap();
         let back = read_user(dir.path()).unwrap();
-        assert_eq!(back["workspaces"]["~/src/app"], json!({"sound": "off", "auto_compact": 50}));
+        assert_eq!(
+            back["workspaces"]["~/src/app"],
+            json!({"sound": "off", "auto_compact": 50})
+        );
         // Nulls have no TOML form: they are dropped.
-        write_changes(dir.path(), &[change(&["x"], Some(json!({"y": null, "z": [null, 1]})))]).unwrap();
+        write_changes(
+            dir.path(),
+            &[change(&["x"], Some(json!({"y": null, "z": [null, 1]})))],
+        )
+        .unwrap();
         assert_eq!(read_user(dir.path()).unwrap()["x"], json!({"z": [1]}));
         // TOML-only values read as strings.
         std::fs::write(user_path(dir.path()), "when = 1979-05-27T07:32:00Z\n").unwrap();
-        assert_eq!(read_user(dir.path()).unwrap()["when"], "1979-05-27T07:32:00Z");
+        assert_eq!(
+            read_user(dir.path()).unwrap()["when"],
+            "1979-05-27T07:32:00Z"
+        );
     }
 }

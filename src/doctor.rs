@@ -106,7 +106,14 @@ pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
             .into_iter()
             .flatten()
             .filter(|l| l["source"] != "default")
-            .map(|l| format!("{}={} ({})", l["name"].as_str().unwrap_or_default(), l["bytes"].as_u64().map_or("off".into(), |b| b.to_string()), l["source"].as_str().unwrap_or_default()))
+            .map(|l| {
+                format!(
+                    "{}={} ({})",
+                    l["name"].as_str().unwrap_or_default(),
+                    l["bytes"].as_u64().map_or("off".into(), |b| b.to_string()),
+                    l["source"].as_str().unwrap_or_default()
+                )
+            })
             .collect();
         if !changed.is_empty() {
             lines.push(format!("  context_limits: {}", changed.join(", ")));
@@ -135,7 +142,9 @@ pub fn show_agent_status(
     if let Some(list) = value["mcp"].as_array_mut() {
         for entry in list {
             let name = entry["name"].as_str().unwrap_or_default().to_string();
-            let state = manager.status(&name).map_or_else(|| "not started".to_string(), |s| s.label());
+            let state = manager
+                .status(&name)
+                .map_or_else(|| "not started".to_string(), |s| s.label());
             entry["state"] = json!(state);
         }
     }
@@ -155,7 +164,13 @@ impl Check {
     fn line(&self) -> String {
         format!(
             "{} {}: {}{}",
-            if self.ok { "✓" } else if self.required { "✗" } else { "!" },
+            if self.ok {
+                "✓"
+            } else if self.required {
+                "✗"
+            } else {
+                "!"
+            },
             self.name,
             self.detail,
             if self.ok || self.hint.is_empty() {
@@ -384,7 +399,11 @@ pub async fn doctor(
     checks.push(info(
         "keybindings",
         key_warnings.is_empty(),
-        if key_warnings.is_empty() { "keybindings.toml parses (or is absent)".into() } else { key_warnings.join("; ") },
+        if key_warnings.is_empty() {
+            "keybindings.toml parses (or is absent)".into()
+        } else {
+            key_warnings.join("; ")
+        },
         "fix keybindings.toml; nyq skips the entries it warned about",
     ));
     checks.push(sessions_check(facts.sessions_dir));
@@ -432,7 +451,11 @@ pub async fn doctor(
     checks.push(info(
         "gh",
         gh,
-        if gh { "GitHub CLI available" } else { "GitHub CLI unavailable" },
+        if gh {
+            "GitHub CLI available"
+        } else {
+            "GitHub CLI unavailable"
+        },
         "install gh to publish with nyq pr and nyq issue",
     ));
     let terminal = std::io::stdin().is_terminal()
@@ -454,7 +477,10 @@ pub async fn doctor(
             .iter()
             .map(|c| json!({"name": c.name, "ok": c.ok, "required": c.required, "detail": c.detail, "hint": c.hint}))
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json!({"ok": passed, "checks": list}))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"ok": passed, "checks": list}))?
+        );
         if !passed {
             // The JSON already says what failed.
             std::process::exit(1);
@@ -475,7 +501,11 @@ fn sessions_check(dir: &Path) -> Check {
         if problems.is_empty() {
             format!("{count} saved, all readable")
         } else {
-            format!("{count} saved, {} need attention: {}", problems.len(), problems.join("; "))
+            format!(
+                "{count} saved, {} need attention: {}",
+                problems.len(),
+                problems.join("; ")
+            )
         },
         "repair with the command shown for each session",
     )
@@ -490,7 +520,10 @@ pub async fn models(home: &Path, json: bool) -> Result<()> {
                     "efforts": c.efforts, "price": c.price})
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json!({"models": list, "warnings": warnings}))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"models": list, "warnings": warnings}))?
+        );
         return Ok(());
     }
     let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
@@ -561,7 +594,11 @@ mod tests {
         std::fs::write(dir.join("deadbeef-broken.jsonl"), "not json\n").unwrap();
         let c = sessions_check(&dir);
         assert!(!c.ok && !c.required, "{c:?}");
-        assert!(c.detail.starts_with("2 saved, 1 need attention: deadbeef-broken:"), "{c:?}");
+        assert!(
+            c.detail
+                .starts_with("2 saved, 1 need attention: deadbeef-broken:"),
+            "{c:?}"
+        );
         assert!(c.line().contains("nyq session recover"));
     }
     #[tokio::test]

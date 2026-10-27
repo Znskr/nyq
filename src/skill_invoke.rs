@@ -7,11 +7,18 @@ use crate::skills::{self, Skill};
 
 /// `(name, description)` rows for the `/` and `$` pickers.
 pub fn entries(skills: &[Skill]) -> Vec<(String, String)> {
-    skills.iter().map(|s| (s.id.clone(), s.description.clone())).collect()
+    skills
+        .iter()
+        .map(|s| (s.id.clone(), s.description.clone()))
+        .collect()
 }
 
 /// The skill a leading `/name` names, unless `is_command` claims the word.
-pub fn leading<'a>(skills: &'a [Skill], text: &str, is_command: impl Fn(&str) -> bool) -> Option<&'a Skill> {
+pub fn leading<'a>(
+    skills: &'a [Skill],
+    text: &str,
+    is_command: impl Fn(&str) -> bool,
+) -> Option<&'a Skill> {
     let word = text.split_whitespace().next()?;
     let name = word.strip_prefix('/')?;
     if is_command(word) {
@@ -33,7 +40,9 @@ pub fn named<'a>(skills: &'a [Skill], text: &str) -> Vec<&'a Skill> {
         .filter(|s| {
             let name = s.id.to_lowercase();
             first.eq_ignore_ascii_case(&format!("/{name}"))
-                || words.iter().any(|w| w.eq_ignore_ascii_case(&format!("${name}")))
+                || words
+                    .iter()
+                    .any(|w| w.eq_ignore_ascii_case(&format!("${name}")))
                 || [
                     format!("use the {name} skill"),
                     format!("use {name} skill"),
@@ -73,7 +82,11 @@ mod tests {
         for name in ["pdf", "review-pr"] {
             let d = dir.join(".agents/skills").join(name);
             std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("SKILL.md"), format!("---\nname: {name}\ndescription: d\n---\nDo {name} things.\n")).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\nDo {name} things.\n"),
+            )
+            .unwrap();
         }
         skills::discover_with(&dir.join("home"), None, dir)
     }
@@ -82,13 +95,21 @@ mod tests {
     fn finds_skills_by_slash_dollar_and_words() {
         let dir = tempfile::tempdir().unwrap();
         let all = skills(dir.path());
-        let names = |text: &str| named(&all, text).iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        let names = |text: &str| {
+            named(&all, text)
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(names("/pdf split this file"), ["pdf"]);
         assert_eq!(names("please $review-pr, and $pdf."), ["pdf", "review-pr"]);
         assert_eq!(names("Use the review-pr skill on #12"), ["review-pr"]);
         assert!(names("a pdf about prices").is_empty());
         assert!(names("cost is $5").is_empty());
-        assert_eq!(leading(&all, "/pdf x", |_| false).map(|s| s.name.as_str()), Some("pdf"));
+        assert_eq!(
+            leading(&all, "/pdf x", |_| false).map(|s| s.name.as_str()),
+            Some("pdf")
+        );
         assert!(leading(&all, "/pdf x", |c| c == "/pdf").is_none());
         assert!(leading(&all, "pdf", |_| false).is_none());
 

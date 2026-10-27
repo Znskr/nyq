@@ -61,12 +61,20 @@ mod tests {
 
     #[test]
     fn masks_assignments_in_numbered_reads_and_search_results() {
-        for prefix in ["", "     1\t", "config.env:1: ", "config.env-2- ", "dir:with:colons/config.env:12: "] {
+        for prefix in [
+            "",
+            "     1\t",
+            "config.env:1: ",
+            "config.env-2- ",
+            "dir:with:colons/config.env:12: ",
+        ] {
             let input = format!("{prefix}DATABASE_PASSWORD=super_secret_123\n");
-            assert_eq!(scrub(&input), format!("{prefix}DATABASE_PASSWORD=[redacted]\n"));
+            assert_eq!(
+                scrub(&input),
+                format!("{prefix}DATABASE_PASSWORD=[redacted]\n")
+            );
         }
     }
-
 
     #[test]
     fn masks_known_token_shapes() {
@@ -83,14 +91,21 @@ mod tests {
             let out = scrub(case);
             assert!(out.contains("[redacted]"), "{case} -> {out}");
         }
-        assert_eq!(scrub("export GITHUB_TOKEN=abcdef123456"), "export GITHUB_TOKEN=[redacted]");
+        assert_eq!(
+            scrub("export GITHUB_TOKEN=abcdef123456"),
+            "export GITHUB_TOKEN=[redacted]"
+        );
         assert_eq!(
             scrub("aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
             "aws_secret_access_key = [redacted]"
         );
-        let pem = "a\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nabc\n-----END RSA PRIVATE KEY-----\nb";
+        let pem =
+            "a\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nabc\n-----END RSA PRIVATE KEY-----\nb";
         let out = scrub(pem);
-        assert!(!out.contains("MIIEow") && out.starts_with("a\n") && out.ends_with("\nb"), "{out}");
+        assert!(
+            !out.contains("MIIEow") && out.starts_with("a\n") && out.ends_with("\nb"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -101,7 +116,10 @@ mod tests {
             "fetch http://user:pa%24ss@data.example.com/x",
         ] {
             let out = scrub(case);
-            assert!(!out.contains("hunter2") && !out.contains("secretpw") && !out.contains("ghp_"), "{case} -> {out}");
+            assert!(
+                !out.contains("hunter2") && !out.contains("secretpw") && !out.contains("ghp_"),
+                "{case} -> {out}"
+            );
             assert!(out.contains("://[redacted]@"), "{case} -> {out}");
         }
         assert_eq!(
@@ -115,7 +133,11 @@ mod tests {
             "https://user@example.com/x",
             "see https://docs.rs/tokio and http://93.184.216.34/",
         ] {
-            assert!(matches!(scrub(plain), Cow::Borrowed(_)), "{plain} -> {}", scrub(plain));
+            assert!(
+                matches!(scrub(plain), Cow::Borrowed(_)),
+                "{plain} -> {}",
+                scrub(plain)
+            );
         }
     }
 
@@ -129,7 +151,11 @@ mod tests {
             "API_KEY=",
             "task-runner sk-short",
         ] {
-            assert!(matches!(scrub(text), Cow::Borrowed(_)), "{text} -> {}", scrub(text));
+            assert!(
+                matches!(scrub(text), Cow::Borrowed(_)),
+                "{text} -> {}",
+                scrub(text)
+            );
         }
     }
 }

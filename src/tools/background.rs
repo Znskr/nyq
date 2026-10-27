@@ -14,7 +14,9 @@ use regex::Regex;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::bash::{exit_note, finish_pumps, kill_group, reap_leftovers, render_output, spawn, WinJob, GRACE};
+use super::bash::{
+    exit_note, finish_pumps, kill_group, reap_leftovers, render_output, spawn, WinJob, GRACE,
+};
 use super::{Registry, Tool, ToolCtx, ToolOutput};
 use crate::types::ToolSpec;
 
@@ -76,13 +78,18 @@ impl Proc {
     }
 
     fn runtime(&self) -> Duration {
-        self.ended.unwrap_or_else(Instant::now).saturating_duration_since(self.started)
+        self.ended
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.started)
     }
 
     fn status(&self) -> String {
         let t = duration(self.runtime());
         match &self.state {
-            State::Running if self.url.is_some() => format!("running for {t}, serving {}", self.url.as_deref().unwrap_or("")),
+            State::Running if self.url.is_some() => format!(
+                "running for {t}, serving {}",
+                self.url.as_deref().unwrap_or("")
+            ),
             State::Running => format!("running for {t}"),
             State::Exited(None) => format!("exited with code 0 after {t}"),
             State::Exited(Some(note)) => format!("exited ({note}) after {t}"),
@@ -130,7 +137,9 @@ fn finished_and_read(p: &Proc, now: Instant, keep: Duration) -> bool {
 /// Drop processes that have exited, been fully read, and sat that way for a while.
 fn compact_finished(table: &mut Table) {
     let now = Instant::now();
-    table.procs.retain(|p| !finished_and_read(p, now, DONE_KEEP));
+    table
+        .procs
+        .retain(|p| !finished_and_read(p, now, DONE_KEEP));
 }
 
 fn duration(d: Duration) -> String {
@@ -144,11 +153,19 @@ fn duration(d: Duration) -> String {
 
 /// Start `command` in the background (sandboxed like `bash`). Returns its id.
 /// An `interactive` process keeps its stdin open for `process_write`.
-pub(crate) fn start(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy, interactive: bool) -> Result<u32, String> {
+pub(crate) fn start(
+    command: &str,
+    cwd: &Path,
+    sandbox: &crate::sandbox::Policy,
+    interactive: bool,
+) -> Result<u32, String> {
     let (mut child, job) = spawn(command, cwd, sandbox, interactive).map_err(|e| e.to_string())?;
     let pid = child.id().unwrap_or(0);
     let job = job.map(Arc::new);
-    let stdin = child.stdin.take().map(|s| Arc::new(tokio::sync::Mutex::new(s)));
+    let stdin = child
+        .stdin
+        .take()
+        .map(|s| Arc::new(tokio::sync::Mutex::new(s)));
     let id = {
         let mut t = table();
         compact_finished(&mut t);
@@ -229,7 +246,9 @@ pub(crate) fn read_new(id: u32) -> Result<String, String> {
         p.read += slice.len() as u64;
         let mut out = format!("[process {} {}]\n", p.id, p.status());
         if dropped > 0 {
-            out.push_str(&format!("[{dropped} bytes of earlier output were dropped before this read]\n"));
+            out.push_str(&format!(
+                "[{dropped} bytes of earlier output were dropped before this read]\n"
+            ));
         }
         if slice.is_empty() {
             out.push_str("(no new output)");
@@ -303,18 +322,29 @@ pub(crate) struct WaitFor {
 
 async fn port_open(port: u16) -> bool {
     let connect = tokio::net::TcpStream::connect(("127.0.0.1", port));
-    matches!(tokio::time::timeout(Duration::from_millis(250), connect).await, Ok(Ok(_)))
+    matches!(
+        tokio::time::timeout(Duration::from_millis(250), connect).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Wait until `cond` holds, the process exits, `timeout` passes or `cancel`
 /// fires; then return why, followed by the new output.
-pub(crate) async fn wait(id: u32, cond: &WaitFor, timeout: Duration, cancel: &tokio_util::sync::CancellationToken) -> Result<String, String> {
+pub(crate) async fn wait(
+    id: u32,
+    cond: &WaitFor,
+    timeout: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<String, String> {
     let deadline = Instant::now() + timeout;
     let reason = loop {
         let (running, matched) = with_proc(id, |p| {
             let from = p.read.saturating_sub(p.base) as usize;
             let unread = String::from_utf8_lossy(&p.buf[from.min(p.buf.len())..]);
-            let matched = cond.pattern.as_ref().is_some_and(|re| re.is_match(&strip_ansi(&unread)));
+            let matched = cond
+                .pattern
+                .as_ref()
+                .is_some_and(|re| re.is_match(&strip_ansi(&unread)));
             (p.state == State::Running, matched)
         })
         .ok_or_else(|| format!("no background process with id {id}"))?;
@@ -334,7 +364,10 @@ pub(crate) async fn wait(id: u32, cond: &WaitFor, timeout: Duration, cancel: &to
             };
         }
         if Instant::now() >= deadline {
-            break format!("timed out after {}s; the condition was not met", timeout.as_secs());
+            break format!(
+                "timed out after {}s; the condition was not met",
+                timeout.as_secs()
+            );
         }
         tokio::select! {
             _ = tokio::time::sleep(POLL) => {}
@@ -351,16 +384,37 @@ pub(crate) fn context_lines() -> Vec<String> {
     t.procs
         .iter()
         .map(|p| {
-            let cmd: String = p.command.lines().next().unwrap_or("").chars().take(120).collect();
-            let stdin = if p.stdin.is_some() { ", stdin open" } else { "" };
-            format!("- #{} `{cmd}` in {} (pid {}): {}{stdin}", p.id, p.cwd.display(), p.pid, p.status())
+            let cmd: String = p
+                .command
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect();
+            let stdin = if p.stdin.is_some() {
+                ", stdin open"
+            } else {
+                ""
+            };
+            format!(
+                "- #{} `{cmd}` in {} (pid {}): {}{stdin}",
+                p.id,
+                p.cwd.display(),
+                p.pid,
+                p.status()
+            )
         })
         .collect()
 }
 
 /// Kill every running background process (on exit).
 pub(crate) fn kill_all() {
-    for p in table().procs.iter_mut().filter(|p| p.state == State::Running) {
+    for p in table()
+        .procs
+        .iter_mut()
+        .filter(|p| p.state == State::Running)
+    {
         p.kill_requested = true;
         kill_group(p.pid, "KILL", p.job.as_deref());
     }
@@ -416,13 +470,27 @@ fn server_url(text: &str) -> Option<String> {
             continue;
         }
         let end = rest
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '`' | ','))
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '`' | ',')
+            })
             .unwrap_or(rest.len());
         let url = rest[..end].trim_end_matches(['.', ';', ':']);
-        let host = url.split("://").nth(1).unwrap_or("").split(['/', '?', '#']).next().unwrap_or("");
+        let host = url
+            .split("://")
+            .nth(1)
+            .unwrap_or("")
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("");
         let name = host.rsplit_once(':').map_or(host, |(h, _)| h);
-        if matches!(name, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "[::]") {
-            found = Some(url.replacen("0.0.0.0", "localhost", 1).replacen("[::]", "localhost", 1));
+        if matches!(
+            name,
+            "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "[::]"
+        ) {
+            found = Some(
+                url.replacen("0.0.0.0", "localhost", 1)
+                    .replacen("[::]", "localhost", 1),
+            );
         }
     }
     found
@@ -433,7 +501,14 @@ fn server_url(text: &str) -> Option<String> {
 fn log_lines(id: u32) -> Result<Vec<String>, String> {
     with_proc(id, |p| {
         let text = strip_ansi(&String::from_utf8_lossy(&p.buf));
-        let cmd: String = p.command.lines().next().unwrap_or("").chars().take(80).collect();
+        let cmd: String = p
+            .command
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect();
         let mut out = vec![format!("#{} {} · {cmd}", p.id, p.status())];
         if p.base > 0 {
             out.push(format!("[{} earlier bytes were dropped]", p.base));
@@ -460,7 +535,8 @@ fn log_lines(id: u32) -> Result<Vec<String>, String> {
 fn url_of(id: u32) -> Result<(String, bool), String> {
     with_proc(id, |p| {
         let url = server_url(&strip_ansi(&String::from_utf8_lossy(&p.buf)));
-        url.map(|u| (u, p.state == State::Running)).ok_or_else(|| format!("process {id} has not printed a local server URL"))
+        url.map(|u| (u, p.state == State::Running))
+            .ok_or_else(|| format!("process {id} has not printed a local server URL"))
     })
     .ok_or_else(|| format!("no background process with id {id}"))?
 }
@@ -488,11 +564,23 @@ pub(crate) fn list_lines() -> Vec<String> {
     t.procs
         .iter()
         .map(|p| {
-            let cmd: String = p.command.lines().next().unwrap_or("").chars().take(80).collect();
+            let cmd: String = p
+                .command
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect();
             let url = server_url(&strip_ansi(&String::from_utf8_lossy(&p.buf)))
                 .map(|u| format!("  url: {u}"))
                 .unwrap_or_default();
-            format!("  #{:<3} {:<10} {:>7}  {cmd}{url}", p.id, p.short_state(), duration(p.runtime()))
+            format!(
+                "  #{:<3} {:<10} {:>7}  {cmd}{url}",
+                p.id,
+                p.short_state(),
+                duration(p.runtime())
+            )
         })
         .collect()
 }
@@ -502,11 +590,17 @@ pub(crate) async fn slash(args: &[&str]) {
     let id = |which: &str| parse_id(&Value::String(which.to_string()));
     match args {
         [] | ["list"] => crate::ui::list(&list_lines()),
-        ["logs" | "log", which] => match id(which).ok_or_else(|| "usage: /background logs ID|last".to_string()).and_then(log_lines) {
+        ["logs" | "log", which] => match id(which)
+            .ok_or_else(|| "usage: /background logs ID|last".to_string())
+            .and_then(log_lines)
+        {
             Ok(lines) => crate::ui::list(&lines),
             Err(e) => crate::ui::error(&e),
         },
-        ["open", which] => match id(which).ok_or_else(|| "usage: /background open ID|last".to_string()).and_then(url_of) {
+        ["open", which] => match id(which)
+            .ok_or_else(|| "usage: /background open ID|last".to_string())
+            .and_then(url_of)
+        {
             Ok((url, running)) => {
                 crate::login::open_browser(&url);
                 crate::ui::info(&format!("  Opened {url}"));
@@ -528,7 +622,11 @@ pub(crate) async fn slash(args: &[&str]) {
 }
 
 fn id_arg(args: &Value, tool: &str) -> Result<u32, ToolOutput> {
-    args.get("id").and_then(parse_id).ok_or_else(|| ToolOutput::err(format!("{tool}: missing or invalid `id` (a background process id)")))
+    args.get("id").and_then(parse_id).ok_or_else(|| {
+        ToolOutput::err(format!(
+            "{tool}: missing or invalid `id` (a background process id)"
+        ))
+    })
 }
 
 const ID_SCHEMA: &str = "Background process id returned by bash with run_in_background.";
@@ -562,13 +660,25 @@ impl Tool for ProcessWrite {
     }
 
     fn summary(&self, args: &Value) -> String {
-        let text: String = args.get("text").and_then(Value::as_str).unwrap_or("").escape_debug().take(80).collect();
-        format!("{} {text}", BashOutput.summary(args)).trim_end().to_string()
+        let text: String = args
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .escape_debug()
+            .take(80)
+            .collect();
+        format!("{} {text}", BashOutput.summary(args))
+            .trim_end()
+            .to_string()
     }
 
     fn preview(&self, args: &Value, _ctx: &ToolCtx) -> Option<String> {
         let text = args.get("text").and_then(Value::as_str).unwrap_or("");
-        let close = if args.get("close_stdin").and_then(Value::as_bool) == Some(true) { "\n(then close stdin)" } else { "" };
+        let close = if args.get("close_stdin").and_then(Value::as_bool) == Some(true) {
+            "\n(then close stdin)"
+        } else {
+            ""
+        };
         Some(format!("{text}{close}"))
     }
 
@@ -578,7 +688,10 @@ impl Tool for ProcessWrite {
             Err(out) => return out,
         };
         let text = args.get("text").and_then(Value::as_str).unwrap_or("");
-        let close = args.get("close_stdin").and_then(Value::as_bool).unwrap_or(false);
+        let close = args
+            .get("close_stdin")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if text.is_empty() && !close {
             return ToolOutput::err("process_write: give `text` to send, or close_stdin.");
         }
@@ -630,22 +743,43 @@ impl Tool for ProcessWait {
             Ok(id) => id,
             Err(out) => return out,
         };
-        let pattern = match args.get("pattern").and_then(Value::as_str).filter(|p| !p.is_empty()) {
+        let pattern = match args
+            .get("pattern")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+        {
             Some(p) => match Regex::new(p) {
                 Ok(re) => Some(re),
-                Err(e) => return ToolOutput::err(format!("process_wait: invalid pattern {p:?}: {e}")),
+                Err(e) => {
+                    return ToolOutput::err(format!("process_wait: invalid pattern {p:?}: {e}"))
+                }
             },
             None => None,
         };
         let port = match args.get("port").filter(|v| !v.is_null()) {
-            Some(v) => match v.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0) {
+            Some(v) => match v
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .filter(|n| *n > 0)
+            {
                 Some(n) => Some(n),
                 None => return ToolOutput::err("process_wait: `port` must be a TCP port number."),
             },
             None => None,
         };
-        let secs = args.get("timeout_secs").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX);
-        match wait(id, &WaitFor { pattern, port }, Duration::from_secs(secs), &ctx.cancel).await {
+        let secs = args
+            .get("timeout_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(WAIT_DEFAULT)
+            .clamp(1, WAIT_MAX);
+        match wait(
+            id,
+            &WaitFor { pattern, port },
+            Duration::from_secs(secs),
+            &ctx.cancel,
+        )
+        .await
+        {
             Ok(text) => ToolOutput::ok(text),
             Err(e) => ToolOutput::err(format!("process_wait: {e}")),
         }
@@ -671,7 +805,16 @@ impl Tool for BashOutput {
     }
 
     fn summary(&self, args: &Value) -> String {
-        args.get("id").map(|v| format!("#{}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).unwrap_or_default()
+        args.get("id")
+            .map(|v| {
+                format!(
+                    "#{}",
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                )
+            })
+            .unwrap_or_default()
     }
 
     async fn run(&self, args: Value, _ctx: &ToolCtx) -> ToolOutput {
@@ -704,17 +847,28 @@ impl Tool for KillShell {
 
     async fn run(&self, args: Value, _ctx: &ToolCtx) -> ToolOutput {
         match id_arg(&args, "kill_shell") {
-            Ok(id) => kill(id).await.map_or_else(ToolOutput::err, |m| ToolOutput::ok(format!("Stopped {m}."))),
+            Ok(id) => kill(id)
+                .await
+                .map_or_else(ToolOutput::err, |m| ToolOutput::ok(format!("Stopped {m}."))),
             Err(out) => out,
         }
     }
 }
 
 /// The `bash` result for a command started with `run_in_background`.
-pub(crate) fn started_message(command: &str, cwd: &Path, sandbox: &crate::sandbox::Policy, interactive: bool) -> ToolOutput {
+pub(crate) fn started_message(
+    command: &str,
+    cwd: &Path,
+    sandbox: &crate::sandbox::Policy,
+    interactive: bool,
+) -> ToolOutput {
     match start(command, cwd, sandbox, interactive) {
         Ok(id) => {
-            let input = if interactive { format!(" Send input with process_write {{\"id\": {id}, \"text\": \"…\\n\"}}.") } else { String::new() };
+            let input = if interactive {
+                format!(" Send input with process_write {{\"id\": {id}, \"text\": \"…\\n\"}}.")
+            } else {
+                String::new()
+            };
             ToolOutput::ok(format!(
                 "Started background process {id}. Read its output with bash_output {{\"id\": {id}}}, or wait for a \
                  line, a port or its exit with process_wait {{\"id\": {id}, \"pattern\": \"…\"}}.{input} Stop it with \
@@ -737,13 +891,19 @@ mod tests {
     use super::*;
 
     fn policy() -> crate::sandbox::Policy {
-        crate::sandbox::Policy { mode: crate::sandbox::Mode::Off, ..Default::default() }
+        crate::sandbox::Policy {
+            mode: crate::sandbox::Mode::Off,
+            ..Default::default()
+        }
     }
 
     async fn wait_until(id: u32, f: impl Fn(&Proc) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !with_proc(id, |p| f(p)).unwrap() {
-            assert!(Instant::now() < deadline, "timed out waiting on process {id}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting on process {id}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -751,7 +911,13 @@ mod tests {
     #[tokio::test]
     async fn output_is_read_incrementally_and_exit_status_reported() {
         let dir = tempfile::tempdir().unwrap();
-        let id = start("echo one; sleep 0.3; echo two; exit 3", dir.path(), &policy(), false).unwrap();
+        let id = start(
+            "echo one; sleep 0.3; echo two; exit 3",
+            dir.path(),
+            &policy(),
+            false,
+        )
+        .unwrap();
         wait_until(id, |p| String::from_utf8_lossy(&p.buf).contains("one")).await;
         let first = read_new(id).unwrap();
         assert!(first.contains("running for"), "{first}");
@@ -759,49 +925,98 @@ mod tests {
         wait_until(id, |p| p.state != State::Running).await;
         let second = read_new(id).unwrap();
         assert!(second.contains("exited (exit code 3)"), "{second}");
-        assert!(second.contains("two") && !second.contains("one"), "{second}");
+        assert!(
+            second.contains("two") && !second.contains("one"),
+            "{second}"
+        );
         let third = read_new(id).unwrap();
         assert!(third.ends_with("(no new output)"), "{third}");
         assert!(kill(id).await.unwrap_err().contains("not running"));
-        assert!(list_lines().iter().any(|l| l.contains(&format!("#{id}")) && l.contains("exit 3")));
+        assert!(list_lines()
+            .iter()
+            .any(|l| l.contains(&format!("#{id}")) && l.contains("exit 3")));
     }
 
     #[test]
     fn server_urls_and_escapes() {
-        assert_eq!(strip_ansi("\x1b[1;32mready\x1b[0m \x1b]8;;x\x07link"), "ready link");
-        let out = "Local:   \x1b[36mhttp://localhost:5173/\x1b[39m\n  Network: http://192.168.1.4:5173/";
-        assert_eq!(server_url(&strip_ansi(out)).as_deref(), Some("http://localhost:5173/"));
-        assert_eq!(server_url("Listening on http://0.0.0.0:8000.").as_deref(), Some("http://localhost:8000"));
+        assert_eq!(
+            strip_ansi("\x1b[1;32mready\x1b[0m \x1b]8;;x\x07link"),
+            "ready link"
+        );
+        let out =
+            "Local:   \x1b[36mhttp://localhost:5173/\x1b[39m\n  Network: http://192.168.1.4:5173/";
+        assert_eq!(
+            server_url(&strip_ansi(out)).as_deref(),
+            Some("http://localhost:5173/")
+        );
+        assert_eq!(
+            server_url("Listening on http://0.0.0.0:8000.").as_deref(),
+            Some("http://localhost:8000")
+        );
         assert_eq!(server_url("see https://example.com/docs").as_deref(), None);
-        assert_eq!(server_url("a http://127.0.0.1:1 then http://localhost:2/x").as_deref(), Some("http://localhost:2/x"));
+        assert_eq!(
+            server_url("a http://127.0.0.1:1 then http://localhost:2/x").as_deref(),
+            Some("http://localhost:2/x")
+        );
     }
 
     #[tokio::test]
     async fn logs_show_head_tail_and_url() {
         let dir = tempfile::tempdir().unwrap();
-        let id = start("for i in $(seq 1 60); do echo line$i; done; echo 'at http://localhost:4321'", dir.path(), &policy(), false).unwrap();
+        let id = start(
+            "for i in $(seq 1 60); do echo line$i; done; echo 'at http://localhost:4321'",
+            dir.path(),
+            &policy(),
+            false,
+        )
+        .unwrap();
         wait_until(id, |p| p.state != State::Running).await;
         let lines = log_lines(id).unwrap();
-        assert!(lines[0].starts_with(&format!("#{id} exited with code 0")), "{lines:?}");
+        assert!(
+            lines[0].starts_with(&format!("#{id} exited with code 0")),
+            "{lines:?}"
+        );
         assert_eq!(lines[1], "line1");
-        assert!(lines.contains(&"… 21 more lines …".to_string()), "{lines:?}");
+        assert!(
+            lines.contains(&"… 21 more lines …".to_string()),
+            "{lines:?}"
+        );
         assert_eq!(lines.last().unwrap(), "url: http://localhost:4321");
-        assert_eq!(url_of(id).unwrap(), ("http://localhost:4321".to_string(), false));
-        assert!(list_lines().iter().any(|l| l.contains(&format!("#{id}")) && l.ends_with("url: http://localhost:4321")));
+        assert_eq!(
+            url_of(id).unwrap(),
+            ("http://localhost:4321".to_string(), false)
+        );
+        assert!(list_lines()
+            .iter()
+            .any(|l| l.contains(&format!("#{id}")) && l.ends_with("url: http://localhost:4321")));
         assert!(log_lines(999_999).is_err());
     }
 
     #[tokio::test]
     async fn kill_stops_the_process_group() {
         let dir = tempfile::tempdir().unwrap();
-        let id = start("echo started; sleep 885533 & sleep 885533", dir.path(), &policy(), false).unwrap();
+        let id = start(
+            "echo started; sleep 885533 & sleep 885533",
+            dir.path(),
+            &policy(),
+            false,
+        )
+        .unwrap();
         wait_until(id, |p| !p.buf.is_empty()).await;
         let msg = kill(id).await.unwrap();
         assert!(msg.contains("killed"), "{msg}");
         assert!(read_new(id).unwrap().contains("killed after"));
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let pgrep = std::process::Command::new("pgrep").arg("-f").arg("885533").output().unwrap();
-        assert!(pgrep.stdout.is_empty(), "leftover processes: {}", String::from_utf8_lossy(&pgrep.stdout));
+        let pgrep = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg("885533")
+            .output()
+            .unwrap();
+        assert!(
+            pgrep.stdout.is_empty(),
+            "leftover processes: {}",
+            String::from_utf8_lossy(&pgrep.stdout)
+        );
         assert!(read_new(999_999).is_err());
     }
 
@@ -824,13 +1039,33 @@ mod tests {
             .await;
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!out.is_error, "{}", out.content);
-        let id: u32 = out.content.split_whitespace().nth(3).unwrap().trim_end_matches('.').parse().unwrap();
+        let id: u32 = out
+            .content
+            .split_whitespace()
+            .nth(3)
+            .unwrap()
+            .trim_end_matches('.')
+            .parse()
+            .unwrap();
         wait_until(id, |p| p.base + p.buf.len() as u64 >= 1_500_000).await;
         assert_eq!(with_proc(id, |p| p.buf.len()).unwrap(), BUF_CAP);
-        let read = r.get("bash_output").unwrap().run(json!({"id": id}), &ctx).await;
-        assert!(read.content.contains("bytes of earlier output were dropped"), "{}", &read.content[..200]);
+        let read = r
+            .get("bash_output")
+            .unwrap()
+            .run(json!({"id": id}), &ctx)
+            .await;
+        assert!(
+            read.content
+                .contains("bytes of earlier output were dropped"),
+            "{}",
+            &read.content[..200]
+        );
         assert!(read.content.contains("[output truncated"));
-        let killed = r.get("kill_shell").unwrap().run(json!({"id": format!("#{id}")}), &ctx).await;
+        let killed = r
+            .get("kill_shell")
+            .unwrap()
+            .run(json!({"id": format!("#{id}")}), &ctx)
+            .await;
         assert!(!killed.is_error, "{}", killed.content);
     }
 
@@ -838,21 +1073,54 @@ mod tests {
     async fn interactive_input_and_waiting() {
         let dir = tempfile::tempdir().unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let id = start("while read line; do echo \"got $line\"; done; echo bye", dir.path(), &policy(), true).unwrap();
+        let id = start(
+            "while read line; do echo \"got $line\"; done; echo bye",
+            dir.path(),
+            &policy(),
+            true,
+        )
+        .unwrap();
         write(id, "hello\n", false).await.unwrap();
-        let cond = WaitFor { pattern: Some(Regex::new("got hel+o").unwrap()), port: None };
-        let out = wait(id, &cond, Duration::from_secs(10), &cancel).await.unwrap();
-        assert!(out.starts_with("[wait: the output matched the pattern]") && out.contains("got hello"), "{out}");
+        let cond = WaitFor {
+            pattern: Some(Regex::new("got hel+o").unwrap()),
+            port: None,
+        };
+        let out = wait(id, &cond, Duration::from_secs(10), &cancel)
+            .await
+            .unwrap();
+        assert!(
+            out.starts_with("[wait: the output matched the pattern]") && out.contains("got hello"),
+            "{out}"
+        );
         write(id, "", true).await.unwrap();
-        let exit = WaitFor { pattern: None, port: None };
-        let out = wait(id, &exit, Duration::from_secs(10), &cancel).await.unwrap();
-        assert!(out.contains("[wait: the process ended]") && out.contains("bye"), "{out}");
-        assert!(write(id, "x", false).await.unwrap_err().contains("not running"));
+        let exit = WaitFor {
+            pattern: None,
+            port: None,
+        };
+        let out = wait(id, &exit, Duration::from_secs(10), &cancel)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("[wait: the process ended]") && out.contains("bye"),
+            "{out}"
+        );
+        assert!(write(id, "x", false)
+            .await
+            .unwrap_err()
+            .contains("not running"));
 
         let quiet = start("sleep 30", dir.path(), &policy(), false).unwrap();
-        assert!(write(quiet, "x", false).await.unwrap_err().contains("no open stdin"));
-        let cond = WaitFor { pattern: Some(Regex::new("never").unwrap()), port: None };
-        let out = wait(quiet, &cond, Duration::from_secs(1), &cancel).await.unwrap();
+        assert!(write(quiet, "x", false)
+            .await
+            .unwrap_err()
+            .contains("no open stdin"));
+        let cond = WaitFor {
+            pattern: Some(Regex::new("never").unwrap()),
+            port: None,
+        };
+        let out = wait(quiet, &cond, Duration::from_secs(1), &cancel)
+            .await
+            .unwrap();
         assert!(out.contains("timed out after 1s"), "{out}");
         kill(quiet).await.unwrap();
     }
@@ -862,21 +1130,45 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let cmd = format!("printf '\\033[32m  Local:   http://localhost:{port}/\\033[0m\\n'; sleep 30");
+        let cmd =
+            format!("printf '\\033[32m  Local:   http://localhost:{port}/\\033[0m\\n'; sleep 30");
         let id = start(&cmd, dir.path(), &policy(), false).unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let out = wait(id, &WaitFor { pattern: None, port: Some(port) }, Duration::from_secs(10), &cancel).await.unwrap();
+        let out = wait(
+            id,
+            &WaitFor {
+                pattern: None,
+                port: Some(port),
+            },
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await
+        .unwrap();
         assert!(out.contains(&format!("port {port} is accepting")), "{out}");
         wait_until(id, |p| p.url.is_some()).await;
-        let line = context_lines().into_iter().find(|l| l.starts_with(&format!("- #{id} "))).unwrap();
-        assert!(line.contains(&format!("serving http://localhost:{port}/")), "{line}");
+        let line = context_lines()
+            .into_iter()
+            .find(|l| l.starts_with(&format!("- #{id} ")))
+            .unwrap();
+        assert!(
+            line.contains(&format!("serving http://localhost:{port}/")),
+            "{line}"
+        );
         kill(id).await.unwrap();
     }
 
     #[test]
     fn server_urls_are_found_in_colored_output() {
-        assert_eq!(server_url("  ➜  Local:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m").as_deref(), Some("http://localhost:5173/"));
-        assert_eq!(server_url("Listening on http://0.0.0.0:8000.").as_deref(), Some("http://localhost:8000"));
+        assert_eq!(
+            server_url("  ➜  Local:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m")
+                .as_deref(),
+            Some("http://localhost:5173/")
+        );
+        assert_eq!(
+            server_url("Listening on http://0.0.0.0:8000.").as_deref(),
+            Some("http://localhost:8000")
+        );
         assert_eq!(server_url("see https://docs.rs/tokio for docs"), None);
     }
 }

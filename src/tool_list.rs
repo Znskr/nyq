@@ -61,7 +61,9 @@ fn turn(agent: &mut Agent, name: &str, off: bool) -> Result<String> {
     agent.tools.set_disabled(&s.disabled_tools);
     Ok(match (off, notice) {
         (_, Some(n)) => n,
-        (true, None) => format!("Turned off {name}: the model no longer gets it (disabled_tools in settings.toml)."),
+        (true, None) => format!(
+            "Turned off {name}: the model no longer gets it (disabled_tools in settings.toml)."
+        ),
         (false, None) => format!("Turned on {name}."),
     })
 }
@@ -76,7 +78,12 @@ fn allowlist(agent: &mut Agent, words: &[&str]) -> Result<Vec<String>> {
 /// means the menu should open.
 pub fn run(agent: &mut Agent, args: &[&str], menu: bool) -> Result<Option<Vec<String>>> {
     let known = |agent: &Agent, name: &str| -> Result<()> {
-        if agent.tools.catalog(&agent.cwd).iter().any(|(s, _, _)| s.name == name) {
+        if agent
+            .tools
+            .catalog(&agent.cwd)
+            .iter()
+            .any(|(s, _, _)| s.name == name)
+        {
             Ok(())
         } else {
             bail!("no tool named `{name}` (see /tools list)")
@@ -87,7 +94,9 @@ pub fn run(agent: &mut Agent, args: &[&str], menu: bool) -> Result<Option<Vec<St
         Command::Menu | Command::List => tools_menu::plain_lines(&entries(agent)),
         Command::Info(name) => {
             let all = entries(agent);
-            let Some(e) = all.iter().find(|e| e.spec.name == name) else { bail!("no tool named `{name}` (see /tools list)") };
+            let Some(e) = all.iter().find(|e| e.spec.name == name) else {
+                bail!("no tool named `{name}` (see /tools list)")
+            };
             tools_menu::detail(e).lines().map(String::from).collect()
         }
         Command::Disable(name) => {
@@ -146,7 +155,10 @@ mod tests {
         assert_eq!(parse(&["info", "bash"]), Command::Info("bash".into()));
         assert_eq!(parse(&["off", "bash"]), Command::Disable("bash".into()));
         assert_eq!(parse(&["enable", "bash"]), Command::Enable("bash".into()));
-        assert_eq!(parse(&["trust", "mcp__gh__list"]), Command::Trust("mcp__gh__list".into()));
+        assert_eq!(
+            parse(&["trust", "mcp__gh__list"]),
+            Command::Trust("mcp__gh__list".into())
+        );
         assert_eq!(parse(&["untrust", "x"]), Command::Untrust("x".into()));
         assert_eq!(parse(&["disable"]), Command::Usage);
         assert_eq!(parse(&["bogus", "x"]), Command::Usage);
@@ -159,15 +171,44 @@ mod tests {
         let mut agent = crate::agent::test_agent();
         let perms = std::sync::Arc::make_mut(&mut agent.permissions);
         perms.deny = vec!["web_fetch".into()];
-        let lines = run(&mut agent, &[], ui::menus_available()).unwrap().expect("text, not a menu");
+        let lines = run(&mut agent, &[], ui::menus_available())
+            .unwrap()
+            .expect("text, not a menu");
         assert_eq!(lines[0].split(' ').next(), Some("Built-in"));
-        assert!(lines.iter().any(|l| l.contains("read_file") && l.contains("[auto]")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("web_fetch") && l.contains("[denied]")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("bash") && l.contains("[asks]")), "{lines:?}");
-        assert!(run(&mut agent, &[], true).unwrap().is_none(), "with a terminal the menu opens");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("read_file") && l.contains("[auto]")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("web_fetch") && l.contains("[denied]")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("bash") && l.contains("[asks]")),
+            "{lines:?}"
+        );
+        assert!(
+            run(&mut agent, &[], true).unwrap().is_none(),
+            "with a terminal the menu opens"
+        );
         let info = run(&mut agent, &["info", "bash"], false).unwrap().unwrap();
-        assert!(info[0].starts_with("bash · Built-in") && info.iter().any(|l| l.contains("command (string, required)")), "{info:?}");
-        assert!(run(&mut agent, &["info", "nope"], false).unwrap_err().to_string().contains("no tool named"));
+        assert!(
+            info[0].starts_with("bash · Built-in")
+                && info
+                    .iter()
+                    .any(|l| l.contains("command (string, required)")),
+            "{info:?}"
+        );
+        assert!(run(&mut agent, &["info", "nope"], false)
+            .unwrap_err()
+            .to_string()
+            .contains("no tool named"));
         assert!(run(&mut agent, &["trust", "nope"], false).is_err());
         assert_eq!(run(&mut agent, &["what"], false).unwrap().unwrap(), [USAGE]);
     }

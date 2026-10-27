@@ -49,7 +49,9 @@ fn describe_with(keys: &ui::keys::Keymap, cmd: &str, description: &str) -> Strin
         "/model" => KeyAction::ModelMenu,
         _ => return description.to_string(),
     };
-    let Some(at) = description.find("{key}") else { return description.to_string() };
+    let Some(at) = description.find("{key}") else {
+        return description.to_string();
+    };
     match keys.hint(action) {
         Some(key) => description.replace("{key}", &key),
         None => {
@@ -83,7 +85,9 @@ pub fn sync_footer(footer: &mut ui::tui::Footer, agent: &Agent, current: Option<
     footer.fast = agent.provider.fast();
     footer.fast_supported = agent.provider.supports_fast() || fast_unknown(agent);
     footer.efforts = efforts(agent, current);
-    footer.models = crate::provider::listing(agent.provider.name()).map(|l| l.models).unwrap_or_default();
+    footer.models = crate::provider::listing(agent.provider.name())
+        .map(|l| l.models)
+        .unwrap_or_default();
     footer.branch = ui::statusline::git_branch(&agent.cwd);
     footer.segments = settings::current().statusline;
 }
@@ -121,7 +125,10 @@ fn learn_models_in_background(home: &Path, agent: &Agent) {
 }
 
 /// Save settings, saying so when a project or workspace layer overrides the change.
-fn persist(home: &Path, f: impl FnOnce(&mut settings::Settings)) -> anyhow::Result<settings::Settings> {
+fn persist(
+    home: &Path,
+    f: impl FnOnce(&mut settings::Settings),
+) -> anyhow::Result<settings::Settings> {
     let (saved, notice) = settings::update(home, f)?;
     if let Some(notice) = notice {
         ui::info(&format!("  {notice}"));
@@ -266,7 +273,9 @@ fn set_fast(home: &Path, agent: &mut Agent, on: bool) {
     save(home, |s| s.fast_mode = on);
     ui::info(match (on, agent.provider.name()) {
         (false, _) => "  Fast mode off.",
-        (true, "codex") => "  Fast mode on: priority processing, which uses more of your plan's usage.",
+        (true, "codex") => {
+            "  Fast mode on: priority processing, which uses more of your plan's usage."
+        }
         (true, _) => "  Fast mode on: faster inference, at the model's higher fast-mode price.",
     });
 }
@@ -289,7 +298,9 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
     match cmd {
         "/settings" if ui::menu_or_hint(SETTINGS_HINT) => tui.screen().open_settings(Category::All),
         "/settings" => {}
-        "/statusline" if args.is_empty() && ui::menu_or_hint(SETTINGS_HINT) => tui.screen().open_settings(Category::StatusLine),
+        "/statusline" if args.is_empty() && ui::menu_or_hint(SETTINGS_HINT) => {
+            tui.screen().open_settings(Category::StatusLine)
+        }
         "/statusline" if args.is_empty() => {}
         "/statusline" => {
             let mut changes = Vec::new();
@@ -429,7 +440,11 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
                     ui::info("  cleared pending images");
                 }
                 ["remove" | "rm", n] => {
-                    let a = n.trim_start_matches('#').parse::<usize>().ok().and_then(|id| s.detach(id));
+                    let a = n
+                        .trim_start_matches('#')
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|id| s.detach(id));
                     let Some(a) = a else {
                         anyhow::bail!("no pending image #{n}")
                     };
@@ -453,7 +468,10 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
         "/transcript" => tui.screen().open_transcript(),
         "/keys" => {
             let mut lines = ui::keys::current().lines();
-            lines.push(format!("Edit {} to change these (see README).", crate::config::home().join("keybindings.toml").display()));
+            lines.push(format!(
+                "Edit {} to change these (see README).",
+                crate::config::home().join("keybindings.toml").display()
+            ));
             ui::list(&lines);
         }
         "/alias" => match args.first() {
@@ -585,7 +603,9 @@ pub fn restore_prefs(home: &Path, agent: &mut Agent, prefs: Option<&session::Pre
 /// session's settings. (`/new` and `/clear` keep background processes.)
 pub fn reset(agent: &mut Agent) -> Result<()> {
     agent.clear_context()?;
-    std::sync::Arc::make_mut(&mut agent.permissions).session_rules.clear();
+    std::sync::Arc::make_mut(&mut agent.permissions)
+        .session_rules
+        .clear();
     let stopped = crate::tools::background::forget_all();
     ui::info("Cleared the conversation. Session settings are unchanged.");
     if stopped > 0 {
@@ -692,14 +712,35 @@ mod tests {
     #[test]
     fn descriptions_name_the_bound_key() {
         let paste = COMMANDS.iter().find(|(c, _)| *c == "/paste").unwrap().1;
-        assert_eq!(describe("/paste", paste), "attach an image from the clipboard (also ctrl+v)");
-        assert_eq!(describe("/image", "attach {key}"), "attach {key}", "only commands with a key action");
-        let (keys, _) = ui::keys::Keymap::parse("paste_image = \"f9\"\nexpand_tools = []");
-        assert_eq!(describe_with(&keys, "/paste", paste), "attach an image from the clipboard (also f9)");
-        let transcript = COMMANDS.iter().find(|(c, _)| *c == "/transcript").unwrap().1;
-        assert_eq!(describe_with(&keys, "/transcript", transcript), "full-screen transcript with search");
         assert_eq!(
-            describe_with(&keys, "/model", "switch model or provider ({key}); /model ID"),
+            describe("/paste", paste),
+            "attach an image from the clipboard (also ctrl+v)"
+        );
+        assert_eq!(
+            describe("/image", "attach {key}"),
+            "attach {key}",
+            "only commands with a key action"
+        );
+        let (keys, _) = ui::keys::Keymap::parse("paste_image = \"f9\"\nexpand_tools = []");
+        assert_eq!(
+            describe_with(&keys, "/paste", paste),
+            "attach an image from the clipboard (also f9)"
+        );
+        let transcript = COMMANDS
+            .iter()
+            .find(|(c, _)| *c == "/transcript")
+            .unwrap()
+            .1;
+        assert_eq!(
+            describe_with(&keys, "/transcript", transcript),
+            "full-screen transcript with search"
+        );
+        assert_eq!(
+            describe_with(
+                &keys,
+                "/model",
+                "switch model or provider ({key}); /model ID"
+            ),
             "switch model or provider (ctrl+l); /model ID"
         );
     }

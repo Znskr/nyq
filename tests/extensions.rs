@@ -36,8 +36,12 @@ fn fake_server(replies: Vec<Vec<Value>>) -> (String, Arc<Mutex<Vec<Value>>>) {
             }
             let mut body = vec![0; len];
             reader.read_exact(&mut body).unwrap();
-            log.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
-            let mut out = String::from("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
+            log.lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap());
+            let mut out = String::from(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            );
             for c in chunks {
                 out.push_str(&format!("data: {c}\n\n"));
             }
@@ -53,8 +57,10 @@ fn delta(d: Value) -> Value {
 }
 
 fn tool_call(id: &str, name: &str, args: Value) -> Value {
-    delta(json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
-        "function": {"name": name, "arguments": args.to_string()}}]}))
+    delta(
+        json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
+        "function": {"name": name, "arguments": args.to_string()}}]}),
+    )
 }
 
 fn nyq(home: &Path, work: &Path) -> Command {
@@ -94,24 +100,55 @@ fn installed_extensions_add_tools_guard_calls_and_rewrite_prompts() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/word-tools");
-    let out = nyq(home.path(), work.path()).args(["ext", "install"]).arg(&example).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = nyq(home.path(), work.path())
+        .args(["ext", "install"])
+        .arg(&example)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let rw = home.path().join("extensions/rewriter");
     std::fs::create_dir_all(&rw).unwrap();
     std::fs::write(rw.join("ext.py"), REWRITER).unwrap();
-    std::fs::write(rw.join("extension.json"), r#"{"name": "rewriter", "command": ["python3", "ext.py"]}"#).unwrap();
-    let list = nyq(home.path(), work.path()).args(["extensions", "list"]).output().unwrap();
+    std::fs::write(
+        rw.join("extension.json"),
+        r#"{"name": "rewriter", "command": ["python3", "ext.py"]}"#,
+    )
+    .unwrap();
+    let list = nyq(home.path(), work.path())
+        .args(["extensions", "list"])
+        .output()
+        .unwrap();
     let list = String::from_utf8_lossy(&list.stdout);
     assert!(list.contains("word-tools 0.1.0 · user · enabled"), "{list}");
     assert!(list.contains("rewriter"), "{list}");
 
     let (url, seen) = fake_server(vec![
-        vec![tool_call("c1", "ext__word-tools__word_count", json!({"text": "one two three"}))],
-        vec![tool_call("c2", "bash", json!({"command": "rm -rf ./nothing-here"}))],
+        vec![tool_call(
+            "c1",
+            "ext__word-tools__word_count",
+            json!({"text": "one two three"}),
+        )],
+        vec![tool_call(
+            "c2",
+            "bash",
+            json!({"command": "rm -rf ./nothing-here"}),
+        )],
         vec![delta(json!({"content": "Done."}))],
     ]);
     let out = nyq(home.path(), work.path())
-        .args(["--print", "--yolo", "--sandbox", "off", "--provider", "openai", "count PLEASE"])
+        .args([
+            "--print",
+            "--yolo",
+            "--sandbox",
+            "off",
+            "--provider",
+            "openai",
+            "count PLEASE",
+        ])
         .env("NYQ_BASE_URL", &url)
         .output()
         .unwrap();
@@ -124,17 +161,29 @@ fn installed_extensions_add_tools_guard_calls_and_rewrite_prompts() {
     let tools = seen[0]["tools"].to_string();
     assert!(tools.contains("ext__word-tools__word_count"), "{tools}");
     let first = seen[0]["messages"].to_string();
-    assert!(first.contains("count please") && !first.contains("PLEASE"), "{first}");
+    assert!(
+        first.contains("count please") && !first.contains("PLEASE"),
+        "{first}"
+    );
     assert!(first.contains("EXT CONTEXT: branch main"), "{first}");
     let second = seen[1]["messages"].to_string();
-    assert!(second.contains("1 lines, 3 words, 13 characters [checked]"), "{second}");
+    assert!(
+        second.contains("1 lines, 3 words, 13 characters [checked]"),
+        "{second}"
+    );
     let third = seen[2]["messages"].to_string();
-    assert!(third.contains("rm -rf is blocked by the word-tools extension"), "{third}");
+    assert!(
+        third.contains("rm -rf is blocked by the word-tools extension"),
+        "{third}"
+    );
 
     let log = std::fs::read_to_string(home.path().join("logs/ext-word-tools.log")).unwrap();
     assert!(log.contains("started for"), "{log}");
 
-    let out = nyq(home.path(), work.path()).args(["ext", "remove", "word-tools"]).output().unwrap();
+    let out = nyq(home.path(), work.path())
+        .args(["ext", "remove", "word-tools"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     assert!(!home.path().join("extensions/word-tools").exists());
 }

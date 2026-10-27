@@ -26,7 +26,10 @@ pub struct List {
 impl List {
     /// The filter's words, lowercased.
     pub fn words(&self) -> Vec<String> {
-        self.filter.split_whitespace().map(str::to_lowercase).collect()
+        self.filter
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect()
     }
 
     /// Navigation and filter typing over `count` rows in `groups` groups.
@@ -34,10 +37,23 @@ impl List {
     pub fn on_key(&mut self, key: KeyEvent, count: usize, groups: usize) -> bool {
         let mods = key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
-            KeyCode::Up => self.selected = self.selected.checked_sub(1).unwrap_or(count.saturating_sub(1)),
-            KeyCode::Down => self.selected = if count == 0 { 0 } else { (self.selected + 1) % count },
+            KeyCode::Up => {
+                self.selected = self
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(count.saturating_sub(1))
+            }
+            KeyCode::Down => {
+                self.selected = if count == 0 {
+                    0
+                } else {
+                    (self.selected + 1) % count
+                }
+            }
             KeyCode::PageUp => self.selected = self.selected.saturating_sub(LIST_ROWS),
-            KeyCode::PageDown => self.selected = (self.selected + LIST_ROWS).min(count.saturating_sub(1)),
+            KeyCode::PageDown => {
+                self.selected = (self.selected + LIST_ROWS).min(count.saturating_sub(1))
+            }
             KeyCode::Tab => self.cycle(1, groups),
             KeyCode::BackTab => self.cycle(-1, groups),
             KeyCode::Backspace => {
@@ -70,7 +86,10 @@ pub fn matches(hay: &str, words: &[String]) -> bool {
 
 /// Which characters of `text` fall inside a case-insensitive match of a word.
 fn hits(text: &str, words: &[String]) -> Vec<bool> {
-    let lower: Vec<char> = text.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
+    let lower: Vec<char> = text
+        .chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
     let mut marks = vec![false; lower.len()];
     for w in words {
         let w: Vec<char> = w.chars().collect();
@@ -79,7 +98,9 @@ fn hits(text: &str, words: &[String]) -> Vec<bool> {
         }
         for start in 0..=lower.len() - w.len() {
             if lower[start..start + w.len()] == w[..] {
-                marks[start..start + w.len()].iter_mut().for_each(|m| *m = true);
+                marks[start..start + w.len()]
+                    .iter_mut()
+                    .for_each(|m| *m = true);
             }
         }
     }
@@ -94,7 +115,11 @@ pub fn highlight(text: &str, words: &[String], base: Style, hit: Style) -> Strin
     let mut on = false;
     let flush = |run: &mut String, on: bool, out: &mut String| {
         if !run.is_empty() {
-            out.push_str(&(if on { hit } else { base }).paint(run.as_str()).to_string());
+            out.push_str(
+                &(if on { hit } else { base })
+                    .paint(run.as_str())
+                    .to_string(),
+            );
             run.clear();
         }
     };
@@ -117,7 +142,10 @@ pub struct Badge {
 
 impl Badge {
     pub fn new(text: impl Into<String>, color: Color) -> Self {
-        Self { text: text.into(), color }
+        Self {
+            text: text.into(),
+            color,
+        }
     }
 }
 
@@ -236,9 +264,12 @@ fn hint_rows(pairs: &[(&str, &str)], width: usize) -> Vec<String> {
 /// The group tabs, `[All N]` first; when they don't fit, tabs before the
 /// chosen one give way (marked `‹`).
 fn tab_row(v: &View, width: usize) -> String {
-    let tabs: Vec<(String, bool)> = std::iter::once((format!("All {}", v.total), v.group.is_none()))
-        .chain(v.tabs.iter().enumerate().map(|(i, (label, n))| (format!("{} {n}", sanitize_text(label)), v.group == Some(i))))
-        .collect();
+    let tabs: Vec<(String, bool)> =
+        std::iter::once((format!("All {}", v.total), v.group.is_none()))
+            .chain(v.tabs.iter().enumerate().map(|(i, (label, n))| {
+                (format!("{} {n}", sanitize_text(label)), v.group == Some(i))
+            }))
+            .collect();
     let shown = |from: usize| -> (String, usize) {
         let mut out = String::new();
         let mut w = 0;
@@ -275,19 +306,32 @@ pub fn render(v: &View, width: usize, height: usize) -> Vec<String> {
     let rule = || paint(fg(FAINT), &"─".repeat(w));
     let mut top = vec![rule()];
     let count = format!("{} ", v.rows.len());
-    let prefix = format!("{} {}", paint(fg(BRIGHT).bold(), v.title), paint(fg(GRAY), &count));
+    let prefix = format!(
+        "{} {}",
+        paint(fg(BRIGHT).bold(), v.title),
+        paint(fg(GRAY), &count)
+    );
     let room = w.saturating_sub(visible_width(&prefix) + 1);
     top.push(if v.filter.is_empty() {
-        format!("{prefix} {}", paint(fg(FAINT), &truncate("Type to filter", room)))
+        format!(
+            "{prefix} {}",
+            paint(fg(FAINT), &truncate("Type to filter", room))
+        )
     } else {
-        format!("{prefix} {}", paint(fg(MID), &truncate(&sanitize_text(v.filter), room)))
+        format!(
+            "{prefix} {}",
+            paint(fg(MID), &truncate(&sanitize_text(v.filter), room))
+        )
     });
     top.push(tab_row(v, w));
     top.push(String::new());
 
     let mut bottom = Vec::new();
     if !v.rows.is_empty() && !v.preview.is_empty() {
-        bottom.push(paint(fg(FAINT), &format!("  {}", "╌".repeat(w.saturating_sub(4)))));
+        bottom.push(paint(
+            fg(FAINT),
+            &format!("  {}", "╌".repeat(w.saturating_sub(4))),
+        ));
         for (i, line) in v.preview.iter().enumerate() {
             let style = if i == 0 { fg(MID) } else { fg(GRAY) };
             for row in wrap_text(&sanitize_text(line), w.saturating_sub(4), 2) {
@@ -328,12 +372,27 @@ pub fn render(v: &View, width: usize, height: usize) -> Vec<String> {
     let max_rows = height.saturating_sub(fixed).clamp(3, LIST_ROWS);
     let selected = v.selected.min(v.rows.len().saturating_sub(1));
     let start = selected.saturating_sub(max_rows - 1);
-    let label_w = v.rows.iter().map(|r| visible_width(&r.label)).max().unwrap_or(0).min(LABEL_MAX) + 2;
+    let label_w = v
+        .rows
+        .iter()
+        .map(|r| visible_width(&r.label))
+        .max()
+        .unwrap_or(0)
+        .min(LABEL_MAX)
+        + 2;
     let words: Vec<String> = v.filter.split_whitespace().map(str::to_lowercase).collect();
     for (i, row) in v.rows.iter().enumerate().skip(start).take(max_rows) {
         let sel = i == selected;
-        let lead = if sel { paint(fg(BRIGHT), "› ") } else { "  ".into() };
-        let badges: Vec<String> = row.badges.iter().map(|b| paint(fg(b.color), &b.text)).collect();
+        let lead = if sel {
+            paint(fg(BRIGHT), "› ")
+        } else {
+            "  ".into()
+        };
+        let badges: Vec<String> = row
+            .badges
+            .iter()
+            .map(|b| paint(fg(b.color), &b.text))
+            .collect();
         let badges = badges.join(&paint(fg(FAINT), " · "));
         let badge_w = visible_width(&badges);
         let label_w = label_w.min(w.saturating_sub(badge_w + 6).max(4));
@@ -355,11 +414,21 @@ pub fn render(v: &View, width: usize, height: usize) -> Vec<String> {
         list.push(spread(&left, &badges, w));
     }
     if !v.rows.is_empty() {
-        let range = format!("{}–{} of {}", start + 1, (start + max_rows).min(v.rows.len()), v.rows.len());
+        let range = format!(
+            "{}–{} of {}",
+            start + 1,
+            (start + max_rows).min(v.rows.len()),
+            v.rows.len()
+        );
         let last = hints.last_mut().expect("a hint row");
         *last = spread(last, &paint(fg(GRAY), &range), w);
     }
-    top.into_iter().chain(list).chain(std::iter::once(String::new())).chain(bottom).chain(hints).collect()
+    top.into_iter()
+        .chain(list)
+        .chain(std::iter::once(String::new()))
+        .chain(bottom)
+        .chain(hints)
+        .collect()
 }
 
 #[cfg(test)]
@@ -385,7 +454,11 @@ mod tests {
         l.on_key(key(KeyCode::Char('P')), 3, 2);
         l.on_key(key(KeyCode::Char('d')), 3, 2);
         assert_eq!(l.words(), ["pd"]);
-        assert!(!l.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), 3, 2));
+        assert!(!l.on_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            3,
+            2
+        ));
         assert!(!l.on_key(key(KeyCode::Enter), 3, 2));
     }
 
@@ -394,7 +467,10 @@ mod tests {
         let words = vec!["pdf".to_string(), "orm".to_string()];
         assert!(matches("Fill PDF forms", &words));
         assert!(!matches("Fill PDF", &words));
-        assert_eq!(hits("a PdF form", &words), [false, false, true, true, true, false, false, true, true, true]);
+        assert_eq!(
+            hits("a PdF form", &words),
+            [false, false, true, true, true, false, false, true, true, true]
+        );
         let painted = highlight("PdF x", &words, Style::new(), Style::new().bold());
         assert_eq!(strip_ansi(&painted), "PdF x");
         assert!(painted.starts_with("\x1b[1mPdF"), "{painted:?}");
@@ -402,8 +478,14 @@ mod tests {
 
     #[test]
     fn wraps_text_and_hints() {
-        assert_eq!(wrap_text("one two three four", 9, 5), ["one two", "three", "four"]);
-        assert_eq!(wrap_text("one two three four", 9, 2), ["one two", "three …"]);
+        assert_eq!(
+            wrap_text("one two three four", 9, 5),
+            ["one two", "three", "four"]
+        );
+        assert_eq!(
+            wrap_text("one two three four", 9, 2),
+            ["one two", "three …"]
+        );
         assert_eq!(wrap_text("abcdefghij", 4, 5), ["abcd", "efgh", "ij"]);
         let rows = hint_rows(&[("Enter", "Run"), ("^E", "Args"), ("Esc", "Close")], 20);
         let rows: Vec<String> = rows.iter().map(|r| strip_ansi(r)).collect();
@@ -415,17 +497,26 @@ mod tests {
         let rows = (0..12)
             .map(|i| Row {
                 label: format!("a-rather-long-skill-name-number-{i}"),
-                detail: "A description that goes on for quite a while and will not fit in the row".into(),
+                detail: "A description that goes on for quite a while and will not fit in the row"
+                    .into(),
                 badges: vec![Badge::new("disabled", GRAY), Badge::new("asks", YELLOW)],
                 dim: i == 3,
             })
             .collect();
         let v = View {
             title: "Skills",
-            tabs: ["nyq", "Agents", "Claude Code", "Codex", "OpenCode", "Claw", "Workspace"]
-                .iter()
-                .map(|t| (t.to_string(), 12))
-                .collect(),
+            tabs: [
+                "nyq",
+                "Agents",
+                "Claude Code",
+                "Codex",
+                "OpenCode",
+                "Claw",
+                "Workspace",
+            ]
+            .iter()
+            .map(|t| (t.to_string(), 12))
+            .collect(),
             group: Some(6),
             total: 84,
             filter: "skill",
@@ -435,16 +526,42 @@ mod tests {
             preview: vec!["Description ".repeat(20), "Claude Code · project".into()],
             note: Some(("Copy it?".into(), YELLOW)),
             input: Some(("Install from".into(), "x".repeat(200))),
-            hints: vec![("Enter", "Run"), ("^E", "Args"), ("→", "View"), ("Tab", "Source"), ("^T", "On/off"), ("^O", "Copy to nyq"), ("^N", "Install"), ("Del", "Remove"), ("Esc", "Close")],
+            hints: vec![
+                ("Enter", "Run"),
+                ("^E", "Args"),
+                ("→", "View"),
+                ("Tab", "Source"),
+                ("^T", "On/off"),
+                ("^O", "Copy to nyq"),
+                ("^N", "Install"),
+                ("Del", "Remove"),
+                ("Esc", "Close"),
+            ],
         };
         let out = render(&v, 80, 40);
         for row in &out {
-            assert!(visible_width(row) <= 80, "{} > 80: {}", visible_width(row), strip_ansi(row));
+            assert!(
+                visible_width(row) <= 80,
+                "{} > 80: {}",
+                visible_width(row),
+                strip_ansi(row)
+            );
         }
         let text = strip_ansi(&out.join("\n"));
-        assert!(text.contains("Skills 12") && text.contains("[Workspace 12]") && text.contains("‹"), "{text}");
-        assert!(text.contains("› a-rather-long") && text.contains("disabled · asks"), "{text}");
-        assert!(text.contains("3–10 of 12") && text.contains("Copy it?") && text.contains("Install from"), "{text}");
+        assert!(
+            text.contains("Skills 12") && text.contains("[Workspace 12]") && text.contains("‹"),
+            "{text}"
+        );
+        assert!(
+            text.contains("› a-rather-long") && text.contains("disabled · asks"),
+            "{text}"
+        );
+        assert!(
+            text.contains("3–10 of 12")
+                && text.contains("Copy it?")
+                && text.contains("Install from"),
+            "{text}"
+        );
         // A short terminal keeps the hints and shrinks the list.
         let short = render(&v, 80, 20);
         assert!(short.len() < out.len());

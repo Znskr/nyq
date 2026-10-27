@@ -48,12 +48,17 @@ pub enum Item {
 
 /// How a compaction summary is presented to the model.
 pub fn compaction_text(summary: &str) -> String {
-    format!("[This conversation was compacted. Summary of everything before this point:]\n\n{summary}")
+    format!(
+        "[This conversation was compacted. Summary of everything before this point:]\n\n{summary}"
+    )
 }
 
 impl Item {
     pub fn user(text: impl Into<String>) -> Self {
-        Item::User { text: text.into(), images: Vec::new() }
+        Item::User {
+            text: text.into(),
+            images: Vec::new(),
+        }
     }
 }
 
@@ -87,7 +92,10 @@ pub enum StreamEvent {
     Text(String),
     Reasoning(String),
     /// The model started emitting a tool call (arguments still streaming).
-    ToolCallStart { id: String, name: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
     /// A request failed before any output and will be retried (status text).
     Retrying(String),
 }

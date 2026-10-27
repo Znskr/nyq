@@ -7,8 +7,11 @@ use nu_ansi_term::{Color, Style};
 use unicode_width::UnicodeWidthChar;
 
 use super::chrome::{self, Mark};
+use super::render::{
+    looks_like_diff, numbered_diff, sanitize_text, strip_ansi, truncate, visible_width, wrap_row,
+    Markdown,
+};
 use super::theme::{fg, on, BRIGHT, FAINT, GRAY, MID, RED, YELLOW};
-use super::render::{looks_like_diff, numbered_diff, sanitize_text, strip_ansi, truncate, visible_width, wrap_row, Markdown};
 
 /// Tool output kept per call.
 const MAX_OUTPUT: usize = 256 * 1024;
@@ -20,7 +23,13 @@ pub enum Entry {
     User(String),
     Assistant(String),
     Reasoning(String),
-    Tool { name: String, summary: String, output: Option<String>, display: Option<String>, is_error: bool },
+    Tool {
+        name: String,
+        summary: String,
+        output: Option<String>,
+        display: Option<String>,
+        is_error: bool,
+    },
     Info(String),
 }
 
@@ -71,11 +80,17 @@ impl Log {
         self.version += 1;
         if self.open {
             match (self.entries.last_mut(), reasoning) {
-                (Some(Entry::Assistant(t)), false) | (Some(Entry::Reasoning(t)), true) => return t.push_str(delta),
+                (Some(Entry::Assistant(t)), false) | (Some(Entry::Reasoning(t)), true) => {
+                    return t.push_str(delta)
+                }
                 _ => {}
             }
         }
-        self.push(if reasoning { Entry::Reasoning(delta.into()) } else { Entry::Assistant(delta.into()) });
+        self.push(if reasoning {
+            Entry::Reasoning(delta.into())
+        } else {
+            Entry::Assistant(delta.into())
+        });
         self.open = true;
     }
 
@@ -85,14 +100,30 @@ impl Log {
     }
 
     pub fn tool_start(&mut self, name: &str, summary: &str) {
-        self.push(Entry::Tool { name: name.into(), summary: summary.into(), output: None, display: None, is_error: false });
+        self.push(Entry::Tool {
+            name: name.into(),
+            summary: summary.into(),
+            output: None,
+            display: None,
+            is_error: false,
+        });
     }
 
     /// Attach a result to the latest tool call still waiting for one.
     pub fn tool_end(&mut self, content: &str, display: Option<&str>, is_error: bool) {
         self.version += 1;
-        let pending = self.entries.iter_mut().rev().find(|e| matches!(e, Entry::Tool { output: None, .. }));
-        if let Some(Entry::Tool { output, display: d, is_error: err, .. }) = pending {
+        let pending = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| matches!(e, Entry::Tool { output: None, .. }));
+        if let Some(Entry::Tool {
+            output,
+            display: d,
+            is_error: err,
+            ..
+        }) = pending
+        {
             *output = Some(capped(content));
             *d = display.map(capped);
             *err = is_error;
@@ -143,7 +174,10 @@ fn cap(rows: &mut Vec<String>, from: usize, max: usize, bar: &str) {
     let n = rows.len() - from;
     if n > max {
         rows.truncate(from + max);
-        rows.push(format!("{bar}{}", paint(fg(FAINT), &format!("… {} more lines", n - max))));
+        rows.push(format!(
+            "{bar}{}",
+            paint(fg(FAINT), &format!("… {} more lines", n - max))
+        ));
     }
 }
 
@@ -172,7 +206,12 @@ pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
                 }
             }
             Entry::Reasoning(t) if compact => {
-                let first = t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").trim_matches('*');
+                let first = t
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("")
+                    .trim_matches('*');
                 let line = sanitize_text(&format!("• Thought · {first}"));
                 rows.push(paint(fg(GRAY).italic(), &truncate(&line, width)));
             }
@@ -180,7 +219,13 @@ pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
                 rows.push(paint(fg(GRAY).italic(), "• Thinking"));
                 block(&mut rows, t.trim(), width, "  ", "  ", fg(GRAY).italic());
             }
-            Entry::Tool { name, summary, output, display, is_error } => {
+            Entry::Tool {
+                name,
+                summary,
+                output,
+                display,
+                is_error,
+            } => {
                 let mark = match (output, is_error) {
                     (None, _) => Mark::Running,
                     (Some(_), true) => Mark::Failed,
@@ -191,10 +236,16 @@ pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
                 } else {
                     paint(fg(if *is_error { RED } else { BRIGHT }), "●")
                 };
-                let head = format!("{lead} {}", paint(fg(if *is_error { RED } else { BRIGHT }), name));
+                let head = format!(
+                    "{lead} {}",
+                    paint(fg(if *is_error { RED } else { BRIGHT }), name)
+                );
                 let summary = sanitize_text(summary).replace('\n', " ");
                 let room = width.saturating_sub(visible_width(&head) + 1);
-                rows.push(format!("{head} {}", paint(fg(GRAY), &truncate(&summary, room))));
+                rows.push(format!(
+                    "{head} {}",
+                    paint(fg(GRAY), &truncate(&summary, room))
+                ));
                 let bar = paint(fg(FAINT), "  │ ");
                 let from = rows.len();
                 match (display.as_deref().filter(|d| looks_like_diff(d)), output) {
@@ -205,12 +256,21 @@ pub fn render(entries: &[Entry], width: usize, compact: bool) -> Vec<String> {
                         }
                     }
                     (None, Some(o)) if !o.trim().is_empty() => {
-                        block(&mut rows, o.trim_end(), width, &bar, &bar, fg(if *is_error { RED } else { GRAY }));
+                        block(
+                            &mut rows,
+                            o.trim_end(),
+                            width,
+                            &bar,
+                            &bar,
+                            fg(if *is_error { RED } else { GRAY }),
+                        );
                         if compact {
                             cap(&mut rows, from, COMPACT_ROWS, &bar);
                         }
                     }
-                    (None, Some(_)) => rows.push(format!("{bar}{}", paint(fg(FAINT), "(no output)"))),
+                    (None, Some(_)) => {
+                        rows.push(format!("{bar}{}", paint(fg(FAINT), "(no output)")))
+                    }
                     (None, None) => rows.push(format!("{bar}{}", paint(fg(FAINT), "(running…)"))),
                 }
             }
@@ -226,14 +286,23 @@ pub fn find_matches(plain: &[String], query: &str) -> Vec<usize> {
     if q.is_empty() {
         return Vec::new();
     }
-    plain.iter().enumerate().filter(|(_, r)| r.contains(&q)).map(|(i, _)| i).collect()
+    plain
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.contains(&q))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// `row` (plain) with every occurrence of `query` highlighted.
 fn highlight(row: &str, query: &str, current: bool) -> String {
     let lower = row.to_lowercase();
     let q = query.to_lowercase();
-    let hit = if current { on(fg(Color::Black), YELLOW) } else { Style::new().reverse() };
+    let hit = if current {
+        on(fg(Color::Black), YELLOW)
+    } else {
+        Style::new().reverse()
+    };
     if q.is_empty() || lower.len() != row.len() {
         return paint(hit, row);
     }
@@ -306,19 +375,31 @@ impl Viewer {
 
     /// Re-render when the log or the size changed; follows the end if it was there.
     pub fn refresh(&mut self, log: &Log, width: usize, height: usize) -> bool {
-        if log.version == self.version && width == self.width && height == self.height && self.compact == self.compact_shown {
+        if log.version == self.version
+            && width == self.width
+            && height == self.height
+            && self.compact == self.compact_shown
+        {
             return false;
         }
         let at_end = self.top >= self.max_top();
         self.rows = render(&log.entries, width.max(1), self.compact);
         self.compact_shown = self.compact;
-        self.plain = self.rows.iter().map(|r| strip_ansi(r).to_lowercase()).collect();
+        self.plain = self
+            .rows
+            .iter()
+            .map(|r| strip_ansi(r).to_lowercase())
+            .collect();
         self.width = width;
         self.height = height;
         self.version = log.version;
         self.matches = find_matches(&self.plain, &self.query);
         self.current = self.current.min(self.matches.len().saturating_sub(1));
-        self.top = if at_end { self.max_top() } else { self.top.min(self.max_top()) };
+        self.top = if at_end {
+            self.max_top()
+        } else {
+            self.top.min(self.max_top())
+        };
         true
     }
 
@@ -338,7 +419,9 @@ impl Viewer {
             return;
         }
         self.current = i % self.matches.len();
-        self.top = self.matches[self.current].saturating_sub(self.body() / 3).min(self.max_top());
+        self.top = self.matches[self.current]
+            .saturating_sub(self.body() / 3)
+            .min(self.max_top());
         self.message = None;
     }
 
@@ -359,7 +442,11 @@ impl Viewer {
                         self.message = None;
                     } else {
                         // The first match at or after the top of the screen.
-                        let first = self.matches.iter().position(|&r| r >= self.top).unwrap_or(0);
+                        let first = self
+                            .matches
+                            .iter()
+                            .position(|&r| r >= self.top)
+                            .unwrap_or(0);
                         self.jump(first);
                     }
                 }
@@ -380,7 +467,9 @@ impl Viewer {
             KeyCode::Char('f') if ctrl => self.typing = Some(String::new()),
             KeyCode::Char('/') => self.typing = Some(String::new()),
             KeyCode::Char('n') if !self.query.is_empty() => self.jump(self.current + 1),
-            KeyCode::Char('N') if !self.query.is_empty() => self.jump(self.current + self.matches.len().max(1) - 1),
+            KeyCode::Char('N') if !self.query.is_empty() => {
+                self.jump(self.current + self.matches.len().max(1) - 1)
+            }
             KeyCode::Up | KeyCode::Char('k') => self.scroll(-1),
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => self.scroll(1),
             KeyCode::PageUp | KeyCode::Char('b') => self.scroll(-page),
@@ -402,28 +491,64 @@ impl Viewer {
         let w = self.width.max(1);
         let body = self.body();
         let end = (self.top + body).min(self.rows.len());
-        let range = if self.rows.is_empty() { "empty".to_string() } else { format!("{}–{} of {}", self.top + 1, end, self.rows.len()) };
+        let range = if self.rows.is_empty() {
+            "empty".to_string()
+        } else {
+            format!("{}–{} of {}", self.top + 1, end, self.rows.len())
+        };
         let view = if self.compact { "compact" } else { "full" };
-        let mut head = format!("{} {}", paint(fg(BRIGHT).bold(), "Transcript"), paint(fg(GRAY), &format!("{view} · {range}")));
+        let mut head = format!(
+            "{} {}",
+            paint(fg(BRIGHT).bold(), "Transcript"),
+            paint(fg(GRAY), &format!("{view} · {range}"))
+        );
         if !self.query.is_empty() {
-            let pos = if self.matches.is_empty() { "no matches".into() } else { format!("{}/{}", self.current + 1, self.matches.len()) };
-            head.push_str(&paint(fg(GRAY), &format!("  /{} {pos}", truncate(&self.query, 30))));
+            let pos = if self.matches.is_empty() {
+                "no matches".into()
+            } else {
+                format!("{}/{}", self.current + 1, self.matches.len())
+            };
+            head.push_str(&paint(
+                fg(GRAY),
+                &format!("  /{} {pos}", truncate(&self.query, 30)),
+            ));
         }
         let mut out = vec![head];
         let current_row = self.matches.get(self.current).copied();
         for i in self.top..self.top + body {
             let row = match self.rows.get(i) {
                 Some(_) if !self.query.is_empty() && self.matches.binary_search(&i).is_ok() => {
-                    highlight(&strip_ansi(&self.rows[i]), &self.query, Some(i) == current_row)
+                    highlight(
+                        &strip_ansi(&self.rows[i]),
+                        &self.query,
+                        Some(i) == current_row,
+                    )
                 }
                 Some(r) => r.clone(),
                 None => String::new(),
             };
-            out.push(if visible_width(&row) > w { format!("{}\x1b[0m", truncate(&strip_ansi(&row), w)) } else { row });
+            out.push(if visible_width(&row) > w {
+                format!("{}\x1b[0m", truncate(&strip_ansi(&row), w))
+            } else {
+                row
+            });
         }
-        let hints: &[(&str, &str)] = &[("↑↓", "Scroll"), ("PgUp/PgDn", "Page"), ("Home/End", "Jump"), ("←→", "Compact/Full"), ("/", "Search"), ("n/N", "Next"), ("q", "Close")];
+        let hints: &[(&str, &str)] = &[
+            ("↑↓", "Scroll"),
+            ("PgUp/PgDn", "Page"),
+            ("Home/End", "Jump"),
+            ("←→", "Compact/Full"),
+            ("/", "Search"),
+            ("n/N", "Next"),
+            ("q", "Close"),
+        ];
         let footer = match (&self.typing, &self.message) {
-            (Some(t), _) => format!("{}{}{}", paint(fg(BRIGHT), "/"), paint(fg(MID), t), paint(fg(FAINT), "  Enter Find · Esc Cancel")),
+            (Some(t), _) => format!(
+                "{}{}{}",
+                paint(fg(BRIGHT), "/"),
+                paint(fg(MID), t),
+                paint(fg(FAINT), "  Enter Find · Esc Cancel")
+            ),
             (None, Some(m)) => paint(fg(YELLOW), m),
             (None, None) => hints
                 .iter()
@@ -469,27 +594,48 @@ mod tests {
     fn log_merges_streams_and_pairs_results() {
         let l = log();
         assert_eq!(l.entries[1], Entry::Reasoning("Thinking about it".into()));
-        assert_eq!(l.entries[2], Entry::Assistant("Looking at **main**.\nDone.".into()));
-        let Entry::Tool { output, .. } = &l.entries[3] else { panic!() };
+        assert_eq!(
+            l.entries[2],
+            Entry::Assistant("Looking at **main**.\nDone.".into())
+        );
+        let Entry::Tool { output, .. } = &l.entries[3] else {
+            panic!()
+        };
         assert!(output.as_deref().unwrap().contains("NEEDLE"));
-        let Entry::Tool { name, output, .. } = &l.entries[4] else { panic!() };
-        assert_eq!((name.as_str(), output.as_deref()), ("read_file", Some("fn x() {}")));
+        let Entry::Tool { name, output, .. } = &l.entries[4] else {
+            panic!()
+        };
+        assert_eq!(
+            (name.as_str(), output.as_deref()),
+            ("read_file", Some("fn x() {}"))
+        );
     }
 
     #[test]
     fn rendering_expands_tool_output() {
-        let rows: Vec<String> = render(&log().entries, 40, false).iter().map(|r| strip_ansi(r)).collect();
+        let rows: Vec<String> = render(&log().entries, 40, false)
+            .iter()
+            .map(|r| strip_ansi(r))
+            .collect();
         assert!(rows.iter().any(|r| r == "› find the bug"), "{rows:?}");
         assert!(rows.iter().any(|r| r == "✓ bash cargo test"), "{rows:?}");
         assert!(rows.iter().any(|r| r == "  │ NEEDLE here"), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("Looking at main.")), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("Looking at main.")),
+            "{rows:?}"
+        );
         assert!(rows.iter().any(|r| r == "  Thinking about it"), "{rows:?}");
-        assert!(render(&log().entries, 20, false).iter().all(|r| visible_width(r) <= 20));
+        assert!(render(&log().entries, 20, false)
+            .iter()
+            .all(|r| visible_width(r) <= 20));
         // Long assistant lines wrap with their styling.
         let mut l = Log::default();
         l.text("**bold words that go on and on** and on", false);
         let rows = render(&l.entries, 20, false);
-        assert!(rows.len() > 1 && rows.iter().all(|r| visible_width(r) <= 20), "{rows:?}");
+        assert!(
+            rows.len() > 1 && rows.iter().all(|r| visible_width(r) <= 20),
+            "{rows:?}"
+        );
         assert!(rows[1].contains("\x1b[1m"), "{rows:?}");
     }
 
@@ -544,23 +690,49 @@ mod tests {
         assert!(v.refresh(&l, 60, 10));
         assert_eq!(v.top, v.max_top(), "follows new output at the end");
         assert!(!v.refresh(&l, 60, 10));
-        assert_eq!(v.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)), Action::Close);
+        assert_eq!(
+            v.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Action::Close
+        );
     }
 
     #[test]
     fn compact_view_folds_output_and_wheel_scrolls() {
         let mut l = log();
         l.tool_start("bash", "seq 10");
-        l.tool_end(&(1..=10).map(|i| i.to_string()).collect::<Vec<_>>().join("\n"), None, false);
+        l.tool_end(
+            &(1..=10)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None,
+            false,
+        );
         l.tool_start("edit_file", "a.rs");
-        l.tool_end("Edited a.rs.", Some("--- a/a.rs\n+++ b/a.rs\n@@ -3,2 +3,2 @@\n ctx\n-old\n+new\n"), false);
-        let full: Vec<String> = render(&l.entries, 60, false).iter().map(|r| strip_ansi(r)).collect();
+        l.tool_end(
+            "Edited a.rs.",
+            Some("--- a/a.rs\n+++ b/a.rs\n@@ -3,2 +3,2 @@\n ctx\n-old\n+new\n"),
+            false,
+        );
+        let full: Vec<String> = render(&l.entries, 60, false)
+            .iter()
+            .map(|r| strip_ansi(r))
+            .collect();
         assert!(full.iter().any(|r| r == "  │ 10"), "{full:?}");
         assert!(full.iter().any(|r| r == "  │ 4 - old"), "{full:?}");
         assert!(full.iter().any(|r| r == "  │ 4 + new"), "{full:?}");
-        let compact: Vec<String> = render(&l.entries, 60, true).iter().map(|r| strip_ansi(r)).collect();
-        assert!(compact.iter().any(|r| r == "  │ … 7 more lines"), "{compact:?}");
-        assert!(compact.iter().any(|r| r == "• Thought · Thinking about it"), "{compact:?}");
+        let compact: Vec<String> = render(&l.entries, 60, true)
+            .iter()
+            .map(|r| strip_ansi(r))
+            .collect();
+        assert!(
+            compact.iter().any(|r| r == "  │ … 7 more lines"),
+            "{compact:?}"
+        );
+        assert!(
+            compact.iter().any(|r| r == "• Thought · Thinking about it"),
+            "{compact:?}"
+        );
         let mut v = Viewer::new(&l, 60, 10);
         v.on_key(key(KeyCode::Left));
         assert!(v.refresh(&l, 60, 10));

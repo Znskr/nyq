@@ -45,7 +45,10 @@ enum Mode {
     /// Copy this skill where: user or project?
     CopyWhere(String),
     /// The copy target exists: replace it?
-    Replace { id: String, project: bool },
+    Replace {
+        id: String,
+        project: bool,
+    },
     /// Typing an install source.
     Install,
 }
@@ -100,10 +103,19 @@ impl SkillsMenu {
     pub fn set_entries(&mut self, mut entries: Vec<Entry>) {
         let keep = self.current().map(|e| e.skill.path.clone());
         let group = self.list.group.and_then(|g| self.groups.get(g).copied());
-        let order = |g: &str| crate::skills::SOURCES.iter().position(|s| *s == g).unwrap_or(usize::MAX);
+        let order = |g: &str| {
+            crate::skills::SOURCES
+                .iter()
+                .position(|s| *s == g)
+                .unwrap_or(usize::MAX)
+        };
         // Grouped by source, project before user within a group, then by name.
         entries.sort_by(|a, b| {
-            (order(a.group), a.skill.scope != "project", &a.skill.id).cmp(&(order(b.group), b.skill.scope != "project", &b.skill.id))
+            (order(a.group), a.skill.scope != "project", &a.skill.id).cmp(&(
+                order(b.group),
+                b.skill.scope != "project",
+                &b.skill.id,
+            ))
         });
         self.groups = entries.iter().map(|e| e.group).collect();
         self.groups.dedup();
@@ -111,7 +123,11 @@ impl SkillsMenu {
         self.list.group = group.and_then(|g| self.groups.iter().position(|x| *x == g));
         self.busy = None;
         if let Some(path) = keep {
-            self.list.selected = self.rows().iter().position(|e| e.skill.path == path).unwrap_or(self.list.selected);
+            self.list.selected = self
+                .rows()
+                .iter()
+                .position(|e| e.skill.path == path)
+                .unwrap_or(self.list.selected);
         }
     }
 
@@ -120,7 +136,13 @@ impl SkillsMenu {
         self.entries.iter().filter(move |e| {
             let s = &e.skill;
             let state = if e.disabled { "disabled" } else { "" };
-            menu::matches(&format!("{} {} {} {} {} {state}", s.id, s.description, e.group, s.scope, s.location), &words)
+            menu::matches(
+                &format!(
+                    "{} {} {} {} {} {state}",
+                    s.id, s.description, e.group, s.scope, s.location
+                ),
+                &words,
+            )
         })
     }
 
@@ -128,12 +150,15 @@ impl SkillsMenu {
     /// location contain every word of the filter.
     pub fn rows(&self) -> Vec<&Entry> {
         let group = self.list.group.and_then(|g| self.groups.get(g).copied());
-        self.matching().filter(|e| group.is_none_or(|g| g == e.group)).collect()
+        self.matching()
+            .filter(|e| group.is_none_or(|g| g == e.group))
+            .collect()
     }
 
     fn current(&self) -> Option<&Entry> {
         let rows = self.rows();
-        rows.get(self.list.selected.min(rows.len().saturating_sub(1))).copied()
+        rows.get(self.list.selected.min(rows.len().saturating_sub(1)))
+            .copied()
     }
 
     /// The entry for `id`.
@@ -143,14 +168,19 @@ impl SkillsMenu {
 
     /// Where Ctrl+O would copy `e`, and whether something is there already.
     fn copy_target(&self, e: &Entry, project: bool) -> (PathBuf, bool) {
-        let root = if project { &self.targets.project } else { &self.targets.user };
+        let root = if project {
+            &self.targets.project
+        } else {
+            &self.targets.user
+        };
         let dir = root.join(e.skill.dir.file_name().unwrap_or_default());
         let taken = std::fs::symlink_metadata(&dir).is_ok();
         (dir, taken)
     }
 
     pub fn on_key(&mut self, key: KeyEvent, is_command: impl Fn(&str) -> bool) -> Action {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
         if ctrl && key.code == KeyCode::Char('c') {
             return Action::Close;
         }
@@ -159,7 +189,9 @@ impl SkillsMenu {
             Mode::List => {}
             Mode::Remove(id) => {
                 return match key.code {
-                    KeyCode::Enter | KeyCode::Char('y' | 'Y') => Action::Run(format!("/skills remove {id}")),
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                        Action::Run(format!("/skills remove {id}"))
+                    }
                     _ => Action::None,
                 };
             }
@@ -169,7 +201,9 @@ impl SkillsMenu {
                     KeyCode::Char('p' | 'P') => true,
                     _ => return Action::None,
                 };
-                let Some(e) = self.entry(&id) else { return Action::None };
+                let Some(e) = self.entry(&id) else {
+                    return Action::None;
+                };
                 return match self.copy_target(e, project) {
                     (_, true) => {
                         self.mode = Mode::Replace { id, project };
@@ -215,7 +249,10 @@ impl SkillsMenu {
             KeyCode::Esc => return Action::Close,
             KeyCode::Enter => match current {
                 Some(e) if e.disabled => {
-                    self.notice = Some((format!("{} is turned off; Ctrl+T turns it on.", e.skill.id), true));
+                    self.notice = Some((
+                        format!("{} is turned off; Ctrl+T turns it on.", e.skill.id),
+                        true,
+                    ));
                 }
                 Some(e) => return Action::Send(invocation(&e.skill.id, &is_command)),
                 None => {}
@@ -238,22 +275,27 @@ impl SkillsMenu {
             }
             KeyCode::Char('o') if ctrl => match current {
                 Some(e) if e.group == "nyq" => {
-                    self.notice = Some((format!("{} is already in nyq's skills directory.", e.skill.id), false));
+                    self.notice = Some((
+                        format!("{} is already in nyq's skills directory.", e.skill.id),
+                        false,
+                    ));
                 }
                 Some(e) => self.mode = Mode::CopyWhere(e.skill.id.clone()),
                 None => {}
             },
-            KeyCode::Delete | KeyCode::Char('x') if key.code == KeyCode::Delete || ctrl => match current {
-                Some(e) if e.managed => self.mode = Mode::Remove(e.skill.id.clone()),
-                Some(e) => {
-                    let msg = format!(
+            KeyCode::Delete | KeyCode::Char('x') if key.code == KeyCode::Delete || ctrl => {
+                match current {
+                    Some(e) if e.managed => self.mode = Mode::Remove(e.skill.id.clone()),
+                    Some(e) => {
+                        let msg = format!(
                         "{} is in {} ({}); nyq only removes skills it installed. Delete it there, or Ctrl+T turns it off.",
                         e.skill.id, e.skill.location, e.group
                     );
-                    self.notice = Some((msg, true));
+                        self.notice = Some((msg, true));
+                    }
+                    None => {}
                 }
-                None => {}
-            },
+            }
             KeyCode::Char('n') if ctrl => self.mode = Mode::Install,
             _ => {
                 self.list.on_key(key, count, self.groups.len());
@@ -266,7 +308,11 @@ impl SkillsMenu {
     pub fn render(&self, width: usize, height: usize) -> Vec<String> {
         let rows = self.rows();
         let all: Vec<&Entry> = self.matching().collect();
-        let tabs = self.groups.iter().map(|g| (g.to_string(), all.iter().filter(|e| e.group == *g).count())).collect();
+        let tabs = self
+            .groups
+            .iter()
+            .map(|g| (g.to_string(), all.iter().filter(|e| e.group == *g).count()))
+            .collect();
         let current = self.current();
         let note = match &self.mode {
             Mode::Remove(id) => {
@@ -299,10 +345,19 @@ impl SkillsMenu {
         let hints: Vec<(&str, &str)> = match &self.mode {
             Mode::Install => vec![("Enter", "Install"), ("^U", "Clear"), ("Esc", "Back")],
             Mode::Remove(_) => vec![("Enter/y", "Remove"), ("any other key", "Keep")],
-            Mode::CopyWhere(_) => vec![("u", "Your skills"), ("p", "This project"), ("any other key", "Cancel")],
+            Mode::CopyWhere(_) => vec![
+                ("u", "Your skills"),
+                ("p", "This project"),
+                ("any other key", "Cancel"),
+            ],
             Mode::Replace { .. } => vec![("y", "Replace"), ("any other key", "Keep")],
             Mode::List => {
-                let mut h = vec![("Enter", "Run"), ("^E", "Add request"), ("→", "View"), ("Tab", "Source")];
+                let mut h = vec![
+                    ("Enter", "Run"),
+                    ("^E", "Add request"),
+                    ("→", "View"),
+                    ("Tab", "Source"),
+                ];
                 if let Some(e) = current {
                     h.push(("^T", if e.disabled { "Turn on" } else { "Turn off" }));
                     if e.group != "nyq" {
@@ -325,7 +380,11 @@ impl SkillsMenu {
             filter: &self.list.filter,
             rows: rows.iter().map(|e| row(e)).collect(),
             selected: self.list.selected,
-            empty: if self.entries.is_empty() { empty_lines() } else { vec!["No matching skills.".into()] },
+            empty: if self.entries.is_empty() {
+                empty_lines()
+            } else {
+                vec!["No matching skills.".into()]
+            },
             preview: current.map(preview).unwrap_or_default(),
             note,
             input: install.then(|| ("Install from".to_string(), self.input.clone())),
@@ -339,7 +398,11 @@ impl SkillsMenu {
 /// `$name` works anywhere.
 fn invocation(id: &str, is_command: impl Fn(&str) -> bool) -> String {
     let slash = format!("/{id}");
-    if is_command(&slash) { format!("${id}") } else { slash }
+    if is_command(&slash) {
+        format!("${id}")
+    } else {
+        slash
+    }
 }
 
 fn copy_command(id: &str, project: bool, force: bool) -> String {
@@ -358,12 +421,21 @@ fn row(e: &Entry) -> Row {
     if e.disabled {
         badges.insert(0, Badge::new("off", RED));
     }
-    Row { label: e.skill.id.clone(), detail: super::render::one_line(&e.skill.description, 300), badges, dim: e.disabled }
+    Row {
+        label: e.skill.id.clone(),
+        detail: super::render::one_line(&e.skill.description, 300),
+        badges,
+        dim: e.disabled,
+    }
 }
 
 fn preview(e: &Entry) -> Vec<String> {
     let s = &e.skill;
-    let desc = s.description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let desc = s
+        .description
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let files = match e.files {
         0 => "SKILL.md only".to_string(),
         1 => "SKILL.md and 1 more file".to_string(),
@@ -375,7 +447,11 @@ fn preview(e: &Entry) -> Vec<String> {
         place.push_str(" · turned off (disabled_skills)");
     }
     vec![
-        if desc.is_empty() { "(no description)".into() } else { desc },
+        if desc.is_empty() {
+            "(no description)".into()
+        } else {
+            desc
+        },
         place,
         super::statusline::tilde(&crate::tools::slash_path(&s.path)),
     ]
@@ -396,9 +472,17 @@ fn empty_lines() -> Vec<String> {
 /// no menu can open (piped, `-p`, editors).
 pub fn plain_lines(entries: &[Entry]) -> Vec<String> {
     if entries.is_empty() {
-        return empty_lines()[..3].iter().cloned().chain(["Install one with /skills install SOURCE [--project].".into()]).collect();
+        return empty_lines()[..3]
+            .iter()
+            .cloned()
+            .chain(["Install one with /skills install SOURCE [--project].".into()])
+            .collect();
     }
-    let width = entries.iter().map(|e| e.skill.id.chars().count()).max().unwrap_or(0);
+    let width = entries
+        .iter()
+        .map(|e| e.skill.id.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut out = Vec::new();
     for group in crate::skills::SOURCES {
         let rows: Vec<&Entry> = entries.iter().filter(|e| e.group == *group).collect();
@@ -409,7 +493,14 @@ pub fn plain_lines(entries: &[Entry]) -> Vec<String> {
         for e in rows {
             let state = if e.disabled { "  [off]" } else { "" };
             let desc = super::render::one_line(&e.skill.description, 100);
-            out.push(format!("  {:width$}  {:7}  {desc}{state}", e.skill.id, e.skill.scope).trim_end().to_string());
+            out.push(
+                format!(
+                    "  {:width$}  {:7}  {desc}{state}",
+                    e.skill.id, e.skill.scope
+                )
+                .trim_end()
+                .to_string(),
+            );
         }
     }
     out.push(
@@ -440,13 +531,25 @@ mod tests {
     fn menu_in(t: &std::path::Path) -> SkillsMenu {
         let (cwd, home) = (t.join("proj"), t.join("home"));
         for (root, name, desc) in [
-            (cwd.join(".claude/skills"), "review", "Review a pull request"),
+            (
+                cwd.join(".claude/skills"),
+                "review",
+                "Review a pull request",
+            ),
             (cwd.join(".nyq/skills"), "pdf", "Fill PDF forms"),
-            (cwd.join(".agents/skills"), "model", "A skill named like a command"),
+            (
+                cwd.join(".agents/skills"),
+                "model",
+                "A skill named like a command",
+            ),
             (home.join("skills"), "review", "user review"),
         ] {
             std::fs::create_dir_all(root.join(name)).unwrap();
-            std::fs::write(root.join(name).join("SKILL.md"), format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n")).unwrap();
+            std::fs::write(
+                root.join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n"),
+            )
+            .unwrap();
         }
         let skills = crate::skills::discover_with(&home, None, &cwd);
         let entries = skills
@@ -460,7 +563,13 @@ mod tests {
                 skill,
             })
             .collect();
-        SkillsMenu::new(entries, Targets { user: home.join("skills"), project: cwd.join(".nyq/skills") })
+        SkillsMenu::new(
+            entries,
+            Targets {
+                user: home.join("skills"),
+                project: cwd.join(".nyq/skills"),
+            },
+        )
     }
 
     fn ids(m: &SkillsMenu) -> Vec<String> {
@@ -473,7 +582,11 @@ mod tests {
         let mut m = menu_in(t.path());
         assert_eq!(m.groups, ["nyq", "Agents", "Claude Code"]);
         assert_eq!(ids(&m)[0], "pdf");
-        assert_eq!(ids(&m)[1].split('@').next(), Some("review"), "project before user within nyq");
+        assert_eq!(
+            ids(&m)[1].split('@').next(),
+            Some("review"),
+            "project before user within nyq"
+        );
         m.on_key(key(KeyCode::Tab), |_| false);
         assert_eq!(m.list.group, Some(0));
         m.on_key(key(KeyCode::Tab), |_| false);
@@ -481,18 +594,36 @@ mod tests {
         // A turned-off skill doesn't run; Ctrl+T turns it back on.
         assert_eq!(m.on_key(key(KeyCode::Enter), |_| false), Action::None);
         assert!(m.notice.as_ref().unwrap().0.contains("turned off"));
-        assert_eq!(m.on_key(ctrl('t'), |_| false), Action::Run("/skills enable model".into()));
+        assert_eq!(
+            m.on_key(ctrl('t'), |_| false),
+            Action::Run("/skills enable model".into())
+        );
         // A skill named like a command is invoked with `$`.
-        assert_eq!(m.on_key(ctrl('e'), |c| c == "/model"), Action::Insert("$model ".into()));
+        assert_eq!(
+            m.on_key(ctrl('e'), |c| c == "/model"),
+            Action::Insert("$model ".into())
+        );
         m.on_key(key(KeyCode::BackTab), |_| false);
         m.on_key(key(KeyCode::BackTab), |_| false);
         assert_eq!(m.list.group, None);
         typed(&mut m, "pdf form");
         assert_eq!(ids(&m), ["pdf"]);
-        assert_eq!(m.on_key(key(KeyCode::Enter), |_| false), Action::Send("/pdf".into()));
-        assert_eq!(m.on_key(ctrl('e'), |_| false), Action::Insert("/pdf ".into()));
-        assert_eq!(m.on_key(ctrl('t'), |_| false), Action::Run("/skills disable pdf".into()));
-        assert_eq!(m.on_key(key(KeyCode::Right), |_| false), Action::View("pdf".into()));
+        assert_eq!(
+            m.on_key(key(KeyCode::Enter), |_| false),
+            Action::Send("/pdf".into())
+        );
+        assert_eq!(
+            m.on_key(ctrl('e'), |_| false),
+            Action::Insert("/pdf ".into())
+        );
+        assert_eq!(
+            m.on_key(ctrl('t'), |_| false),
+            Action::Run("/skills disable pdf".into())
+        );
+        assert_eq!(
+            m.on_key(key(KeyCode::Right), |_| false),
+            Action::View("pdf".into())
+        );
         assert_eq!(m.on_key(key(KeyCode::Esc), |_| false), Action::Close);
     }
 
@@ -502,19 +633,41 @@ mod tests {
         let mut m = menu_in(t.path());
         typed(&mut m, "review");
         let out = m.render(80, 40);
-        assert!(out.iter().all(|r| super::super::render::visible_width(r) <= 80));
+        assert!(out
+            .iter()
+            .all(|r| super::super::render::visible_width(r) <= 80));
         let text = strip_ansi(&out.join("\n"));
-        assert!(text.contains("[All 2]") && text.contains("nyq 1") && text.contains("Agents 0") && text.contains("Claude Code 1"), "{text}");
+        assert!(
+            text.contains("[All 2]")
+                && text.contains("nyq 1")
+                && text.contains("Agents 0")
+                && text.contains("Claude Code 1"),
+            "{text}"
+        );
         // The preview shows the selected skill's description, source and path.
-        assert!(text.contains("user review") && text.contains("nyq · user · "), "{text}");
+        assert!(
+            text.contains("user review") && text.contains("nyq · user · "),
+            "{text}"
+        );
         assert!(!text.contains("^O Copy"), "{text}");
         m.on_key(key(KeyCode::Down), |_| false);
         let text = strip_ansi(&m.render(80, 40).join("\n"));
-        assert!(text.contains("Review a pull request") && text.contains("Claude Code · project · .claude/skills"), "{text}");
+        assert!(
+            text.contains("Review a pull request")
+                && text.contains("Claude Code · project · .claude/skills"),
+            "{text}"
+        );
         assert!(text.contains(".claude/skills/review/SKILL.md"), "{text}");
-        assert!(text.contains("^O Copy to nyq") && !text.contains("Del Remove"), "{text}");
+        assert!(
+            text.contains("^O Copy to nyq") && !text.contains("Del Remove"),
+            "{text}"
+        );
         // Matched characters are highlighted.
-        assert!(out.iter().any(|r| r.contains("\x1b[1;4;") && strip_ansi(r).contains("review")), "{out:?}");
+        assert!(
+            out.iter()
+                .any(|r| r.contains("\x1b[1;4;") && strip_ansi(r).contains("review")),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -524,7 +677,12 @@ mod tests {
         typed(&mut m, "pull");
         assert_eq!(ids(&m), ["review"]);
         assert_eq!(m.on_key(key(KeyCode::Delete), |_| false), Action::None);
-        assert!(m.notice.as_ref().unwrap().0.contains("only removes skills it installed"));
+        assert!(m
+            .notice
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("only removes skills it installed"));
         m.list.filter.clear();
         m.list.selected = 0;
         assert_eq!(m.on_key(ctrl('x'), |_| false), Action::None);
@@ -534,7 +692,10 @@ mod tests {
         assert!(m.mode == Mode::List && m.list.filter.is_empty());
         m.on_key(key(KeyCode::Delete), |_| false);
         assert!(strip_ansi(&m.render(80, 40).join("\n")).contains("Remove skill pdf"));
-        assert_eq!(m.on_key(key(KeyCode::Char('y')), |_| false), Action::Run("/skills remove pdf".into()));
+        assert_eq!(
+            m.on_key(key(KeyCode::Char('y')), |_| false),
+            Action::Run("/skills remove pdf".into())
+        );
     }
 
     #[test]
@@ -547,18 +708,30 @@ mod tests {
         m.list.filter = "pull".into();
         m.on_key(ctrl('o'), |_| false);
         assert!(strip_ansi(&m.render(80, 40).join("\n")).contains("Copy review into nyq's skills"));
-        assert_eq!(m.on_key(key(KeyCode::Char('p')), |_| false), Action::Run("/skills copy review --project".into()));
+        assert_eq!(
+            m.on_key(key(KeyCode::Char('p')), |_| false),
+            Action::Run("/skills copy review --project".into())
+        );
         // Your skills already have a `review`: confirm first.
         m.on_key(ctrl('o'), |_| false);
         assert_eq!(m.on_key(key(KeyCode::Char('u')), |_| false), Action::None);
-        assert!(strip_ansi(&m.render(80, 40).join("\n")).contains("home/skills/review already exists"));
-        assert_eq!(m.on_key(key(KeyCode::Enter), |_| false), Action::None, "only y replaces");
+        assert!(
+            strip_ansi(&m.render(80, 40).join("\n")).contains("home/skills/review already exists")
+        );
+        assert_eq!(
+            m.on_key(key(KeyCode::Enter), |_| false),
+            Action::None,
+            "only y replaces"
+        );
         assert_eq!(m.mode, Mode::List);
         // So does a project copy once there is one.
         std::fs::create_dir_all(t.path().join("proj/.nyq/skills/review")).unwrap();
         m.on_key(ctrl('o'), |_| false);
         m.on_key(key(KeyCode::Char('p')), |_| false);
-        assert_eq!(m.on_key(key(KeyCode::Char('y')), |_| false), Action::Run("/skills copy review --project --force".into()));
+        assert_eq!(
+            m.on_key(key(KeyCode::Char('y')), |_| false),
+            Action::Run("/skills copy review --project --force".into())
+        );
     }
 
     #[test]
@@ -570,8 +743,14 @@ mod tests {
         m.on_key(key(KeyCode::Backspace), |_| false);
         m.on_key(key(KeyCode::Backspace), |_| false);
         assert!(strip_ansi(&m.render(80, 40).join("\n")).contains("Install from owner/repo"));
-        assert!(m.list.filter.is_empty(), "typing goes to the input, not the filter");
-        assert_eq!(m.on_key(key(KeyCode::Enter), |_| false), Action::Run("/skills install owner/repo".into()));
+        assert!(
+            m.list.filter.is_empty(),
+            "typing goes to the input, not the filter"
+        );
+        assert_eq!(
+            m.on_key(key(KeyCode::Enter), |_| false),
+            Action::Run("/skills install owner/repo".into())
+        );
         assert!(strip_ansi(&m.render(80, 40).join("\n")).contains("Installing owner/repo…"));
         // Refreshing clears the progress line and keeps the selection.
         m.list.filter = "pull".into();
@@ -589,14 +768,26 @@ mod tests {
     fn empty_state_and_plain_listing() {
         let m = SkillsMenu::new(Vec::new(), Targets::default());
         let text = strip_ansi(&m.render(80, 40).join("\n"));
-        assert!(text.contains("No skills yet") && text.contains(".claude/skills") && text.contains("Ctrl+N installs"), "{text}");
-        assert!(plain_lines(&[]).iter().any(|l| l.contains("/skills install SOURCE")));
+        assert!(
+            text.contains("No skills yet")
+                && text.contains(".claude/skills")
+                && text.contains("Ctrl+N installs"),
+            "{text}"
+        );
+        assert!(plain_lines(&[])
+            .iter()
+            .any(|l| l.contains("/skills install SOURCE")));
         let t = tempfile::tempdir().unwrap();
         let m = menu_in(t.path());
         let lines = plain_lines(&m.entries);
         assert_eq!(lines[0], "nyq (2)");
         assert!(lines.iter().any(|l| l.starts_with("Agents (1)")));
-        assert!(lines.iter().any(|l| l.contains("model") && l.ends_with("[off]")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("model") && l.ends_with("[off]")),
+            "{lines:?}"
+        );
         assert!(lines.last().unwrap().contains("/skills copy NAME"));
     }
 }

@@ -390,8 +390,9 @@ impl Session {
         if self.permissions.as_ref() == Some(&state) {
             return Ok(());
         }
-        let line = serde_json::to_string(&serde_json::json!({ "type": "permissions", "state": state }))
-            .with_context(|| format!("encoding permissions for {}", self.id))?;
+        let line =
+            serde_json::to_string(&serde_json::json!({ "type": "permissions", "state": state }))
+                .with_context(|| format!("encoding permissions for {}", self.id))?;
         self.queued.push(line);
         self.flush_queue()?;
         self.permissions = Some(state);
@@ -419,7 +420,8 @@ impl Session {
         // Drop the old handle so the replacement can be opened (the session
         // keeps its lock, which lives on a separate file).
         self.file.take();
-        write_private(&self.path, &bytes).with_context(|| format!("clearing session {}", self.id))?;
+        write_private(&self.path, &bytes)
+            .with_context(|| format!("clearing session {}", self.id))?;
         self.ensure_file()?;
         self.pending_header = None;
         // The settings stay; write them again.
@@ -477,7 +479,9 @@ fn lock_session(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let file = opts.open(&lock_path).with_context(|| format!("opening {}", lock_path.display()))?;
+    let file = opts
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
     let mut tries = 0u32;
     loop {
         match file.try_lock() {
@@ -579,7 +583,10 @@ pub fn list_report(dir: &Path) -> Result<(Vec<Meta>, Vec<PathBuf>)> {
 /// The `nyq sessions` warning for unreadable files, if any.
 pub fn skipped_warning(skipped: usize) -> Option<String> {
     (skipped > 0).then(|| {
-        format!("skipped {skipped} unreadable saved session{} (see nyq doctor)", if skipped == 1 { "" } else { "s" })
+        format!(
+            "skipped {skipped} unreadable saved session{} (see nyq doctor)",
+            if skipped == 1 { "" } else { "s" }
+        )
     })
 }
 
@@ -605,11 +612,18 @@ fn cached_meta(path: &Path) -> Option<Meta> {
         .and_then(|b| serde_json::from_slice::<Summary>(&b).ok())
         .filter(|s| s.len == stat.len() && s.modified == modified)
     {
-        return Some(Meta { path: path.into(), ..summary.meta });
+        return Some(Meta {
+            path: path.into(),
+            ..summary.meta
+        });
     }
     let mut meta = read_meta(path)?;
     meta.updated = modified;
-    let summary = Summary { len: stat.len(), modified, meta };
+    let summary = Summary {
+        len: stat.len(),
+        modified,
+        meta,
+    };
     if let Ok(bytes) = serde_json::to_vec(&summary) {
         let _ = write_private(&cache, &bytes);
     }
@@ -659,7 +673,11 @@ fn read_meta(path: &Path) -> Option<Meta> {
     }
     let (derived, preview) = first.unzip();
     // An image-only first prompt names the session even if text follows.
-    let derived = if image_only { Some(IMAGE_TITLE.to_string()) } else { derived };
+    let derived = if image_only {
+        Some(IMAGE_TITLE.to_string())
+    } else {
+        derived
+    };
     let preview = preview.unwrap_or_default();
     Some(Meta {
         id: header.id,
@@ -721,7 +739,12 @@ pub fn generated_title(raw: &str) -> Result<String> {
 fn is_meta_line(line: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(line)
         .ok()
-        .is_some_and(|value| matches!(value["type"].as_str(), Some("title" | "prefs" | "permissions")))
+        .is_some_and(|value| {
+            matches!(
+                value["type"].as_str(),
+                Some("title" | "prefs" | "permissions")
+            )
+        })
 }
 
 /// The state of the last `permissions` line.
@@ -758,7 +781,10 @@ pub fn title_of(text: &str) -> String {
 
 /// The whole prompt on one line, for searching and previews.
 fn preview_of(text: &str) -> String {
-    clip(&text.split_whitespace().collect::<Vec<_>>().join(" "), PREVIEW_MAX)
+    clip(
+        &text.split_whitespace().collect::<Vec<_>>().join(" "),
+        PREVIEW_MAX,
+    )
 }
 
 /// Resolve `last`, an id, or a unique id prefix to one session in `dir`.
@@ -768,9 +794,12 @@ pub fn find(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
         bail!("No saved sessions in {}", dir.display());
     }
     if which == "last" {
-        return all.into_iter().find(|m| same_cwd(&m.cwd, cwd)).ok_or_else(|| {
-            anyhow::anyhow!("No saved conversation in this directory (use -r to pick one)")
-        });
+        return all
+            .into_iter()
+            .find(|m| same_cwd(&m.cwd, cwd))
+            .ok_or_else(|| {
+                anyhow::anyhow!("No saved conversation in this directory (use -r to pick one)")
+            });
     }
     if let Some(meta) = all.iter().find(|m| m.id == which) {
         return Ok(meta.clone());
@@ -863,7 +892,8 @@ pub fn same_cwd(saved: &Path, current: &Path) -> bool {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn case_fold_eq(left: &Path, right: &Path) -> bool {
-    left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -907,7 +937,10 @@ pub fn format_summary(meta: &Meta, items: &[Item]) -> String {
             "{} · {}{}{}",
             p.provider,
             p.model,
-            p.effort.as_deref().map(|e| format!(" · effort {e}")).unwrap_or_default(),
+            p.effort
+                .as_deref()
+                .map(|e| format!(" · effort {e}"))
+                .unwrap_or_default(),
             if p.fast { " · fast" } else { "" }
         ),
         None => meta.model.clone(),
@@ -1039,7 +1072,11 @@ pub fn health(dir: &Path) -> (usize, Vec<String>) {
             continue;
         }
         count += 1;
-        let id = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let id = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let Ok(data) = fs::read(&path) else {
             problems.push(format!("{id}: unreadable"));
             continue;
@@ -1382,7 +1419,10 @@ mod tests {
         s.clear_transcript().unwrap();
         let raw = fs::read(&s.path).unwrap();
         assert!(!raw.is_empty());
-        assert!(raw.starts_with(b"{"), "a crash window must not leave an empty file");
+        assert!(
+            raw.starts_with(b"{"),
+            "a crash window must not leave an empty file"
+        );
         let metas = list(dir).unwrap();
         assert_eq!(metas[0].id, id);
         assert_eq!(metas[0].title, UNTITLED);
@@ -1575,7 +1615,10 @@ mod tests {
     }
 
     fn prefs_lines(path: &Path) -> usize {
-        fs::read_to_string(path).unwrap().matches("\"type\":\"prefs\"").count()
+        fs::read_to_string(path)
+            .unwrap()
+            .matches("\"type\":\"prefs\"")
+            .count()
     }
 
     #[test]
@@ -1590,23 +1633,37 @@ mod tests {
         s.append(&user("hi")).unwrap();
         assert_eq!(prefs_lines(&s.path), 1);
         s.set_prefs(&prefs("b", Some("high"), false)).unwrap();
-        assert_eq!(prefs_lines(&s.path), 1, "unchanged prefs are not written again");
+        assert_eq!(
+            prefs_lines(&s.path),
+            1,
+            "unchanged prefs are not written again"
+        );
         s.set_prefs(&prefs("b", Some("low"), true)).unwrap();
         assert_eq!(prefs_lines(&s.path), 2);
-        assert_eq!(list(dir).unwrap()[0].prefs, Some(prefs("b", Some("low"), true)));
+        assert_eq!(
+            list(dir).unwrap()[0].prefs,
+            Some(prefs("b", Some("low"), true))
+        );
         let id = s.id.clone();
         drop(s);
 
         let (mut s, meta, items) = load(dir, &id, Path::new("/w")).unwrap();
         assert_eq!(meta.prefs, Some(prefs("b", Some("low"), true)));
-        assert_eq!(items, vec![user("hi")], "prefs lines are not transcript items");
+        assert_eq!(
+            items,
+            vec![user("hi")],
+            "prefs lines are not transcript items"
+        );
         s.set_prefs(&prefs("b", Some("low"), true)).unwrap();
         assert_eq!(prefs_lines(&s.path), 2);
         // /reset keeps the settings.
         s.clear_transcript().unwrap();
         assert_eq!(prefs_lines(&s.path), 1);
         drop(s);
-        assert_eq!(find(dir, &id, Path::new("/w")).unwrap().prefs, Some(prefs("b", Some("low"), true)));
+        assert_eq!(
+            find(dir, &id, Path::new("/w")).unwrap().prefs,
+            Some(prefs("b", Some("low"), true))
+        );
         assert!(!migrate(dir, &id, Path::new("/w")).unwrap());
     }
 
@@ -1618,7 +1675,10 @@ mod tests {
         s.append(&user("hi")).unwrap();
         let (id, kept, skipped) = recover(tmp.path(), &s.id, Path::new("/w")).unwrap();
         assert_eq!((kept, skipped), (1, 0));
-        assert_eq!(find(tmp.path(), &id, Path::new("/w")).unwrap().prefs, Some(prefs("a", None, true)));
+        assert_eq!(
+            find(tmp.path(), &id, Path::new("/w")).unwrap().prefs,
+            Some(prefs("a", None, true))
+        );
     }
 
     #[test]
@@ -1647,7 +1707,10 @@ mod tests {
         );
         assert_eq!(title(vec![image, user("what is this")]).0, IMAGE_TITLE);
         assert_eq!(title(vec![user("   ")]).0, UNTITLED);
-        assert_eq!(title(vec![Item::Assistant { text: "hi".into() }]).0, UNTITLED);
+        assert_eq!(
+            title(vec![Item::Assistant { text: "hi".into() }]).0,
+            UNTITLED
+        );
         // A blank /rename title does not hide the derived one.
         let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
         s.append(&user("real")).unwrap();
@@ -1667,18 +1730,29 @@ mod tests {
         let now = std::time::SystemTime::now();
         let at = |s: &Session, secs: u64| {
             let f = OpenOptions::new().append(true).open(&s.path).unwrap();
-            f.set_modified(now - std::time::Duration::from_secs(secs)).unwrap();
+            f.set_modified(now - std::time::Duration::from_secs(secs))
+                .unwrap();
         };
         at(&new, 600);
         at(&old, 60);
-        let titles = |dir: &Path| list(dir).unwrap().into_iter().map(|m| m.title).collect::<Vec<_>>();
+        let titles = |dir: &Path| {
+            list(dir)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.title)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(titles(dir), ["old", "new"]);
         assert_eq!(find(dir, "last", Path::new("/w")).unwrap().title, "old");
         let summary = summary_path(&old.path);
         assert!(summary.exists());
         // A cached summary is reused while the file is unchanged...
         let cached = fs::read_to_string(&summary).unwrap();
-        fs::write(&summary, cached.replace("\"title\":\"old\"", "\"title\":\"cached\"")).unwrap();
+        fs::write(
+            &summary,
+            cached.replace("\"title\":\"old\"", "\"title\":\"cached\""),
+        )
+        .unwrap();
         assert_eq!(titles(dir), ["cached", "new"]);
         // ...and refreshed once it changes.
         old.append(&user("more")).unwrap();
@@ -1688,7 +1762,7 @@ mod tests {
 
         fs::write(dir.join("broken.jsonl"), "not json\n").unwrap();
         let (all, skipped) = list_report(dir).unwrap();
-        assert_eq!((all.len(), skipped, ), (2, vec![dir.join("broken.jsonl")]));
+        assert_eq!((all.len(), skipped,), (2, vec![dir.join("broken.jsonl")]));
         assert_eq!(skipped_warning(0), None);
         assert_eq!(
             skipped_warning(2).unwrap(),
@@ -1707,13 +1781,19 @@ mod tests {
         s.set_prefs(&prefs("gpt", Some("high"), true)).unwrap();
         for i in 1..=12 {
             s.append(&user(&format!("question {i}"))).unwrap();
-            s.append(&Item::Assistant { text: format!("answer {i}") }).unwrap();
+            s.append(&Item::Assistant {
+                text: format!("answer {i}"),
+            })
+            .unwrap();
         }
         s.append(&call("c1")).unwrap();
         let meta = find(tmp.path(), &s.id, Path::new("/w")).unwrap();
         let items = read_stored_items(&meta.path).unwrap();
         let out = format_summary(&meta, &items);
-        assert!(out.contains("[turn 1]\nuser: question 1\nassistant: answer 1\n"), "{out}");
+        assert!(
+            out.contains("[turn 1]\nuser: question 1\nassistant: answer 1\n"),
+            "{out}"
+        );
         assert!(out.contains("[turn 12]\nuser: question 12\nassistant: answer 12\ntool: bash\n"));
         assert!(out.contains("updated: "));
         assert!(out.contains("model: codex · gpt · effort high · fast"));

@@ -27,7 +27,10 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 pub fn read_capped(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
     if !file.metadata()?.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     let mut buf = Vec::new();
     file.take(max.saturating_add(1)).read_to_end(&mut buf)?;
@@ -75,12 +78,18 @@ fn split_rel(rel: &Path) -> io::Result<(Vec<OsString>, OsString)> {
             Component::Normal(s) => names.push(s.to_os_string()),
             Component::CurDir => {}
             _ => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "path escapes the sandbox root"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path escapes the sandbox root",
+                ));
             }
         }
     }
     let Some(file_name) = names.pop() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing file name",
+        ));
     };
     Ok((names, file_name))
 }
@@ -97,9 +106,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let Some(name) = target.file_name() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing file name",
+        ));
     };
     replace_in_dir(parent, name, bytes)
 }
@@ -110,25 +125,30 @@ fn follow_final(path: &Path) -> io::Result<PathBuf> {
 
 fn follow_final_depth(path: &Path, depth: usize) -> io::Result<PathBuf> {
     if depth > 40 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many symlinks"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many symlinks",
+        ));
     }
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let link = fs::read_link(path)?;
-            let target = if link.is_absolute() { link } else {
+            let target = if link.is_absolute() {
+                link
+            } else {
                 path.parent().unwrap_or(Path::new(".")).join(link)
             };
             follow_final_depth(&target, depth + 1)
-        },
+        }
         Ok(_) => Ok(path.to_path_buf()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let Some(name) = path.file_name() else {
                 return Ok(path.to_path_buf());
             };
             match path.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => {
-                    Ok(fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()).join(name))
-                }
+                Some(parent) if !parent.as_os_str().is_empty() => Ok(fs::canonicalize(parent)
+                    .unwrap_or_else(|_| parent.to_path_buf())
+                    .join(name)),
                 _ => Ok(path.to_path_buf()),
             }
         }
@@ -164,7 +184,10 @@ pub fn write_beneath(root: &Path, rel: &Path, bytes: &[u8]) -> io::Result<()> {
         match open_read(&dir, &name) {
             Ok(file) => {
                 if !file.metadata()?.is_file() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "not a regular file",
+                    ));
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -177,10 +200,16 @@ pub fn write_beneath(root: &Path, rel: &Path, bytes: &[u8]) -> io::Result<()> {
         let (parent, name) = walk_beneath(root, rel, true)?;
         if let Ok(meta) = fs::symlink_metadata(parent.join(&name)) {
             if meta.file_type().is_symlink() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to follow a symlink",
+                ));
             }
             if !meta.is_file() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
             }
         }
         replace_in_dir(&parent, &name, bytes)
@@ -206,7 +235,8 @@ pub fn remove_beneath(root: &Path, rel: &Path) -> io::Result<()> {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
         let (dir, name) = descend(root, rel, false)?;
-        let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+        let c = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
         unlink_at(&dir, &c)
     }
     #[cfg(not(unix))]
@@ -243,7 +273,10 @@ pub fn read_beneath(root: &Path, rel: &Path, max: u64) -> io::Result<Vec<u8>> {
         let (dir, name) = descend(root, rel, false)?;
         let file = open_read(&dir, &name)?;
         if !file.metadata()?.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
         }
         let mut buf = Vec::new();
         file.take(max.saturating_add(1)).read_to_end(&mut buf)?;
@@ -255,7 +288,10 @@ pub fn read_beneath(root: &Path, rel: &Path, max: u64) -> io::Result<Vec<u8>> {
         let path = parent.join(name);
         let meta = fs::symlink_metadata(&path)?;
         if meta.file_type().is_symlink() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to follow a symlink",
+            ));
         }
         read_capped(&path, max)
     }
@@ -269,15 +305,26 @@ fn walk_beneath(root: &Path, rel: &Path, create: bool) -> io::Result<(PathBuf, O
         let next = cur.join(&name);
         match fs::symlink_metadata(&next) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to follow a symlink",
+                ));
             }
             Ok(meta) if meta.is_dir() => cur = next,
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory")),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a directory",
+                ))
+            }
             Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(&next)?;
                 let meta = fs::symlink_metadata(&next)?;
                 if meta.file_type().is_symlink() || !meta.is_dir() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to follow a symlink",
+                    ));
                 }
                 cur = next;
             }
@@ -298,10 +345,15 @@ fn replace_in_dir(dir: &Path, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Resul
         let dest = dir.join(name);
         if let Ok(meta) = fs::symlink_metadata(&dest) {
             if meta.file_type().is_symlink() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to follow a symlink",
+                ));
             }
         }
-        let was_readonly = fs::symlink_metadata(&dest).ok().is_some_and(|m| m.permissions().readonly());
+        let was_readonly = fs::symlink_metadata(&dest)
+            .ok()
+            .is_some_and(|m| m.permissions().readonly());
         if was_readonly {
             let mut perms = fs::metadata(&dest)?.permissions();
             // Windows only: lift the read-only attribute so the rename can replace it.
@@ -349,8 +401,18 @@ fn replace_existing(from: &Path, to: &Path) -> io::Result<()> {
     extern "system" {
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     }
-    let rc = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
-    if rc == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    let rc = unsafe {
+        MoveFileExW(
+            from_w.as_ptr(),
+            to_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if rc == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -377,7 +439,8 @@ fn replace_at(dir: &File, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
     let tmp = tmp_name();
-    let tmp_c = CString::new(tmp.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let tmp_c = CString::new(tmp.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let fd = unsafe { libc::openat(dir.as_raw_fd(), tmp_c.as_ptr(), flags, 0o666) };
     if fd < 0 {
@@ -402,7 +465,14 @@ fn replace_at(dir: &File, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()
         return Err(e);
     }
     drop(file);
-    let rc = unsafe { libc::renameat(dir.as_raw_fd(), tmp_c.as_ptr(), dir.as_raw_fd(), dest.as_ptr()) };
+    let rc = unsafe {
+        libc::renameat(
+            dir.as_raw_fd(),
+            tmp_c.as_ptr(),
+            dir.as_raw_fd(),
+            dest.as_ptr(),
+        )
+    };
     if rc < 0 {
         let err = io::Error::last_os_error();
         let _ = unlink_at(dir, &tmp_c);
@@ -417,7 +487,14 @@ fn copy_owner_mode(dir: &File, dest: &std::ffi::CStr, file: &File) -> io::Result
     use std::os::unix::io::AsRawFd;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `st` is a valid `stat` buffer and `dest` is NUL-terminated.
-    let rc = unsafe { libc::fstatat(dir.as_raw_fd(), dest.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            dest.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
     if rc < 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENOENT) {
@@ -447,7 +524,11 @@ fn copy_owner_mode(dir: &File, dest: &std::ffi::CStr, file: &File) -> io::Result
 fn unlink_at(dir: &File, name: &std::ffi::CStr) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
-    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -455,7 +536,8 @@ fn open_directory(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let canon = fs::canonicalize(path)?;
     let mut opts = OpenOptions::new();
-    opts.read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    opts.read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     opts.open(canon)
 }
 
@@ -465,10 +547,17 @@ fn open_subdir(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
-    let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
     #[cfg(target_os = "linux")]
     {
-        match openat2(parent.as_raw_fd(), &c, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC, 0, RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH) {
+        match openat2(
+            parent.as_raw_fd(),
+            &c,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+            RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        ) {
             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
             other => return map_loop(other),
         }
@@ -494,15 +583,28 @@ fn open_read(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
-    let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
     #[cfg(target_os = "linux")]
     {
-        match openat2(parent.as_raw_fd(), &c, libc::O_RDONLY | libc::O_CLOEXEC, 0, RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH) {
+        match openat2(
+            parent.as_raw_fd(),
+            &c,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+            RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        ) {
             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
             other => return map_loop(other),
         }
     }
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         map_loop(Err(io::Error::last_os_error()))
     } else {
@@ -517,7 +619,13 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
 #[cfg(all(unix, target_os = "linux"))]
-fn openat2(dirfd: i32, path: &std::ffi::CStr, flags: i32, mode: u32, resolve: u64) -> io::Result<File> {
+fn openat2(
+    dirfd: i32,
+    path: &std::ffi::CStr,
+    flags: i32,
+    mode: u32,
+    resolve: u64,
+) -> io::Result<File> {
     use std::os::unix::io::FromRawFd;
     #[repr(C)]
     struct OpenHow {
@@ -531,11 +639,20 @@ fn openat2(dirfd: i32, path: &std::ffi::CStr, flags: i32, mode: u32, resolve: u6
         resolve,
     };
     // SAFETY: `how` is a valid `open_how` and outlives the syscall.
-    let fd = unsafe { libc::syscall(libc::SYS_openat2, dirfd, path.as_ptr(), &how, std::mem::size_of::<OpenHow>()) };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd,
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
-        let fd = std::os::unix::io::RawFd::try_from(fd).map_err(|_| io::Error::other("bad file descriptor"))?;
+        let fd = std::os::unix::io::RawFd::try_from(fd)
+            .map_err(|_| io::Error::other("bad file descriptor"))?;
         // SAFETY: the syscall returned a new descriptor we own.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
@@ -546,7 +663,8 @@ fn mkdir_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
-    let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
     let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o777) };
     if rc == 0 {
         return Ok(());
@@ -592,13 +710,22 @@ fn rel_cstr(rel: &Path) -> io::Result<std::ffi::CString> {
                 bytes.extend_from_slice(s.as_bytes());
             }
             Component::CurDir => {}
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "path escapes the sandbox root")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path escapes the sandbox root",
+                ))
+            }
         }
     }
     if bytes.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing file name",
+        ));
     }
-    std::ffi::CString::new(bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
+    std::ffi::CString::new(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
 }
 
 #[cfg(target_os = "linux")]
@@ -620,28 +747,50 @@ fn resolved_rel(root: &Path, rel: &Path) -> io::Result<PathBuf> {
         match fs::canonicalize(cur) {
             Ok(real) => {
                 if !real.starts_with(&root_real) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to follow a symlink",
+                    ));
                 }
-                let mut out = real.strip_prefix(&root_real).unwrap_or(Path::new("")).to_path_buf();
+                let mut out = real
+                    .strip_prefix(&root_real)
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf();
                 for name in rest.iter().rev() {
                     out.push(name);
                 }
                 if out.as_os_str().is_empty() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to follow a symlink",
+                    ));
                 }
                 return Ok(out);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let Some(name) = cur.file_name() else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to follow a symlink",
+                    ));
                 };
                 rest.push(name.to_os_string());
                 match cur.parent() {
                     Some(parent) if parent != cur => cur = parent,
-                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "refusing to follow a symlink",
+                        ))
+                    }
                 }
             }
-            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to follow a symlink",
+                ))
+            }
         }
     }
 }
@@ -649,7 +798,9 @@ fn resolved_rel(root: &Path, rel: &Path) -> io::Result<PathBuf> {
 #[cfg(target_os = "linux")]
 fn read_resolving(root: &Path, rel: &Path, max: u64) -> io::Result<Vec<u8>> {
     match read_at(root, rel, max) {
-        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => read_at(root, &resolved_rel(root, rel)?, max),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            read_at(root, &resolved_rel(root, rel)?, max)
+        }
         other => other,
     }
 }
@@ -660,7 +811,10 @@ fn read_at(root: &Path, rel: &Path, max: u64) -> io::Result<Vec<u8>> {
     let path = rel_cstr(rel)?;
     let file = open_raw(&root_fd, &path, libc::O_RDONLY | libc::O_CLOEXEC)?;
     if !file.metadata()?.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     let mut buf = Vec::new();
     file.take(max.saturating_add(1)).read_to_end(&mut buf)?;
@@ -670,7 +824,9 @@ fn read_at(root: &Path, rel: &Path, max: u64) -> io::Result<Vec<u8>> {
 #[cfg(target_os = "linux")]
 fn write_resolving(root: &Path, rel: &Path, bytes: &[u8]) -> io::Result<()> {
     match write_at(root, rel, bytes) {
-        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => write_at(root, &resolved_rel(root, rel)?, bytes),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            write_at(root, &resolved_rel(root, rel)?, bytes)
+        }
         other => other,
     }
 }
@@ -680,7 +836,10 @@ fn write_at(root: &Path, rel: &Path, bytes: &[u8]) -> io::Result<()> {
     let root_fd = open_directory(root)?;
     let parts = path_parts(rel);
     if parts.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing file name",
+        ));
     }
     write_parts(&root_fd, root, &parts, bytes, 0)
 }
@@ -690,7 +849,10 @@ fn remove_at(root: &Path, rel: &Path) -> io::Result<()> {
     let root_fd = open_directory(root)?;
     let parts = path_parts(rel);
     if parts.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing file name",
+        ));
     }
     remove_parts(&root_fd, root, &parts, 0)
 }
@@ -716,31 +878,53 @@ fn classify(dir: &File, name: &std::ffi::OsStr, want_dir: bool) -> io::Result<En
     }
     if kind == libc::S_IFDIR {
         if !want_dir {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
         }
         return Ok(Entry::Dir(open_subdir(dir, name)?));
     }
     if kind == libc::S_IFREG {
         if want_dir {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a directory",
+            ));
         }
         let file = open_read(dir, name)?;
         let opened = fstat_fd(&file)?;
         if opened.st_ino != st.st_ino || opened.st_dev != st.st_dev {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "file changed during write"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file changed during write",
+            ));
         }
         return Ok(Entry::File);
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        if want_dir { "not a directory" } else { "not a regular file" },
+        if want_dir {
+            "not a directory"
+        } else {
+            "not a regular file"
+        },
     ))
 }
 
 #[cfg(target_os = "linux")]
-fn write_parts(root_fd: &File, root: &Path, parts: &[OsString], bytes: &[u8], depth: u32) -> io::Result<()> {
+fn write_parts(
+    root_fd: &File,
+    root: &Path,
+    parts: &[OsString],
+    bytes: &[u8],
+    depth: u32,
+) -> io::Result<()> {
     if depth > 32 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to follow a symlink",
+        ));
     }
     let mut current = root_fd.try_clone()?;
     let mut walked = PathBuf::new();
@@ -764,7 +948,10 @@ fn write_parts(root_fd: &File, root: &Path, parts: &[OsString], bytes: &[u8], de
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "missing file name",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -772,7 +959,10 @@ fn remove_parts(root_fd: &File, root: &Path, parts: &[OsString], depth: u32) -> 
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     if depth > 32 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to follow a symlink",
+        ));
     }
     let mut current = root_fd.try_clone()?;
     let mut walked = PathBuf::new();
@@ -785,7 +975,8 @@ fn remove_parts(root_fd: &File, root: &Path, parts: &[OsString], depth: u32) -> 
                 walked.push(name);
             }
             Entry::File => {
-                let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+                let c = CString::new(name.as_bytes())
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
                 return unlink_at(&current, &c);
             }
             Entry::Link(target) => {
@@ -794,7 +985,10 @@ fn remove_parts(root_fd: &File, root: &Path, parts: &[OsString], depth: u32) -> 
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "missing file name",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -808,7 +1002,12 @@ fn path_parts(path: &Path) -> Vec<OsString> {
 }
 
 #[cfg(target_os = "linux")]
-fn retarget(root: &Path, walked: &Path, target: &Path, rest: &[OsString]) -> io::Result<Vec<OsString>> {
+fn retarget(
+    root: &Path,
+    walked: &Path,
+    target: &Path,
+    rest: &[OsString],
+) -> io::Result<Vec<OsString>> {
     let base = if target.is_absolute() {
         absolute_under(root, target)?
     } else {
@@ -817,7 +1016,10 @@ fn retarget(root: &Path, walked: &Path, target: &Path, rest: &[OsString]) -> io:
     let mut parts = path_parts(&base);
     parts.extend(rest.iter().cloned());
     if parts.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to follow a symlink",
+        ));
     }
     Ok(parts)
 }
@@ -831,10 +1033,18 @@ fn normalize_rel(path: &Path) -> io::Result<PathBuf> {
             Component::CurDir => {}
             Component::ParentDir => {
                 if !out.pop() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to follow a symlink",
+                    ));
                 }
             }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to follow a symlink",
+                ))
+            }
         }
     }
     Ok(out)
@@ -851,9 +1061,15 @@ fn absolute_under(root: &Path, target: &Path) -> io::Result<PathBuf> {
         match fs::canonicalize(&cur) {
             Ok(real) => {
                 if !real.starts_with(&root_real) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to follow a symlink",
+                    ));
                 }
-                let mut out = real.strip_prefix(&root_real).unwrap_or(Path::new("")).to_path_buf();
+                let mut out = real
+                    .strip_prefix(&root_real)
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf();
                 for name in suffix.iter().rev() {
                     out.push(name);
                 }
@@ -861,15 +1077,28 @@ fn absolute_under(root: &Path, target: &Path) -> io::Result<PathBuf> {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let Some(name) = cur.file_name() else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to follow a symlink",
+                    ));
                 };
                 suffix.push(name.to_os_string());
                 match cur.parent() {
                     Some(parent) if parent != cur => cur = parent.to_path_buf(),
-                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "refusing to follow a symlink",
+                        ))
+                    }
                 }
             }
-            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink")),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to follow a symlink",
+                ))
+            }
         }
     }
 }
@@ -879,11 +1108,19 @@ fn read_link_at(dir: &File, name: &std::ffi::OsStr) -> io::Result<PathBuf> {
     use std::ffi::CString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::io::AsRawFd;
-    let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
     let mut buf = vec![0u8; 256];
     loop {
         // SAFETY: `c` is NUL-terminated and `buf` is writable for `buf.len()` bytes.
-        let rc = unsafe { libc::readlinkat(dir.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        let rc = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -893,7 +1130,10 @@ fn read_link_at(dir: &File, name: &std::ffi::OsStr) -> io::Result<PathBuf> {
             return Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)));
         }
         if buf.len() >= 64 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "symlink target too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "symlink target too long",
+            ));
         }
         buf.resize(buf.len() * 2, 0);
     }
@@ -905,7 +1145,11 @@ fn fstat_fd(file: &File) -> io::Result<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `st` is a valid `stat` buffer and `file` is an open descriptor.
     let rc = unsafe { libc::fstat(file.as_raw_fd(), &mut st) };
-    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(st) }
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(st)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -913,19 +1157,25 @@ fn fstat_at(dir: &File, name: &std::ffi::OsStr, flags: i32) -> io::Result<libc::
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
-    let c = CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `st` is a valid `stat` buffer and `c` is NUL-terminated.
     let rc = unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, flags) };
-    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(st) }
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(st)
+    }
 }
 
 #[cfg(unix)]
 fn map_loop(result: io::Result<File>) -> io::Result<File> {
     match result {
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symlink"))
-        }
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to follow a symlink",
+        )),
         other => other,
     }
 }
@@ -943,18 +1193,26 @@ mod tests {
         symlink("new/target", dir.path().join("second")).unwrap();
         write_atomic(&dir.path().join("first"), b"created").unwrap();
         assert_eq!(fs::read(dir.path().join("new/target")).unwrap(), b"created");
-        assert!(fs::symlink_metadata(dir.path().join("first")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(dir.path().join("first"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
         symlink("cycle", dir.path().join("cycle")).unwrap();
         assert!(write_atomic(&dir.path().join("cycle"), b"no").is_err());
     }
-
 
     #[test]
     fn relative_under_rejects_escape() {
         let root = Path::new("/tmp/ws");
         assert_eq!(relative_under(root, "a/b").unwrap(), PathBuf::from("a/b"));
-        assert_eq!(relative_under(root, "/tmp/ws/a").unwrap(), PathBuf::from("a"));
-        assert_eq!(relative_under(root, "sub/../file").unwrap(), PathBuf::from("file"));
+        assert_eq!(
+            relative_under(root, "/tmp/ws/a").unwrap(),
+            PathBuf::from("a")
+        );
+        assert_eq!(
+            relative_under(root, "sub/../file").unwrap(),
+            PathBuf::from("file")
+        );
         assert!(relative_under(root, "../etc/passwd").is_none());
         assert!(relative_under(root, "a/../../etc/passwd").is_none());
         assert!(relative_under(root, "/etc/passwd").is_none());
@@ -965,7 +1223,10 @@ mod tests {
     fn capped_read_rejects_non_regular_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
-        assert_eq!(read_capped(&dir.path().join("a.txt"), 10).unwrap(), b"hello");
+        assert_eq!(
+            read_capped(&dir.path().join("a.txt"), 10).unwrap(),
+            b"hello"
+        );
         #[cfg(unix)]
         if Path::new("/dev/zero").exists() {
             let err = read_capped(Path::new("/dev/zero"), 32).unwrap_err();
@@ -987,7 +1248,10 @@ mod tests {
         assert!(err.to_string().contains("symlink"), "{err}");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
         write_beneath(&root, Path::new("nested/file.txt"), b"ok").unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("nested/file.txt")).unwrap(), "ok");
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/file.txt")).unwrap(),
+            "ok"
+        );
     }
 
     #[cfg(unix)]
@@ -1018,16 +1282,28 @@ mod tests {
         std::fs::create_dir(root.join("docs")).unwrap();
         std::os::unix::fs::symlink("../README.md", root.join("docs/README.md")).unwrap();
         write_beneath(&root, Path::new("docs/README.md"), b"new").unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("README.md")).unwrap(), "new");
-        assert!(std::fs::symlink_metadata(root.join("docs/README.md")).unwrap().file_type().is_symlink());
-        assert_eq!(read_beneath(&root, Path::new("docs/README.md"), 100).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "new"
+        );
+        assert!(std::fs::symlink_metadata(root.join("docs/README.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            read_beneath(&root, Path::new("docs/README.md"), 100).unwrap(),
+            b"new"
+        );
 
         let abs_target = root.join("abs-target.txt");
         std::fs::write(&abs_target, "abs").unwrap();
         std::os::unix::fs::symlink(&abs_target, root.join("abs-link")).unwrap();
         write_beneath(&root, Path::new("abs-link"), b"ABS").unwrap();
         assert_eq!(std::fs::read_to_string(&abs_target).unwrap(), "ABS");
-        assert!(std::fs::symlink_metadata(root.join("abs-link")).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(root.join("abs-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         std::fs::create_dir_all(root.join("node_modules/.pnpm/pkg")).unwrap();
         std::fs::create_dir_all(root.join("packages/web/node_modules")).unwrap();
@@ -1036,8 +1312,16 @@ mod tests {
             root.join("packages/web/node_modules/@acme"),
         )
         .unwrap();
-        write_beneath(&root, Path::new("packages/web/node_modules/@acme/file.txt"), b"ok").unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("node_modules/.pnpm/pkg/file.txt")).unwrap(), "ok");
+        write_beneath(
+            &root,
+            Path::new("packages/web/node_modules/@acme/file.txt"),
+            b"ok",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("node_modules/.pnpm/pkg/file.txt")).unwrap(),
+            "ok"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1048,9 +1332,20 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::os::unix::fs::symlink("generated/config", root.join("alias")).unwrap();
         write_beneath(&root, Path::new("alias"), b"value").unwrap();
-        assert!(std::fs::symlink_metadata(root.join("alias")).unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read_to_string(root.join("generated/config")).unwrap(), "value");
-        assert!(!root.join("alias").metadata().unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(root.join("alias"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(root.join("generated/config")).unwrap(),
+            "value"
+        );
+        assert!(!root
+            .join("alias")
+            .metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(unix)]

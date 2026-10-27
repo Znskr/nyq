@@ -28,7 +28,9 @@ fn type_name(v: &Value) -> &'static str {
 fn is_type(v: &Value, ty: &str) -> bool {
     match ty {
         "integer" => match v {
-            Value::Number(n) => n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0),
+            Value::Number(n) => {
+                n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)
+            }
             _ => false,
         },
         "number" => v.is_number(),
@@ -41,14 +43,22 @@ fn walk(schema: &Value, value: &Value, path: &str, out: &mut Vec<String>, depth:
     if depth > 32 || out.len() >= 20 {
         return;
     }
-    let at = if path.is_empty() { "arguments".to_string() } else { format!("`{path}`") };
+    let at = if path.is_empty() {
+        "arguments".to_string()
+    } else {
+        format!("`{path}`")
+    };
     let types: Vec<&str> = match s.get("type") {
         Some(Value::String(t)) => vec![t.as_str()],
         Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
     if !types.is_empty() && !types.iter().any(|t| is_type(value, t)) {
-        out.push(format!("{at} must be {} (got {})", types.join(" or "), type_name(value)));
+        out.push(format!(
+            "{at} must be {} (got {})",
+            types.join(" or "),
+            type_name(value)
+        ));
         return;
     }
     if let Some(Value::Array(options)) = s.get("enum") {
@@ -64,7 +74,13 @@ fn walk(schema: &Value, value: &Value, path: &str, out: &mut Vec<String>, depth:
     }
     match value {
         Value::Object(m) => {
-            for name in s.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            for name in s
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
                 if !m.contains_key(name) {
                     out.push(format!("`{}` is required", join(path, name)));
                 }
@@ -74,8 +90,14 @@ fn walk(schema: &Value, value: &Value, path: &str, out: &mut Vec<String>, depth:
                 match props.and_then(|p| p.get(k)) {
                     Some(sub) => walk(sub, v, &join(path, k), out, depth + 1),
                     None if s.get("additionalProperties") == Some(&Value::Bool(false)) => {
-                        let known: Vec<&str> = props.map(|p| p.keys().map(String::as_str).collect()).unwrap_or_default();
-                        out.push(format!("`{}` is not a known property (expected: {})", join(path, k), known.join(", ")));
+                        let known: Vec<&str> = props
+                            .map(|p| p.keys().map(String::as_str).collect())
+                            .unwrap_or_default();
+                        out.push(format!(
+                            "`{}` is not a known property (expected: {})",
+                            join(path, k),
+                            known.join(", ")
+                        ));
                     }
                     None => {}
                 }
@@ -87,9 +109,25 @@ fn walk(schema: &Value, value: &Value, path: &str, out: &mut Vec<String>, depth:
                     walk(sub, v, &format!("{path}[{i}]"), out, depth + 1);
                 }
             }
-            bound(s, "minItems", "maxItems", items.len() as f64, &at, "items", out);
+            bound(
+                s,
+                "minItems",
+                "maxItems",
+                items.len() as f64,
+                &at,
+                "items",
+                out,
+            );
         }
-        Value::String(text) => bound(s, "minLength", "maxLength", text.chars().count() as f64, &at, "characters", out),
+        Value::String(text) => bound(
+            s,
+            "minLength",
+            "maxLength",
+            text.chars().count() as f64,
+            &at,
+            "characters",
+            out,
+        ),
         Value::Number(n) => {
             if let Some(n) = n.as_f64() {
                 bound(s, "minimum", "maximum", n, &at, "", out);
@@ -99,8 +137,20 @@ fn walk(schema: &Value, value: &Value, path: &str, out: &mut Vec<String>, depth:
     }
 }
 
-fn bound(s: &serde_json::Map<String, Value>, min: &str, max: &str, n: f64, at: &str, unit: &str, out: &mut Vec<String>) {
-    let unit = if unit.is_empty() { String::new() } else { format!(" {unit}") };
+fn bound(
+    s: &serde_json::Map<String, Value>,
+    min: &str,
+    max: &str,
+    n: f64,
+    at: &str,
+    unit: &str,
+    out: &mut Vec<String>,
+) {
+    let unit = if unit.is_empty() {
+        String::new()
+    } else {
+        format!(" {unit}")
+    };
     if let Some(lo) = s.get(min).and_then(Value::as_f64).filter(|lo| n < *lo) {
         out.push(format!("{at} must be at least {lo}{unit}"));
     }
@@ -136,9 +186,16 @@ mod tests {
             },
             "required": ["path"]
         });
-        assert!(check(&schema, &json!({"path": "a", "count": 2, "mode": "fast", "tags": ["x"], "any": [1]})).is_empty());
+        assert!(check(
+            &schema,
+            &json!({"path": "a", "count": 2, "mode": "fast", "tags": ["x"], "any": [1]})
+        )
+        .is_empty());
         assert!(check(&schema, &json!({"path": "a", "count": 2.0})).is_empty());
-        let errors = check(&schema, &json!({"count": "2", "mode": "medium", "opts": {}, "tags": [1]}));
+        let errors = check(
+            &schema,
+            &json!({"count": "2", "mode": "medium", "opts": {}, "tags": [1]}),
+        );
         assert_eq!(
             errors,
             [
@@ -149,10 +206,20 @@ mod tests {
                 "`tags[0]` must be string (got integer)",
             ]
         );
-        assert_eq!(check(&schema, &json!({"path": ""})), ["`path` must be at least 1 characters"]);
-        assert_eq!(check(&schema, &json!([])), ["arguments must be object (got array)"]);
-        let strict = json!({"type": "object", "properties": {"a": {}}, "additionalProperties": false});
-        assert_eq!(check(&strict, &json!({"b": 1})), ["`b` is not a known property (expected: a)"]);
+        assert_eq!(
+            check(&schema, &json!({"path": ""})),
+            ["`path` must be at least 1 characters"]
+        );
+        assert_eq!(
+            check(&schema, &json!([])),
+            ["arguments must be object (got array)"]
+        );
+        let strict =
+            json!({"type": "object", "properties": {"a": {}}, "additionalProperties": false});
+        assert_eq!(
+            check(&strict, &json!({"b": 1})),
+            ["`b` is not a known property (expected: a)"]
+        );
         // Unknown keywords and non-object schemas never reject.
         assert!(check(&json!({"$ref": "#/defs/x", "oneOf": []}), &json!(1)).is_empty());
         assert!(check(&json!(true), &json!(1)).is_empty());

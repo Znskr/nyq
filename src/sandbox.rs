@@ -74,10 +74,19 @@ fn warn_tmpdir(path: &Path) {
 
 /// Paths every sandboxed command may write: temp dirs and harmless devices.
 fn scratch_paths() -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = ["/tmp", "/var/tmp", "/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/pts", "/dev/shm"]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
+    let mut v: Vec<PathBuf> = [
+        "/tmp",
+        "/var/tmp",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/tty",
+        "/dev/pts",
+        "/dev/shm",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
     if let Some(t) = std::env::var_os("TMPDIR").filter(|t| !t.is_empty()) {
         let path = PathBuf::from(&t);
         match accepted_tmpdir(&path, dirs::home_dir().as_deref()) {
@@ -104,37 +113,58 @@ fn writable_roots(policy: &Policy, cwd: &Path) -> Vec<PathBuf> {
 
 #[cfg(not(windows))]
 fn find_in_path(name: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
 }
 
 /// Resolve Git Bash without selecting the WSL launcher under Windows.
 #[cfg(any(windows, test))]
-fn windows_bash(paths: impl Iterator<Item = PathBuf>, system_root: Option<&Path>) -> Option<PathBuf> {
+fn windows_bash(
+    paths: impl Iterator<Item = PathBuf>,
+    system_root: Option<&Path>,
+) -> Option<PathBuf> {
     // Empty or relative PATH entries resolve against the workspace; never run a planted bash.exe.
-    paths.filter(|dir| dir.is_absolute()).filter_map(|dir| std::fs::canonicalize(dir.join("bash.exe")).ok()).find(|p| {
-        let under_system = system_root.is_some_and(|root| {
-            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            p.to_string_lossy().to_lowercase().starts_with(&format!("{}{}", root.to_string_lossy().to_lowercase(), std::path::MAIN_SEPARATOR))
-        });
-        p.is_file() && !under_system
-    })
+    paths
+        .filter(|dir| dir.is_absolute())
+        .filter_map(|dir| std::fs::canonicalize(dir.join("bash.exe")).ok())
+        .find(|p| {
+            let under_system = system_root.is_some_and(|root| {
+                let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+                p.to_string_lossy().to_lowercase().starts_with(&format!(
+                    "{}{}",
+                    root.to_string_lossy().to_lowercase(),
+                    std::path::MAIN_SEPARATOR
+                ))
+            });
+            p.is_file() && !under_system
+        })
 }
 
 fn shell_argv(script: &str, windows: bool, bash_exe: Option<&Path>, bash: bool) -> Vec<String> {
     if windows {
         return match bash_exe {
-            Some(path) => vec![path.to_string_lossy().into_owned(), "-c".into(), script.into()],
+            Some(path) => vec![
+                path.to_string_lossy().into_owned(),
+                "-c".into(),
+                script.into(),
+            ],
             None => vec!["cmd".into(), "/S".into(), "/C".into(), script.into()],
         };
     }
-    vec![if bash { "bash" } else { "sh" }.into(), "-c".into(), script.into()]
+    vec![
+        if bash { "bash" } else { "sh" }.into(),
+        "-c".into(),
+        script.into(),
+    ]
 }
 
 fn shell(script: &str) -> Vec<String> {
     #[cfg(windows)]
     {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let root = std::env::var_os("SystemRoot").map(PathBuf::from)
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         let bash = windows_bash(std::env::split_paths(&path), Some(&root));
         shell_argv(script, true, bash.as_deref(), false)
@@ -144,7 +174,11 @@ fn shell(script: &str) -> Vec<String> {
 }
 
 /// A shell command running `script` in `cwd`, confined according to the policy.
-pub fn shell_command(policy: &Policy, cwd: &Path, script: &str) -> anyhow::Result<tokio::process::Command> {
+pub fn shell_command(
+    policy: &Policy,
+    cwd: &Path,
+    script: &str,
+) -> anyhow::Result<tokio::process::Command> {
     let argv = shell(script);
     let argv = match policy.mode {
         Mode::Off => argv,
@@ -176,7 +210,10 @@ fn trusted_helper(current: &Path, override_path: Option<&Path>) -> anyhow::Resul
         let current_real = std::fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
         let over_real = std::fs::canonicalize(over).unwrap_or_else(|_| over.to_path_buf());
         if current_real != over_real {
-            anyhow::bail!("NYQ_SANDBOX_HELPER ({}) is not this nyq binary", over.display());
+            anyhow::bail!(
+                "NYQ_SANDBOX_HELPER ({}) is not this nyq binary",
+                over.display()
+            );
         }
     }
     Ok(current.to_path_buf())
@@ -187,12 +224,21 @@ fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<St
     let current = std::env::current_exe()?;
     let over = std::env::var_os("NYQ_SANDBOX_HELPER").map(PathBuf::from);
     let exe = trusted_helper(&current, over.as_deref())?;
-    Ok(linux::helper_args(&exe, &writable_roots(policy, cwd), policy.network, argv))
+    Ok(linux::helper_args(
+        &exe,
+        &writable_roots(policy, cwd),
+        policy.network,
+        argv,
+    ))
 }
 
 #[cfg(target_os = "macos")]
 fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<String>> {
-    let mut v = vec!["/usr/bin/sandbox-exec".to_string(), "-p".into(), seatbelt_profile(&writable_roots(policy, cwd), policy.network)];
+    let mut v = vec![
+        "/usr/bin/sandbox-exec".to_string(),
+        "-p".into(),
+        seatbelt_profile(&writable_roots(policy, cwd), policy.network),
+    ];
     v.extend(argv);
     Ok(v)
 }
@@ -205,8 +251,17 @@ fn wrap(_policy: &Policy, _cwd: &Path, _argv: Vec<String>) -> anyhow::Result<Vec
 /// A macOS Seatbelt (SBPL) profile allowing writes only under `roots`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn seatbelt_profile(roots: &[PathBuf], network: bool) -> String {
-    let quote = |p: &Path| format!("\"{}\"", p.display().to_string().replace('\\', "\\\\").replace('"', "\\\""));
-    let mut s = String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
+    let quote = |p: &Path| {
+        format!(
+            "\"{}\"",
+            p.display()
+                .to_string()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        )
+    };
+    let mut s =
+        String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
     for r in roots {
         let kind = if r.is_dir() { "subpath" } else { "literal" };
         s.push_str(&format!(" ({kind} {})", quote(r)));
@@ -226,9 +281,15 @@ pub fn check(policy: &Policy) -> Result<(), String> {
         return Ok(());
     }
     #[cfg(target_os = "linux")]
-    return linux::abi().map(|_| ()).ok_or_else(|| "Landlock is not supported or not enabled in this kernel".into());
+    return linux::abi()
+        .map(|_| ())
+        .ok_or_else(|| "Landlock is not supported or not enabled in this kernel".into());
     #[cfg(target_os = "macos")]
-    return if Path::new("/usr/bin/sandbox-exec").exists() { Ok(()) } else { Err("/usr/bin/sandbox-exec not found".into()) };
+    return if Path::new("/usr/bin/sandbox-exec").exists() {
+        Ok(())
+    } else {
+        Err("/usr/bin/sandbox-exec not found".into())
+    };
     #[allow(unreachable_code)]
     Err("sandboxing is not supported on this platform".into())
 }
@@ -240,7 +301,11 @@ pub fn describe(policy: &Policy) -> String {
         Mode::ReadOnly => "read-only",
         Mode::WorkspaceWrite => "workspace-write",
     };
-    let net = if policy.network { "network on" } else { "network off" };
+    let net = if policy.network {
+        "network on"
+    } else {
+        "network off"
+    };
     #[cfg(target_os = "linux")]
     if let Some(abi) = linux::abi() {
         // Landlock ABI v4 can deny TCP bind/connect only. UDP and AF_UNIX
@@ -252,11 +317,23 @@ pub fn describe(policy: &Policy) -> String {
         } else {
             "TCP blocked; UDP and unix sockets not restricted"
         };
-        let git = if policy.mode == Mode::WorkspaceWrite { "; .git remains writable" } else { "" };
+        let git = if policy.mode == Mode::WorkspaceWrite {
+            "; .git remains writable"
+        } else {
+            ""
+        };
         return format!("sandbox: {mode} · {net}{git} (landlock v{abi})");
     }
-    let engine = if cfg!(target_os = "macos") { "seatbelt" } else { "unavailable" };
-    let git = if policy.mode == Mode::WorkspaceWrite && cfg!(target_os = "macos") { "; .git remains writable" } else { "" };
+    let engine = if cfg!(target_os = "macos") {
+        "seatbelt"
+    } else {
+        "unavailable"
+    };
+    let git = if policy.mode == Mode::WorkspaceWrite && cfg!(target_os = "macos") {
+        "; .git remains writable"
+    } else {
+        ""
+    };
     format!("sandbox: {mode} · {net}{git} ({engine})")
 }
 
@@ -278,8 +355,8 @@ mod linux {
     use std::path::{Path, PathBuf};
 
     use landlock::{
-        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, ABI,
+        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
+        RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
     };
 
     const ABIS: [ABI; 6] = [ABI::V6, ABI::V5, ABI::V4, ABI::V3, ABI::V2, ABI::V1];
@@ -297,7 +374,12 @@ mod linux {
     }
 
     /// `exe __sandbox [--net] [--write PATH]... -- argv...`
-    pub fn helper_args(exe: &Path, writable: &[PathBuf], network: bool, argv: Vec<String>) -> Vec<String> {
+    pub fn helper_args(
+        exe: &Path,
+        writable: &[PathBuf],
+        network: bool,
+        argv: Vec<String>,
+    ) -> Vec<String> {
         let mut v = vec![exe.display().to_string(), super::HELPER_ARG.into()];
         if network {
             v.push("--net".into());
@@ -334,9 +416,13 @@ mod linux {
 
     fn restrict(writable: &[PathBuf], network: bool) -> Result<RulesetStatus, String> {
         let abi = ABI::V6;
-        let mut ruleset = Ruleset::default().handle_access(AccessFs::from_all(abi)).map_err(|e| e.to_string())?;
+        let mut ruleset = Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))
+            .map_err(|e| e.to_string())?;
         if !network {
-            ruleset = ruleset.handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp).map_err(|e| e.to_string())?;
+            ruleset = ruleset
+                .handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)
+                .map_err(|e| e.to_string())?;
         }
         let status = ruleset
             .create()
@@ -354,7 +440,9 @@ mod linux {
         };
         let (writable, network, argv) = parse(&args).unwrap_or_else(|e| fail(e));
         match restrict(&writable, network) {
-            Ok(RulesetStatus::NotEnforced) => fail("Landlock is not enforced by this kernel; refusing to run unconfined".into()),
+            Ok(RulesetStatus::NotEnforced) => {
+                fail("Landlock is not enforced by this kernel; refusing to run unconfined".into())
+            }
             Ok(_) => {}
             Err(e) => fail(e),
         }
@@ -369,9 +457,17 @@ mod linux {
         #[test]
         fn args_round_trip() {
             let argv = vec!["bash".to_string(), "-c".into(), "echo --write hi".into()];
-            let v = helper_args(Path::new("/bin/nyq"), &[PathBuf::from("/w s")], false, argv.clone());
+            let v = helper_args(
+                Path::new("/bin/nyq"),
+                &[PathBuf::from("/w s")],
+                false,
+                argv.clone(),
+            );
             assert_eq!(&v[..2], ["/bin/nyq", "__sandbox"]);
-            assert_eq!(parse(&v[2..]).unwrap(), (vec![PathBuf::from("/w s")], false, argv));
+            assert_eq!(
+                parse(&v[2..]).unwrap(),
+                (vec![PathBuf::from("/w s")], false, argv)
+            );
             assert!(parse(&["--net".into()]).is_err());
             assert!(parse(&["--bogus".into(), "--".into(), "x".into()]).is_err());
         }
@@ -392,10 +488,18 @@ mod tests {
         std::fs::create_dir_all(&git).unwrap();
         std::fs::write(system_bin.join("bash.exe"), "").unwrap();
         std::fs::write(git.join("bash.exe"), "").unwrap();
-        assert_eq!(windows_bash(vec![system_bin.clone(), git.clone()].into_iter(), Some(&system)), Some(git.join("bash.exe").canonicalize().unwrap()));
+        assert_eq!(
+            windows_bash(
+                vec![system_bin.clone(), git.clone()].into_iter(),
+                Some(&system)
+            ),
+            Some(git.join("bash.exe").canonicalize().unwrap())
+        );
         assert!(windows_bash(vec![system_bin].into_iter(), Some(&system)).is_none());
         // A relative or empty PATH entry (resolving into the workspace) is never used.
-        assert!(windows_bash(vec![PathBuf::new(), PathBuf::from("rel")].into_iter(), None).is_none());
+        assert!(
+            windows_bash(vec![PathBuf::new(), PathBuf::from("rel")].into_iter(), None).is_none()
+        );
     }
 
     #[cfg(windows)]
@@ -405,14 +509,20 @@ mod tests {
         let mut command = shell_process(&shell_argv(script, true, None, false));
         let out = command.output().await.unwrap();
         assert!(out.status.success());
-        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "\"hi there\"");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            "\"hi there\""
+        );
     }
 
     #[test]
     fn seatbelt_profile_escapes_and_denies() {
         let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false);
         assert!(p.contains("(deny file-write*)"));
-        assert!(!p.contains(".git"), "git must stay usable inside the sandbox");
+        assert!(
+            !p.contains(".git"),
+            "git must stay usable inside the sandbox"
+        );
         assert!(p.contains(r#""/tmp/a\"b""#));
         assert!(p.contains("(deny network*)"));
         assert!(!p.contains("unix-socket"));
@@ -423,9 +533,17 @@ mod tests {
     fn shell_selection_matches_the_platform() {
         assert_eq!(
             shell_argv("echo hi", true, None, false),
-            vec!["cmd".to_string(), "/S".into(), "/C".into(), "echo hi".into()]
+            vec![
+                "cmd".to_string(),
+                "/S".into(),
+                "/C".into(),
+                "echo hi".into()
+            ]
         );
-        assert_eq!(shell_argv("echo hi", true, Some(Path::new("/git/bash.exe")), false)[..2], ["/git/bash.exe", "-c"]);
+        assert_eq!(
+            shell_argv("echo hi", true, Some(Path::new("/git/bash.exe")), false)[..2],
+            ["/git/bash.exe", "-c"]
+        );
         assert_eq!(shell_argv("echo hi", false, None, false)[0], "sh");
         assert_eq!(shell_argv("echo hi", false, None, true)[0], "bash");
     }
@@ -433,7 +551,9 @@ mod tests {
     #[test]
     fn tmpdir_must_sit_under_a_system_temp_root() {
         // Not under /tmp: a workspace `tmp` must not become a writable root.
-        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("nyq-fake-home-{}", std::process::id()));
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("nyq-fake-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let nested = home.join("tmp");
         std::fs::create_dir_all(&nested).unwrap();
@@ -441,11 +561,15 @@ mod tests {
         assert!(accepted_tmpdir(&home, Some(&home)).is_none());
         assert!(accepted_tmpdir(Path::new("/"), Some(&home)).is_none());
         if Path::new("/tmp").is_dir() {
-            let t = tempfile::Builder::new().prefix("nyq-tmp-").tempdir_in("/tmp").unwrap();
+            let t = tempfile::Builder::new()
+                .prefix("nyq-tmp-")
+                .tempdir_in("/tmp")
+                .unwrap();
             assert!(accepted_tmpdir(t.path(), Some(&home)).is_some());
             #[cfg(unix)]
             {
-                let link = std::env::temp_dir().join(format!("nyq-tmpdir-link-{}", std::process::id()));
+                let link =
+                    std::env::temp_dir().join(format!("nyq-tmpdir-link-{}", std::process::id()));
                 let _ = std::fs::remove_file(&link);
                 if std::os::unix::fs::symlink(&nested, &link).is_ok() {
                     assert!(accepted_tmpdir(&link, Some(&home)).is_none());
@@ -454,7 +578,10 @@ mod tests {
             }
         }
         if Path::new("/var/tmp").is_dir() {
-            let t = tempfile::Builder::new().prefix("nyq-tmp-").tempdir_in("/var/tmp").unwrap();
+            let t = tempfile::Builder::new()
+                .prefix("nyq-tmp-")
+                .tempdir_in("/var/tmp")
+                .unwrap();
             assert!(accepted_tmpdir(t.path(), Some(&home)).is_some());
         }
         let _ = std::fs::remove_dir_all(&home);
@@ -462,14 +589,21 @@ mod tests {
 
     #[test]
     fn describe_mentions_the_unix_socket_gap_on_linux() {
-        let p = describe(&Policy { mode: Mode::ReadOnly, network: false, ..Default::default() });
+        let p = describe(&Policy {
+            mode: Mode::ReadOnly,
+            network: false,
+            ..Default::default()
+        });
         assert!(p.contains("read-only"), "{p}");
         #[cfg(target_os = "linux")]
         if p.contains("landlock") {
             if p.contains("kernel too old") {
                 assert!(p.contains("network not restricted"), "{p}");
             } else {
-                assert!(p.contains("TCP blocked; UDP and unix sockets not restricted"), "{p}");
+                assert!(
+                    p.contains("TCP blocked; UDP and unix sockets not restricted"),
+                    "{p}"
+                );
                 assert_eq!(p.matches("unix sockets").count(), 1, "{p}");
             }
         }
@@ -496,8 +630,24 @@ mod tests {
 
     #[test]
     fn off_runs_plain_shell() {
-        let c = shell_command(&Policy { mode: Mode::Off, ..Default::default() }, Path::new("/"), "true").unwrap();
+        let c = shell_command(
+            &Policy {
+                mode: Mode::Off,
+                ..Default::default()
+            },
+            Path::new("/"),
+            "true",
+        )
+        .unwrap();
         let prog = c.as_std().get_program().to_string_lossy().into_owned();
-        assert!(prog == "bash" || prog == "sh" || prog == "cmd" || Path::new(&prog).file_name().is_some_and(|n| n == "bash.exe"), "{prog}");
+        assert!(
+            prog == "bash"
+                || prog == "sh"
+                || prog == "cmd"
+                || Path::new(&prog)
+                    .file_name()
+                    .is_some_and(|n| n == "bash.exe"),
+            "{prog}"
+        );
     }
 }

@@ -170,9 +170,7 @@ pub fn append(
     }
     file.unlock()?;
     // Only saved sessions get a copy; subagents share their parent's.
-    if let Some(path) =
-        sidecar(home, session).filter(|p| p.with_extension("jsonl").exists())
-    {
+    if let Some(path) = sidecar(home, session).filter(|p| p.with_extension("jsonl").exists()) {
         locked_append(&path, &line)?.0.unlock()?;
     }
     Ok(())
@@ -209,7 +207,11 @@ fn compact(home: &Path, file: &mut File, now: DateTime<Utc>) -> Result<()> {
 }
 
 fn tracking_since(home: &Path) -> Option<DateTime<Utc>> {
-    std::fs::read_to_string(since_path(home)).ok()?.trim().parse().ok()
+    std::fs::read_to_string(since_path(home))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[derive(Default, Debug)]
@@ -301,7 +303,11 @@ impl Report {
         lines.push("Usage by model:".into());
         let all: u64 = self.models.values().map(|t| t.input + t.output).sum();
         lines.extend(self.models.iter().map(|((p, m), t)| {
-            let share = if all == 0 { 0.0 } else { (t.input + t.output) as f64 * 100.0 / all as f64 };
+            let share = if all == 0 {
+                0.0
+            } else {
+                (t.input + t.output) as f64 * 100.0 / all as f64
+            };
             format!("{} · {share:.0}% of tokens", t.line(&format!("{p}/{m}")))
         }));
         if self.models.is_empty() {
@@ -324,7 +330,9 @@ impl Report {
 }
 pub fn read(home: &Path, period: Period) -> Result<Report> {
     let now = Utc::now();
-    let mut report = read_with(&home.join("usage.jsonl"), |report, r| report.add(r, period, now))?;
+    let mut report = read_with(&home.join("usage.jsonl"), |report, r| {
+        report.add(r, period, now)
+    })?;
     report.since = tracking_since(home).or(report.since);
     Ok(report)
 }
@@ -378,13 +386,20 @@ pub fn slash(home: &Path, args: &[&str], session: Option<&str>) -> Result<()> {
     match args {
         ["session"] => {
             let id = session.context("this conversation has no session yet")?;
-            let mut lines = vec![format!("This session ({}):", id.chars().take(8).collect::<String>())];
+            let mut lines = vec![format!(
+                "This session ({}):",
+                id.chars().take(8).collect::<String>()
+            )];
             lines.extend(read_session(home, id)?.lines());
             crate::ui::list(&lines);
             Ok(())
         }
         [] => show(home, Period::Month, false),
-        [p] => show(home, Period::parse(p).map_err(|_| anyhow::anyhow!("usage: /usage [session|24h|7d|30d]"))?, false),
+        [p] => show(
+            home,
+            Period::parse(p).map_err(|_| anyhow::anyhow!("usage: /usage [session|24h|7d|30d]"))?,
+            false,
+        ),
         _ => anyhow::bail!("usage: /usage [session|24h|7d|30d]"),
     }
 }
@@ -637,7 +652,10 @@ mod tests {
         });
         let report = read(dir.path(), Period::Day).unwrap();
         assert_eq!(report.malformed, 1);
-        assert_eq!(read_session(dir.path(), "s").unwrap().providers["openai"].requests, 20);
+        assert_eq!(
+            read_session(dir.path(), "s").unwrap().providers["openai"].requests,
+            20
+        );
         assert!(read_session(dir.path(), "other").unwrap().models.is_empty());
         assert_eq!(report.providers["openai"].requests, 20);
         assert!((report.providers["openai"].cost - 0.00082).abs() < 1e-10);
@@ -733,10 +751,22 @@ mod tests {
             }
             assert_eq!(report.models.len(), 3);
             let lines = report.lines();
-            assert!(lines.iter().any(|l| l.contains("openai/b") && l.ends_with("· 33% of tokens")), "{lines:?}");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("openai/b") && l.ends_with("· 33% of tokens")),
+                "{lines:?}"
+            );
             let t = &report.providers["openai"];
             assert_eq!(
-                (t.requests, t.input, t.cached, t.output, t.reasoning, t.unknown),
+                (
+                    t.requests,
+                    t.input,
+                    t.cached,
+                    t.output,
+                    t.reasoning,
+                    t.unknown
+                ),
                 (2, 20, 4, 6, 2, 1)
             );
             assert_eq!(t.cost, 1.0);
@@ -774,10 +804,17 @@ mod tests {
         .unwrap();
         let mut stats = Stats::default();
         let usage = stats.restore(&session, Some(home)).unwrap();
-        assert_eq!((stats.requests, usage.input_tokens, usage.cache_write_tokens), (1, 4, 2));
+        assert_eq!(
+            (stats.requests, usage.input_tokens, usage.cache_write_tokens),
+            (1, 4, 2)
+        );
         let sidecar = home.join("sessions").join(format!("{}.usage", session.id));
         assert!(sidecar.exists());
-        let u = Usage { input_tokens: 6, output_tokens: 1, ..Default::default() };
+        let u = Usage {
+            input_tokens: 6,
+            output_tokens: 1,
+            ..Default::default()
+        };
         append(home, &session.id, "openai", "openai", "m", u).unwrap();
         // Unsaved sessions (and unknown ids) get no copy.
         append(home, "nosuch", "openai", "openai", "m", u).unwrap();
@@ -810,7 +847,13 @@ mod tests {
         assert!(report.lines().last().unwrap().contains("Tracking since"));
         // A small log is left alone.
         append(home, "s", "openai", "openai", "m", Usage::default()).unwrap();
-        assert_eq!(std::fs::read_to_string(home.join("usage.jsonl")).unwrap().lines().count(), 3);
+        assert_eq!(
+            std::fs::read_to_string(home.join("usage.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
     }
     #[test]
     fn activity_counts_changed_lines_and_formats_durations() {
@@ -825,9 +868,17 @@ mod tests {
         stats.file_change("bash", &serde_json::json!({}), Some(diff));
         assert_eq!((stats.lines_added, stats.lines_removed), (5, 1));
         stats.api_time = Duration::from_secs(75);
-        let u = Usage { reasoning_tokens: 7, cache_write_tokens: 3, ..Default::default() };
+        let u = Usage {
+            reasoning_tokens: 7,
+            cache_write_tokens: 3,
+            ..Default::default()
+        };
         let lines = stats.lines(u);
-        assert!(lines[1].starts_with("this run: wall 0s · API 1m 15s · lines +5 -1"), "{}", lines[1]);
+        assert!(
+            lines[1].starts_with("this run: wall 0s · API 1m 15s · lines +5 -1"),
+            "{}",
+            lines[1]
+        );
         assert!(lines[2].contains("reasoning 7") && lines[2].contains("cache writes 3"));
         assert_eq!(duration(Duration::from_secs(3720)), "1h 2m");
     }

@@ -80,8 +80,16 @@ fn bits() -> u8 {
 /// Render this test thread without colors (`NO_COLOR`), in ASCII, or in 256 colors.
 #[cfg(test)]
 pub fn test_mode(no_color: bool, ascii: bool, truecolor: bool) {
-    let bits = [(no_color, NO_COLOR), (ascii, ASCII), (!truecolor, NO_TRUECOLOR)];
-    TEST_MODE.with(|m| m.set(Some(bits.iter().filter(|(on, _)| *on).map(|(_, b)| b).sum())));
+    let bits = [
+        (no_color, NO_COLOR),
+        (ascii, ASCII),
+        (!truecolor, NO_TRUECOLOR),
+    ];
+    TEST_MODE.with(|m| {
+        m.set(Some(
+            bits.iter().filter(|(on, _)| *on).map(|(_, b)| b).sum(),
+        ))
+    });
 }
 
 pub fn parse(s: &str) -> Option<Theme> {
@@ -95,10 +103,22 @@ pub fn parse(s: &str) -> Option<Theme> {
 /// Pick the theme and color depth. `query` asks the terminal for its
 /// background (raw mode must be on and nothing else reading input).
 pub fn init(setting: &str, query: bool) {
-    let detected = if query { query_background(Duration::from_millis(200)).map(from_rgb) } else { None }
-        .or_else(|| std::env::var("COLORFGBG").ok().and_then(|v| from_colorfgbg(&v)))
-        .unwrap_or(Theme::Dark);
-    let mut bits = if detected == Theme::Light { DETECTED_LIGHT } else { 0 };
+    let detected = if query {
+        query_background(Duration::from_millis(200)).map(from_rgb)
+    } else {
+        None
+    }
+    .or_else(|| {
+        std::env::var("COLORFGBG")
+            .ok()
+            .and_then(|v| from_colorfgbg(&v))
+    })
+    .unwrap_or(Theme::Dark);
+    let mut bits = if detected == Theme::Light {
+        DETECTED_LIGHT
+    } else {
+        0
+    };
     let env = |k: &str| std::env::var(k).ok();
     if !truecolor(env) {
         bits |= NO_TRUECOLOR;
@@ -117,7 +137,10 @@ pub fn init(setting: &str, query: bool) {
 /// `LANG` that is set decides. With none set (Windows, bare containers) the
 /// terminal is trusted to cope.
 fn utf8_locale(env: impl Fn(&str) -> Option<String>) -> bool {
-    match ["LC_ALL", "LC_CTYPE", "LANG"].iter().find_map(|k| env(k).filter(|v| !v.is_empty())) {
+    match ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|k| env(k).filter(|v| !v.is_empty()))
+    {
         Some(v) => {
             let v = v.to_ascii_lowercase();
             v.contains("utf-8") || v.contains("utf8")
@@ -144,9 +167,21 @@ pub fn truecolor_on() -> bool {
 /// Re-apply the `theme` setting (`auto`, `light` or `dark`); `NYQ_THEME` wins.
 pub fn apply_setting(setting: &str) {
     let bits = MODE.load(Ordering::Relaxed);
-    let detected = if bits & DETECTED_LIGHT != 0 { Theme::Light } else { Theme::Dark };
-    let theme = std::env::var("NYQ_THEME").ok().and_then(|v| parse(&v)).or_else(|| parse(setting)).unwrap_or(detected);
-    let bits = if theme == Theme::Light { bits | LIGHT } else { bits & !LIGHT };
+    let detected = if bits & DETECTED_LIGHT != 0 {
+        Theme::Light
+    } else {
+        Theme::Dark
+    };
+    let theme = std::env::var("NYQ_THEME")
+        .ok()
+        .and_then(|v| parse(&v))
+        .or_else(|| parse(setting))
+        .unwrap_or(detected);
+    let bits = if theme == Theme::Light {
+        bits | LIGHT
+    } else {
+        bits & !LIGHT
+    };
     MODE.store(bits, Ordering::Relaxed);
 }
 
@@ -172,9 +207,15 @@ fn parse_colors(settings: &Map<String, Value>) -> (Palette, Vec<String>) {
     let mut palette: Palette = [[None; ROLES.len()]; 2];
     let mut warnings = Vec::new();
     let mut set = |path: String, role: &str, v: &Value, themes: &[Theme]| {
-        let Some(i) = ROLES.iter().position(|(name, _)| name.eq_ignore_ascii_case(role.trim())) else {
+        let Some(i) = ROLES
+            .iter()
+            .position(|(name, _)| name.eq_ignore_ascii_case(role.trim()))
+        else {
             let names: Vec<&str> = ROLES.iter().map(|(name, _)| *name).collect();
-            return Err(format!("{path}: unknown role (one of {}) (ignored)", names.join(", ")));
+            return Err(format!(
+                "{path}: unknown role (one of {}) (ignored)",
+                names.join(", ")
+            ));
         };
         let c = parse_color(v).ok_or_else(|| {
             format!("{path}: expected \"#rrggbb\" or a color index 0-255, got {v} (ignored)")
@@ -186,12 +227,22 @@ fn parse_colors(settings: &Map<String, Value>) -> (Palette, Vec<String>) {
     };
     // The top level first, so the theme tables overwrite it.
     for (role, v) in settings.iter().filter(|(k, _)| parse(k).is_none()) {
-        warnings.extend(set(format!("theme_colors.{role}"), role, v, &[Theme::Dark, Theme::Light]).err());
+        warnings.extend(
+            set(
+                format!("theme_colors.{role}"),
+                role,
+                v,
+                &[Theme::Dark, Theme::Light],
+            )
+            .err(),
+        );
     }
     for (table, v) in settings {
         let Some(theme) = parse(table) else { continue };
         let Some(entries) = v.as_object() else {
-            warnings.push(format!("theme_colors.{table}: expected a table of role colors (ignored)"));
+            warnings.push(format!(
+                "theme_colors.{table}: expected a table of role colors (ignored)"
+            ));
             continue;
         };
         for (role, v) in entries {
@@ -241,13 +292,19 @@ fn from_rgb((r, g, b): (u8, u8, u8)) -> Theme {
 /// `COLORFGBG` is `fg;bg` (sometimes `fg;default;bg`) in ANSI color numbers.
 fn from_colorfgbg(v: &str) -> Option<Theme> {
     let bg: u8 = v.rsplit(';').next()?.trim().parse().ok()?;
-    Some(if bg == 7 || bg == 15 { Theme::Light } else { Theme::Dark })
+    Some(if bg == 7 || bg == 15 {
+        Theme::Light
+    } else {
+        Theme::Dark
+    })
 }
 
 /// The background from an OSC 11 reply: `ESC ] 11 ; rgb:RRRR/GGGG/BBBB`.
 fn parse_osc11(reply: &str) -> Option<(u8, u8, u8)> {
     let rest = &reply[reply.find("]11;")? + 4..];
-    let rest = rest.strip_prefix("rgb:").or_else(|| rest.strip_prefix("rgba:"))?;
+    let rest = rest
+        .strip_prefix("rgb:")
+        .or_else(|| rest.strip_prefix("rgba:"))?;
     let mut parts = rest.split('/').map(|p| {
         let hex: String = p.chars().take_while(char::is_ascii_hexdigit).collect();
         let v = u32::from_str_radix(&hex, 16).ok()?;
@@ -273,7 +330,11 @@ fn query_background(timeout: Duration) -> Option<(u8, u8, u8)> {
         if left.is_zero() {
             break;
         }
-        let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: one valid pollfd for the duration of the call.
         if unsafe { libc::poll(&mut fd, 1, left.as_millis().max(1) as i32) } <= 0 {
             break;
@@ -320,11 +381,17 @@ pub fn to_256(r: u8, g: u8, b: u8) -> u8 {
     let level = |v: u8| if v < 48 { 0 } else if v < 115 { 1 } else { (v as u16 - 35) / 40 } as u8;
     let (lr, lg, lb) = (level(r), level(g), level(b));
     let cube = |l: u8| if l == 0 { 0 } else { 55 + 40 * l as i32 };
-    let cube_err = [(r, lr), (g, lg), (b, lb)].iter().map(|&(v, l)| (v as i32 - cube(l)).pow(2)).sum::<i32>();
+    let cube_err = [(r, lr), (g, lg), (b, lb)]
+        .iter()
+        .map(|&(v, l)| (v as i32 - cube(l)).pow(2))
+        .sum::<i32>();
     let avg = (r as i32 + g as i32 + b as i32) / 3;
     let gray = ((avg - 3).clamp(0, 230) / 10) as u8;
     let gray_v = 8 + 10 * gray as i32;
-    let gray_err = [r, g, b].iter().map(|&v| (v as i32 - gray_v).pow(2)).sum::<i32>();
+    let gray_err = [r, g, b]
+        .iter()
+        .map(|&v| (v as i32 - gray_v).pow(2))
+        .sum::<i32>();
     if gray_err < cube_err {
         232 + gray
     } else {
@@ -335,12 +402,21 @@ pub fn to_256(r: u8, g: u8, b: u8) -> u8 {
 /// `c` in the active theme and color depth.
 pub fn color(c: Color) -> Color {
     let bits = bits();
-    let theme = if bits & LIGHT != 0 { Theme::Light } else { Theme::Dark };
+    let theme = if bits & LIGHT != 0 {
+        Theme::Light
+    } else {
+        Theme::Dark
+    };
     let truecolor = bits & NO_TRUECOLOR == 0;
     if !OVERRIDDEN.load(Ordering::Relaxed) {
         return resolve(c, theme, truecolor, None);
     }
-    resolve(c, theme, truecolor, Some(&PALETTE.read().unwrap_or_else(|e| e.into_inner())))
+    resolve(
+        c,
+        theme,
+        truecolor,
+        Some(&PALETTE.read().unwrap_or_else(|e| e.into_inner())),
+    )
 }
 
 /// A role's override, else its built-in color for `theme`, at the color depth.
@@ -378,8 +454,14 @@ mod tests {
 
     #[test]
     fn detects_backgrounds() {
-        assert_eq!(parse_osc11("\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), Some((255, 255, 255)));
-        assert_eq!(parse_osc11("junk\x1b]11;rgb:1e/1e/2e\x07\x1b[?62;c"), Some((30, 30, 46)));
+        assert_eq!(
+            parse_osc11("\x1b]11;rgb:ffff/ffff/ffff\x1b\\"),
+            Some((255, 255, 255))
+        );
+        assert_eq!(
+            parse_osc11("junk\x1b]11;rgb:1e/1e/2e\x07\x1b[?62;c"),
+            Some((30, 30, 46))
+        );
         assert_eq!(parse_osc11("\x1b[?62;c"), None);
         assert_eq!(from_rgb((255, 255, 240)), Theme::Light);
         assert_eq!(from_rgb((30, 30, 46)), Theme::Dark);
@@ -393,24 +475,43 @@ mod tests {
     #[test]
     fn truecolor_needs_a_promise() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
         };
         assert!(truecolor(env(&[("COLORTERM", "truecolor")])));
         assert!(truecolor(env(&[("TERM_PROGRAM", "WezTerm")])));
-        assert!(!truecolor(env(&[("TERM", "xterm-256color"), ("TERM_PROGRAM", "Apple_Terminal")])));
+        assert!(!truecolor(env(&[
+            ("TERM", "xterm-256color"),
+            ("TERM_PROGRAM", "Apple_Terminal")
+        ])));
     }
 
     #[test]
     fn utf8_locales_and_no_color() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
         };
         assert!(utf8_locale(env(&[("LANG", "en_US.UTF-8")])));
         assert!(utf8_locale(env(&[("LC_CTYPE", "C.utf8"), ("LANG", "C")])));
         assert!(utf8_locale(env(&[])), "nothing set trusts the terminal");
-        assert!(!utf8_locale(env(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")])), "LC_ALL wins");
+        assert!(
+            !utf8_locale(env(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")])),
+            "LC_ALL wins"
+        );
         assert!(!utf8_locale(env(&[("LANG", "POSIX")])));
-        assert!(utf8_locale(env(&[("LC_ALL", ""), ("LANG", "de_DE.UTF-8")])), "empty values don't count");
+        assert!(
+            utf8_locale(env(&[("LC_ALL", ""), ("LANG", "de_DE.UTF-8")])),
+            "empty values don't count"
+        );
         test_mode(true, true, true);
         assert!(no_color() && ascii() && !truecolor_on());
         assert_eq!(fg(BLUE), Style::new());
@@ -440,10 +541,21 @@ mod tests {
 
     #[test]
     fn parses_role_colors() {
-        assert_eq!(parse_color(&json!("#5fAFd7")), Some(Color::Rgb(95, 175, 215)));
+        assert_eq!(
+            parse_color(&json!("#5fAFd7")),
+            Some(Color::Rgb(95, 175, 215))
+        );
         assert_eq!(parse_color(&json!(" #000000 ")), Some(Color::Rgb(0, 0, 0)));
         assert_eq!(parse_color(&json!(208)), Some(Color::Fixed(208)));
-        for bad in [json!("5fafd7"), json!("#5faf"), json!("#5fafzz"), json!(256), json!(-1), json!(1.5), json!(true)] {
+        for bad in [
+            json!("5fafd7"),
+            json!("#5faf"),
+            json!("#5fafzz"),
+            json!(256),
+            json!(-1),
+            json!(1.5),
+            json!(true),
+        ] {
             assert_eq!(parse_color(&bad), None, "{bad}");
         }
         let (p, warnings) = colors(json!({"blue": "#5fafd7", "red": 160}));
@@ -462,7 +574,8 @@ mod tests {
             "dark": {"faint": "#444444"},
         }));
         assert!(warnings.is_empty(), "{warnings:?}");
-        let check = |theme, c, want| assert_eq!(resolve(c, theme, true, Some(&p)), want, "{theme:?} {c:?}");
+        let check =
+            |theme, c, want| assert_eq!(resolve(c, theme, true, Some(&p)), want, "{theme:?} {c:?}");
         check(Theme::Dark, BLUE, Color::Rgb(95, 175, 215));
         check(Theme::Light, BLUE, Color::Rgb(0, 95, 135));
         check(Theme::Light, GREEN, Color::Fixed(28));
@@ -477,9 +590,15 @@ mod tests {
     #[test]
     fn overrides_fall_back_to_256_colors() {
         let (p, _) = colors(json!({"blue": "#d75f5f", "red": 9}));
-        assert_eq!(resolve(BLUE, Theme::Dark, false, Some(&p)), Color::Fixed(167));
+        assert_eq!(
+            resolve(BLUE, Theme::Dark, false, Some(&p)),
+            Color::Fixed(167)
+        );
         assert_eq!(resolve(RED, Theme::Light, false, Some(&p)), Color::Fixed(9));
-        assert_eq!(resolve(GRAY, Theme::Dark, false, Some(&p)), Color::Fixed(245));
+        assert_eq!(
+            resolve(GRAY, Theme::Dark, false, Some(&p)),
+            Color::Fixed(245)
+        );
     }
 
     #[test]
@@ -499,10 +618,16 @@ mod tests {
             "theme_colors.dark.blue: expected",
             "theme_colors.dark.purple: unknown role",
         ] {
-            assert!(warnings.iter().any(|w| w.starts_with(start)), "{start}: {warnings:?}");
+            assert!(
+                warnings.iter().any(|w| w.starts_with(start)),
+                "{start}: {warnings:?}"
+            );
         }
         assert_eq!(p.iter().flatten().filter(|c| c.is_some()).count(), 3);
-        assert_eq!(p[Theme::Light as usize][role("green")], Some(Color::Rgb(0, 175, 0)));
+        assert_eq!(
+            p[Theme::Light as usize][role("green")],
+            Some(Color::Rgb(0, 175, 0))
+        );
         assert_eq!(color_warnings(&Map::new()), Vec::<String>::new());
     }
 }

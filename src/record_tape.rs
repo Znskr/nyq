@@ -75,7 +75,9 @@ pub fn input(text: &str) {
 pub fn key_text(key: &crossterm::event::KeyEvent) -> Option<String> {
     use crossterm::event::{KeyCode, KeyModifiers};
     let text = match key.code {
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic() => {
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic() =>
+        {
             ((c.to_ascii_lowercase() as u8 - b'a' + 1) as char).to_string()
         }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => format!("\x1b{c}"),
@@ -255,10 +257,22 @@ mod tests {
     fn keys_become_terminal_input() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let key = |code, mods| key_text(&KeyEvent::new(code, mods));
-        assert_eq!(key(KeyCode::Char('a'), KeyModifiers::NONE).as_deref(), Some("a"));
-        assert_eq!(key(KeyCode::Char('c'), KeyModifiers::CONTROL).as_deref(), Some("\x03"));
-        assert_eq!(key(KeyCode::Enter, KeyModifiers::NONE).as_deref(), Some("\r"));
-        assert_eq!(key(KeyCode::Up, KeyModifiers::NONE).as_deref(), Some("\x1b[A"));
+        assert_eq!(
+            key(KeyCode::Char('a'), KeyModifiers::NONE).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL).as_deref(),
+            Some("\x03")
+        );
+        assert_eq!(
+            key(KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+            Some("\r")
+        );
+        assert_eq!(
+            key(KeyCode::Up, KeyModifiers::NONE).as_deref(),
+            Some("\x1b[A")
+        );
         assert_eq!(key(KeyCode::F(5), KeyModifiers::NONE), None);
     }
     #[test]

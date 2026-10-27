@@ -38,14 +38,34 @@ pub struct Skill {
 type Root = (PathBuf, PathBuf, &'static str, String);
 
 /// Project skill roots, relative to the workspace, in precedence order.
-pub(crate) const PROJECT_ROOTS: &[&str] =
-    &[".agents/skills", ".codex/skills", ".claude/skills", ".nyq/skills", ".opencode/skills", "skills", ".claw/skills"];
+pub(crate) const PROJECT_ROOTS: &[&str] = &[
+    ".agents/skills",
+    ".codex/skills",
+    ".claude/skills",
+    ".nyq/skills",
+    ".opencode/skills",
+    "skills",
+    ".claw/skills",
+];
 /// Other agents' user skill roots, relative to the user's home, after `~/.nyq/skills`.
-pub(crate) const USER_ROOTS: &[&str] =
-    &[".agents/skills", ".codex/skills", ".claude/skills", ".config/opencode/skills", ".claw/skills"];
+pub(crate) const USER_ROOTS: &[&str] = &[
+    ".agents/skills",
+    ".codex/skills",
+    ".claude/skills",
+    ".config/opencode/skills",
+    ".claw/skills",
+];
 
 /// Where skills come from, as `/skills` groups them.
-pub const SOURCES: &[&str] = &["nyq", "Agents", "Claude Code", "Codex", "OpenCode", "Claw", "Workspace"];
+pub const SOURCES: &[&str] = &[
+    "nyq",
+    "Agents",
+    "Claude Code",
+    "Codex",
+    "OpenCode",
+    "Claw",
+    "Workspace",
+];
 
 /// The [`SOURCES`] group of the root a skill was found in.
 pub fn source(skill: &Skill) -> &'static str {
@@ -70,12 +90,21 @@ fn roots(home: &Path, user_home: Option<&Path>, cwd: &Path) -> Vec<Root> {
         _ => a == b,
     };
     let at_home = same(&cwd.join(".nyq"), home) || user_home.is_some_and(|h| same(cwd, h));
-    let mut roots: Vec<Root> = if at_home { Vec::new() } else { PROJECT_ROOTS.to_vec() }
-        .iter()
-        .map(|d| (cwd.join(d), cwd.to_path_buf(), "project", d.to_string()))
-        .collect();
+    let mut roots: Vec<Root> = if at_home {
+        Vec::new()
+    } else {
+        PROJECT_ROOTS.to_vec()
+    }
+    .iter()
+    .map(|d| (cwd.join(d), cwd.to_path_buf(), "project", d.to_string()))
+    .collect();
     let user_skills = home.join("skills");
-    roots.push((user_skills.clone(), user_skills.clone(), "user", slash_path(&user_skills)));
+    roots.push((
+        user_skills.clone(),
+        user_skills.clone(),
+        "user",
+        slash_path(&user_skills),
+    ));
     if let Some(user_home) = user_home {
         for d in USER_ROOTS {
             let dir = user_home.join(d);
@@ -95,7 +124,9 @@ pub fn discover(home: &Path, cwd: &Path) -> Vec<Skill> {
 
 /// Whether the `disabled_skills` setting turns `skill` off (by its id).
 pub fn is_disabled(skill: &Skill) -> bool {
-    crate::settings::current().disabled_skills.contains(&skill.id)
+    crate::settings::current()
+        .disabled_skills
+        .contains(&skill.id)
 }
 
 /// Every skill found, disabled ones included, plus problems with SKILL.md
@@ -114,8 +145,14 @@ fn discover_in(roots: &[Root]) -> (Vec<Skill>, Vec<String>) {
     let mut skills: Vec<Skill> = Vec::new();
     let mut problems = Vec::new();
     for (scan, root, scope, location) in roots {
-        let Ok(entries) = std::fs::read_dir(scan) else { continue };
-        let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        let Ok(entries) = std::fs::read_dir(scan) else {
+            continue;
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
         dirs.sort();
         for dir in dirs {
             let path = dir.join("SKILL.md");
@@ -133,17 +170,34 @@ fn discover_in(roots: &[Root]) -> (Vec<Skill>, Vec<String>) {
                 problems.push(format!("{}: {e}", slash_path(&path)));
             }
             let (meta, _) = split_frontmatter(&text);
-            if meta.description.as_deref().is_none_or(|d| d.trim().is_empty()) {
-                problems.push(format!("{}: no `description` in the frontmatter", slash_path(&path)));
+            if meta
+                .description
+                .as_deref()
+                .is_none_or(|d| d.trim().is_empty())
+            {
+                problems.push(format!(
+                    "{}: no `description` in the frontmatter",
+                    slash_path(&path)
+                ));
             }
-            let dir_name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let dir_name = dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             let name = meta.name.filter(|n| !n.is_empty()).unwrap_or(dir_name);
             // Same-named skills from different roots are all kept; later ones
             // are told apart by where they live.
-            let id = if skills.iter().any(|s| s.name == name) { format!("{name}@{location}") } else { name.clone() };
+            let id = if skills.iter().any(|s| s.name == name) {
+                format!("{name}@{location}")
+            } else {
+                name.clone()
+            };
             // The same SKILL.md reached twice (a symlinked directory) is one skill.
             let real = std::fs::canonicalize(&path).ok();
-            if skills.iter().any(|s| s.id == id || (real.is_some() && std::fs::canonicalize(&s.path).ok() == real)) {
+            if skills.iter().any(|s| {
+                s.id == id || (real.is_some() && std::fs::canonicalize(&s.path).ok() == real)
+            }) {
                 continue;
             }
             let description = sanitize(&meta.description.unwrap_or_default()).0;
@@ -213,7 +267,9 @@ fn parse_header(lines: &[&str]) -> Meta {
         if line.starts_with([' ', '\t']) || line.trim_start().starts_with('#') {
             continue;
         }
-        let Some((key, raw)) = line.split_once(':') else { continue };
+        let Some((key, raw)) = line.split_once(':') else {
+            continue;
+        };
         // Indented (or blank) lines that follow belong to this value.
         let start = i;
         while i < lines.len() && (lines[i].trim().is_empty() || lines[i].starts_with([' ', '\t'])) {
@@ -234,8 +290,16 @@ fn parse_header(lines: &[&str]) -> Meta {
 fn parse_value(raw: &str, continuation: &[&str]) -> String {
     let cont: Vec<&str> = continuation.iter().map(|l| l.trim()).collect();
     if let Some(style) = raw.chars().next().filter(|c| matches!(c, '>' | '|')) {
-        if raw[1..].trim_start_matches(|c: char| c == '-' || c == '+' || c.is_ascii_digit()).trim().is_empty() {
-            return if style == '|' { cont.join("\n").trim().to_string() } else { fold(&cont) };
+        if raw[1..]
+            .trim_start_matches(|c: char| c == '-' || c == '+' || c.is_ascii_digit())
+            .trim()
+            .is_empty()
+        {
+            return if style == '|' {
+                cont.join("\n").trim().to_string()
+            } else {
+                fold(&cont)
+            };
         }
     }
     let mut parts = vec![raw];
@@ -337,14 +401,20 @@ pub fn prompt_section(skills: &[Skill]) -> String {
         }
     }
     if skills.len() > MAX_PROMPT_SKILLS {
-        out.push_str(&format!("- ... and {} more\n", skills.len() - MAX_PROMPT_SKILLS));
+        out.push_str(&format!(
+            "- ... and {} more\n",
+            skills.len() - MAX_PROMPT_SKILLS
+        ));
     }
     crate::limits::clip("skill_catalog_bytes", &out)
 }
 
 #[cfg(test)]
 pub fn tool(skills: Vec<Skill>) -> Box<dyn Tool> {
-    Box::new(SkillTool { skills, reload: None })
+    Box::new(SkillTool {
+        skills,
+        reload: None,
+    })
 }
 
 /// Add the `skill` tool (which also finds skills installed after it was
@@ -352,8 +422,13 @@ pub fn tool(skills: Vec<Skill>) -> Box<dyn Tool> {
 pub fn register(tools: &mut crate::tools::Registry, skills: Vec<Skill>, home: &Path, cwd: &Path) {
     tools.remove_names(&["skill".to_string(), "install_skill".to_string()]);
     tools.set_skills(skills.clone());
-    tools.add(Box::new(SkillTool { skills, reload: Some((home.to_path_buf(), cwd.to_path_buf())) }));
-    tools.add(Box::new(crate::skill_install::InstallSkill { home: home.to_path_buf() }));
+    tools.add(Box::new(SkillTool {
+        skills,
+        reload: Some((home.to_path_buf(), cwd.to_path_buf())),
+    }));
+    tools.add(Box::new(crate::skill_install::InstallSkill {
+        home: home.to_path_buf(),
+    }));
 }
 
 struct SkillTool {
@@ -394,9 +469,15 @@ impl SkillTool {
             .collect();
         if close.is_empty() {
             let all: Vec<&str> = self.skills.iter().take(30).map(|s| s.id.as_str()).collect();
-            format!("Unknown skill \"{name}\". Available skills: {}", all.join(", "))
+            format!(
+                "Unknown skill \"{name}\". Available skills: {}",
+                all.join(", ")
+            )
         } else {
-            format!("Unknown skill \"{name}\". Did you mean: {}?", close.join(", "))
+            format!(
+                "Unknown skill \"{name}\". Did you mean: {}?",
+                close.join(", ")
+            )
         }
     }
 }
@@ -407,7 +488,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
     for (i, ca) in a.chars().enumerate() {
         let mut cur = vec![i + 1];
         for (j, cb) in b.iter().enumerate() {
-            cur.push((prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
+            cur.push(
+                (prev[j] + usize::from(ca != *cb))
+                    .min(prev[j + 1] + 1)
+                    .min(cur[j] + 1),
+            );
         }
         prev = cur;
     }
@@ -418,7 +503,9 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// hidden entries. Returns at most `max` plus the total count.
 pub(crate) fn skill_files(dir: &Path, max: usize) -> (Vec<String>, usize) {
     fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if entry.file_name().to_string_lossy().starts_with('.') {
@@ -459,7 +546,10 @@ pub fn load_text(skill: &Skill) -> Result<String, String> {
 /// Errors when it is over `skill_file_bytes`.
 fn document(skill: &Skill, resource: Option<&str>) -> Result<(String, bool), String> {
     let (text, what) = match resource {
-        Some(rel) => (read_resource(skill, rel)?, format!("resource `{rel}` of skill {}", skill.id)),
+        Some(rel) => (
+            read_resource(skill, rel)?,
+            format!("resource `{rel}` of skill {}", skill.id),
+        ),
         None => (skill_md(skill)?, format!("skill {}", skill.id)),
     };
     if let Some(max) = crate::limits::get("skill_file_bytes").filter(|max| text.len() > *max) {
@@ -485,7 +575,12 @@ fn skill_md(skill: &Skill) -> Result<String, String> {
         Err(e) => return Err(format!("reading {}: {e}", slash_path(&skill.path))),
     };
     let (_, body) = split_frontmatter(&text);
-    let mut out = format!("Skill: {}\nBase directory: {}\n\n{}\n", skill.name, slash_path(&skill.dir), body.trim());
+    let mut out = format!(
+        "Skill: {}\nBase directory: {}\n\n{}\n",
+        skill.name,
+        slash_path(&skill.dir),
+        body.trim()
+    );
     let (files, total) = skill_files(&skill.dir, MAX_LISTED_FILES);
     if !files.is_empty() {
         out.push_str("\nOther files in this skill (relative to the base directory; read one with the `skill` tool's `resource`):\n");
@@ -504,7 +599,12 @@ fn skill_md(skill: &Skill) -> Result<String, String> {
 /// the skill directory (a link as the file itself is refused).
 fn read_resource(skill: &Skill, rel: &str) -> Result<String, String> {
     use std::path::Component;
-    let invalid = |why: &str| Err(format!("Invalid resource path `{rel}` for skill {}: {why}.", skill.id));
+    let invalid = |why: &str| {
+        Err(format!(
+            "Invalid resource path `{rel}` for skill {}: {why}.",
+            skill.id
+        ))
+    };
     let path = Path::new(rel);
     if path.is_absolute() || rel.starts_with(['/', '\\']) {
         return invalid("use a path relative to the skill directory");
@@ -519,9 +619,13 @@ fn read_resource(skill: &Skill, rel: &str) -> Result<String, String> {
     }
     // The skill directory itself must still be where discovery found it.
     let dir = std::fs::canonicalize(&skill.dir).map_err(|e| format!("skill {}: {e}", skill.id))?;
-    let root = std::fs::canonicalize(&skill.root).map_err(|e| format!("skill {}: {e}", skill.id))?;
+    let root =
+        std::fs::canonicalize(&skill.root).map_err(|e| format!("skill {}: {e}", skill.id))?;
     if !dir.starts_with(&root) {
-        return Err(format!("skill {}: its directory left its skill root", skill.id));
+        return Err(format!(
+            "skill {}: its directory left its skill root",
+            skill.id
+        ));
     }
     let full = dir.join(path);
     if std::fs::symlink_metadata(&full).is_err() {
@@ -530,12 +634,20 @@ fn read_resource(skill: &Skill, rel: &str) -> Result<String, String> {
             skill.id
         ));
     }
-    let binary = || format!("Resource `{rel}` of skill {} is a binary file; only text resources can be loaded.", skill.id);
+    let binary = || {
+        format!(
+            "Resource `{rel}` of skill {} is a binary file; only text resources can be loaded.",
+            skill.id
+        )
+    };
     match crate::tools::read_rooted_text(&dir, &full) {
         Ok(text) if text.contains('\0') => Err(binary()),
         Ok(text) => Ok(text),
         Err(e) if e == "not UTF-8 text" => Err(binary()),
-        Err(e) => Err(format!("reading resource `{rel}` of skill {}: {e}", skill.id)),
+        Err(e) => Err(format!(
+            "reading resource `{rel}` of skill {}: {e}",
+            skill.id
+        )),
     }
 }
 
@@ -586,7 +698,11 @@ impl Tool for SkillTool {
 
     fn summary(&self, args: &Value) -> String {
         let name = args["name"].as_str().unwrap_or_default();
-        match args["resource"].as_str().map(str::trim).filter(|r| !r.is_empty()) {
+        match args["resource"]
+            .as_str()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
             Some(resource) => format!("{name} {resource}"),
             None => name.to_string(),
         }
@@ -624,7 +740,9 @@ impl Tool for SkillTool {
         let (part, next) = chunk(&text, offset, crate::limits::get("skill_chunk_bytes"));
         let mut out = part.to_string();
         if next < text.len() {
-            let resource = resource.map(|r| format!(", resource \"{r}\"")).unwrap_or_default();
+            let resource = resource
+                .map(|r| format!(", resource \"{r}\""))
+                .unwrap_or_default();
             out.push_str(&format!(
                 "\n<context_limit name=\"skill_chunk_bytes\" action=\"truncated\" observed_bytes=\"{}\" next_offset=\"{next}\" \
                  override=\"--context-limit skill_chunk_bytes=BYTES|off\" />\n\
@@ -657,21 +775,27 @@ mod tests {
 
     #[test]
     fn frontmatter_variants() {
-        let (m, body) = split_frontmatter("---\nname: \"pdf\"\ndescription: 'It''s great: \"yes\"'\n---\nhello\n");
+        let (m, body) = split_frontmatter(
+            "---\nname: \"pdf\"\ndescription: 'It''s great: \"yes\"'\n---\nhello\n",
+        );
         assert_eq!(m.name.as_deref(), Some("pdf"));
         assert_eq!(m.description.as_deref(), Some("It's great: \"yes\""));
         assert_eq!(body, "hello\n");
 
         let folded = "---\nname: x\ndescription: >-\n  first line\n  second line\n\n  para\nlicense: MIT\n---\nb";
         let (m, body) = split_frontmatter(folded);
-        assert_eq!(m.description.as_deref(), Some("first line second line\npara"));
+        assert_eq!(
+            m.description.as_deref(),
+            Some("first line second line\npara")
+        );
         assert_eq!(body, "b");
 
         let (m, _) = split_frontmatter("---\ndescription: |\n  a\n  b\n---\n");
         assert_eq!(m.description.as_deref(), Some("a\nb"));
         assert_eq!(m.name, None);
 
-        let (m, _) = split_frontmatter("---\r\nname: plain\r\ndescription: one\r\n  two\r\n---\r\nbody");
+        let (m, _) =
+            split_frontmatter("---\r\nname: plain\r\ndescription: one\r\n  two\r\n---\r\nbody");
         assert_eq!(m.name.as_deref(), Some("plain"));
         assert_eq!(m.description.as_deref(), Some("one two"));
 
@@ -679,28 +803,63 @@ mod tests {
         assert_eq!(m.description.as_deref(), Some("esc \"q\" \\ ok"));
 
         // No frontmatter / unterminated: whole text is the body.
-        assert_eq!(split_frontmatter("# just text"), (Meta::default(), "# just text"));
+        assert_eq!(
+            split_frontmatter("# just text"),
+            (Meta::default(), "# just text")
+        );
         assert_eq!(split_frontmatter("---\nname: x\n").1, "---\nname: x\n");
     }
 
     #[test]
     fn discovery_precedence_and_fallbacks() {
         let t = tempfile::tempdir().unwrap();
-        let (cwd, home, user) = (t.path().join("proj"), t.path().join("home"), t.path().join("user"));
-        write_skill(&cwd.join(".claude/skills"), "review", &md("review", "project review"));
-        write_skill(&cwd.join(".agents/skills"), "rev", &md("review", "agents review wins"));
+        let (cwd, home, user) = (
+            t.path().join("proj"),
+            t.path().join("home"),
+            t.path().join("user"),
+        );
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "review",
+            &md("review", "project review"),
+        );
+        write_skill(
+            &cwd.join(".agents/skills"),
+            "rev",
+            &md("review", "agents review wins"),
+        );
         write_skill(&home.join("skills"), "review", &md("review", "user review"));
         write_skill(&home.join("skills"), "deploy", &md("deploy", "ship it"));
-        write_skill(&user.join(".codex/skills"), "nodesc", "no frontmatter at all\n");
-        write_skill(&user.join(".claude/skills"), "deploy", &md("deploy", "shadowed"));
+        write_skill(
+            &user.join(".codex/skills"),
+            "nodesc",
+            "no frontmatter at all\n",
+        );
+        write_skill(
+            &user.join(".claude/skills"),
+            "deploy",
+            &md("deploy", "shadowed"),
+        );
         // Nested packs are not discovered (only one level is scanned).
-        write_skill(&cwd.join(".nyq/skills"), "pack/inner", &md("inner", "nested"));
+        write_skill(
+            &cwd.join(".nyq/skills"),
+            "pack/inner",
+            &md("inner", "nested"),
+        );
         fs::write(cwd.join(".nyq/skills/stray.md"), "not a dir").unwrap();
 
         // Workspace `skills/`, `.opencode/skills` and opencode's user root count too.
         write_skill(&cwd.join("skills"), "lint", &md("lint", "workspace lint"));
-        write_skill(&cwd.join(".opencode/skills"), "fmt", &md("fmt", "opencode fmt"));
-        write_skill(&user.join(".config/opencode/skills"), "doc", &md("doc", "user doc"));
+        write_skill(
+            &cwd.join(".opencode/skills"),
+            "fmt",
+            &md("fmt", "opencode fmt"),
+        );
+        write_skill(
+            &user.join(".config/opencode/skills"),
+            "doc",
+            &md("doc", "user doc"),
+        );
         // Malformed SKILL.md files are reported.
         write_skill(&cwd.join(".claude/skills"), "broken", "---\nname: broken\n");
 
@@ -732,24 +891,52 @@ mod tests {
         assert_eq!(get("review").dir, cwd.join(".agents/skills/rev"));
         assert_eq!(get("review").path, cwd.join(".agents/skills/rev/SKILL.md"));
         assert_eq!(get("review@.claude/skills").description, "project review");
-        assert_eq!(find_in(&skills, "review@.claude/skills").unwrap().description, "project review");
-        assert_eq!(find_in(&skills, "Review").unwrap().description, "agents review wins");
-        assert!(problems.iter().any(|p| p.contains("broken/SKILL.md") && p.contains("closing")), "{problems:?}");
-        assert!(problems.iter().any(|p| p.contains("nodesc/SKILL.md") && p.contains("description")), "{problems:?}");
-        assert!(!problems.iter().any(|p| p.contains("deploy")), "{problems:?}");
+        assert_eq!(
+            find_in(&skills, "review@.claude/skills")
+                .unwrap()
+                .description,
+            "project review"
+        );
+        assert_eq!(
+            find_in(&skills, "Review").unwrap().description,
+            "agents review wins"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("broken/SKILL.md") && p.contains("closing")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("nodesc/SKILL.md") && p.contains("description")),
+            "{problems:?}"
+        );
+        assert!(
+            !problems.iter().any(|p| p.contains("deploy")),
+            "{problems:?}"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn skill_files_must_stay_inside_their_root() {
         let t = tempfile::tempdir().unwrap();
-        write_skill(&t.path().join("store"), "linked", &md("linked", "via symlink"));
+        write_skill(
+            &t.path().join("store"),
+            "linked",
+            &md("linked", "via symlink"),
+        );
         let proj = t.path().join("proj");
         let root = proj.join(".claude/skills");
         fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(t.path().join("store/linked"), root.join("linked")).unwrap();
         let skills = discover_in(&roots(&t.path().join("home"), None, &proj)).0;
-        assert!(skills.is_empty(), "a skill directory symlink must not leave the project");
+        assert!(
+            skills.is_empty(),
+            "a skill directory symlink must not leave the project"
+        );
 
         write_skill(&root, "real", &md("real", "inside"));
         std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
@@ -759,7 +946,11 @@ mod tests {
 
         let evil = root.join("evil");
         fs::create_dir(&evil).unwrap();
-        std::os::unix::fs::symlink(t.path().join("store/linked/SKILL.md"), evil.join("SKILL.md")).unwrap();
+        std::os::unix::fs::symlink(
+            t.path().join("store/linked/SKILL.md"),
+            evil.join("SKILL.md"),
+        )
+        .unwrap();
         let skills = discover_in(&roots(&t.path().join("home"), None, &proj)).0;
         assert!(skills.iter().all(|s| s.name != "linked"));
         if Path::new("/dev/zero").exists() {
@@ -786,7 +977,9 @@ mod tests {
     #[test]
     fn prompt_section_caps() {
         assert_eq!(prompt_section(&[]), "");
-        let mut skills: Vec<Skill> = (0..105).map(|i| skill(&format!("s{i:03}"), "short")).collect();
+        let mut skills: Vec<Skill> = (0..105)
+            .map(|i| skill(&format!("s{i:03}"), "short"))
+            .collect();
         skills[0].description = "word ".repeat(100);
         skills[1].description = String::new();
         let p = prompt_section(&skills);
@@ -821,8 +1014,13 @@ mod tests {
         let out = tool.run(json!({"name": "pfd"}), &ToolCtx::default()).await;
         assert!(out.is_error);
         assert_eq!(out.content, "Unknown skill \"pfd\". Did you mean: pdf?");
-        let out = tool.run(json!({"name": "kubernetes-deploy"}), &ToolCtx::default()).await;
-        assert_eq!(out.content, "Unknown skill \"kubernetes-deploy\". Available skills: pdf");
+        let out = tool
+            .run(json!({"name": "kubernetes-deploy"}), &ToolCtx::default())
+            .await;
+        assert_eq!(
+            out.content,
+            "Unknown skill \"kubernetes-deploy\". Available skills: pdf"
+        );
         assert!(tool.run(json!({}), &ToolCtx::default()).await.is_error);
     }
 
@@ -832,7 +1030,11 @@ mod tests {
         // are listed once, as user skills.
         let t = tempfile::tempdir().unwrap();
         let user = t.path();
-        write_skill(&user.join(".claude/skills"), "review", &md("review", "claude review"));
+        write_skill(
+            &user.join(".claude/skills"),
+            "review",
+            &md("review", "claude review"),
+        );
         write_skill(&user.join(".nyq/skills"), "mine", &md("mine", "nyq skill"));
         let skills = discover_with(&user.join(".nyq"), Some(user), user);
         let ids: Vec<(&str, &str)> = skills.iter().map(|s| (s.id.as_str(), s.scope)).collect();
@@ -843,22 +1045,42 @@ mod tests {
     fn claw_roots_come_after_the_others() {
         let t = tempfile::tempdir().unwrap();
         let (cwd, user) = (t.path().join("proj"), t.path().join("user"));
-        write_skill(&cwd.join(".claw/skills"), "claw", &md("claw", "project claw"));
-        write_skill(&user.join(".claw/skills"), "uclaw", &md("uclaw", "user claw"));
+        write_skill(
+            &cwd.join(".claw/skills"),
+            "claw",
+            &md("claw", "project claw"),
+        );
+        write_skill(
+            &user.join(".claw/skills"),
+            "uclaw",
+            &md("uclaw", "user claw"),
+        );
         write_skill(&user.join(".claw/skills"), "dup", &md("dup", "shadowed"));
         write_skill(&cwd.join(".nyq/skills"), "dup", &md("dup", "nyq wins"));
         let skills = discover_with(&t.path().join("home"), Some(&user), &cwd);
-        let ids: Vec<(&str, &str)> = skills.iter().map(|s| (s.id.as_str(), s.location.as_str())).collect();
+        let ids: Vec<(&str, &str)> = skills
+            .iter()
+            .map(|s| (s.id.as_str(), s.location.as_str()))
+            .collect();
         assert_eq!(
             ids,
-            [("claw", ".claw/skills"), ("dup", ".nyq/skills"), ("dup@~/.claw/skills", "~/.claw/skills"), ("uclaw", "~/.claw/skills")]
+            [
+                ("claw", ".claw/skills"),
+                ("dup", ".nyq/skills"),
+                ("dup@~/.claw/skills", "~/.claw/skills"),
+                ("uclaw", "~/.claw/skills")
+            ]
         );
     }
 
     #[test]
     fn sanitize_strips_hidden_characters() {
-        assert_eq!(sanitize("plain\ttext\r\nnext\n"), ("plain\ttext\nnext\n".to_string(), false));
-        let (clean, changed) = sanitize("a\u{202e}b\u{2066}c\u{200b}d\u{7}e\u{feff}f\u{e0041}g\u{85}h");
+        assert_eq!(
+            sanitize("plain\ttext\r\nnext\n"),
+            ("plain\ttext\nnext\n".to_string(), false)
+        );
+        let (clean, changed) =
+            sanitize("a\u{202e}b\u{2066}c\u{200b}d\u{7}e\u{feff}f\u{e0041}g\u{85}h");
         assert_eq!(clean, "abcdefgh");
         assert!(changed);
         assert_eq!(sanitize("emoji 🎉 and é").0, "emoji 🎉 and é");
@@ -874,7 +1096,11 @@ mod tests {
         assert_eq!(chunk(text, 10, Some(8)), ("cccc", 14));
         let wide = "ééé";
         assert_eq!(chunk(wide, 0, Some(3)), ("é", 2));
-        assert_eq!(chunk(wide, 0, Some(1)), ("é", 2), "always at least one character");
+        assert_eq!(
+            chunk(wide, 0, Some(1)),
+            ("é", 2),
+            "always at least one character"
+        );
         assert_eq!(chunk(wide, 2, Some(4)), ("éé", 6));
     }
 
@@ -892,7 +1118,10 @@ mod tests {
         let line = format!("{}\n", "x".repeat(99));
         fs::write(root.join("pdf/big.md"), line.repeat(700)).unwrap();
         let skills = discover_in(&roots(&t.path().join("home"), None, &t.path().join("proj"))).0;
-        assert_eq!(skills[0].description, "PDF tools", "descriptions are sanitized");
+        assert_eq!(
+            skills[0].description, "PDF tools",
+            "descriptions are sanitized"
+        );
         let tool = tool(skills);
         let run = |args: Value| {
             let tool = &tool;
@@ -900,12 +1129,25 @@ mod tests {
         };
 
         let out = run(json!({"name": "pdf"})).await;
-        assert!(out.content.contains("read one with the `skill` tool's `resource`"), "{}", out.content);
+        assert!(
+            out.content
+                .contains("read one with the `skill` tool's `resource`"),
+            "{}",
+            out.content
+        );
         assert!(!out.content.contains("sanitized"));
         let out = run(json!({"name": "pdf", "resource": "docs/forms.md"})).await;
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(out.content, "Fill forms.\n\n[context] Skill content was sanitized before delivery.\n");
-        assert_eq!(run(json!({"name": "pdf", "resource": "./docs/forms.md"})).await.content, out.content);
+        assert_eq!(
+            out.content,
+            "Fill forms.\n\n[context] Skill content was sanitized before delivery.\n"
+        );
+        assert_eq!(
+            run(json!({"name": "pdf", "resource": "./docs/forms.md"}))
+                .await
+                .content,
+            out.content
+        );
         let same = run(json!({"name": "pdf", "resource": ""})).await;
         assert!(same.content.starts_with("Skill: pdf\n"));
 
@@ -920,7 +1162,11 @@ mod tests {
             ("docs", "not a regular file"),
         ] {
             let out = run(json!({"name": "pdf", "resource": resource})).await;
-            assert!(out.is_error && out.content.contains(expect), "{resource}: {}", out.content);
+            assert!(
+                out.is_error && out.content.contains(expect),
+                "{resource}: {}",
+                out.content
+            );
         }
         assert!(run(json!({"name": "pdf", "resource": 5})).await.is_error);
         assert!(run(json!({"name": "pdf", "offset": -1})).await.is_error);
@@ -935,17 +1181,36 @@ mod tests {
                 Some((part, marker)) => {
                     assert!(part.len() <= 32 * 1024);
                     assert!(marker.contains("name=\"skill_chunk_bytes\" action=\"truncated\" observed_bytes=\"70000\""), "{marker}");
-                    assert!(marker.contains("override=\"--context-limit skill_chunk_bytes=BYTES|off\""));
+                    assert!(
+                        marker.contains("override=\"--context-limit skill_chunk_bytes=BYTES|off\"")
+                    );
                     all.push_str(part);
-                    offset = marker.split("next_offset=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+                    offset = marker
+                        .split("next_offset=\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
                     assert_eq!(offset, all.len());
                 }
                 None => all.push_str(&out.content),
             }
         }
         assert_eq!(all, line.repeat(700));
-        assert!(run(json!({"name": "pdf", "resource": "big.md", "offset": 70_001})).await.is_error);
-        assert_eq!(run(json!({"name": "pdf", "resource": "big.md", "offset": 70_000})).await.content, "");
+        assert!(
+            run(json!({"name": "pdf", "resource": "big.md", "offset": 70_001}))
+                .await
+                .is_error
+        );
+        assert_eq!(
+            run(json!({"name": "pdf", "resource": "big.md", "offset": 70_000}))
+                .await
+                .content,
+            ""
+        );
     }
 
     #[cfg(unix)]
@@ -958,9 +1223,15 @@ mod tests {
         fs::write(root.join("other/notes.md"), "other notes").unwrap();
         std::os::unix::fs::symlink(root.join("other"), root.join("pdf/linked")).unwrap();
         std::os::unix::fs::symlink(root.join("other/notes.md"), root.join("pdf/notes.md")).unwrap();
-        let tool = tool(discover_in(&roots(&t.path().join("home"), None, &t.path().join("proj"))).0);
+        let tool =
+            tool(discover_in(&roots(&t.path().join("home"), None, &t.path().join("proj"))).0);
         for resource in ["linked/notes.md", "notes.md"] {
-            let out = tool.run(json!({"name": "pdf", "resource": resource}), &ToolCtx::default()).await;
+            let out = tool
+                .run(
+                    json!({"name": "pdf", "resource": resource}),
+                    &ToolCtx::default(),
+                )
+                .await;
             assert!(out.is_error, "{resource}: {}", out.content);
         }
     }

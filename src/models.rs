@@ -24,7 +24,10 @@ pub struct ModelChoice {
 /// Choices matching a search: those containing every word of `query` in
 /// `provider/model`; failing that, those whose model id contains the
 /// query's letters and digits in order (`gpt55` finds `gpt-5.5`).
-pub fn search<'a>(choices: impl IntoIterator<Item = &'a ModelChoice>, query: &str) -> Vec<&'a ModelChoice> {
+pub fn search<'a>(
+    choices: impl IntoIterator<Item = &'a ModelChoice>,
+    query: &str,
+) -> Vec<&'a ModelChoice> {
     let choices: Vec<&ModelChoice> = choices.into_iter().collect();
     let query = query.to_lowercase();
     let words: Vec<&str> = query.split_whitespace().collect();
@@ -59,7 +62,9 @@ pub struct ModelArgs {
     pub fast: Option<bool>,
 }
 
-const EFFORT_WORDS: [&str; 8] = ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_WORDS: [&str; 8] = [
+    "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+];
 
 pub fn parse_args(args: &[&str]) -> ModelArgs {
     let mut parsed = ModelArgs::default();
@@ -83,7 +88,9 @@ pub fn find<'a>(choices: &'a [ModelChoice], query: &str, provider: &str) -> Vec<
     let q = query.trim().to_lowercase();
     let exact: Vec<_> = choices
         .iter()
-        .filter(|c| c.model.to_lowercase() == q || format!("{}/{}", c.provider, c.model).to_lowercase() == q)
+        .filter(|c| {
+            c.model.to_lowercase() == q || format!("{}/{}", c.provider, c.model).to_lowercase() == q
+        })
         .collect();
     match exact.iter().find(|c| c.provider == provider) {
         Some(c) => vec![*c],
@@ -95,7 +102,11 @@ pub fn find<'a>(choices: &'a [ModelChoice], query: &str, provider: &str) -> Vec<
 /// Check a requested effort and fast mode against what `choice` offers.
 pub fn check_options(choice: &ModelChoice, effort: Option<&str>, fast: Option<bool>) -> Result<()> {
     if let Some(e) = effort.filter(|e| *e != "auto") {
-        anyhow::ensure!(!choice.efforts.is_empty(), "{} has no adjustable reasoning effort", choice.model);
+        anyhow::ensure!(
+            !choice.efforts.is_empty(),
+            "{} has no adjustable reasoning effort",
+            choice.model
+        );
         anyhow::ensure!(
             choice.efforts.iter().any(|x| x == e),
             "{} supports reasoning effort {} (not {e})",
@@ -117,7 +128,10 @@ pub fn check_options(choice: &ModelChoice, effort: Option<&str>, fast: Option<bo
 /// key are skipped silently; failures become short warnings.
 async fn hosted(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
     use crate::provider::hosted::{api_key, HostedProvider, Service};
-    let configured: Vec<_> = Service::ALL.into_iter().filter(|s| api_key(home, *s).is_some()).collect();
+    let configured: Vec<_> = Service::ALL
+        .into_iter()
+        .filter(|s| api_key(home, *s).is_some())
+        .collect();
     if configured.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -187,7 +201,11 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
         if !crate::provider::grok::has_session(home) {
             return Ok(Vec::new());
         }
-        let provider = GrokProvider::new(home.to_path_buf(), crate::provider::grok::DEFAULT_MODEL.into(), None);
+        let provider = GrokProvider::new(
+            home.to_path_buf(),
+            crate::provider::grok::DEFAULT_MODEL.into(),
+            None,
+        );
         tokio::time::timeout(std::time::Duration::from_secs(6), provider.list_models())
             .await
             .map_err(anyhow::Error::from)?
@@ -273,8 +291,12 @@ pub fn build(
                 "grok provider needs a Grok subscription sign-in"
             );
             Ok(Box::new(
-                GrokProvider::new(home.to_path_buf(), choice.model.clone(), effort.filter(|e| e != "auto"))
-                    .with_catalog(choice.efforts.clone(), choice.context_window),
+                GrokProvider::new(
+                    home.to_path_buf(),
+                    choice.model.clone(),
+                    effort.filter(|e| e != "auto"),
+                )
+                .with_catalog(choice.efforts.clone(), choice.context_window),
             ))
         }
         "ollama" => Ok(Box::new(OpenAiProvider::with_label(
@@ -292,12 +314,14 @@ pub fn build(
             )))
         }
         other => match crate::provider::hosted::Service::parse(other) {
-            Some(service) => Ok(Box::new(crate::provider::hosted::HostedProvider::configured(
-                home,
-                service,
-                choice.model.clone(),
-                effort,
-            )?)),
+            Some(service) => Ok(Box::new(
+                crate::provider::hosted::HostedProvider::configured(
+                    home,
+                    service,
+                    choice.model.clone(),
+                    effort,
+                )?,
+            )),
             None => Err(crate::config::unknown_provider(other)),
         },
     }
@@ -329,18 +353,50 @@ mod tests {
     use super::*;
 
     fn choice(provider: &str, model: &str, efforts: &[&str]) -> ModelChoice {
-        ModelChoice { provider: provider.into(), model: model.into(), efforts: efforts.iter().map(|e| e.to_string()).collect(), ..ModelChoice::default() }
+        ModelChoice {
+            provider: provider.into(),
+            model: model.into(),
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+            ..ModelChoice::default()
+        }
     }
 
     #[test]
     fn model_arguments() {
         let p = |a: &[&str]| parse_args(a);
-        assert_eq!(p(&["gpt-5.5"]), ModelArgs { query: "gpt-5.5".into(), ..ModelArgs::default() });
-        assert_eq!(p(&["gpt-5.5", "high", "fast"]), ModelArgs { query: "gpt-5.5".into(), effort: Some("high".into()), fast: Some(true) });
-        assert_eq!(p(&["claude", "sonnet", "Normal", "LOW"]), ModelArgs { query: "claude sonnet".into(), effort: Some("low".into()), fast: Some(false) });
+        assert_eq!(
+            p(&["gpt-5.5"]),
+            ModelArgs {
+                query: "gpt-5.5".into(),
+                ..ModelArgs::default()
+            }
+        );
+        assert_eq!(
+            p(&["gpt-5.5", "high", "fast"]),
+            ModelArgs {
+                query: "gpt-5.5".into(),
+                effort: Some("high".into()),
+                fast: Some(true)
+            }
+        );
+        assert_eq!(
+            p(&["claude", "sonnet", "Normal", "LOW"]),
+            ModelArgs {
+                query: "claude sonnet".into(),
+                effort: Some("low".into()),
+                fast: Some(false)
+            }
+        );
         // A lone word is always the query.
         assert_eq!(p(&["high"]).query, "high");
-        assert_eq!(p(&["fast", "fast"]), ModelArgs { query: "fast".into(), fast: Some(true), ..ModelArgs::default() });
+        assert_eq!(
+            p(&["fast", "fast"]),
+            ModelArgs {
+                query: "fast".into(),
+                fast: Some(true),
+                ..ModelArgs::default()
+            }
+        );
     }
 
     #[test]
@@ -352,16 +408,33 @@ mod tests {
             choice("opencode", "claude-sonnet-5", &[]),
             choice("opencode", "claude-opus-5", &[]),
         ];
-        let ids = |found: Vec<&ModelChoice>| found.iter().map(|c| format!("{}/{}", c.provider, c.model)).collect::<Vec<_>>();
+        let ids = |found: Vec<&ModelChoice>| {
+            found
+                .iter()
+                .map(|c| format!("{}/{}", c.provider, c.model))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(ids(find(&all, "GPT-5.5", "openai")), ["openai/gpt-5.5"]);
-        assert_eq!(ids(find(&all, "gpt-5.5", "opencode")), ["codex/gpt-5.5", "openai/gpt-5.5"]);
-        assert_eq!(ids(find(&all, "codex/gpt-5.5", "openai")), ["codex/gpt-5.5"]);
-        assert_eq!(ids(find(&all, "sonnet", "codex")), ["opencode/claude-sonnet-5"]);
+        assert_eq!(
+            ids(find(&all, "gpt-5.5", "opencode")),
+            ["codex/gpt-5.5", "openai/gpt-5.5"]
+        );
+        assert_eq!(
+            ids(find(&all, "codex/gpt-5.5", "openai")),
+            ["codex/gpt-5.5"]
+        );
+        assert_eq!(
+            ids(find(&all, "sonnet", "codex")),
+            ["opencode/claude-sonnet-5"]
+        );
         assert_eq!(ids(find(&all, "claude 5", "codex")).len(), 2);
         assert_eq!(ids(find(&all, "mini", "codex")), ["codex/gpt-5.5-mini"]);
         // Letters in order when no word matches.
         assert_eq!(ids(find(&all, "clop", "codex")), ["opencode/claude-opus-5"]);
-        assert_eq!(ids(find(&all, "gpt55mini", "codex")), ["codex/gpt-5.5-mini"]);
+        assert_eq!(
+            ids(find(&all, "gpt55mini", "codex")),
+            ["codex/gpt-5.5-mini"]
+        );
         assert!(find(&all, "llama", "codex").is_empty());
         assert_eq!(search(&all, "").len(), all.len());
     }
@@ -371,12 +444,27 @@ mod tests {
         let gpt = choice("codex", "gpt-options-test", &["low", "high"]);
         assert!(check_options(&gpt, Some("high"), Some(false)).is_ok());
         assert!(check_options(&gpt, Some("auto"), None).is_ok());
-        let err = check_options(&gpt, Some("xhigh"), None).unwrap_err().to_string();
-        assert_eq!(err, "gpt-options-test supports reasoning effort low, high (not xhigh)");
+        let err = check_options(&gpt, Some("xhigh"), None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "gpt-options-test supports reasoning effort low, high (not xhigh)"
+        );
         let bare = choice("ollama", "qwen", &[]);
-        assert!(check_options(&bare, Some("low"), None).unwrap_err().to_string().contains("no adjustable"));
-        assert!(check_options(&gpt, None, Some(true)).unwrap_err().to_string().contains("does not offer fast mode"));
-        crate::provider::remember_listing("codex", vec!["gpt-options-test".into()], vec!["gpt-options-test".into()]);
+        assert!(check_options(&bare, Some("low"), None)
+            .unwrap_err()
+            .to_string()
+            .contains("no adjustable"));
+        assert!(check_options(&gpt, None, Some(true))
+            .unwrap_err()
+            .to_string()
+            .contains("does not offer fast mode"));
+        crate::provider::remember_listing(
+            "codex",
+            vec!["gpt-options-test".into()],
+            vec!["gpt-options-test".into()],
+        );
         assert!(check_options(&gpt, None, Some(true)).is_ok());
     }
 
@@ -389,9 +477,16 @@ mod tests {
     #[test]
     fn unknown_saved_provider_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let choice = ModelChoice { provider: "vercel".into(), model: "m".into(), ..Default::default() };
+        let choice = ModelChoice {
+            provider: "vercel".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
         let err = build(dir.path(), &choice, None).err().unwrap().to_string();
-        assert!(err.starts_with("unknown provider `vercel`") && err.contains("nyq provider NAME"), "{err}");
+        assert!(
+            err.starts_with("unknown provider `vercel`") && err.contains("nyq provider NAME"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -417,10 +512,7 @@ mod tests {
         );
         save_last(dir.path(), &choice, None).unwrap();
         assert!(read()["effort"].is_null());
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            1
-        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         let invalid = ModelChoice {
             provider: "unknown".into(),
             ..choice

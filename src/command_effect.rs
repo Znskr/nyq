@@ -84,7 +84,13 @@ pub(crate) fn lex(cmd: &str) -> Option<Vec<Token>> {
                 if let Some(&next) = chars.peek() {
                     let pair = matches!(
                         (c, next),
-                        ('&', '&') | ('|', '|') | ('|', '&') | (';', ';') | ('>', '>' | '&' | '|') | ('<', '<' | '&' | '>') | ('&', '>')
+                        ('&', '&')
+                            | ('|', '|')
+                            | ('|', '&')
+                            | (';', ';')
+                            | ('>', '>' | '&' | '|')
+                            | ('<', '<' | '&' | '>')
+                            | ('&', '>')
                     );
                     if pair {
                         op.push(next);
@@ -98,7 +104,9 @@ pub(crate) fn lex(cmd: &str) -> Option<Vec<Token>> {
             _ => {
                 let starts = word.is_none();
                 let w = word.get_or_insert_with(empty);
-                if matches!(c, '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}') || (starts && c == '~') {
+                if matches!(c, '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}')
+                    || (starts && c == '~')
+                {
                     w.dynamic = true;
                 }
                 w.text.push(c);
@@ -156,9 +164,8 @@ pub fn read_only(cmd: &str, cwd: &Path, extra: &[PathBuf]) -> Option<String> {
         return None;
     }
     let secrets = crate::tools::SecretRoots::load();
-    let ok_path = |p: &str| {
-        crate::agent::inside_any(cwd, extra, p) && !secrets.blocks_path(&cwd.join(p))
-    };
+    let ok_path =
+        |p: &str| crate::agent::inside_any(cwd, extra, p) && !secrets.blocks_path(&cwd.join(p));
     let mut out = Vec::new();
     for words in &stages {
         if words.iter().any(|w| w.dynamic) {
@@ -174,7 +181,8 @@ pub fn read_only(cmd: &str, cwd: &Path, extra: &[PathBuf]) -> Option<String> {
 /// Shell-quote one word.
 fn quote(w: &str) -> String {
     let plain = !w.is_empty()
-        && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@,+%".contains(c));
+        && w.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@,+%".contains(c));
     if plain {
         w.to_string()
     } else {
@@ -197,7 +205,10 @@ fn read_only_stage(w: &[&str], ok_path: &dyn Fn(&str) -> bool) -> Option<Vec<Str
     // Operands after the options must all be paths inside the workspace.
     let paths = |ops: &[&str]| ops.iter().all(|p| ok_path(p));
     match program {
-        "pwd" => args.iter().all(|a| matches!(*a, "-L" | "-P")).then(|| owned(w)),
+        "pwd" => args
+            .iter()
+            .all(|a| matches!(*a, "-L" | "-P"))
+            .then(|| owned(w)),
         "echo" => Some(owned(w)),
         "printf" => (!args.first().is_some_and(|a| a.starts_with('-'))).then(|| owned(w)),
         "ls" | "cat" => {
@@ -207,7 +218,10 @@ fn read_only_stage(w: &[&str], ok_path: &dyn Fn(&str) -> bool) -> Option<Vec<Str
         "wc" => {
             let (_, ops) = split_options(args, |f| {
                 let short = !f.starts_with("--") && f[1..].chars().all(|c| "clmwL".contains(c));
-                let long = matches!(f, "--bytes" | "--chars" | "--lines" | "--words" | "--max-line-length");
+                let long = matches!(
+                    f,
+                    "--bytes" | "--chars" | "--lines" | "--words" | "--max-line-length"
+                );
                 if short || long {
                     BOOL
                 } else {
@@ -239,8 +253,13 @@ fn read_only_stage(w: &[&str], ok_path: &dyn Fn(&str) -> bool) -> Option<Vec<Str
         "grep" | "rg" => {
             let rg = program == "rg";
             let (patterns, ops) = split_options(args, |f| search_flag(rg, f))?;
-            let pattern_given = patterns || (rg && args.iter().any(|a| matches!(*a, "--files" | "--type-list")));
-            let files = if pattern_given { &ops[..] } else { ops.get(1..).unwrap_or(&[]) };
+            let pattern_given =
+                patterns || (rg && args.iter().any(|a| matches!(*a, "--files" | "--type-list")));
+            let files = if pattern_given {
+                &ops[..]
+            } else {
+                ops.get(1..).unwrap_or(&[])
+            };
             let ok = (pattern_given || !ops.is_empty()) && paths(files);
             ok.then(|| owned(w))
         }
@@ -257,7 +276,10 @@ const VALUE: Option<(bool, bool)> = Some((true, false));
 /// allowed: `Some((takes_next_word, supplies_pattern))`. Returns whether an
 /// option supplied a pattern (`-e`, `--regexp`), and the operands. `--` ends
 /// the options.
-fn split_options<'a>(args: &[&'a str], flag: impl Fn(&str) -> Option<(bool, bool)>) -> Option<(bool, Vec<&'a str>)> {
+fn split_options<'a>(
+    args: &[&'a str],
+    flag: impl Fn(&str) -> Option<(bool, bool)>,
+) -> Option<(bool, Vec<&'a str>)> {
     let mut ops = Vec::new();
     let mut pattern = false;
     let mut i = 0;
@@ -292,32 +314,110 @@ fn search_flag(rg: bool, f: &str) -> Option<(bool, bool)> {
         };
         let valued: &[&str] = if rg {
             &[
-                "glob", "iglob", "type", "type-not", "max-count", "after-context", "before-context", "context",
-                "max-depth", "replace", "regexp", "max-columns", "sort", "sortr", "color", "colors", "threads",
-                "encoding", "max-filesize",
+                "glob",
+                "iglob",
+                "type",
+                "type-not",
+                "max-count",
+                "after-context",
+                "before-context",
+                "context",
+                "max-depth",
+                "replace",
+                "regexp",
+                "max-columns",
+                "sort",
+                "sortr",
+                "color",
+                "colors",
+                "threads",
+                "encoding",
+                "max-filesize",
             ]
         } else {
             &[
-                "regexp", "max-count", "after-context", "before-context", "context", "include", "exclude",
-                "exclude-dir", "label", "binary-files", "group-separator",
+                "regexp",
+                "max-count",
+                "after-context",
+                "before-context",
+                "context",
+                "include",
+                "exclude",
+                "exclude-dir",
+                "label",
+                "binary-files",
+                "group-separator",
             ]
         };
         let boolean: &[&str] = if rg {
             &[
-                "hidden", "no-ignore", "no-ignore-vcs", "ignore-case", "smart-case", "case-sensitive",
-                "line-number", "no-line-number", "files", "files-with-matches", "files-without-match", "count",
-                "count-matches", "word-regexp", "line-regexp", "invert-match", "fixed-strings",
-                "with-filename", "no-filename", "only-matching", "multiline", "pcre2", "json", "vimgrep",
-                "no-heading", "heading", "trim", "stats", "type-list", "text", "null", "column", "no-messages",
-                "unrestricted", "quiet", "byte-offset", "no-config",
+                "hidden",
+                "no-ignore",
+                "no-ignore-vcs",
+                "ignore-case",
+                "smart-case",
+                "case-sensitive",
+                "line-number",
+                "no-line-number",
+                "files",
+                "files-with-matches",
+                "files-without-match",
+                "count",
+                "count-matches",
+                "word-regexp",
+                "line-regexp",
+                "invert-match",
+                "fixed-strings",
+                "with-filename",
+                "no-filename",
+                "only-matching",
+                "multiline",
+                "pcre2",
+                "json",
+                "vimgrep",
+                "no-heading",
+                "heading",
+                "trim",
+                "stats",
+                "type-list",
+                "text",
+                "null",
+                "column",
+                "no-messages",
+                "unrestricted",
+                "quiet",
+                "byte-offset",
+                "no-config",
             ]
         } else {
             &[
-                "extended-regexp", "fixed-strings", "basic-regexp", "perl-regexp", "ignore-case", "no-ignore-case",
-                "invert-match", "word-regexp", "line-regexp", "count", "files-with-matches",
-                "files-without-match", "line-number", "with-filename", "no-filename", "no-messages", "quiet",
-                "silent", "only-matching", "byte-offset", "recursive", "text", "null",
-                "null-data", "initial-tab", "color", "colour",
+                "extended-regexp",
+                "fixed-strings",
+                "basic-regexp",
+                "perl-regexp",
+                "ignore-case",
+                "no-ignore-case",
+                "invert-match",
+                "word-regexp",
+                "line-regexp",
+                "count",
+                "files-with-matches",
+                "files-without-match",
+                "line-number",
+                "with-filename",
+                "no-filename",
+                "no-messages",
+                "quiet",
+                "silent",
+                "only-matching",
+                "byte-offset",
+                "recursive",
+                "text",
+                "null",
+                "null-data",
+                "initial-tab",
+                "color",
+                "colour",
             ]
         };
         return if valued.contains(&name) {
@@ -349,20 +449,32 @@ fn search_flag(rg: bool, f: &str) -> Option<(bool, bool)> {
 
 /// Only reviewed options enter the read-only Git path. Unknown options ask.
 fn git_option(sub: &str, flag: &str) -> Option<(bool, bool)> {
-    let (name, value) = flag.split_once('=').map_or((flag, None), |(n, v)| (n, Some(v)));
+    let (name, value) = flag
+        .split_once('=')
+        .map_or((flag, None), |(n, v)| (n, Some(v)));
     let options = |booleans: &[&str], valued: &[&str]| {
         if valued.contains(&name) {
-            if value.is_some() { BOOL } else { VALUE }
+            if value.is_some() {
+                BOOL
+            } else {
+                VALUE
+            }
         } else if value.is_none() && booleans.contains(&name) {
             BOOL
         } else {
             None
         }
     };
-    if matches!(sub, "ls-files" | "branch" | "diff" | "log" | "show") && name == "--abbrev" && value.is_some_and(digits) {
+    if matches!(sub, "ls-files" | "branch" | "diff" | "log" | "show")
+        && name == "--abbrev"
+        && value.is_some_and(digits)
+    {
         return BOOL;
     }
-    if matches!(sub, "branch" | "diff" | "log" | "show") && name == "--color" && matches!(value, None | Some("always" | "auto" | "never")) {
+    if matches!(sub, "branch" | "diff" | "log" | "show")
+        && name == "--color"
+        && matches!(value, None | Some("always" | "auto" | "never"))
+    {
         return BOOL;
     }
     match sub {
@@ -370,17 +482,64 @@ fn git_option(sub: &str, flag: &str) -> Option<(bool, bool)> {
             if (name == "--porcelain" && matches!(value, Some("v1" | "v2" | "1" | "2")))
                 || (name == "--untracked-files" && matches!(value, Some("no" | "normal" | "all")))
                 || (name == "--ignored" && matches!(value, Some("traditional" | "matching" | "no")))
-                || (value.is_none() && flag.starts_with('-') && !flag.starts_with("--")
+                || (value.is_none()
+                    && flag.starts_with('-')
+                    && !flag.starts_with("--")
                     && flag[1..].chars().all(|c| "sbz".contains(c)))
             {
                 return BOOL;
             }
-            options(&["--short", "--branch", "--show-stash", "--porcelain", "--null", "--ignored",
-                "--no-renames", "--renames", "--ahead-behind", "--no-ahead-behind", "-uno", "-unormal", "-uall", "-v", "--verbose"], &[])
+            options(
+                &[
+                    "--short",
+                    "--branch",
+                    "--show-stash",
+                    "--porcelain",
+                    "--null",
+                    "--ignored",
+                    "--no-renames",
+                    "--renames",
+                    "--ahead-behind",
+                    "--no-ahead-behind",
+                    "-uno",
+                    "-unormal",
+                    "-uall",
+                    "-v",
+                    "--verbose",
+                ],
+                &[],
+            )
         }
-        "ls-files" => options(&["-c", "--cached", "-d", "--deleted", "-m", "--modified", "-o", "--others",
-            "-i", "--ignored", "--exclude-standard", "-s", "--stage", "-u", "--unmerged", "-k", "--killed",
-            "-t", "-v", "-f", "-z", "--full-name", "--error-unmatch", "--deduplicate", "--eol"], &["-x", "--exclude"]),
+        "ls-files" => options(
+            &[
+                "-c",
+                "--cached",
+                "-d",
+                "--deleted",
+                "-m",
+                "--modified",
+                "-o",
+                "--others",
+                "-i",
+                "--ignored",
+                "--exclude-standard",
+                "-s",
+                "--stage",
+                "-u",
+                "--unmerged",
+                "-k",
+                "--killed",
+                "-t",
+                "-v",
+                "-f",
+                "-z",
+                "--full-name",
+                "--error-unmatch",
+                "--deduplicate",
+                "--eol",
+            ],
+            &["-x", "--exclude"],
+        ),
         "rev-parse" => {
             if (name == "--short" && value.is_some_and(digits))
                 || (name == "--abbrev-ref" && matches!(value, Some("strict" | "loose")))
@@ -388,42 +547,194 @@ fn git_option(sub: &str, flag: &str) -> Option<(bool, bool)> {
             {
                 return BOOL;
             }
-            options(&["--show-toplevel", "--show-prefix", "--show-cdup", "--git-dir", "--absolute-git-dir",
-                "--git-common-dir", "--is-inside-work-tree", "--is-inside-git-dir", "--is-bare-repository",
-                "--verify", "--quiet", "-q", "--short", "--abbrev-ref", "--symbolic", "--symbolic-full-name",
-                "--all", "--branches", "--tags", "--remotes", "--not", "--no-revs", "--revs-only", "--no-flags",
-                "--flags", "--sq", "--local-env-vars", "--show-object-format", "--end-of-options"], &[])
+            options(
+                &[
+                    "--show-toplevel",
+                    "--show-prefix",
+                    "--show-cdup",
+                    "--git-dir",
+                    "--absolute-git-dir",
+                    "--git-common-dir",
+                    "--is-inside-work-tree",
+                    "--is-inside-git-dir",
+                    "--is-bare-repository",
+                    "--verify",
+                    "--quiet",
+                    "-q",
+                    "--short",
+                    "--abbrev-ref",
+                    "--symbolic",
+                    "--symbolic-full-name",
+                    "--all",
+                    "--branches",
+                    "--tags",
+                    "--remotes",
+                    "--not",
+                    "--no-revs",
+                    "--revs-only",
+                    "--no-flags",
+                    "--flags",
+                    "--sq",
+                    "--local-env-vars",
+                    "--show-object-format",
+                    "--end-of-options",
+                ],
+                &[],
+            )
         }
-        "branch" => options(&["-a", "-r", "-v", "-vv", "--list", "--all", "--remotes", "--verbose",
-            "--show-current", "-i", "--ignore-case", "--no-color", "--no-column", "--no-abbrev"],
-            &["--merged", "--no-merged", "--contains", "--no-contains", "--points-at", "--sort", "--format"]),
+        "branch" => options(
+            &[
+                "-a",
+                "-r",
+                "-v",
+                "-vv",
+                "--list",
+                "--all",
+                "--remotes",
+                "--verbose",
+                "--show-current",
+                "-i",
+                "--ignore-case",
+                "--no-color",
+                "--no-column",
+                "--no-abbrev",
+            ],
+            &[
+                "--merged",
+                "--no-merged",
+                "--contains",
+                "--no-contains",
+                "--points-at",
+                "--sort",
+                "--format",
+            ],
+        ),
         "diff" | "log" | "show" => {
-            if value.is_none() && (flag.strip_prefix("-U").is_some_and(digits)
-                || sub != "diff" && (flag.strip_prefix('-').is_some_and(digits) || flag.strip_prefix("-n").is_some_and(digits)))
+            if value.is_none()
+                && (flag.strip_prefix("-U").is_some_and(digits)
+                    || sub != "diff"
+                        && (flag.strip_prefix('-').is_some_and(digits)
+                            || flag.strip_prefix("-n").is_some_and(digits)))
             {
                 return BOOL;
             }
             if matches!(name, "--format" | "--pretty") && sub != "diff" {
                 // Signature format placeholders can start a verifier.
-                return value.filter(|v| matches!(*v, "oneline" | "short" | "medium" | "full" | "fuller" | "raw" | "email" | "mboxrd")).and(BOOL);
+                return value
+                    .filter(|v| {
+                        matches!(
+                            *v,
+                            "oneline"
+                                | "short"
+                                | "medium"
+                                | "full"
+                                | "fuller"
+                                | "raw"
+                                | "email"
+                                | "mboxrd"
+                        )
+                    })
+                    .and(BOOL);
             }
-            let common = options(&["-p", "--patch", "-s", "--no-patch", "-u", "--raw", "--patch-with-raw",
-                "--patch-with-stat", "--numstat", "--shortstat", "--stat", "--compact-summary", "--summary",
-                "--name-only", "--name-status", "--check", "--binary", "--full-index", "--no-abbrev", "--no-color",
-                "-z", "--exit-code", "--quiet", "--no-ext-diff", "--no-textconv", "--no-renames", "--minimal",
-                "-w", "--ignore-all-space", "-b", "--ignore-space-change", "--ignore-space-at-eol",
-                "--ignore-cr-at-eol", "--ignore-blank-lines", "--patience", "--histogram", "--no-prefix", "--relative"],
-                &["-U", "--unified", "--inter-hunk-context", "--stat-width", "--stat-name-width", "--stat-count",
-                    "-S", "-G", "--diff-filter", "--word-diff-regex"]);
+            let common = options(
+                &[
+                    "-p",
+                    "--patch",
+                    "-s",
+                    "--no-patch",
+                    "-u",
+                    "--raw",
+                    "--patch-with-raw",
+                    "--patch-with-stat",
+                    "--numstat",
+                    "--shortstat",
+                    "--stat",
+                    "--compact-summary",
+                    "--summary",
+                    "--name-only",
+                    "--name-status",
+                    "--check",
+                    "--binary",
+                    "--full-index",
+                    "--no-abbrev",
+                    "--no-color",
+                    "-z",
+                    "--exit-code",
+                    "--quiet",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    "--minimal",
+                    "-w",
+                    "--ignore-all-space",
+                    "-b",
+                    "--ignore-space-change",
+                    "--ignore-space-at-eol",
+                    "--ignore-cr-at-eol",
+                    "--ignore-blank-lines",
+                    "--patience",
+                    "--histogram",
+                    "--no-prefix",
+                    "--relative",
+                ],
+                &[
+                    "-U",
+                    "--unified",
+                    "--inter-hunk-context",
+                    "--stat-width",
+                    "--stat-name-width",
+                    "--stat-count",
+                    "-S",
+                    "-G",
+                    "--diff-filter",
+                    "--word-diff-regex",
+                ],
+            );
             common.or_else(|| {
                 if sub == "diff" {
                     options(&["--cached", "--staged"], &[])
                 } else {
-                    options(&["--oneline", "--decorate", "--no-decorate", "--all", "--branches", "--tags", "--remotes",
-                        "--graph", "--first-parent", "--no-merges", "--merges", "--reverse", "--topo-order", "--date-order",
-                        "--author-date-order", "--follow", "--no-walk", "--walk-reflogs", "--parents", "--children",
-                        "--boundary", "--left-right", "--cherry-pick", "--cherry-mark"],
-                        &["-n", "--max-count", "--skip", "--author", "--committer", "--grep", "--since", "--until", "--after", "--before", "--date"])
+                    options(
+                        &[
+                            "--oneline",
+                            "--decorate",
+                            "--no-decorate",
+                            "--all",
+                            "--branches",
+                            "--tags",
+                            "--remotes",
+                            "--graph",
+                            "--first-parent",
+                            "--no-merges",
+                            "--merges",
+                            "--reverse",
+                            "--topo-order",
+                            "--date-order",
+                            "--author-date-order",
+                            "--follow",
+                            "--no-walk",
+                            "--walk-reflogs",
+                            "--parents",
+                            "--children",
+                            "--boundary",
+                            "--left-right",
+                            "--cherry-pick",
+                            "--cherry-mark",
+                        ],
+                        &[
+                            "-n",
+                            "--max-count",
+                            "--skip",
+                            "--author",
+                            "--committer",
+                            "--grep",
+                            "--since",
+                            "--until",
+                            "--after",
+                            "--before",
+                            "--date",
+                        ],
+                    )
                 }
             })
         }
@@ -466,7 +777,13 @@ fn git_stage(args: &[&str], paths: &dyn Fn(&[&str]) -> bool) -> Option<Vec<Strin
         _ => args,
     };
     let (&sub, rest) = args.split_first()?;
-    let has = |names: &[&str]| rest.iter().any(|a| names.iter().any(|n| a == n || a.strip_prefix(n).is_some_and(|r| r.starts_with('='))));
+    let has = |names: &[&str]| {
+        rest.iter().any(|a| {
+            names
+                .iter()
+                .any(|n| a == n || a.strip_prefix(n).is_some_and(|r| r.starts_with('=')))
+        })
+    };
     let mut extra: &[&str] = &[];
     let ok = match sub {
         "status" | "ls-files" | "rev-parse" | "diff" | "log" | "show" | "branch" => {
@@ -476,14 +793,28 @@ fn git_stage(args: &[&str], paths: &dyn Fn(&[&str]) -> bool) -> Option<Vec<Strin
             }
             if sub == "branch" {
                 // Bare operands create branches unless listing was requested.
-                ops.is_empty() || has(&["--list", "--merged", "--no-merged", "--contains", "--no-contains", "--points-at"])
+                ops.is_empty()
+                    || has(&[
+                        "--list",
+                        "--merged",
+                        "--no-merged",
+                        "--contains",
+                        "--no-contains",
+                        "--points-at",
+                    ])
             } else {
                 paths(&ops)
             }
         }
-        "remote" => matches!(rest, [] | ["-v"] | ["--verbose"]) || matches!(rest, ["get-url", name] if !is_flag(name)),
+        "remote" => {
+            matches!(rest, [] | ["-v"] | ["--verbose"])
+                || matches!(rest, ["get-url", name] if !is_flag(name))
+        }
         "worktree" => {
-            matches!(rest.first(), Some(&"list")) && rest[1..].iter().all(|a| matches!(*a, "--porcelain" | "-v" | "--verbose" | "-z"))
+            matches!(rest.first(), Some(&"list"))
+                && rest[1..]
+                    .iter()
+                    .all(|a| matches!(*a, "--porcelain" | "-v" | "--verbose" | "-z"))
         }
         _ => false,
     };
@@ -526,38 +857,66 @@ pub fn known_reversible(cmd: &str, cwd: &Path, extra: &[PathBuf]) -> bool {
 }
 
 const VERSIONED: &[&str] = &[
-    "node", "npm", "pnpm", "bun", "yarn", "deno", "cargo", "rustc", "rustup", "git", "python", "python3", "go",
-    "java", "javac", "make", "cmake", "gcc", "clang", "tsc",
+    "node", "npm", "pnpm", "bun", "yarn", "deno", "cargo", "rustc", "rustup", "git", "python",
+    "python3", "go", "java", "javac", "make", "cmake", "gcc", "clang", "tsc",
 ];
 
 fn reversible_stage(w: &[&str]) -> bool {
     let Some((&program, args)) = w.split_first() else {
         return false;
     };
-    if matches!(args, ["--version"]) || (matches!(args, ["-v"]) && matches!(program, "node" | "npm" | "pnpm" | "bun")) {
+    if matches!(args, ["--version"])
+        || (matches!(args, ["-v"]) && matches!(program, "node" | "npm" | "pnpm" | "bun"))
+    {
         return VERSIONED.contains(&program);
     }
     match (program, args) {
         ("git", ["remote", "-v"]) => true,
-        ("git", ["worktree", "list", rest @ ..]) => rest.iter().all(|a| matches!(*a, "--porcelain" | "-v" | "--verbose")),
+        ("git", ["worktree", "list", rest @ ..]) => rest
+            .iter()
+            .all(|a| matches!(*a, "--porcelain" | "-v" | "--verbose")),
         ("git", ["fetch", rest @ ..]) => rest.iter().all(|a| {
-            matches!(*a, "--all" | "--tags" | "--no-tags" | "-q" | "--quiet" | "-v" | "--verbose" | "--dry-run")
-                || a.strip_prefix("--depth=").is_some_and(digits)
+            matches!(
+                *a,
+                "--all"
+                    | "--tags"
+                    | "--no-tags"
+                    | "-q"
+                    | "--quiet"
+                    | "-v"
+                    | "--verbose"
+                    | "--dry-run"
+            ) || a.strip_prefix("--depth=").is_some_and(digits)
                 || (!is_flag(a) && !a.contains("::"))
         }),
-        ("npm", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test" | "t") => !install_escapes(rest),
-        ("pnpm" | "bun", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test") => !install_escapes(rest),
-        ("npm" | "pnpm" | "bun", ["run", script, rest @ ..]) => !is_flag(script) && !install_escapes(rest),
+        ("npm", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test" | "t") => {
+            !install_escapes(rest)
+        }
+        ("pnpm" | "bun", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test") => {
+            !install_escapes(rest)
+        }
+        ("npm" | "pnpm" | "bun", ["run", script, rest @ ..]) => {
+            !is_flag(script) && !install_escapes(rest)
+        }
         ("cargo", [sub, rest @ ..]) => {
             let outside = rest.iter().any(|a| {
-                ["--config", "-Z", "--manifest-path", "--target-dir", "--out-dir", "--artifact-dir"]
-                    .iter()
-                    .any(|f| a == f || a.strip_prefix(f).is_some_and(|r| r.starts_with('=')))
+                [
+                    "--config",
+                    "-Z",
+                    "--manifest-path",
+                    "--target-dir",
+                    "--out-dir",
+                    "--artifact-dir",
+                ]
+                .iter()
+                .any(|f| a == f || a.strip_prefix(f).is_some_and(|r| r.starts_with('=')))
                     || a.starts_with("-Z")
             });
             !outside
-                && (matches!(*sub, "build" | "b" | "test" | "t" | "check" | "c" | "clippy")
-                    || (*sub == "fmt" && rest.contains(&"--check")))
+                && (matches!(
+                    *sub,
+                    "build" | "b" | "test" | "t" | "check" | "c" | "clippy"
+                ) || (*sub == "fmt" && rest.contains(&"--check")))
         }
         _ => false,
     }
@@ -607,7 +966,16 @@ mod tests {
 
     #[test]
     fn dynamic_extra_arguments_are_not_read_only() {
-        for arg in ["$'--short'", "$'\\x2d\\x2dshort'", "$\"--short\"", "$", "$FLAGS", "${FLAGS}", "`echo --short`", "$(echo --short)"] {
+        for arg in [
+            "$'--short'",
+            "$'\\x2d\\x2dshort'",
+            "$\"--short\"",
+            "$",
+            "$FLAGS",
+            "${FLAGS}",
+            "`echo --short`",
+            "$(echo --short)",
+        ] {
             let cmd = format!("git status {arg}");
             assert!(ro(&cmd).is_none(), "{cmd}");
             assert!(!known_reversible(&cmd, &std::env::temp_dir(), &[]), "{cmd}");
@@ -627,12 +995,28 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(words("grep -n 'a b' \"c d\"|wc -l"), ["grep", "-n", "a b", "c d", "<|>", "wc", "-l"]);
-        assert_eq!(words("a&&b 2>&1;c"), ["a", "<&&>", "b", "2", "<>&>", "1", "<;>", "c"]);
-        assert_eq!(words("echo $HOME \"$x\" '$y' *.rs ~/a a~b"), ["echo", "$HOME!", "$x!", "$y", "*.rs!", "~/a!", "a~b"]);
+        assert_eq!(
+            words("grep -n 'a b' \"c d\"|wc -l"),
+            ["grep", "-n", "a b", "c d", "<|>", "wc", "-l"]
+        );
+        assert_eq!(
+            words("a&&b 2>&1;c"),
+            ["a", "<&&>", "b", "2", "<>&>", "1", "<;>", "c"]
+        );
+        assert_eq!(
+            words("echo $HOME \"$x\" '$y' *.rs ~/a a~b"),
+            ["echo", "$HOME!", "$x!", "$y", "*.rs!", "~/a!", "a~b"]
+        );
         assert_eq!(words("echo it''s"), ["echo", "its"]);
         assert_eq!(words("printf '%s\\n' a"), ["printf", "%s\\n", "a"]);
-        for bad in ["echo 'open", "echo \"open", "a\\ b", "echo \"a\\\"\"", "ls\nrm x", "ls # c"] {
+        for bad in [
+            "echo 'open",
+            "echo \"open",
+            "a\\ b",
+            "echo \"a\\\"\"",
+            "ls\nrm x",
+            "ls # c",
+        ] {
             assert!(lex(bad).is_none(), "{bad:?}");
         }
     }
@@ -672,30 +1056,64 @@ mod tests {
     #[test]
     fn git_options_must_be_known_safe_for_the_subcommand() {
         for cmd in [
-            "git status --short", "git status -sb", "git status --porcelain=v2",
-            "git log --oneline -n 5", "git log -n5", "git log -5 --all --graph",
+            "git status --short",
+            "git status -sb",
+            "git status --porcelain=v2",
+            "git log --oneline -n 5",
+            "git log -n5",
+            "git log -5 --all --graph",
             "git log --author someone --since=yesterday --pretty=short",
-            "git diff --stat HEAD~1", "git diff --cached --name-only", "git diff -U5 -- src",
-            "git show HEAD:path", "git show --stat HEAD", "git ls-files --stage",
-            "git rev-parse --abbrev-ref HEAD", "git rev-parse --short=8 HEAD",
-            "git branch --list 'topic*'", "git branch -a", "git branch --contains HEAD",
-            "git remote -v", "git worktree list --porcelain",
+            "git diff --stat HEAD~1",
+            "git diff --cached --name-only",
+            "git diff -U5 -- src",
+            "git show HEAD:path",
+            "git show --stat HEAD",
+            "git ls-files --stage",
+            "git rev-parse --abbrev-ref HEAD",
+            "git rev-parse --short=8 HEAD",
+            "git branch --list 'topic*'",
+            "git branch -a",
+            "git branch --contains HEAD",
+            "git remote -v",
+            "git worktree list --porcelain",
         ] {
             assert!(ro(cmd).is_some(), "{cmd}");
             assert!(known_reversible(cmd, &std::env::temp_dir(), &[]), "{cmd}");
         }
         for cmd in [
-            "git status --future-option", "git log --future-option", "git diff --future-option",
-            "git show --future-option", "git ls-files --future-option", "git rev-parse --future-option",
-            "git branch --list --future-option", "git remote -v --future-option", "git worktree list --future-option",
-            "git log --output=out", "git log --output out", "git diff --output=out", "git show --output=out",
-            "git log --ext-diff", "git show --textconv", "git diff --no-index a b", "git log -Oorder",
-            "git log --show-signature", "git show --format=%G?", "git log --pretty=format:%GG",
-            "git ls-files --exclude-from=/etc/passwd", "git rev-parse --resolve-git-dir /etc",
-            "git diff -U --output=out", "git diff --unified --output=out",
-            "git log --author -- --output=out", "git branch --contains --edit-description",
-            "git branch --edit-description", "git branch new", "git remote update", "git worktree repair",
-            "git status --oneline", "git diff --max-count=5", "git branch --list --output=out",
+            "git status --future-option",
+            "git log --future-option",
+            "git diff --future-option",
+            "git show --future-option",
+            "git ls-files --future-option",
+            "git rev-parse --future-option",
+            "git branch --list --future-option",
+            "git remote -v --future-option",
+            "git worktree list --future-option",
+            "git log --output=out",
+            "git log --output out",
+            "git diff --output=out",
+            "git show --output=out",
+            "git log --ext-diff",
+            "git show --textconv",
+            "git diff --no-index a b",
+            "git log -Oorder",
+            "git log --show-signature",
+            "git show --format=%G?",
+            "git log --pretty=format:%GG",
+            "git ls-files --exclude-from=/etc/passwd",
+            "git rev-parse --resolve-git-dir /etc",
+            "git diff -U --output=out",
+            "git diff --unified --output=out",
+            "git log --author -- --output=out",
+            "git branch --contains --edit-description",
+            "git branch --edit-description",
+            "git branch new",
+            "git remote update",
+            "git worktree repair",
+            "git status --oneline",
+            "git diff --max-count=5",
+            "git branch --list --output=out",
         ] {
             assert!(ro(cmd).is_none(), "{cmd}");
             assert!(!known_reversible(cmd, &std::env::temp_dir(), &[]), "{cmd}");
@@ -749,17 +1167,24 @@ mod tests {
         ] {
             assert!(ro(cmd).is_none(), "{cmd:?}");
         }
-        assert!(ro("echo 1 | echo 2 | echo 3 | echo 4 | echo 5 | echo 6 | echo 7 | echo 8").is_some());
+        assert!(
+            ro("echo 1 | echo 2 | echo 3 | echo 4 | echo 5 | echo 6 | echo 7 | echo 8").is_some()
+        );
     }
 
     #[test]
     fn the_command_that_runs_is_rebuilt_and_hardened() {
-        assert_eq!(ro("grep -n \"it's here\" a.txt").unwrap(), "grep -n 'it'\\''s here' a.txt");
+        assert_eq!(
+            ro("grep -n \"it's here\" a.txt").unwrap(),
+            "grep -n 'it'\\''s here' a.txt"
+        );
         assert_eq!(
             ro("git diff --stat").unwrap(),
             "git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null -c log.showSignature=false diff --no-ext-diff --no-textconv --stat"
         );
-        assert!(ro("git status | head -n 3").unwrap().ends_with("status | head -n 3"));
+        assert!(ro("git status | head -n 3")
+            .unwrap()
+            .ends_with("status | head -n 3"));
     }
 
     #[test]

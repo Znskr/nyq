@@ -31,19 +31,31 @@ pub fn load(home: &Path) -> Result<Vec<String>, String> {
         Err(e) => return Err(format!("memory store could not be read: {e}")),
     };
     if !meta.is_file() {
-        return Err(format!("memory store {} is not a regular file", path.display()));
+        return Err(format!(
+            "memory store {} is not a regular file",
+            path.display()
+        ));
     }
     if meta.len() > MAX_STORE_BYTES {
-        return Err(format!("memory store {} exceeds the 1 MiB limit; it was not modified", path.display()));
+        return Err(format!(
+            "memory store {} exceeds the 1 MiB limit; it was not modified",
+            path.display()
+        ));
     }
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("memory store could not be read: {e}"))?;
-    serde_json::from_str::<Vec<String>>(&text)
-        .map_err(|_| format!("memory store {} is malformed (expected a JSON array of strings); it was not modified", path.display()))
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("memory store could not be read: {e}"))?;
+    serde_json::from_str::<Vec<String>>(&text).map_err(|_| {
+        format!(
+            "memory store {} is malformed (expected a JSON array of strings); it was not modified",
+            path.display()
+        )
+    })
 }
 
 fn save(home: &Path, facts: &[String]) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(facts).map_err(|e| e.to_string())?;
-    crate::session::write_private(&path(home), &bytes).map_err(|e| format!("could not save memory: {e}"))
+    crate::session::write_private(&path(home), &bytes)
+        .map_err(|e| format!("could not save memory: {e}"))
 }
 
 /// Add `fact` unless it is already saved. Returns whether it was new.
@@ -71,7 +83,10 @@ pub fn remove(home: &Path, which: &str) -> Result<String, String> {
     let index = match which.trim_start_matches('#').parse::<usize>() {
         Ok(n) if (1..=facts.len()).contains(&n) => n - 1,
         Ok(n) => return Err(format!("no memory #{n} (there are {})", facts.len())),
-        Err(_) => facts.iter().position(|f| f == which).ok_or_else(|| format!("no saved memory matches \"{which}\""))?,
+        Err(_) => facts
+            .iter()
+            .position(|f| f == which)
+            .ok_or_else(|| format!("no saved memory matches \"{which}\""))?,
     };
     let removed = facts.remove(index);
     save(home, &facts)?;
@@ -83,7 +98,11 @@ pub fn list_lines(facts: &[String]) -> Vec<String> {
     if facts.is_empty() {
         return vec!["No saved memories.".into()];
     }
-    facts.iter().enumerate().map(|(i, f)| format!("{:>3}. {}", i + 1, one_line(f))).collect()
+    facts
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{:>3}. {}", i + 1, one_line(f)))
+        .collect()
 }
 
 fn one_line(s: &str) -> String {
@@ -106,7 +125,10 @@ pub fn prompt_section(facts: &[String]) -> String {
         shown += 1;
     }
     if shown < facts.len() {
-        out.push_str(&format!("- ({} more; use the memory tool's list action to see them)\n", facts.len() - shown));
+        out.push_str(&format!(
+            "- ({} more; use the memory tool's list action to see them)\n",
+            facts.len() - shown
+        ));
     }
     out.truncate(out.trim_end().len());
     out
@@ -116,7 +138,9 @@ pub fn prompt_section(facts: &[String]) -> String {
 pub fn refresh_section(system: &mut String, home: &Path) {
     if let Some(start) = system.find(HEADER) {
         let body = start + HEADER.len();
-        let end = system[body..].find("\n\n").map_or(system.len(), |i| body + i);
+        let end = system[body..]
+            .find("\n\n")
+            .map_or(system.len(), |i| body + i);
         system.replace_range(start..end, "");
     }
     let facts = load(home).unwrap_or_default();
@@ -130,13 +154,15 @@ pub fn slash(home: &Path, args: &[&str], system: &mut String) {
             Ok(facts) => crate::ui::list(&list_lines(&facts)),
             Err(e) => crate::ui::error(&e),
         },
-        ["remove" | "rm" | "forget", rest @ ..] if !rest.is_empty() => match remove(home, &rest.join(" ")) {
-            Ok(fact) => {
-                refresh_section(system, home);
-                crate::ui::info(&format!("  Forgot: {}", one_line(&fact)));
+        ["remove" | "rm" | "forget", rest @ ..] if !rest.is_empty() => {
+            match remove(home, &rest.join(" ")) {
+                Ok(fact) => {
+                    refresh_section(system, home);
+                    crate::ui::info(&format!("  Forgot: {}", one_line(&fact)));
+                }
+                Err(e) => crate::ui::error(&e),
             }
-            Err(e) => crate::ui::error(&e),
-        },
+        }
         _ => crate::ui::error("usage: /memory [list] | /memory remove N"),
     }
 }
@@ -171,7 +197,10 @@ impl Tool for Memory {
     fn summary(&self, args: &Value) -> String {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
         match args.get("fact").and_then(Value::as_str) {
-            Some(f) if action != "list" => format!("{action}: {}", one_line(f).chars().take(80).collect::<String>()),
+            Some(f) if action != "list" => format!(
+                "{action}: {}",
+                one_line(f).chars().take(80).collect::<String>()
+            ),
             _ => action.to_string(),
         }
     }
@@ -180,11 +209,22 @@ impl Tool for Memory {
         let home = crate::config::home();
         let fact = args.get("fact").and_then(Value::as_str).unwrap_or("");
         let result = match args.get("action").and_then(Value::as_str).unwrap_or("") {
-            "add" | "save" => add(&home, fact).map(|new| if new { "Remembered." } else { "Already remembered." }.to_string()),
+            "add" | "save" => add(&home, fact).map(|new| {
+                if new {
+                    "Remembered."
+                } else {
+                    "Already remembered."
+                }
+                .to_string()
+            }),
             "list" => load(&home).map(|facts| list_lines(&facts).join("\n")),
-            "remove" | "forget" if fact.trim().is_empty() => Err("remove needs `fact`: a number from list or the exact text".into()),
+            "remove" | "forget" if fact.trim().is_empty() => {
+                Err("remove needs `fact`: a number from list or the exact text".into())
+            }
             "remove" | "forget" => remove(&home, fact).map(|f| format!("Forgot: {}", one_line(&f))),
-            other => Err(format!("memory: unknown action \"{other}\" (use add, list or remove)")),
+            other => Err(format!(
+                "memory: unknown action \"{other}\" (use add, list or remove)"
+            )),
         };
         match result {
             Ok(s) => ToolOutput::ok(s),
@@ -207,7 +247,10 @@ mod tests {
         let h = home.path();
         assert!(load(h).unwrap().is_empty());
         assert!(add(h, "  prefers tabs  ").unwrap());
-        assert!(!add(h, "prefers tabs").unwrap(), "duplicates are not stored twice");
+        assert!(
+            !add(h, "prefers tabs").unwrap(),
+            "duplicates are not stored twice"
+        );
         assert!(add(h, "name is Ada").unwrap());
         assert!(add(h, "").is_err());
         assert_eq!(load(h).unwrap(), ["prefers tabs", "name is Ada"]);
@@ -216,9 +259,15 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(path(h)).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(path(h)).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
-        assert_eq!(list_lines(&load(h).unwrap()), ["  1. prefers tabs", "  2. name is Ada"]);
+        assert_eq!(
+            list_lines(&load(h).unwrap()),
+            ["  1. prefers tabs", "  2. name is Ada"]
+        );
 
         assert_eq!(remove(h, "1").unwrap(), "prefers tabs");
         assert!(remove(h, "5").is_err());
@@ -227,13 +276,19 @@ mod tests {
 
         std::fs::write(path(h), "{not json").unwrap();
         assert!(add(h, "x").unwrap_err().contains("malformed"));
-        assert_eq!(std::fs::read_to_string(path(h)).unwrap(), "{not json", "a malformed store is left alone");
+        assert_eq!(
+            std::fs::read_to_string(path(h)).unwrap(),
+            "{not json",
+            "a malformed store is left alone"
+        );
     }
 
     #[test]
     fn prompt_section_is_capped_and_refreshable() {
         assert_eq!(prompt_section(&[]), "");
-        let facts: Vec<String> = (0..100).map(|i| format!("fact {i}\nwith a newline")).collect();
+        let facts: Vec<String> = (0..100)
+            .map(|i| format!("fact {i}\nwith a newline"))
+            .collect();
         let section = prompt_section(&facts);
         assert!(section.starts_with("\n\n# Memory"));
         assert!(section.contains("- fact 0 with a newline"));
@@ -252,7 +307,10 @@ mod tests {
         refresh_section(&mut system, home.path());
         assert_eq!(system.matches("# Memory").count(), 1);
         assert!(system.contains("# Skills\n\nlater section"));
-        assert!(system.ends_with("- likes short answers\n- uses fish"), "{system}");
+        assert!(
+            system.ends_with("- likes short answers\n- uses fish"),
+            "{system}"
+        );
         remove(home.path(), "1").unwrap();
         remove(home.path(), "1").unwrap();
         refresh_section(&mut system, home.path());

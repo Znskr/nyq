@@ -160,7 +160,11 @@ async fn bind_callback(ports: &[u16]) -> Result<(TcpListener, u16)> {
             return Ok((listener, port));
         }
     }
-    let list = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(" and ");
+    let list = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" and ");
     anyhow::bail!("cannot listen for the ChatGPT sign-in callback on 127.0.0.1 ports {list}; close any other sign-in using them and retry")
 }
 
@@ -262,11 +266,15 @@ pub fn browser_disabled() -> bool {
 /// What to print before a terminal sign-in opens `url`.
 pub fn sign_in_prompt(url: &str) -> String {
     if browser_disabled() {
-        format!("Open this URL in a browser to sign in:
-  {url}")
+        format!(
+            "Open this URL in a browser to sign in:
+  {url}"
+        )
     } else {
-        format!("Opening your browser to sign in. If it doesn't open, visit:
-  {url}")
+        format!(
+            "Opening your browser to sign in. If it doesn't open, visit:
+  {url}"
+        )
     }
 }
 
@@ -301,9 +309,11 @@ pub fn open_browser(url: &str) {
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            let _ = std::thread::Builder::new().name("browser-launch".into()).spawn(move || {
-                let _ = child.wait();
-            });
+            let _ = std::thread::Builder::new()
+                .name("browser-launch".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
         }
     }
 }
@@ -311,8 +321,14 @@ pub fn open_browser(url: &str) {
 #[cfg(target_os = "windows")]
 fn open_browser_windows(url: &str) {
     use std::os::windows::ffi::OsStrExt;
-    let file: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(Some(0)).collect();
-    let op: Vec<u16> = std::ffi::OsStr::new("open").encode_wide().chain(Some(0)).collect();
+    let file: Vec<u16> = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let op: Vec<u16> = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     #[link(name = "shell32")]
     extern "system" {
         fn ShellExecuteW(
@@ -327,7 +343,14 @@ fn open_browser_windows(url: &str) {
     // SAFETY: both strings are NUL-terminated UTF-16. A result ≤ 32 is a
     // launch failure, which is ignored the same way a missing `open` is.
     unsafe {
-        ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        );
     }
 }
 
@@ -346,7 +369,11 @@ pub fn key_prompt(service: Service) -> String {
     if service == Service::Anthropic && base != hosted::ANTHROPIC_URL {
         return format!("Paste the API key for the Anthropic-compatible endpoint {base}");
     }
-    format!("Paste your {} API key from {}", service.title(), key_site(service))
+    format!(
+        "Paste your {} API key from {}",
+        service.title(),
+        key_site(service)
+    )
 }
 
 /// Where to get an API key for `service`.
@@ -369,15 +396,27 @@ async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) 
     anyhow::ensure!(!key.trim().is_empty(), "the API key is empty");
     let warning = match hosted::check_key(service, base_url, key).await {
         hosted::KeyCheck::Accepted => None,
-        hosted::KeyCheck::Refused(e) => anyhow::bail!("{} rejected this API key, so it was not saved: {e}", service.title()),
-        hosted::KeyCheck::Unknown(e) => Some(format!("\nWarning: could not check the key with {} ({e}); saved it anyway.", service.title())),
+        hosted::KeyCheck::Refused(e) => anyhow::bail!(
+            "{} rejected this API key, so it was not saved: {e}",
+            service.title()
+        ),
+        hosted::KeyCheck::Unknown(e) => Some(format!(
+            "\nWarning: could not check the key with {} ({e}); saved it anyway.",
+            service.title()
+        )),
     };
     hosted::save_key(home, service, key)?;
-    let mut msg = format!("Saved your {} key in {}.", service.title(), home.join("auth.json").display());
+    let mut msg = format!(
+        "Saved your {} key in {}.",
+        service.title(),
+        home.join("auth.json").display()
+    );
     msg.extend(warning);
     if hosted::api_key(home, service).as_deref() != Some(key.trim()) {
         let other = match service {
-            Service::OpencodeGo | Service::Opencode => "OPENCODE_API_KEY or the OpenCode CLI's login",
+            Service::OpencodeGo | Service::Opencode => {
+                "OPENCODE_API_KEY or the OpenCode CLI's login"
+            }
             Service::Anthropic => "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN",
             Service::Xai => service.key_env(),
         };
@@ -415,7 +454,9 @@ pub async fn logout(home: &Path, provider: &str) -> Result<String> {
         let path = home.join("chatgpt-auth.json");
         return Ok(match std::fs::remove_file(&path) {
             Ok(()) => "Signed out of ChatGPT.".into(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "No ChatGPT sign-in stored by nyq.".into(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                "No ChatGPT sign-in stored by nyq.".into()
+            }
             Err(e) => return Err(e).context("removing chatgpt-auth.json"),
         });
     }
@@ -465,7 +506,9 @@ fn read_secret() -> Result<String> {
                 Event::Paste(text) => key.push_str(&text),
                 Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
                     KeyCode::Enter => return Ok(key),
-                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => anyhow::bail!("cancelled"),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        anyhow::bail!("cancelled")
+                    }
                     KeyCode::Esc => anyhow::bail!("cancelled"),
                     KeyCode::Backspace => {
                         key.pop();
@@ -490,14 +533,20 @@ mod tests {
     async fn logout_all_forgets_every_stored_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        assert_eq!(logout_all(home).await.unwrap(), "No sign-ins stored by nyq.");
+        assert_eq!(
+            logout_all(home).await.unwrap(),
+            "No sign-ins stored by nyq."
+        );
         std::fs::write(home.join("chatgpt-auth.json"), "{}").unwrap();
         hosted::save_key(home, Service::Xai, "xai-key").unwrap();
         let msg = logout_all(home).await.unwrap();
         assert!(msg.contains("Signed out of ChatGPT."), "{msg}");
         assert!(msg.contains(Service::Xai.title()), "{msg}");
         assert!(!home.join("chatgpt-auth.json").exists());
-        assert_eq!(logout_all(home).await.unwrap(), "No sign-ins stored by nyq.");
+        assert_eq!(
+            logout_all(home).await.unwrap(),
+            "No sign-ins stored by nyq."
+        );
     }
 
     #[test]
@@ -516,7 +565,13 @@ mod tests {
 
     #[test]
     fn authorize_params() {
-        let url = authorize("https://auth.openai.com/", &redirect(1455), "state", "verifier").unwrap();
+        let url = authorize(
+            "https://auth.openai.com/",
+            &redirect(1455),
+            "state",
+            "verifier",
+        )
+        .unwrap();
         assert_eq!(url.path(), "/oauth/authorize");
         let params: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(params.len(), 10);
@@ -562,7 +617,10 @@ mod tests {
         let (_listener, port) = bind_callback(&ports).await.unwrap();
         assert_eq!(port, spare);
         let err = bind_callback(&ports).await.unwrap_err().to_string();
-        assert!(err.contains(&format!("ports {} and {spare}", ports[0])), "{err}");
+        assert!(
+            err.contains(&format!("ports {} and {spare}", ports[0])),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -570,28 +628,61 @@ mod tests {
         use crate::provider::sse::tests::server;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let stored = || hosted::read_own(home).unwrap().get("xai").map(|v| v["key"].clone());
+        let stored = || {
+            hosted::read_own(home)
+                .unwrap()
+                .get("xai")
+                .map(|v| v["key"].clone())
+        };
         let (url, mut requests, task) = server(vec![
-            (401, r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key"}}"#.into()),
+            (
+                401,
+                r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key"}}"#.into(),
+            ),
             (200, r#"{"data":[]}"#.into()),
-            (402, r#"{"error":{"code":"payment_required","message":"Add a payment method"}}"#.into()),
+            (
+                402,
+                r#"{"error":{"code":"payment_required","message":"Add a payment method"}}"#.into(),
+            ),
         ])
         .await;
-        let err = store_key_at(home, Service::Xai, "bad", &url).await.unwrap_err().to_string();
-        assert!(err.contains("rejected") && err.contains("HTTP 401 · invalid_api_key: Incorrect API key"), "{err}");
+        let err = store_key_at(home, Service::Xai, "bad", &url)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rejected")
+                && err.contains("HTTP 401 · invalid_api_key: Incorrect API key"),
+            "{err}"
+        );
         assert_eq!(stored(), None);
         let request = requests.recv().await.unwrap().to_lowercase();
-        assert!(request.starts_with("get /models ") && request.contains("authorization: bearer bad"), "{request}");
-        let msg = store_key_at(home, Service::Xai, " good ", &url).await.unwrap();
-        assert!(msg.starts_with("Saved your xAI key") && !msg.contains("Warning"), "{msg}");
+        assert!(
+            request.starts_with("get /models ") && request.contains("authorization: bearer bad"),
+            "{request}"
+        );
+        let msg = store_key_at(home, Service::Xai, " good ", &url)
+            .await
+            .unwrap();
+        assert!(
+            msg.starts_with("Saved your xAI key") && !msg.contains("Warning"),
+            "{msg}"
+        );
         assert_eq!(stored(), Some(json!("good")));
         // A status that says nothing about the key: saved with a warning.
-        let msg = store_key_at(home, Service::Xai, "maybe", &url).await.unwrap();
-        assert!(msg.contains("Warning: could not check the key") && msg.contains("HTTP 402"), "{msg}");
+        let msg = store_key_at(home, Service::Xai, "maybe", &url)
+            .await
+            .unwrap();
+        assert!(
+            msg.contains("Warning: could not check the key") && msg.contains("HTTP 402"),
+            "{msg}"
+        );
         assert_eq!(stored(), Some(json!("maybe")));
         task.await.unwrap();
         // Unreachable: saved with a warning.
-        let msg = store_key_at(home, Service::Xai, "offline", "http://127.0.0.1:1").await.unwrap();
+        let msg = store_key_at(home, Service::Xai, "offline", "http://127.0.0.1:1")
+            .await
+            .unwrap();
         assert!(msg.contains("Warning"), "{msg}");
         assert_eq!(stored(), Some(json!("offline")));
         assert!(store_key_at(home, Service::Xai, " ", &url).await.is_err());
@@ -608,19 +699,34 @@ mod tests {
         ])
         .await;
         let base = format!("{url}/v1");
-        let err = store_key_at(home, Service::Anthropic, "sk-ant-bad", &base).await.unwrap_err().to_string();
-        assert!(err.contains("Anthropic API rejected this API key") && err.contains("invalid x-api-key"), "{err}");
+        let err = store_key_at(home, Service::Anthropic, "sk-ant-bad", &base)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Anthropic API rejected this API key")
+                && err.contains("invalid x-api-key"),
+            "{err}"
+        );
         let request = requests.recv().await.unwrap().to_lowercase();
         assert!(request.starts_with("get /v1/models "), "{request}");
         for header in ["x-api-key: sk-ant-bad", "anthropic-version: 2023-06-01"] {
             assert!(request.contains(header), "{header}");
         }
         assert!(!request.contains("authorization"));
-        let msg = store_key_at(home, Service::Anthropic, "sk-ant-good", &base).await.unwrap();
+        let msg = store_key_at(home, Service::Anthropic, "sk-ant-good", &base)
+            .await
+            .unwrap();
         assert!(msg.starts_with("Saved your Anthropic API key"), "{msg}");
-        assert_eq!(hosted::read_own(home).unwrap()["anthropic"]["key"], json!("sk-ant-good"));
+        assert_eq!(
+            hosted::read_own(home).unwrap()["anthropic"]["key"],
+            json!("sk-ant-good")
+        );
         task.await.unwrap();
-        assert!(logout(home, "claude").await.unwrap().contains("Anthropic API"));
+        assert!(logout(home, "claude")
+            .await
+            .unwrap()
+            .contains("Anthropic API"));
         assert!(hosted::read_own(home).unwrap().get("anthropic").is_none());
     }
 
@@ -692,7 +798,9 @@ mod tests {
             assert_eq!(fields["grant_type"], "authorization_code");
             assert_eq!(fields["code"], "fake-code");
             assert_eq!(fields["client_id"], CLIENT_ID);
-            assert!(CALLBACK_PORTS.map(redirect).contains(&fields["redirect_uri"]));
+            assert!(CALLBACK_PORTS
+                .map(redirect)
+                .contains(&fields["redirect_uri"]));
             let body = json!({"access_token":access,"refresh_token":"refresh-test",
                 "id_token":jwt(json!({"email":"test@example.com"})),"expires_in":3600})
             .to_string();
@@ -717,13 +825,7 @@ mod tests {
                 let favicon = callback.join("/favicon.ico").unwrap();
                 tokio::spawn(async move {
                     // Browsers may request unrelated resources before the callback.
-                    assert_eq!(
-                        reqwest::get(favicon)
-                            .await
-                            .unwrap()
-                            .status(),
-                        404
-                    );
+                    assert_eq!(reqwest::get(favicon).await.unwrap().status(), 404);
                     let html = reqwest::get(callback).await.unwrap().text().await.unwrap();
                     assert!(html.contains("Signed in — you can close this tab"));
                 });

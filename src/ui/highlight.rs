@@ -85,11 +85,34 @@ const fn code(
     consts: &'static str,
     flags: u16,
 ) -> Lang {
-    Lang { line, block, strs, kw, types, consts, flags, mode: Mode::Code }
+    Lang {
+        line,
+        block,
+        strs,
+        kw,
+        types,
+        consts,
+        flags,
+        mode: Mode::Code,
+    }
 }
 
-const fn special(mode: Mode, line: &'static [&'static str], strs: &'static [(&'static str, &'static str, u8)], consts: &'static str) -> Lang {
-    Lang { line, block: &[], strs, kw: "", types: "", consts, flags: 0, mode }
+const fn special(
+    mode: Mode,
+    line: &'static [&'static str],
+    strs: &'static [(&'static str, &'static str, u8)],
+    consts: &'static str,
+) -> Lang {
+    Lang {
+        line,
+        block: &[],
+        strs,
+        kw: "",
+        types: "",
+        consts,
+        flags: 0,
+        mode,
+    }
 }
 
 const C_TYPES: &str = "char double float int long short signed unsigned void bool size_t ssize_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t";
@@ -203,7 +226,15 @@ static PHP: Lang = code(
     CAPS | DOLLAR,
 );
 const SH_KW: &str = "alias break case continue declare do done elif else esac eval exec exit export fi for function if in local readonly return select set shift source then trap unset until while";
-static SH: Lang = code(HASH, &[], &[("\"", "\"", ML | ESC), ("'", "'", ML)], SH_KW, "", "true false", VARS);
+static SH: Lang = code(
+    HASH,
+    &[],
+    &[("\"", "\"", ML | ESC), ("'", "'", ML)],
+    SH_KW,
+    "",
+    "true false",
+    VARS,
+);
 static SQL: Lang = code(
     &["--"],
     C_BLOCK,
@@ -222,8 +253,26 @@ static LUA: Lang = code(
     "true false nil",
     0,
 );
-static CSS: Lang = Lang { line: &[], block: C_BLOCK, strs: QUOTES, kw: "", types: "", consts: "", flags: DASH, mode: Mode::Css };
-static DOCKER: Lang = Lang { line: HASH, block: &[], strs: QUOTES, kw: SH_KW, types: "", consts: "", flags: VARS, mode: Mode::Docker };
+static CSS: Lang = Lang {
+    line: &[],
+    block: C_BLOCK,
+    strs: QUOTES,
+    kw: "",
+    types: "",
+    consts: "",
+    flags: DASH,
+    mode: Mode::Css,
+};
+static DOCKER: Lang = Lang {
+    line: HASH,
+    block: &[],
+    strs: QUOTES,
+    kw: SH_KW,
+    types: "",
+    consts: "",
+    flags: VARS,
+    mode: Mode::Docker,
+};
 static MAKE: Lang = Lang {
     line: HASH,
     block: &[],
@@ -239,7 +288,12 @@ static YAML: Lang = special(Mode::Yaml, HASH, QUOTES, "true false null yes no on
 static TOML: Lang = special(
     Mode::Toml,
     HASH,
-    &[("\"\"\"", "\"\"\"", ML | ESC), ("'''", "'''", ML), ("\"", "\"", ESC), ("'", "'", 0)],
+    &[
+        ("\"\"\"", "\"\"\"", ML | ESC),
+        ("'''", "'''", ML),
+        ("\"", "\"", ESC),
+        ("'", "'", 0),
+    ],
     "true false",
 );
 static MARKUP: Lang = special(Mode::Markup, &[], &[], "");
@@ -296,11 +350,21 @@ fn lang(token: &str) -> Option<&'static Lang> {
 }
 
 fn has(list: &str, word: &str, nocase: bool) -> bool {
-    list.split(' ').any(|w| if nocase { w.eq_ignore_ascii_case(word) } else { w == word })
+    list.split(' ').any(|w| {
+        if nocase {
+            w.eq_ignore_ascii_case(word)
+        } else {
+            w == word
+        }
+    })
 }
 
 fn ident_byte(b: u8, flags: u16) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 || (b == b'$' && flags & DOLLAR != 0) || (b == b'-' && flags & DASH != 0)
+    b.is_ascii_alphanumeric()
+        || b == b'_'
+        || b >= 0x80
+        || (b == b'$' && flags & DOLLAR != 0)
+        || (b == b'-' && flags & DASH != 0)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -342,8 +406,16 @@ impl Out {
 impl Code {
     /// None when `lang` (the fence's info string) names no known language.
     pub fn new(lang: &str) -> Option<Code> {
-        let name = lang.split_whitespace().next()?.trim_start_matches('.').to_ascii_lowercase();
-        Some(Code { lang: self::lang(token(&name))?, state: State::Normal, depth: 0 })
+        let name = lang
+            .split_whitespace()
+            .next()?
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        Some(Code {
+            lang: self::lang(token(&name))?,
+            state: State::Normal,
+            depth: 0,
+        })
     }
 
     /// One line of the block, colored.
@@ -353,11 +425,18 @@ impl Code {
             Mode::Diff => out.push(0, line.len(), diff_role(line)),
             Mode::Markup => self.markup(line, &mut out),
             _ => {
-                let start = if self.state == State::Normal { self.lead(line, &mut out) } else { 0 };
+                let start = if self.state == State::Normal {
+                    self.lead(line, &mut out)
+                } else {
+                    0
+                };
                 self.code(line, start, &mut out);
             }
         }
-        out.spans.iter().map(|&(a, b, role)| style(role).paint(&line[a..b]).to_string()).collect()
+        out.spans
+            .iter()
+            .map(|&(a, b, role)| style(role).paint(&line[a..b]).to_string())
+            .collect()
     }
 
     /// Line-leading constructs (keys, targets, instructions); returns where
@@ -374,9 +453,14 @@ impl Code {
                     out.push(at, at + 2, Role::Plain);
                     at += 2;
                 }
-                let key = s[at..].find(": ").or_else(|| s[at..].strip_suffix(':').map(|k| k.len()));
+                let key = s[at..]
+                    .find(": ")
+                    .or_else(|| s[at..].strip_suffix(':').map(|k| k.len()));
                 match key {
-                    Some(k) if !matches!(b.get(at), Some(b'#' | b'"' | b'\'' | b'{' | b'[')) && !s[at..at + k].contains(" #") => {
+                    Some(k)
+                        if !matches!(b.get(at), Some(b'#' | b'"' | b'\'' | b'{' | b'['))
+                            && !s[at..at + k].contains(" #") =>
+                    {
                         out.push(at, at + k, Role::Type);
                         at + k
                     }
@@ -397,7 +481,11 @@ impl Code {
                 _ => indent,
             },
             Mode::Make if indent == 0 => match s.find(':') {
-                Some(k) if k > 0 && b.get(k + 1) != Some(&b'=') && !s[..k].contains(['=', '$', '#']) => {
+                Some(k)
+                    if k > 0
+                        && b.get(k + 1) != Some(&b'=')
+                        && !s[..k].contains(['=', '$', '#']) =>
+                {
                     out.push(0, k, Role::Function);
                     k
                 }
@@ -499,7 +587,8 @@ impl Code {
                     let w = b.get(i + 1).map_or(1, |&c| char_len(c));
                     if b.get(i + 1) != Some(&b'\\') && b.get(i + 1 + w) != Some(&b'\'') {
                         // A lifetime or label.
-                        let e = i + 1 + b[i + 1..].iter().take_while(|&&c| ident_byte(c, 0)).count();
+                        let e =
+                            i + 1 + b[i + 1..].iter().take_while(|&&c| ident_byte(c, 0)).count();
                         out.push(i, e, Role::Type);
                         i = e;
                         continue 'scan;
@@ -510,11 +599,17 @@ impl Code {
                 self.state = State::Str(close, f);
                 continue 'scan;
             }
-            if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) && !ident_byte(prev, 0)) {
+            if c.is_ascii_digit()
+                || (c == b'.'
+                    && b.get(i + 1).is_some_and(u8::is_ascii_digit)
+                    && !ident_byte(prev, 0))
+            {
                 let mut k = i + 1;
                 while k < n {
                     let d = b[k];
-                    let exp = matches!(d, b'+' | b'-') && matches!(b[k - 1], b'e' | b'E') && !s[i..].starts_with("0x");
+                    let exp = matches!(d, b'+' | b'-')
+                        && matches!(b[k - 1], b'e' | b'E')
+                        && !s[i..].starts_with("0x");
                     let dot = d == b'.' && b.get(k + 1).is_some_and(u8::is_ascii_digit);
                     if !(d.is_ascii_alphanumeric() || d == b'_' || dot || exp) {
                         break;
@@ -526,7 +621,10 @@ impl Code {
                 continue;
             }
             if ident_byte(c, l.flags) && c != b'-' {
-                let e = i + b[i..].iter().take_while(|&&c| ident_byte(c, l.flags)).count();
+                let e = i + b[i..]
+                    .iter()
+                    .take_while(|&&c| ident_byte(c, l.flags))
+                    .count();
                 let word = &s[i..e];
                 // String prefixes: r"..", b'..', f"..", r#".."#.
                 if l.flags & RUST != 0 && (word == "r" || word == "br") {
@@ -576,7 +674,10 @@ impl Code {
                     r
                 } else if after.starts_with('(') {
                     Role::Function
-                } else if l.flags & RUST != 0 && s[e..].starts_with('!') && matches!(b.get(e + 1), Some(b'(' | b'[' | b'{')) {
+                } else if l.flags & RUST != 0
+                    && s[e..].starts_with('!')
+                    && matches!(b.get(e + 1), Some(b'(' | b'[' | b'{'))
+                {
                     end = e + 1;
                     Role::Function
                 } else if has(l.types, word, nocase) {
@@ -596,18 +697,37 @@ impl Code {
                 continue;
             }
             // `@decorator`, `#include`, `$VAR`, CSS `#fff` / `.class` / `@media`.
-            let word = |from: usize| from + b[from..].iter().take_while(|&&c| ident_byte(c, l.flags)).count();
+            let word = |from: usize| {
+                from + b[from..]
+                    .iter()
+                    .take_while(|&&c| ident_byte(c, l.flags))
+                    .count()
+            };
             let (end, role) = match c {
-                b'@' if word(i + 1) > i + 1 => (word(i + 1), if l.mode == Mode::Css { Role::Keyword } else { Role::Type }),
-                b'#' if l.flags & PREPROC != 0 && word(i + 1) > i + 1 => (word(i + 1), Role::Keyword),
+                b'@' if word(i + 1) > i + 1 => (
+                    word(i + 1),
+                    if l.mode == Mode::Css {
+                        Role::Keyword
+                    } else {
+                        Role::Type
+                    },
+                ),
+                b'#' if l.flags & PREPROC != 0 && word(i + 1) > i + 1 => {
+                    (word(i + 1), Role::Keyword)
+                }
                 b'#' if l.mode == Mode::Css && word(i + 1) > i + 1 => {
                     let e = word(i + 1);
                     let hex = self.depth > 0 && b[i + 1..e].iter().all(u8::is_ascii_hexdigit);
                     (e, if hex { Role::Number } else { Role::Function })
                 }
-                b'.' | b':' if l.mode == Mode::Css && self.depth == 0 && word(i + 1) > i + 1 => {
-                    (word(i + 1), if c == b'.' { Role::Function } else { Role::Type })
-                }
+                b'.' | b':' if l.mode == Mode::Css && self.depth == 0 && word(i + 1) > i + 1 => (
+                    word(i + 1),
+                    if c == b'.' {
+                        Role::Function
+                    } else {
+                        Role::Type
+                    },
+                ),
                 b'!' if l.mode == Mode::Css && word(i + 1) > i + 1 => (word(i + 1), Role::Keyword),
                 b'$' if l.flags & VARS != 0 => {
                     let e = match b.get(i + 1) {
@@ -644,16 +764,29 @@ impl Code {
     fn markup(&mut self, s: &str, out: &mut Out) {
         let b = s.as_bytes();
         let n = b.len();
-        let name = |from: usize| from + b[from..].iter().take_while(|&&c| c.is_ascii_alphanumeric() || b"-_:.".contains(&c) || c >= 0x80).count();
+        let name = |from: usize| {
+            from + b[from..]
+                .iter()
+                .take_while(|&&c| c.is_ascii_alphanumeric() || b"-_:.".contains(&c) || c >= 0x80)
+                .count()
+        };
         let mut i = 0;
         while i < n {
             let rest = &s[i..];
             let (end, role) = match self.state {
                 State::Block(close) | State::Str(close, _) => {
-                    let role = if matches!(self.state, State::Block(_)) { Role::Comment } else { Role::Str };
+                    let role = if matches!(self.state, State::Block(_)) {
+                        Role::Comment
+                    } else {
+                        Role::Str
+                    };
                     match rest.find(close) {
                         Some(k) => {
-                            self.state = if role == Role::Str { State::Tag } else { State::Normal };
+                            self.state = if role == Role::Str {
+                                State::Tag
+                            } else {
+                                State::Normal
+                            };
                             (i + k + close.len(), role)
                         }
                         None => (n, role),
@@ -675,13 +808,20 @@ impl Code {
                     if rest.starts_with("<!--") {
                         self.state = State::Block("-->");
                         (i + 4, Role::Comment)
-                    } else if b[i] == b'<' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || b"/!?".contains(c)) {
+                    } else if b[i] == b'<'
+                        && b.get(i + 1)
+                            .is_some_and(|c| c.is_ascii_alphabetic() || b"/!?".contains(c))
+                    {
                         let tag = i + 1 + usize::from(b"/!?".contains(&b[i + 1]));
                         out.push(i, tag, Role::Plain);
                         i = tag;
                         self.state = State::Tag;
                         (name(tag), Role::Keyword)
-                    } else if b[i] == b'&' && rest[1..].find(';').is_some_and(|k| k < 10 && !rest[1..k + 1].contains(' ')) {
+                    } else if b[i] == b'&'
+                        && rest[1..]
+                            .find(';')
+                            .is_some_and(|k| k < 10 && !rest[1..k + 1].contains(' '))
+                    {
                         (i + rest.find(';').unwrap_or(0) + 1, Role::Number)
                     } else {
                         let w = char_len(b[i]).min(rest.len());
@@ -697,7 +837,10 @@ impl Code {
 }
 
 fn diff_role(line: &str) -> Role {
-    if ["+++", "---", "diff ", "index "].iter().any(|p| line.starts_with(p)) {
+    if ["+++", "---", "diff ", "index "]
+        .iter()
+        .any(|p| line.starts_with(p))
+    {
         Role::Keyword
     } else if line.starts_with('+') {
         Role::Str
@@ -743,7 +886,10 @@ mod tests {
     }
 
     fn has_span(out: &str, role: Role, text: &str) {
-        assert!(out.contains(&paint(role, text)), "missing {text:?} in {out:?}");
+        assert!(
+            out.contains(&paint(role, text)),
+            "missing {text:?} in {out:?}"
+        );
     }
 
     #[test]
@@ -753,15 +899,49 @@ mod tests {
         assert_eq!(strip_ansi(&out), "fn main() { let x = \"hi\"; // note");
         let keyword = fg(MAGENTA).paint("fn").to_string();
         assert!(out.starts_with(&keyword), "{out:?}");
-        assert!(out.contains(&fg(GREEN).paint("\"hi\"").to_string()), "{out:?}");
-        assert!(out.contains(&fg(GRAY).italic().paint("// note").to_string()), "{out:?}");
+        assert!(
+            out.contains(&fg(GREEN).paint("\"hi\"").to_string()),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(&fg(GRAY).italic().paint("// note").to_string()),
+            "{out:?}"
+        );
         // Block comments carry over to the next line.
         let mut c = Code::new("c").unwrap();
         c.line("/* start");
-        assert!(c.line("still comment").contains(&fg(GRAY).italic().paint("still comment").to_string()));
+        assert!(c
+            .line("still comment")
+            .contains(&fg(GRAY).italic().paint("still comment").to_string()));
         for lang in [
-            "ts", "tsx", "jsx", "bash", "zsh", "sh", "python", "go", "json", "yaml", "toml", "sql", "java", "kotlin", "swift",
-            "ruby", "php", "c++", "c#", "html", "xml", "css", "lua", "diff", "dockerfile", "makefile", "rust", ".rs",
+            "ts",
+            "tsx",
+            "jsx",
+            "bash",
+            "zsh",
+            "sh",
+            "python",
+            "go",
+            "json",
+            "yaml",
+            "toml",
+            "sql",
+            "java",
+            "kotlin",
+            "swift",
+            "ruby",
+            "php",
+            "c++",
+            "c#",
+            "html",
+            "xml",
+            "css",
+            "lua",
+            "diff",
+            "dockerfile",
+            "makefile",
+            "rust",
+            ".rs",
             "python title=x.py",
         ] {
             assert!(Code::new(lang).is_some(), "{lang}");
@@ -800,13 +980,28 @@ mod tests {
 
     #[test]
     fn python_and_js_strings() {
-        let out = run("python", &["def f(a):", "    s = f\"x{a}\" + '''doc", "still doc''' # done", "    return None"]);
+        let out = run(
+            "python",
+            &[
+                "def f(a):",
+                "    s = f\"x{a}\" + '''doc",
+                "still doc''' # done",
+                "    return None",
+            ],
+        );
         has_span(&out[0], Role::Function, "f");
         has_span(&out[1], Role::Str, "f\"x{a}\"");
         has_span(&out[2], Role::Str, "still doc'''");
         has_span(&out[2], Role::Comment, "# done");
         has_span(&out[3], Role::Number, "None");
-        let out = run("ts", &["const t = `a ${b}", "c`; let n: number = 1; // x", "class A extends B {}"]);
+        let out = run(
+            "ts",
+            &[
+                "const t = `a ${b}",
+                "c`; let n: number = 1; // x",
+                "class A extends B {}",
+            ],
+        );
         has_span(&out[0], Role::Keyword, "const");
         has_span(&out[1], Role::Str, "c`");
         has_span(&out[1], Role::Type, "number");
@@ -831,7 +1026,13 @@ mod tests {
 
     #[test]
     fn unicode_and_long_lines() {
-        run("rs", &["let ä = \"日本\"; // ünïcode → ok", "日本語 'é' “quoted” 🎉"]);
+        run(
+            "rs",
+            &[
+                "let ä = \"日本\"; // ünïcode → ok",
+                "日本語 'é' “quoted” 🎉",
+            ],
+        );
         run("html", &["<p title=\"é\">日本 &amp; 🎉</p>"]);
         let long = "let x = \"a\"; ".repeat(20_000);
         let start = std::time::Instant::now();
@@ -847,7 +1048,10 @@ mod tests {
         has_span(&out[0], Role::Str, "\"value\"");
         has_span(&out[0], Role::Number, "1.5");
         has_span(&out[0], Role::Number, "true");
-        let out = run("yaml", &["- name: build", "  run: echo \"hi\" # c", "  on: true"]);
+        let out = run(
+            "yaml",
+            &["- name: build", "  run: echo \"hi\" # c", "  on: true"],
+        );
         has_span(&out[0], Role::Type, "name");
         has_span(&out[1], Role::Type, "run");
         has_span(&out[1], Role::Str, "\"hi\"");
@@ -861,11 +1065,22 @@ mod tests {
 
     #[test]
     fn special_modes() {
-        let out = run("diff", &["--- a/x", "+added", "-removed", "@@ -1 +1 @@", " same"]);
+        let out = run(
+            "diff",
+            &["--- a/x", "+added", "-removed", "@@ -1 +1 @@", " same"],
+        );
         has_span(&out[1], Role::Str, "+added");
         has_span(&out[2], Role::Removed, "-removed");
         has_span(&out[3], Role::Function, "@@ -1 +1 @@");
-        let out = run("html", &["<div class=\"a\" id='b'>text &amp; <!-- c", "c --></div>", "<a", "  href=\"x\">"]);
+        let out = run(
+            "html",
+            &[
+                "<div class=\"a\" id='b'>text &amp; <!-- c",
+                "c --></div>",
+                "<a",
+                "  href=\"x\">",
+            ],
+        );
         has_span(&out[0], Role::Keyword, "div");
         has_span(&out[0], Role::Type, "class");
         has_span(&out[0], Role::Str, "\"a\"");
@@ -873,7 +1088,14 @@ mod tests {
         has_span(&out[0], Role::Number, "&amp;");
         has_span(&out[1], Role::Comment, "c -->");
         has_span(&out[3], Role::Type, "href");
-        let out = run("css", &["@media screen {", "  .a:hover { color: #fff; margin: 0 4px !important; }", "}"]);
+        let out = run(
+            "css",
+            &[
+                "@media screen {",
+                "  .a:hover { color: #fff; margin: 0 4px !important; }",
+                "}",
+            ],
+        );
         has_span(&out[0], Role::Keyword, "@media");
         has_span(&out[1], Role::Type, "color");
         has_span(&out[1], Role::Number, "#fff");
@@ -882,10 +1104,16 @@ mod tests {
         has_span(&out[0], Role::Keyword, "if");
         has_span(&out[0], Role::Type, "${HOME}");
         has_span(&out[0], Role::Comment, "# c; fi");
-        let out = run("dockerfile", &["FROM rust:1 AS build", "RUN cargo build # x"]);
+        let out = run(
+            "dockerfile",
+            &["FROM rust:1 AS build", "RUN cargo build # x"],
+        );
         has_span(&out[0], Role::Keyword, "FROM");
         has_span(&out[1], Role::Keyword, "RUN");
-        let out = run("makefile", &["build: src", "\tcargo build $(FLAGS)", "X := 1"]);
+        let out = run(
+            "makefile",
+            &["build: src", "\tcargo build $(FLAGS)", "X := 1"],
+        );
         has_span(&out[0], Role::Function, "build");
         has_span(&out[1], Role::Type, "$(FLAGS)");
         let out = run("sql", &["SELECT id FROM t WHERE name = 'x' -- c"]);
@@ -894,7 +1122,10 @@ mod tests {
         let out = run("lua", &["--[[ a", "b ]] local x = nil"]);
         has_span(&out[1], Role::Comment, "b ]]");
         has_span(&out[1], Role::Keyword, "local");
-        let out = run("c", &["#include <stdio.h>", "int main(void) { return NULL; }"]);
+        let out = run(
+            "c",
+            &["#include <stdio.h>", "int main(void) { return NULL; }"],
+        );
         has_span(&out[0], Role::Keyword, "#include");
         has_span(&out[1], Role::Type, "int");
         has_span(&out[1], Role::Function, "main");

@@ -74,20 +74,31 @@ pub fn parse_draft(text: &str) -> Result<Draft> {
             title = t.trim();
         }
     }
-    let title = title.trim_start_matches('#').trim().trim_matches('*').trim();
+    let title = title
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches('*')
+        .trim();
     if title.is_empty() {
         bail!("the model's reply has no title line");
     }
     Ok(Draft {
         title: title.to_string(),
-        body: rest.trim_start_matches(['\r', '\n', ' ', '\t']).trim_end().to_string(),
+        body: rest
+            .trim_start_matches(['\r', '\n', ' ', '\t'])
+            .trim_end()
+            .to_string(),
     })
 }
 
 /// Drop one fence wrapping the whole reply (```` ```markdown ... ``` ````).
 fn strip_fence(text: &str) -> &str {
-    let Some(rest) = text.strip_prefix("```") else { return text };
-    let Some((_, inner)) = rest.split_once('\n') else { return text };
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    let Some((_, inner)) = rest.split_once('\n') else {
+        return text;
+    };
     inner.strip_suffix("```").map(str::trim).unwrap_or(text)
 }
 
@@ -109,12 +120,26 @@ pub fn is_git_repo(cwd: &Path) -> bool {
 
 /// The repository's default branch: `origin/HEAD`, else a local `main` or `master`.
 pub fn default_branch(cwd: &Path) -> Option<String> {
-    if let Some(head) = git(cwd, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+    if let Some(head) = git(
+        cwd,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
         return Some(head.strip_prefix("origin/").unwrap_or(&head).to_string());
     }
     ["main", "master"]
         .into_iter()
-        .find(|b| git(cwd, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]).is_some())
+        .find(|b| {
+            git(
+                cwd,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{b}"),
+                ],
+            )
+            .is_some()
+        })
         .map(String::from)
 }
 
@@ -136,25 +161,51 @@ pub fn gather_pr(cwd: &Path, base: Option<&str>) -> Result<PrContext> {
     if !is_git_repo(cwd) {
         bail!("nyq pr: requires running inside a git repository");
     }
-    let branch = git(cwd, &["branch", "--show-current"]).context("nyq pr: HEAD is detached; check out a branch first")?;
+    let branch = git(cwd, &["branch", "--show-current"])
+        .context("nyq pr: HEAD is detached; check out a branch first")?;
     let base = match base {
         Some(b) => b.to_string(),
-        None => default_branch(cwd).context("nyq pr: could not find the default branch; pass --base BRANCH")?,
+        None => default_branch(cwd)
+            .context("nyq pr: could not find the default branch; pass --base BRANCH")?,
     };
     if base == branch {
         bail!("nyq pr: you are on the base branch `{base}`; create a feature branch first (or pass --base)");
     }
     let remote = format!("origin/{base}");
-    let base_ref = if git(cwd, &["rev-parse", "--verify", "--quiet", &remote]).is_some() { remote } else { base.clone() };
-    let merge_base = git(cwd, &["merge-base", "HEAD", &base_ref])
-        .with_context(|| format!("nyq pr: no common history between `{branch}` and `{base_ref}`"))?;
+    let base_ref = if git(cwd, &["rev-parse", "--verify", "--quiet", &remote]).is_some() {
+        remote
+    } else {
+        base.clone()
+    };
+    let merge_base = git(cwd, &["merge-base", "HEAD", &base_ref]).with_context(|| {
+        format!("nyq pr: no common history between `{branch}` and `{base_ref}`")
+    })?;
     let range = format!("{merge_base}..HEAD");
-    let commits = git(cwd, &["log", "--oneline", "--no-decorate", &format!("-{MAX_COMMITS}"), &range])
-        .with_context(|| format!("nyq pr: `{branch}` has no commits ahead of `{base_ref}`"))?;
+    let commits = git(
+        cwd,
+        &[
+            "log",
+            "--oneline",
+            "--no-decorate",
+            &format!("-{MAX_COMMITS}"),
+            &range,
+        ],
+    )
+    .with_context(|| format!("nyq pr: `{branch}` has no commits ahead of `{base_ref}`"))?;
     let stat = git(cwd, &["diff", "--stat", &merge_base, "HEAD"]).unwrap_or_default();
-    let diff = truncate(git(cwd, &["diff", &merge_base, "HEAD"]).unwrap_or_default(), MAX_DIFF_BYTES);
+    let diff = truncate(
+        git(cwd, &["diff", &merge_base, "HEAD"]).unwrap_or_default(),
+        MAX_DIFF_BYTES,
+    );
     let uncommitted = git(cwd, &["status", "--short"]);
-    Ok(PrContext { branch, base, commits, stat, diff, uncommitted })
+    Ok(PrContext {
+        branch,
+        base,
+        commits,
+        stat,
+        diff,
+        uncommitted,
+    })
 }
 
 fn truncate(mut text: String, max: usize) -> String {
@@ -171,7 +222,8 @@ fn truncate(mut text: String, max: usize) -> String {
 
 /// A short repository snapshot for issues; works outside a git repository.
 pub fn snapshot(cwd: &Path) -> String {
-    let section = |args: &[&str], fallback: &str| git(cwd, args).unwrap_or_else(|| fallback.to_string());
+    let section =
+        |args: &[&str], fallback: &str| git(cwd, args).unwrap_or_else(|| fallback.to_string());
     format!(
         "Git snapshot\nBranch: {}\n\nStatus:\n{}\n\nRecent commits:\n{}\n\nStaged diff stat:\n{}\n\nUnstaged diff stat:\n{}\n",
         section(&["branch", "--show-current"], "unavailable"),
@@ -184,7 +236,11 @@ pub fn snapshot(cwd: &Path) -> String {
 
 fn context_clause(context: &str) -> String {
     let context = context.trim();
-    if context.is_empty() { String::new() } else { format!("Additional context: {context}.\n\n") }
+    if context.is_empty() {
+        String::new()
+    } else {
+        format!("Additional context: {context}.\n\n")
+    }
 }
 
 pub fn pr_prompt(ctx: &PrContext, context: &str) -> String {
@@ -209,9 +265,18 @@ Keep the title under 72 characters; leave a section brief rather than inventing 
 
 /// Ask the model for a draft (no tools, nothing stored in the transcript).
 /// Token use is recorded under `usage_id` (`cli-pr` or `cli-issue`).
-pub async fn ask_model(home: &Path, provider: &dyn Provider, prompt: &str, usage_id: &str) -> Result<Draft> {
+pub async fn ask_model(
+    home: &Path,
+    provider: &dyn Provider,
+    prompt: &str,
+    usage_id: &str,
+) -> Result<Draft> {
     let items = [Item::user(prompt)];
-    let req = Request { system: SYSTEM, items: &items, tools: &[] };
+    let req = Request {
+        system: SYSTEM,
+        items: &items,
+        tools: &[],
+    };
     let mut ignore = |_: StreamEvent| {};
     let response = crate::provider::stream_with_retry(provider, req, &mut ignore).await?;
     if let Some(usage) = response.usage {
@@ -242,10 +307,17 @@ pub async fn ask_model(home: &Path, provider: &dyn Provider, prompt: &str, usage
 
 /// `gh pr|issue create` arguments for a draft.
 pub fn publish_args(workflow: Workflow, draft: &Draft, opts: &Options) -> Vec<String> {
-    let mut args: Vec<String> = [workflow.command(), "create", "--title", &draft.title, "--body", &draft.body]
-        .into_iter()
-        .map(String::from)
-        .collect();
+    let mut args: Vec<String> = [
+        workflow.command(),
+        "create",
+        "--title",
+        &draft.title,
+        "--body",
+        &draft.body,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
     if workflow == Workflow::PullRequest {
         if let Some(base) = &opts.base {
             args.extend(["--base".into(), base.clone()]);
@@ -262,13 +334,28 @@ fn publish_result(status_ok: bool, stdout: &[u8], stderr: &[u8]) -> Result<Strin
     let stdout = String::from_utf8_lossy(stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(stderr).trim().to_string();
     if !status_ok {
-        bail!("{}", if stderr.is_empty() { "gh command failed".to_string() } else { stderr });
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                "gh command failed".to_string()
+            } else {
+                stderr
+            }
+        );
     }
-    Ok(if stdout.is_empty() { "created successfully".to_string() } else { stdout })
+    Ok(if stdout.is_empty() {
+        "created successfully".to_string()
+    } else {
+        stdout
+    })
 }
 
 fn publish(cwd: &Path, workflow: Workflow, draft: &Draft, opts: &Options) -> Result<String> {
-    let out = match Command::new("gh").args(publish_args(workflow, draft, opts)).current_dir(cwd).output() {
+    let out = match Command::new("gh")
+        .args(publish_args(workflow, draft, opts))
+        .current_dir(cwd)
+        .output()
+    {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("gh CLI not found in PATH"),
         Err(e) => return Err(e).context("running gh"),
@@ -278,12 +365,20 @@ fn publish(cwd: &Path, workflow: Workflow, draft: &Draft, opts: &Options) -> Res
 
 /// Why the branch must be pushed before a pull request can be opened, if it must.
 fn push_needed(cwd: &Path, branch: &str) -> Option<String> {
-    if git(cwd, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).is_none() {
+    if git(
+        cwd,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .is_none()
+    {
         return Some(format!("`{branch}` has no upstream branch"));
     }
     match git(cwd, &["rev-list", "--count", "@{u}..HEAD"]).and_then(|n| n.parse::<u64>().ok()) {
         Some(0) | None => None,
-        Some(n) => Some(format!("`{branch}` has {n} unpushed commit{}", if n == 1 { "" } else { "s" })),
+        Some(n) => Some(format!(
+            "`{branch}` has {n} unpushed commit{}",
+            if n == 1 { "" } else { "s" }
+        )),
     }
 }
 
@@ -316,14 +411,33 @@ fn edit(draft: &Draft) -> Result<Draft> {
         .ok()
         .or_else(|| std::env::var("EDITOR").ok())
         .filter(|e| !e.trim().is_empty())
-        .unwrap_or_else(|| if cfg!(windows) { "notepad".into() } else { "vi".into() });
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".into()
+            } else {
+                "vi".into()
+            }
+        });
     // The editor value may carry arguments (`code --wait`); let the shell split it.
     #[cfg(windows)]
-    let status = Command::new("cmd").arg("/C").arg(format!("{editor} \"{}\"", path.display())).status();
+    let status = Command::new("cmd")
+        .arg("/C")
+        .arg(format!("{editor} \"{}\"", path.display()))
+        .status();
     #[cfg(not(windows))]
-    let status = Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(&path).status();
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(&path)
+        .status();
     let result = (|| {
-        anyhow::ensure!(status.with_context(|| format!("running {editor}"))?.success(), "{editor} exited with an error");
+        anyhow::ensure!(
+            status
+                .with_context(|| format!("running {editor}"))?
+                .success(),
+            "{editor} exited with an error"
+        );
         parse_draft(&std::fs::read_to_string(&path)?)
     })();
     let _ = std::fs::remove_file(&path);
@@ -331,16 +445,30 @@ fn edit(draft: &Draft) -> Result<Draft> {
 }
 
 /// `nyq pr` / `nyq issue`.
-pub async fn run(cwd: &Path, home: &Path, provider: &dyn Provider, workflow: Workflow, opts: Options) -> Result<()> {
+pub async fn run(
+    cwd: &Path,
+    home: &Path,
+    provider: &dyn Provider,
+    workflow: Workflow,
+    opts: Options,
+) -> Result<()> {
     let name = workflow.command();
     let (prompt, branch) = match workflow {
         Workflow::PullRequest => {
             let ctx = gather_pr(cwd, opts.base.as_deref())?;
             if let Some(changes) = &ctx.uncommitted {
                 let n = changes.lines().count();
-                eprintln!("note: {n} uncommitted change{} not part of the pull request", if n == 1 { " is" } else { "s are" });
+                eprintln!(
+                    "note: {n} uncommitted change{} not part of the pull request",
+                    if n == 1 { " is" } else { "s are" }
+                );
             }
-            eprintln!("Drafting a pull request for {} into {} with {}...", ctx.branch, ctx.base, provider.model());
+            eprintln!(
+                "Drafting a pull request for {} into {} with {}...",
+                ctx.branch,
+                ctx.base,
+                provider.model()
+            );
             (pr_prompt(&ctx, &opts.context), Some(ctx.branch))
         }
         Workflow::Issue => {
@@ -352,7 +480,9 @@ pub async fn run(cwd: &Path, home: &Path, provider: &dyn Provider, workflow: Wor
         Workflow::PullRequest => "cli-pr",
         Workflow::Issue => "cli-issue",
     };
-    let mut draft = ask_model(home, provider, &prompt, usage_id).await.with_context(|| format!("nyq {name}: drafting failed"))?;
+    let mut draft = ask_model(home, provider, &prompt, usage_id)
+        .await
+        .with_context(|| format!("nyq {name}: drafting failed"))?;
     let tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     loop {
         print!("\n{}", draft.render());
@@ -379,13 +509,17 @@ pub async fn run(cwd: &Path, home: &Path, provider: &dyn Provider, workflow: Wor
         if !tty {
             bail!("nyq pr: {why}; push it first, then run nyq pr --publish again");
         }
-        if !matches!(ask(&format!("{why}. Push it to origin now? [y/N] "))?.as_str(), "y" | "yes") {
+        if !matches!(
+            ask(&format!("{why}. Push it to origin now? [y/N] "))?.as_str(),
+            "y" | "yes"
+        ) {
             eprintln!("Not pushed; nothing was published.");
             return Ok(());
         }
         push(cwd, &branch)?;
     }
-    let url = publish(cwd, workflow, &draft, &opts).map_err(|e| anyhow::anyhow!("nyq {name}: {e:#}"))?;
+    let url =
+        publish(cwd, workflow, &draft, &opts).map_err(|e| anyhow::anyhow!("nyq {name}: {e:#}"))?;
     println!("{url}");
     Ok(())
 }
@@ -397,7 +531,13 @@ mod tests {
     #[test]
     fn parse_draft_extracts_title_and_body() {
         let d = parse_draft("Title\n\n## Summary\nhello").unwrap();
-        assert_eq!(d, Draft { title: "Title".into(), body: "## Summary\nhello".into() });
+        assert_eq!(
+            d,
+            Draft {
+                title: "Title".into(),
+                body: "## Summary\nhello".into()
+            }
+        );
         assert!(parse_draft(" \n\t ").is_err());
         assert_eq!(parse_draft("Title only").unwrap().body, "");
         let d = parse_draft(" \r\n  Title with space  \r\n\r\n  - one\r\n  - two\r\n\n").unwrap();
@@ -407,11 +547,20 @@ mod tests {
 
     #[test]
     fn parse_draft_strips_labels_headings_and_fences() {
-        assert_eq!(parse_draft("Title: Fix it\n\nbody").unwrap().title, "Fix it");
+        assert_eq!(
+            parse_draft("Title: Fix it\n\nbody").unwrap().title,
+            "Fix it"
+        );
         assert_eq!(parse_draft("# Fix it\n\nbody").unwrap().title, "Fix it");
         assert_eq!(parse_draft("**Fix it**\nbody").unwrap().title, "Fix it");
         let d = parse_draft("```markdown\nFix it\n\n## Summary\nx\n```").unwrap();
-        assert_eq!(d, Draft { title: "Fix it".into(), body: "## Summary\nx".into() });
+        assert_eq!(
+            d,
+            Draft {
+                title: "Fix it".into(),
+                body: "## Summary\nx".into()
+            }
+        );
         assert!(parse_draft("Title:\nbody").is_err());
     }
 
@@ -469,15 +618,24 @@ mod tests {
 
     #[test]
     fn edited_draft_round_trips() {
-        let d = Draft { title: "T".into(), body: "## Summary\n- a".into() };
+        let d = Draft {
+            title: "T".into(),
+            body: "## Summary\n- a".into(),
+        };
         assert_eq!(parse_draft(&d.render()).unwrap(), d);
     }
 
     #[test]
     fn publish_args_map_flags() {
-        let d = Draft { title: "A title".into(), body: "Body".into() };
+        let d = Draft {
+            title: "A title".into(),
+            body: "Body".into(),
+        };
         let mut opts = Options::default();
-        assert_eq!(publish_args(Workflow::Issue, &d, &opts), ["issue", "create", "--title", "A title", "--body", "Body"]);
+        assert_eq!(
+            publish_args(Workflow::Issue, &d, &opts),
+            ["issue", "create", "--title", "A title", "--body", "Body"]
+        );
         opts.base = Some("dev".into());
         opts.draft = true;
         assert_eq!(
@@ -490,10 +648,24 @@ mod tests {
 
     #[test]
     fn publish_results_follow_gh_output() {
-        assert_eq!(publish_result(true, b" \nhttps://github.com/o/r/pull/1\n", b"").unwrap(), "https://github.com/o/r/pull/1");
-        assert_eq!(publish_result(true, b" ", b"").unwrap(), "created successfully");
-        assert_eq!(publish_result(false, b"x", b"\nfailed to create\n").unwrap_err().to_string(), "failed to create");
-        assert_eq!(publish_result(false, b"x", b" ").unwrap_err().to_string(), "gh command failed");
+        assert_eq!(
+            publish_result(true, b" \nhttps://github.com/o/r/pull/1\n", b"").unwrap(),
+            "https://github.com/o/r/pull/1"
+        );
+        assert_eq!(
+            publish_result(true, b" ", b"").unwrap(),
+            "created successfully"
+        );
+        assert_eq!(
+            publish_result(false, b"x", b"\nfailed to create\n")
+                .unwrap_err()
+                .to_string(),
+            "failed to create"
+        );
+        assert_eq!(
+            publish_result(false, b"x", b" ").unwrap_err().to_string(),
+            "gh command failed"
+        );
     }
 
     #[test]
@@ -509,10 +681,20 @@ mod tests {
         let p = pr_prompt(&ctx, " ready for review \n");
         assert!(p.contains("Additional context: ready for review."));
         assert!(p.contains("`feature` into `main`") && p.contains("abc first") && p.contains("+x"));
-        assert!(p.contains("## Summary") && p.contains("## Testing") && !p.contains("## Steps to Reproduce"));
+        assert!(
+            p.contains("## Summary")
+                && p.contains("## Testing")
+                && !p.contains("## Steps to Reproduce")
+        );
         let p = issue_prompt("Git snapshot\nBranch: unavailable\n", " \t");
         assert!(!p.contains("Additional context:"));
-        for s in ["## Summary", "## Steps to Reproduce", "## Expected", "## Actual", "Branch: unavailable"] {
+        for s in [
+            "## Summary",
+            "## Steps to Reproduce",
+            "## Expected",
+            "## Actual",
+            "Branch: unavailable",
+        ] {
             assert!(p.contains(s), "{s}");
         }
     }
@@ -526,14 +708,30 @@ mod tests {
 
     fn sh(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
             .args(args)
             .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
@@ -559,8 +757,15 @@ mod tests {
         assert!(is_git_repo(dir));
         assert_eq!(default_branch(dir).as_deref(), Some("main"));
         let ctx = gather_pr(dir, None).unwrap();
-        assert_eq!((ctx.branch.as_str(), ctx.base.as_str()), ("feature", "main"));
-        assert!(ctx.commits.contains("add two") && !ctx.commits.contains("base commit") && !ctx.commits.contains("main moves on"));
+        assert_eq!(
+            (ctx.branch.as_str(), ctx.base.as_str()),
+            ("feature", "main")
+        );
+        assert!(
+            ctx.commits.contains("add two")
+                && !ctx.commits.contains("base commit")
+                && !ctx.commits.contains("main moves on")
+        );
         assert!(ctx.diff.contains("+two") && !ctx.diff.contains("main only"));
         assert!(ctx.stat.contains("a.txt"));
         assert!(ctx.uncommitted.unwrap().contains("dirty.txt"));
@@ -571,15 +776,24 @@ mod tests {
         assert!(gather_pr(dir, None).is_err());
         // An explicit base with no new commits is reported.
         sh(dir, &["checkout", "-q", "-b", "empty"]);
-        assert!(gather_pr(dir, Some("main")).unwrap_err().to_string().contains("no commits ahead"));
+        assert!(gather_pr(dir, Some("main"))
+            .unwrap_err()
+            .to_string()
+            .contains("no commits ahead"));
     }
 
     #[test]
     fn outside_a_repository() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!is_git_repo(tmp.path()));
-        assert!(gather_pr(tmp.path(), None).unwrap_err().to_string().contains("git repository"));
+        assert!(gather_pr(tmp.path(), None)
+            .unwrap_err()
+            .to_string()
+            .contains("git repository"));
         let snap = snapshot(tmp.path());
-        assert!(snap.starts_with("Git snapshot\nBranch: unavailable\n") && snap.contains("Staged diff stat:\nnone"));
+        assert!(
+            snap.starts_with("Git snapshot\nBranch: unavailable\n")
+                && snap.contains("Staged diff stat:\nnone")
+        );
     }
 }

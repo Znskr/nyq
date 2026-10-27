@@ -69,9 +69,18 @@ fn prompt_files_in(cwd: &Path, home: &Path) -> (Option<PromptFile>, Vec<PromptFi
     let read = |root: &Path, path: PathBuf| read_prompt_file(root, &path).map(|text| (path, text));
     // Started in the home directory, the project's files are the user's own.
     let own = same_dir(&project, home);
-    let read_project = |name: &str| if own { None } else { read(cwd, project.join(name)) };
+    let read_project = |name: &str| {
+        if own {
+            None
+        } else {
+            read(cwd, project.join(name))
+        }
+    };
     let base = read_project(SYSTEM_FILE).or_else(|| read(home, home.join(SYSTEM_FILE)));
-    let appends = [read(home, home.join(APPEND_FILE)), read_project(APPEND_FILE)];
+    let appends = [
+        read(home, home.join(APPEND_FILE)),
+        read_project(APPEND_FILE),
+    ];
     (base, appends.into_iter().flatten().collect())
 }
 
@@ -85,7 +94,10 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// Paths of the active `system.md` / `append-system.md` files, for status.
 pub fn prompt_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let (base, appends) = prompt_files_in(cwd, home);
-    base.into_iter().chain(appends).map(|(path, _)| path).collect()
+    base.into_iter()
+        .chain(appends)
+        .map(|(path, _)| path)
+        .collect()
 }
 
 /// The base prompt (built in, from `system.md`, or `ask --system`), the
@@ -136,7 +148,10 @@ Relative paths still resolve from the working directory. Project instructions co
             }
         }
     }
-    s.push_str(&crate::limits::clip("project_instructions_total_bytes", &project));
+    s.push_str(&crate::limits::clip(
+        "project_instructions_total_bytes",
+        &project,
+    ));
     let facts = crate::tools::memory::load(&crate::config::home()).unwrap_or_default();
     s.push_str(&crate::tools::memory::prompt_section(&facts));
     s
@@ -157,12 +172,23 @@ fn instructions_above(cwd: &Path, home: &Path) -> String {
         }
     };
     add(home, "AGENTS.md", "User instructions (all projects)".into());
-    let root = cwd.ancestors().skip(1).find(|dir| dir.join(".git").exists());
+    let root = cwd
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join(".git").exists());
     if let Some(root) = root {
-        let parents: Vec<&Path> = cwd.ancestors().skip(1).take_while(|dir| dir.starts_with(root)).collect();
+        let parents: Vec<&Path> = cwd
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(root))
+            .collect();
         for (up, dir) in parents.iter().enumerate().rev() {
             for name in ["AGENTS.md", "CLAUDE.md"] {
-                add(dir, name, format!("Project instructions ({}{name})", "../".repeat(up + 1)));
+                add(
+                    dir,
+                    name,
+                    format!("Project instructions ({}{name})", "../".repeat(up + 1)),
+                );
             }
         }
     }
@@ -256,7 +282,10 @@ mod tests {
         let text = base_prompt(&cwd, &home, &policy);
         assert!(text.starts_with("Project base."), "{text}");
         assert!(!text.contains("User base."), "{text}");
-        let (user, project) = (text.find("User extra.").unwrap(), text.find("Project extra.").unwrap());
+        let (user, project) = (
+            text.find("User extra.").unwrap(),
+            text.find("Project extra.").unwrap(),
+        );
         assert!(user < project, "{text}");
         assert_eq!(
             prompt_files(&cwd, &home),
@@ -283,8 +312,12 @@ mod tests {
         std::fs::write(dir.path().join("AGENTS.md"), "Outside the repo.").unwrap();
         let text = instructions_above(&cwd, &home);
         let global = text.find("Global rule.").unwrap();
-        let top = text.find("# Project instructions (../../AGENTS.md)\n\nRepo rule.").unwrap();
-        let mid = text.find("# Project instructions (../CLAUDE.md)\n\nCrates rule.").unwrap();
+        let top = text
+            .find("# Project instructions (../../AGENTS.md)\n\nRepo rule.")
+            .unwrap();
+        let mid = text
+            .find("# Project instructions (../CLAUDE.md)\n\nCrates rule.")
+            .unwrap();
         assert!(global < top && top < mid, "{text}");
         assert!(!text.contains("Outside the repo."), "{text}");
         // Outside a repository only the global file applies.

@@ -32,9 +32,17 @@ fn from_catalog(home: &Path, provider: &str, model: &str) -> Option<Price> {
         [input, output, cached, cache_write]
             .iter()
             .all(|n| n.is_finite() && *n >= 0.0)
-            .then_some(Price { input, output, cached, cache_write })
+            .then_some(Price {
+                input,
+                output,
+                cached,
+                cache_write,
+            })
     };
-    model.split_once('/').and_then(|(p, m)| lookup(p, m)).or_else(|| lookup(provider, model))
+    model
+        .split_once('/')
+        .and_then(|(p, m)| lookup(p, m))
+        .or_else(|| lookup(provider, model))
 }
 
 pub fn lookup(home: &Path, provider: &str, model: &str) -> Option<Price> {
@@ -107,7 +115,10 @@ mod tests {
             cache_write_tokens: 400_000,
             ..Default::default()
         });
-        assert!((cost - (0.4 * 3.0 + 0.2 * 0.3 + 0.4 * 3.75)).abs() < 1e-9, "{cost}");
+        assert!(
+            (cost - (0.4 * 3.0 + 0.2 * 0.3 + 0.4 * 3.75)).abs() < 1e-9,
+            "{cost}"
+        );
     }
     #[test]
     fn catalog_supports_provider_prefix_and_zero_prices() {

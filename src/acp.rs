@@ -111,7 +111,9 @@ fn sandbox_policy(opts: &Options) -> anyhow::Result<sandbox::Policy> {
                 "sandbox unavailable: {e} (use --sandbox off to run commands unconfined)"
             );
         }
-        warn(format!("sandbox unavailable ({e}); shell commands will run unconfined"));
+        warn(format!(
+            "sandbox unavailable ({e}); shell commands will run unconfined"
+        ));
         policy.mode = sandbox::Mode::Off;
     }
     Ok(policy)
@@ -441,7 +443,9 @@ async fn load_session(
     req: acp::LoadSessionRequest,
 ) -> Result<acp::LoadSessionResponse, sdk::Error> {
     check_cwd(&req.cwd)?;
-    log_request("session/load", || format!("{} cwd={}", req.session_id, req.cwd.display()));
+    log_request("session/load", || {
+        format!("{} cwd={}", req.session_id, req.cwd.display())
+    });
     let live = reopen(state, cx, &req.session_id, req.cwd, &req.mcp_servers).await?;
     {
         let inner = live.inner.lock().await;
@@ -461,7 +465,9 @@ async fn resume_session(
     req: acp::ResumeSessionRequest,
 ) -> Result<acp::ResumeSessionResponse, sdk::Error> {
     check_cwd(&req.cwd)?;
-    log_request("session/resume", || format!("{} cwd={}", req.session_id, req.cwd.display()));
+    log_request("session/resume", || {
+        format!("{} cwd={}", req.session_id, req.cwd.display())
+    });
     let held = lock(&state.sessions).get(&*req.session_id.0).cloned();
     let live = match held {
         Some(live) if live.cwd == req.cwd => live,
@@ -548,7 +554,8 @@ async fn open(
     for w in warnings {
         warn(w);
     }
-    let (ext, warnings) = crate::extensions::Extensions::load(&state.home, &cwd, crate::extensions::Mode::Acp);
+    let (ext, warnings) =
+        crate::extensions::Extensions::load(&state.home, &cwd, crate::extensions::Mode::Acp);
     for w in warnings {
         warn(w);
     }
@@ -586,7 +593,9 @@ async fn open(
         config::context_window_for(agent.provider.name(), agent.provider.context_window());
     let skills = skills::discover(&state.home, &cwd);
     if !skills.is_empty() {
-        agent.system.push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
+        agent
+            .system
+            .push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
     }
     skills::register(&mut agent.tools, skills, &state.home, &cwd);
     if !items.is_empty() {
@@ -601,10 +610,20 @@ async fn open(
     ext.start();
     let mcp = McpManager::new(state.home.clone());
     mcp.attach(&mut agent.tools);
-    let session_id = acp::SessionId::new(agent.session.as_ref().map(|s| s.id.clone()).unwrap_or_default());
+    let session_id = acp::SessionId::new(
+        agent
+            .session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .unwrap_or_default(),
+    );
     let elicitation = lock(&state.elicitation).clone();
     if let Some(caps) = elicitation {
-        mcp.set_elicitor(Arc::new(Elicit { cx: cx.clone(), session: session_id.clone(), caps }));
+        mcp.set_elicitor(Arc::new(Elicit {
+            cx: cx.clone(),
+            session: session_id.clone(),
+            caps,
+        }));
     }
     let (servers, warnings) = mcp::load_configs(&state.home, &cwd);
     for w in warnings {
@@ -726,13 +745,24 @@ struct Elicit {
 }
 
 impl Elicit {
-    async fn ask(&self, mode: acp::ElicitationMode, message: String) -> crate::mcp_client::Elicited {
+    async fn ask(
+        &self,
+        mode: acp::ElicitationMode,
+        message: String,
+    ) -> crate::mcp_client::Elicited {
         use crate::mcp_client::Elicited;
-        match self.cx.send_request(acp::CreateElicitationRequest::new(mode, message)).block_task().await {
+        match self
+            .cx
+            .send_request(acp::CreateElicitationRequest::new(mode, message))
+            .block_task()
+            .await
+        {
             Ok(r) => match r.action {
-                acp::ElicitationAction::Accept(a) => {
-                    Elicited::Accept(a.content.map(|c| serde_json::to_value(c).unwrap_or_default()).unwrap_or_else(|| serde_json::json!({})))
-                }
+                acp::ElicitationAction::Accept(a) => Elicited::Accept(
+                    a.content
+                        .map(|c| serde_json::to_value(c).unwrap_or_default())
+                        .unwrap_or_else(|| serde_json::json!({})),
+                ),
                 acp::ElicitationAction::Decline => Elicited::Decline,
                 _ => Elicited::Cancel,
             },
@@ -746,23 +776,37 @@ impl Elicit {
 
 #[async_trait::async_trait]
 impl crate::mcp_client::Elicitor for Elicit {
-    async fn form(&self, server: &str, message: &str, schema: &serde_json::Value) -> crate::mcp_client::Elicited {
+    async fn form(
+        &self,
+        server: &str,
+        message: &str,
+        schema: &serde_json::Value,
+    ) -> crate::mcp_client::Elicited {
         let parsed = serde_json::from_value::<acp::ElicitationSchema>(schema.clone());
         let (true, Ok(schema)) = (self.caps.supports_form(), parsed) else {
             return crate::mcp_client::Elicited::Decline;
         };
         let scope = acp::ElicitationSessionScope::new(self.session.clone());
         let mode = acp::ElicitationMode::Form(acp::ElicitationFormMode::new(scope, schema));
-        self.ask(mode, format!("MCP server {server}: {message}")).await
+        self.ask(mode, format!("MCP server {server}: {message}"))
+            .await
     }
 
-    async fn url(&self, server: &str, message: &str, url: &str, id: &str) -> crate::mcp_client::Elicited {
+    async fn url(
+        &self,
+        server: &str,
+        message: &str,
+        url: &str,
+        id: &str,
+    ) -> crate::mcp_client::Elicited {
         if !self.caps.supports_url() {
             return crate::mcp_client::Elicited::Decline;
         }
         let scope = acp::ElicitationSessionScope::new(self.session.clone());
-        let mode = acp::ElicitationMode::Url(acp::ElicitationUrlMode::new(scope, id.to_string(), url));
-        self.ask(mode, format!("MCP server {server}: {message}")).await
+        let mode =
+            acp::ElicitationMode::Url(acp::ElicitationUrlMode::new(scope, id.to_string(), url));
+        self.ask(mode, format!("MCP server {server}: {message}"))
+            .await
     }
 }
 

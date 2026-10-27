@@ -27,7 +27,12 @@ use tokio_util::sync::CancellationToken;
 use crate::types::ToolSpec;
 
 /// Session tools that are not MCP tools but still pass to subagents.
-const SHARED: &[&str] = &["skill", "install_skill", "mcp_list_resources", "mcp_read_resource"];
+const SHARED: &[&str] = &[
+    "skill",
+    "install_skill",
+    "mcp_list_resources",
+    "mcp_read_resource",
+];
 
 /// Directories and files the read tools must not open: nyq's own tokens,
 /// the codex CLI login, SSH keys, cloud credentials, and `~/.netrc`.
@@ -205,7 +210,9 @@ pub(crate) fn outside_path_arg(cwd: &Path, args: &Value) -> bool {
 }
 
 fn in_installed_skills(path: &str) -> bool {
-    let Some(full) = expand_tilde(path).or_else(|| Path::new(path).is_absolute().then(|| PathBuf::from(path))) else {
+    let Some(full) =
+        expand_tilde(path).or_else(|| Path::new(path).is_absolute().then(|| PathBuf::from(path)))
+    else {
         return false;
     };
     // Fully resolved, so a link inside a skill that points elsewhere still asks.
@@ -339,7 +346,10 @@ pub struct LiveTools {
 
 impl LiveTools {
     pub fn push(&self, patch: ToolPatch) {
-        self.patches.lock().unwrap_or_else(|e| e.into_inner()).push(patch);
+        self.patches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(patch);
     }
 
     /// Set (or with None, clear) a server's instructions for the model.
@@ -385,7 +395,11 @@ const OTHER_TOOLS: &[&str] = &[
 /// The `disabled_tools` entries that name no nyq tool. MCP (`mcp__…`) and
 /// extension (`ext__…`) names can't be checked before those start.
 pub fn unknown_tool_names(names: &[String]) -> Vec<String> {
-    let known = Registry::all_builtin().tools.iter().map(|t| t.spec().name).collect::<Vec<_>>();
+    let known = Registry::all_builtin()
+        .tools
+        .iter()
+        .map(|t| t.spec().name)
+        .collect::<Vec<_>>();
     names
         .iter()
         .filter(|n| {
@@ -444,7 +458,8 @@ impl Registry {
                 let spec = t.spec();
                 let disabled = self.disabled.contains(&spec.name);
                 // Reads inside the workspace never ask (see `Agent::prepare`).
-                let asks = t.needs_approval_for(&none, cwd) && !crate::permissions::is_read_tool(&spec.name);
+                let asks = t.needs_approval_for(&none, cwd)
+                    && !crate::permissions::is_read_tool(&spec.name);
                 (spec, disabled, asks)
             })
             .collect()
@@ -462,8 +477,12 @@ impl Registry {
 
     /// Apply queued tool changes.
     pub fn refresh(&mut self) {
-        for live in [self.live.clone(), self.extensions.clone()].into_iter().flatten() {
-            let patches = std::mem::take(&mut *live.patches.lock().unwrap_or_else(|e| e.into_inner()));
+        for live in [self.live.clone(), self.extensions.clone()]
+            .into_iter()
+            .flatten()
+        {
+            let patches =
+                std::mem::take(&mut *live.patches.lock().unwrap_or_else(|e| e.into_inner()));
             for patch in patches {
                 patch(self);
             }
@@ -508,7 +527,7 @@ impl Registry {
                 let name = t.spec().name;
                 !self.disabled.contains(&name)
                     && (mcp_search::is_mcp(&name)
-                    || name.starts_with(crate::extensions::TOOL_PREFIX)
+                        || name.starts_with(crate::extensions::TOOL_PREFIX)
                         || SHARED.contains(&name.as_str()))
             })
             .cloned()
@@ -631,7 +650,10 @@ impl SecretRoots {
         for path in paths {
             add_secret(&mut roots, path);
         }
-        Self { roots, open: Vec::new() }
+        Self {
+            roots,
+            open: Vec::new(),
+        }
     }
 }
 

@@ -94,13 +94,24 @@ fn badge_color(e: &Entry, text: &str) -> nu_ansi_term::Color {
 /// A JSON Schema type, readably: `string`, `array of string`, `one of a|b`.
 fn type_name(schema: &Value) -> String {
     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        let names: Vec<String> = values.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), String::from)).collect();
+        let names: Vec<String> = values
+            .iter()
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), String::from))
+            .collect();
         return format!("one of {}", names.join("|"));
     }
     let base = match schema.get("type") {
         Some(Value::String(t)) => t.clone(),
-        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" or "),
-        _ => match schema.get("anyOf").or_else(|| schema.get("oneOf")).and_then(Value::as_array) {
+        Some(Value::Array(ts)) => ts
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" or "),
+        _ => match schema
+            .get("anyOf")
+            .or_else(|| schema.get("oneOf"))
+            .and_then(Value::as_array)
+        {
             Some(alts) => alts.iter().map(type_name).collect::<Vec<_>>().join(" or "),
             None => "any".into(),
         },
@@ -114,9 +125,16 @@ fn type_name(schema: &Value) -> String {
 /// The parameters of a tool's JSON Schema: name, type, whether required,
 /// and the description indented under it.
 pub fn param_lines(schema: &Value) -> Vec<String> {
-    let required: Vec<&str> =
-        schema.get("required").and_then(Value::as_array).map(|r| r.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-    let Some(props) = schema.get("properties").and_then(Value::as_object).filter(|p| !p.is_empty()) else {
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let Some(props) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .filter(|p| !p.is_empty())
+    else {
         return vec!["  (none)".into()];
     };
     // Required parameters first, then the rest, each by name.
@@ -125,9 +143,17 @@ pub fn param_lines(schema: &Value) -> Vec<String> {
     let mut out = Vec::new();
     for name in names {
         let p = &props[name];
-        let req = if required.contains(&name.as_str()) { ", required" } else { "" };
+        let req = if required.contains(&name.as_str()) {
+            ", required"
+        } else {
+            ""
+        };
         out.push(format!("  {name} ({}{req})", type_name(p)));
-        if let Some(d) = p.get("description").and_then(Value::as_str).filter(|d| !d.trim().is_empty()) {
+        if let Some(d) = p
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|d| !d.trim().is_empty())
+        {
             out.extend(d.lines().map(|l| format!("      {}", l.trim_end())));
         }
     }
@@ -136,11 +162,19 @@ pub fn param_lines(schema: &Value) -> Vec<String> {
 
 /// The text of a tool's detail view (and `/tools info NAME`).
 pub fn detail(e: &Entry) -> String {
-    let state = if e.disabled { "off (disabled_tools; Ctrl+T or /tools enable turns it on)" } else { "on" };
+    let state = if e.disabled {
+        "off (disabled_tools; Ctrl+T or /tools enable turns it on)"
+    } else {
+        "on"
+    };
     let mut lines = vec![
         format!("{} · {}", e.spec.name, e.group),
         format!("State: {state}"),
-        format!("Approval: {} · {}", e.approval.badge(), e.approval.explain()),
+        format!(
+            "Approval: {} · {}",
+            e.approval.badge(),
+            e.approval.explain()
+        ),
         String::new(),
         e.spec.description.trim_end().to_string(),
         String::new(),
@@ -156,14 +190,27 @@ pub fn plain_lines(entries: &[Entry]) -> Vec<String> {
     let mut groups: Vec<&str> = entries.iter().map(|e| e.group.as_str()).collect();
     groups.sort_by_key(|g| group_rank(g));
     groups.dedup();
-    let width = entries.iter().map(|e| e.spec.name.chars().count()).max().unwrap_or(0).min(40);
+    let width = entries
+        .iter()
+        .map(|e| e.spec.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(40);
     let mut out = Vec::new();
     for g in groups {
         let rows: Vec<&Entry> = entries.iter().filter(|e| e.group == g).collect();
         out.push(format!("{g} ({})", rows.len()));
         for e in rows {
             let desc = super::render::one_line(e.spec.description.lines().next().unwrap_or(""), 90);
-            out.push(format!("  {:width$}  [{}]  {desc}", e.spec.name, badges(e).join(", ")).trim_end().to_string());
+            out.push(
+                format!(
+                    "  {:width$}  [{}]  {desc}",
+                    e.spec.name,
+                    badges(e).join(", ")
+                )
+                .trim_end()
+                .to_string(),
+            );
         }
     }
     out.push("Use: /tools info|disable|enable|trust|untrust NAME".into());
@@ -192,7 +239,13 @@ pub enum Action {
 
 impl ToolsMenu {
     pub fn new(entries: Vec<Entry>) -> Self {
-        let mut m = Self { entries: Vec::new(), groups: Vec::new(), list: List::default(), confirm: None, notice: None };
+        let mut m = Self {
+            entries: Vec::new(),
+            groups: Vec::new(),
+            list: List::default(),
+            confirm: None,
+            notice: None,
+        };
         m.set_entries(entries);
         m
     }
@@ -202,20 +255,32 @@ impl ToolsMenu {
     pub fn set_entries(&mut self, mut entries: Vec<Entry>) {
         let keep = self.current().map(|e| e.spec.name.clone());
         let group = self.list.group.and_then(|g| self.groups.get(g).cloned());
-        entries.sort_by(|a, b| (group_rank(&a.group), &a.spec.name).cmp(&(group_rank(&b.group), &b.spec.name)));
+        entries.sort_by(|a, b| {
+            (group_rank(&a.group), &a.spec.name).cmp(&(group_rank(&b.group), &b.spec.name))
+        });
         self.groups = entries.iter().map(|e| e.group.clone()).collect();
         self.groups.dedup();
         self.entries = entries;
         self.list.group = group.and_then(|g| self.groups.iter().position(|x| *x == g));
         if let Some(name) = keep {
-            self.list.selected = self.rows().iter().position(|e| e.spec.name == name).unwrap_or(0);
+            self.list.selected = self
+                .rows()
+                .iter()
+                .position(|e| e.spec.name == name)
+                .unwrap_or(0);
         }
     }
 
     fn matching(&self) -> impl Iterator<Item = &Entry> {
         let words = self.list.words();
         self.entries.iter().filter(move |e| {
-            let hay = format!("{} {} {} {}", e.spec.name, e.spec.description, e.group, badges(e).join(" "));
+            let hay = format!(
+                "{} {} {} {}",
+                e.spec.name,
+                e.spec.description,
+                e.group,
+                badges(e).join(" ")
+            );
             menu::matches(&hay, &words)
         })
     }
@@ -224,12 +289,15 @@ impl ToolsMenu {
     /// description, group or badge).
     pub fn rows(&self) -> Vec<&Entry> {
         let group = self.list.group.and_then(|g| self.groups.get(g));
-        self.matching().filter(|e| group.is_none_or(|g| *g == e.group)).collect()
+        self.matching()
+            .filter(|e| group.is_none_or(|g| *g == e.group))
+            .collect()
     }
 
     fn current(&self) -> Option<&Entry> {
         let rows = self.rows();
-        rows.get(self.list.selected.min(rows.len().saturating_sub(1))).copied()
+        rows.get(self.list.selected.min(rows.len().saturating_sub(1)))
+            .copied()
     }
 
     /// The entry for `name`.
@@ -238,7 +306,8 @@ impl ToolsMenu {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
         if ctrl && key.code == KeyCode::Char('c') {
             return Action::Close;
         }
@@ -266,17 +335,25 @@ impl ToolsMenu {
                 }
             }
             KeyCode::Char('a') if ctrl => {
-                let Some(e) = current else { return Action::None };
+                let Some(e) = current else {
+                    return Action::None;
+                };
                 let name = &e.spec.name;
                 let refuse = |msg: String| (msg, true);
                 self.notice = match &e.approval {
                     _ if e.trusted => return Action::Run(format!("/tools untrust {name}")),
-                    ToolApproval::Denied(rule) => Some(refuse(format!("{name} is blocked by `{rule}`; an allow rule can't override a deny."))),
-                    ToolApproval::AskRule(rule) => Some(refuse(format!("{name} always asks because of `{rule}`; an allow rule can't override it."))),
-                    ToolApproval::Free => Some((format!("{name} already runs without asking."), false)),
-                    ToolApproval::Allowed(rule) => {
-                        Some(refuse(format!("{name} is allowed by `{rule}`; change that with /allowlist.")))
+                    ToolApproval::Denied(rule) => Some(refuse(format!(
+                        "{name} is blocked by `{rule}`; an allow rule can't override a deny."
+                    ))),
+                    ToolApproval::AskRule(rule) => Some(refuse(format!(
+                        "{name} always asks because of `{rule}`; an allow rule can't override it."
+                    ))),
+                    ToolApproval::Free => {
+                        Some((format!("{name} already runs without asking."), false))
                     }
+                    ToolApproval::Allowed(rule) => Some(refuse(format!(
+                        "{name} is allowed by `{rule}`; change that with /allowlist."
+                    ))),
                     ToolApproval::Session | ToolApproval::Mode(_) => {
                         self.confirm = Some(name.clone());
                         None
@@ -294,7 +371,11 @@ impl ToolsMenu {
     pub fn render(&self, width: usize, height: usize) -> Vec<String> {
         let rows = self.rows();
         let all: Vec<&Entry> = self.matching().collect();
-        let tabs = self.groups.iter().map(|g| (g.clone(), all.iter().filter(|e| e.group == *g).count())).collect();
+        let tabs = self
+            .groups
+            .iter()
+            .map(|g| (g.clone(), all.iter().filter(|e| e.group == *g).count()))
+            .collect();
         let current = self.current();
         let note = match (&self.confirm, &self.notice) {
             (Some(name), _) => Some((
@@ -311,16 +392,42 @@ impl ToolsMenu {
                 ("Enter", "Details"),
                 ("Tab", "Group"),
                 ("^T", if e.disabled { "Turn on" } else { "Turn off" }),
-                ("^A", if e.trusted { "Stop allowing" } else { "Always allow" }),
+                (
+                    "^A",
+                    if e.trusted {
+                        "Stop allowing"
+                    } else {
+                        "Always allow"
+                    },
+                ),
                 ("Esc", "Close"),
             ],
             (None, None) => vec![("Tab", "Group"), ("Esc", "Close")],
         };
         let preview = current
             .map(|e| {
-                let desc = e.spec.description.split_whitespace().collect::<Vec<_>>().join(" ");
-                let params = e.spec.parameters.get("properties").and_then(Value::as_object).map_or(0, |p| p.len());
-                vec![desc, format!("{} · {} parameter{} · {}", e.group, params, if params == 1 { "" } else { "s" }, e.approval.explain())]
+                let desc = e
+                    .spec
+                    .description
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let params = e
+                    .spec
+                    .parameters
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map_or(0, |p| p.len());
+                vec![
+                    desc,
+                    format!(
+                        "{} · {} parameter{} · {}",
+                        e.group,
+                        params,
+                        if params == 1 { "" } else { "s" },
+                        e.approval.explain()
+                    ),
+                ]
             })
             .unwrap_or_default();
         let view = View {
@@ -333,8 +440,14 @@ impl ToolsMenu {
                 .iter()
                 .map(|e| Row {
                     label: e.spec.name.clone(),
-                    detail: super::render::one_line(e.spec.description.lines().next().unwrap_or(""), 300),
-                    badges: badges(e).into_iter().map(|b| Badge::new(b, badge_color(e, b))).collect(),
+                    detail: super::render::one_line(
+                        e.spec.description.lines().next().unwrap_or(""),
+                        300,
+                    ),
+                    badges: badges(e)
+                        .into_iter()
+                        .map(|b| Badge::new(b, badge_color(e, b)))
+                        .collect(),
                     dim: e.disabled,
                 })
                 .collect(),
@@ -391,11 +504,21 @@ mod tests {
             (spec("bash", "Run a shell command"), false, true),
             (spec("web_search", "Search the web"), true, true),
             (spec("mcp__gh__list_issues", "List issues"), false, true),
-            (spec("mcp__gh__delete_repo", "Delete a repository"), false, true),
+            (
+                spec("mcp__gh__delete_repo", "Delete a repository"),
+                false,
+                true,
+            ),
             (spec("mcp__db__query", "Run SQL"), false, true),
             (spec("ext__notes__save", "Save a note"), false, true),
         ];
-        ToolsMenu::new(entries(catalog, &perms, &HashSet::new(), Path::new("/w"), Mode::Ask))
+        ToolsMenu::new(entries(
+            catalog,
+            &perms,
+            &HashSet::new(),
+            Path::new("/w"),
+            Mode::Ask,
+        ))
     }
 
     fn names(m: &ToolsMenu) -> Vec<&str> {
@@ -425,10 +548,18 @@ mod tests {
         }
         assert_eq!(names(&m), ["web_search"], "badges are searchable");
         let out = m.render(80, 40);
-        assert!(out.iter().all(|r| super::super::render::visible_width(r) <= 80));
+        assert!(out
+            .iter()
+            .all(|r| super::super::render::visible_width(r) <= 80));
         let text = strip_ansi(&out.join("\n"));
-        assert!(text.contains("[All 1]") && text.contains("Built-in 1") && text.contains("MCP gh 0"), "{text}");
-        assert!(text.contains("off · asks") && text.contains("Asks before each call"), "{text}");
+        assert!(
+            text.contains("[All 1]") && text.contains("Built-in 1") && text.contains("MCP gh 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("off · asks") && text.contains("Asks before each call"),
+            "{text}"
+        );
         assert!(text.contains("^T Turn on"), "{text}");
     }
 
@@ -436,24 +567,46 @@ mod tests {
     fn toggles_and_trusts_only_after_a_confirmation() {
         let mut m = menu();
         assert_eq!(m.on_key(key(KeyCode::Enter)), Action::View("bash".into()));
-        assert_eq!(m.on_key(ctrl('t')), Action::Run("/tools disable bash".into()));
+        assert_eq!(
+            m.on_key(ctrl('t')),
+            Action::Run("/tools disable bash".into())
+        );
         assert_eq!(m.on_key(ctrl('a')), Action::None);
         assert!(strip_ansi(&m.render(80, 40).join("\n")).contains("Always allow bash"));
         // Enter does not confirm: only y does.
         assert_eq!(m.on_key(key(KeyCode::Enter)), Action::None);
         m.on_key(ctrl('a'));
-        assert_eq!(m.on_key(key(KeyCode::Char('y'))), Action::Run("/tools trust bash".into()));
+        assert_eq!(
+            m.on_key(key(KeyCode::Char('y'))),
+            Action::Run("/tools trust bash".into())
+        );
         m.on_key(key(KeyCode::Down));
         assert_eq!(m.rows()[m.list.selected].spec.name, "read_file");
         m.on_key(ctrl('a'));
-        assert!(m.notice.as_ref().unwrap().0.contains("already runs without asking"));
+        assert!(m
+            .notice
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("already runs without asking"));
         m.list.filter = "delete".into();
         m.on_key(ctrl('a'));
-        assert!(m.notice.as_ref().unwrap().0.contains("can't override a deny"));
+        assert!(m
+            .notice
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("can't override a deny"));
         m.list.filter = "list_issues".into();
-        assert_eq!(m.on_key(ctrl('a')), Action::Run("/tools untrust mcp__gh__list_issues".into()));
+        assert_eq!(
+            m.on_key(ctrl('a')),
+            Action::Run("/tools untrust mcp__gh__list_issues".into())
+        );
         m.list.filter = "web_search".into();
-        assert_eq!(m.on_key(ctrl('t')), Action::Run("/tools enable web_search".into()));
+        assert_eq!(
+            m.on_key(ctrl('t')),
+            Action::Run("/tools enable web_search".into())
+        );
         assert_eq!(m.on_key(key(KeyCode::Esc)), Action::Close);
     }
 
@@ -461,7 +614,10 @@ mod tests {
     fn details_list_parameters_readably() {
         let m = menu();
         let text = detail(m.entry("bash").unwrap());
-        assert!(text.starts_with("bash · Built-in\nState: on\nApproval: asks"), "{text}");
+        assert!(
+            text.starts_with("bash · Built-in\nState: on\nApproval: asks"),
+            "{text}"
+        );
         let params = text.split("Parameters\n").nth(1).unwrap();
         assert_eq!(
             params.lines().collect::<Vec<_>>(),
@@ -483,7 +639,12 @@ mod tests {
         let m = menu();
         let lines = plain_lines(&m.entries);
         assert_eq!(lines[0], "Built-in (3)");
-        assert!(lines.iter().any(|l| l.contains("web_search") && l.contains("[off, asks]")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("web_search") && l.contains("[off, asks]")),
+            "{lines:?}"
+        );
         assert!(lines.iter().any(|l| l == "MCP gh (2)"));
         assert!(lines.iter().any(|l| l == "Extensions (1)"));
         assert!(lines.last().unwrap().contains("/tools info|disable|enable"));
