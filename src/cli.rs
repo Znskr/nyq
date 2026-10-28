@@ -24,6 +24,7 @@ use crate::provider;
 use crate::record_tape;
 use crate::sandbox;
 use crate::session;
+use crate::settings;
 use crate::tools;
 use crate::upgrade;
 use crate::usage;
@@ -559,7 +560,7 @@ impl Ctx<'_> {
     /// unusable directory.
     fn policy(&self) -> sandbox::Policy {
         sandbox::Policy {
-            mode: self.cli.sandbox.unwrap_or_default(),
+            mode: settings::sandbox_mode_or(self.cli.sandbox),
             network: self.cli.allow_network,
             writable: extra_dirs(self.home, self.cwd, self.cli),
         }
