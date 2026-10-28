@@ -1034,6 +1034,13 @@ pub fn sandbox_mode(s: &Settings) -> crate::sandbox::Mode {
     crate::sandbox::Mode::from_str(&s.sandbox, true).unwrap_or_default()
 }
 
+/// The sandbox mode for this run: the `--sandbox` flag when given, else the
+/// saved setting. Every entry point (interactive, print, ACP, status) uses this,
+/// so the setting means the same thing everywhere.
+pub fn sandbox_mode_or(explicit: Option<crate::sandbox::Mode>) -> crate::sandbox::Mode {
+    explicit.unwrap_or_else(|| sandbox_mode(&current()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1452,5 +1459,15 @@ mod tests {
             }),
             crate::sandbox::Mode::ReadOnly
         );
+    }
+
+    #[test]
+    fn the_flag_beats_the_saved_sandbox() {
+        assert_eq!(
+            sandbox_mode_or(Some(crate::sandbox::Mode::Off)),
+            crate::sandbox::Mode::Off
+        );
+        // Without a flag, the saved setting decides (tests read the defaults).
+        assert_eq!(sandbox_mode_or(None), sandbox_mode(&current()));
     }
 }

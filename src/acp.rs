@@ -23,6 +23,7 @@ use crate::mcp::{McpManager, Scope, ServerConfig, Transport};
 use crate::models::ModelChoice;
 use crate::provider::Provider;
 use crate::session::Session;
+use crate::settings;
 use crate::tools::{Registry, ToolOutput};
 use crate::types::{Image, Item, StreamEvent, Usage};
 use crate::{config, mcp, models, prompt, sandbox, session, skills};
@@ -97,11 +98,11 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     serve(state, transport).await
 }
 
-/// The requested sandbox, or workspace-write where supported (else off, with
+/// The requested sandbox, or the saved setting where supported (else off, with
 /// a warning on stderr). Mirrors the interactive mode.
 fn sandbox_policy(opts: &Options) -> anyhow::Result<sandbox::Policy> {
     let mut policy = sandbox::Policy {
-        mode: opts.sandbox.unwrap_or_default(),
+        mode: settings::sandbox_mode_or(opts.sandbox),
         network: opts.allow_network,
         writable: Vec::new(),
     };

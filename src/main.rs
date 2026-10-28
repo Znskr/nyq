@@ -1024,9 +1024,7 @@ fn sync_footer(tui: &Tui, agent: &Agent, current: Option<&models::ModelChoice>) 
 /// supports it (falling back to off with a warning when it doesn't).
 fn sandbox_policy(cli: &Cli) -> Result<sandbox::Policy> {
     let mut policy = sandbox::Policy {
-        mode: cli
-            .sandbox
-            .unwrap_or_else(|| settings::sandbox_mode(&settings::current())),
+        mode: settings::sandbox_mode_or(cli.sandbox),
         network: cli.allow_network,
         writable: Vec::new(),
     };
