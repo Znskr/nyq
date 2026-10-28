@@ -1133,10 +1133,7 @@ fn parse_catalog(subscription: &str, modalities: &str) -> Result<Vec<ListedModel
             .and_then(Value::as_bool)
             .context("invalid Grok model catalog")?;
         let efforts = reasoning_efforts(object.get("reasoning_efforts"))?;
-        anyhow::ensure!(
-            supports == !efforts.is_empty(),
-            "invalid Grok model catalog"
-        );
+        anyhow::ensure!(supports != efforts.is_empty(), "invalid Grok model catalog");
         listed.push(ListedModel {
             id: id.to_owned(),
             context_window: positive_u32(object.get("context_window"))?,
@@ -1436,7 +1433,6 @@ mod tests {
         assert_eq!(pairs["code_challenge_method"], "S256");
         assert_eq!(pairs["state"], "state-value");
         assert_eq!(pairs["referrer"], PROXY_CLIENT_NAME);
-        assert!(!PROXY_CLIENT_NAME.is_empty());
         let _env = TestEnv::new();
         assert_eq!(
             configured_url(RESPONSES_URL_ENV, RESPONSES_URL).unwrap(),
