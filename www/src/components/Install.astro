@@ -1,0 +1,38 @@
+---
+import Icon from "./Icon.astro";
+import { INSTALL, REPO } from "../lib";
+
+interface Props {
+  id: string;
+  align?: "start" | "center";
+  /** The command box's background; use bg-black on a surface card. */
+  tone?: "bg-surface" | "bg-black";
+}
+const { id, align = "start", tone = "bg-surface" } = Astro.props;
+const center = align === "center";
+---
+<div class:list={["flex w-full min-w-0 max-w-2xl flex-col gap-3", center && "items-center"]} data-install>
+  <div
+    class:list={["flex w-full min-w-0 flex-col gap-2 rounded-2xl border border-line p-2 sm:flex-row sm:items-center", tone]}
+  >
+    <div class="w-full min-w-0 flex-1 overflow-x-auto rounded-lg px-3 py-2 [scrollbar-width:none]">
+      <code id={id} class="body-6 whitespace-nowrap font-mono text-fg">
+        <span class="select-none text-faint">$ </span>{INSTALL}
+      </code>
+    </div>
+    <button
+      type="button"
+      class="button-md group inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-fg px-3 py-2 text-black transition duration-300 ease-base hover:bg-[#e6e6e6] hover:-translate-y-px active:translate-y-0 active:scale-[0.98]"
+      data-copy={INSTALL}
+      aria-describedby={`${id}-status`}
+    >
+      <Icon name="copy" class="size-5 group-data-[state=copied]:hidden" />
+      <Icon name="check" class="hidden size-5 group-data-[state=copied]:block" />
+      <span data-copy-label>Copy install command</span>
+    </button>
+  </div>
+  <p id={`${id}-status`} class:list={["caption-5 text-muted", center && "text-center"]} aria-live="polite" data-copy-status>
+    macOS and Linux, x86_64 and arm64. Windows builds are on the{" "}
+    <a href={`${REPO}/releases`} class="text-fg underline decoration-line-strong underline-offset-4 transition-colors duration-300 ease-base hover:decoration-fg">releases page</a>.
+  </p>
+</div>

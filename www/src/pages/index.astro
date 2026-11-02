@@ -1,0 +1,50 @@
+---
+import Base from "../layouts/Base.astro";
+import Hero from "../components/Hero.astro";
+import Providers from "../components/Providers.astro";
+import Problem from "../components/Problem.astro";
+import Benefits from "../components/Benefits.astro";
+import Tagline from "../components/Tagline.astro";
+import HowItWorks from "../components/HowItWorks.astro";
+import Faq from "../components/Faq.astro";
+import FinalCta from "../components/FinalCta.astro";
+import { faq } from "../faq";
+import { REPO } from "../lib";
+
+const structured = [
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name: "nyq",
+    description: "A small coding agent for your terminal that works with ChatGPT, Grok, Anthropic, xAI, OpenCode and any OpenAI compatible model.",
+    applicationCategory: "DeveloperApplication",
+    operatingSystem: "macOS, Linux, Windows",
+    license: "https://www.apache.org/licenses/LICENSE-2.0",
+    offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+    codeRepository: REPO,
+  },
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: faq.map((f) => ({
+      "@type": "Question",
+      name: f.q,
+      acceptedAnswer: { "@type": "Answer", text: f.a },
+    })),
+  },
+];
+---
+<Base
+  title="nyq: code with any model from your terminal"
+  description="nyq is an open source coding agent for your terminal. Use your ChatGPT or Grok subscription, an Anthropic or OpenAI key, or a local model, with sandboxed shell commands."
+>
+  <script slot="head" type="application/ld+json" set:html={JSON.stringify(structured)} />
+  <Hero />
+  <Providers />
+  <Problem />
+  <Benefits />
+  <Tagline />
+  <HowItWorks />
+  <Faq />
+  <FinalCta />
+</Base>
