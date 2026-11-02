@@ -159,7 +159,8 @@ pub fn ascii() -> bool {
     bits() & ASCII != 0
 }
 
-/// 24-bit color is on, so blends (the banner's gradient) render smoothly.
+/// 24-bit color is on (the tests check the mode bits through it).
+#[cfg(test)]
 pub fn truecolor_on() -> bool {
     bits() & (NO_TRUECOLOR | NO_COLOR) == 0
 }

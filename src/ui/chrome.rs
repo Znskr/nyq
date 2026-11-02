@@ -20,7 +20,7 @@ use super::statusline::{self, tilde, Kind};
 use super::theme::{self, fg, BLUE, BRIGHT, FAINT, GRAY, GREEN, MAGENTA, MID, RED, YELLOW};
 use super::tui::{clip_width, Footer};
 
-/// Prompts, the spinner and the start of the logo's gradient.
+/// Prompts and the spinner.
 pub const ACCENT: Color = BLUE;
 /// The banner is one line below this width.
 const WIDE_BANNER: usize = 60;
@@ -163,28 +163,9 @@ pub fn note(note: &str) -> String {
     }
 }
 
-/// `row` in a left-to-right gradient from the accent to magenta; a single
-/// accent color without truecolor (and none under `NO_COLOR`).
-fn gradient(row: &str) -> String {
-    match (theme::color(ACCENT), theme::color(MAGENTA)) {
-        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) if theme::truecolor_on() => {
-            let last = row.chars().count().saturating_sub(1).max(1) as f64;
-            let mix = |a: u8, b: u8, t: f64| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
-            row.chars()
-                .enumerate()
-                .map(|(i, c)| {
-                    let t = i as f64 / last;
-                    let color = Color::Rgb(mix(r1, r2, t), mix(g1, g2, t), mix(b1, b2, t));
-                    if c == ' ' {
-                        " ".to_string()
-                    } else {
-                        Style::new().fg(color).paint(c.to_string()).to_string()
-                    }
-                })
-                .collect()
-        }
-        _ => paint(fg(ACCENT), row),
-    }
+/// The logo in the foreground color (none under `NO_COLOR`), as on the website.
+fn logo(row: &str) -> String {
+    paint(fg(BRIGHT), row)
 }
 
 /// Startup tips: a key (or prefix) and what it does. Unbound keys drop theirs.
@@ -237,12 +218,12 @@ pub fn banner(version: &str, f: &Footer, keys: &Keymap, width: usize, tip: usize
         let room = width.saturating_sub(LOGO[0].chars().count() + 2);
         rows.push(format!(
             "{}  {name} {}",
-            gradient(LOGO[0]),
+            logo(LOGO[0]),
             paint(fg(GRAY), &truncate(&version, room.saturating_sub(4)))
         ));
         rows.push(format!(
             "{}  {}",
-            gradient(LOGO[1]),
+            logo(LOGO[1]),
             paint(fg(GRAY), &truncate(&facts, room))
         ));
     } else {
@@ -643,11 +624,11 @@ mod tests {
         assert_eq!(plain[2], format!("{}tip {key} {text}", " ".repeat(13)));
         assert!(
             rows[0].contains("\x1b[38;2;"),
-            "a truecolor gradient: {:?}",
+            "a truecolor logo: {:?}",
             rows[0]
         );
         assert!(rows.iter().all(|r| visible_width(r) <= 110));
-        // Without truecolor the logo is one accent color.
+        // Without truecolor the logo uses the 256-color palette.
         theme::test_mode(false, false, false);
         let rows = banner("0.5", &footer(), &keys, 110, 0);
         assert!(
