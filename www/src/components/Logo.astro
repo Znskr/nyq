@@ -1,7 +1,26 @@
 ---
-// The wordmark: nyq's prompt mark beside its name, as in the terminal.
+// The nyq mark: the half-block logo from the terminal banner (src/ui/chrome.rs),
+//   █▀█ █▄█ █▀█
+//   ▀ ▀ ▄▄█ ▀▀█
+// drawn as square pixels. Each text row becomes two pixel rows.
+import { PIXELS } from "../logo";
+
+interface Props {
+  /** Height in pixels; the width follows (11 x 4 grid). */
+  size?: number;
+  class?: string;
+}
+const { size = 16, class: className = "text-fg" } = Astro.props;
 ---
-<span class="inline-flex items-center gap-2 font-mono title-3" aria-hidden="true">
-  <span class="text-nyq-blue">›</span>
-  <span>nyq</span>
-</span>
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 11 4"
+  width={(size / 4) * 11}
+  height={size}
+  shape-rendering="crispEdges"
+  fill="currentColor"
+  class={className}
+  aria-hidden="true"
+>
+  {PIXELS.map(([x, y]) => <rect x={x} y={y} width="1.02" height="1.02" />)}
+</svg>
