@@ -1,0 +1,26 @@
+---
+import Icon from "./Icon.astro";
+import { href } from "../lib";
+
+interface Props {
+  title: string;
+  updated: string;
+}
+const { title, updated } = Astro.props;
+---
+<article class="mx-auto flex max-w-2xl flex-col gap-8 px-6 pb-24 pt-40">
+  <a
+    href={href()}
+    class="body-5 inline-flex w-fit items-center gap-2 rounded-full text-muted transition-colors duration-300 ease-base hover:text-fg"
+  >
+    <Icon name="arrow-left" class="size-4" />
+    Back to nyq
+  </a>
+  <header class="flex flex-col gap-3">
+    <h1 class="heading-4 sm:heading-3">{title}</h1>
+    <p class="caption-5 text-faint">Last updated {updated}</p>
+  </header>
+  <div class="flex flex-col gap-6 body-3 text-muted [&_h2]:heading-6 [&_h2]:text-fg [&_h2]:mt-6 [&_a]:text-fg [&_a]:underline [&_a]:underline-offset-4 [&_code]:font-mono [&_code]:text-fg [&_ul]:flex [&_ul]:flex-col [&_ul]:gap-2 [&_ul]:pl-6 [&_ul]:list-disc">
+    <slot />
+  </div>
+</article>

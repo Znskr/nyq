@@ -1,0 +1,24 @@
+---
+import Install from "./Install.astro";
+import Terminal from "./Terminal.astro";
+---
+<section class="relative px-6 pb-24 pt-32 sm:pt-40" aria-labelledby="hero-title">
+  <div class="mx-auto flex max-w-6xl flex-col items-center gap-16">
+    <div class="flex w-full min-w-0 flex-col items-center gap-6 text-center">
+      <p class="caption-4 rounded-full border border-line bg-surface px-3 py-1 text-muted">
+        Open source · Apache 2.0 · Written in Rust
+      </p>
+      <h1 id="hero-title" class="heading-3 sm:heading-2 lg:heading-1 max-w-[680px] text-hero pb-2">
+        Code with any model <br />from your terminal
+      </h1>
+      <p class="body-3 max-w-[680px] text-muted">
+        nyq is a coding agent that reads your code, runs your tests and edits files.
+        Use the ChatGPT or Grok plan you already pay for, an Anthropic or OpenAI key, or a local model.
+      </p>
+      <Install id="install-top" align="center" />
+    </div>
+    <div class="w-full max-w-4xl">
+      <Terminal />
+    </div>
+  </div>
+</section>

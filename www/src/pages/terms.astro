@@ -1,0 +1,32 @@
+---
+import Base from "../layouts/Base.astro";
+import Prose from "../components/Prose.astro";
+import { REPO } from "../lib";
+---
+<Base
+  title="Terms · nyq"
+  description="nyq is licensed under the Apache License 2.0."
+  current="terms"
+>
+  <Prose title="Terms" updated="2 November 2026">
+    <h2>License</h2>
+    <p>
+      nyq is free software licensed under the
+      <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License, Version 2.0</a>.
+      You may use, change and redistribute it under that license. The source is on
+      <a href={REPO}>GitHub</a>.
+    </p>
+    <h2>No warranty</h2>
+    <p>
+      As the license says, nyq is provided as is, without warranties or conditions of any kind.
+      It runs commands and edits files on your machine at a language model's direction. Review its
+      changes, keep your work in version control, and use the sandbox and permission settings that
+      fit your risk.
+    </p>
+    <h2>Model providers</h2>
+    <p>
+      Your use of a model through nyq is also governed by that provider's terms. You are
+      responsible for having the right to use the subscription or API key you sign in with.
+    </p>
+  </Prose>
+</Base>

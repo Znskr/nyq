@@ -1,0 +1,99 @@
+---
+import Icon from "./Icon.astro";
+import Logo from "./Logo.astro";
+import { href, REPO } from "../lib";
+
+interface Props {
+  current: "home" | "privacy" | "terms" | "none";
+}
+const { current } = Astro.props;
+const onHome = current === "home";
+const links = [
+  { label: "Features", to: "#features", id: "features" },
+  { label: "How it works", to: "#how", id: "how" },
+  { label: "FAQ", to: "#faq", id: "faq" },
+].map((l) => ({ ...l, url: onHome ? l.to : href(l.to) }));
+// Legal pages are not in the menu, so they appear as the current item while open.
+const page = { privacy: "Privacy", terms: "Terms" } as Record<string, string>;
+const currentLabel = page[current];
+const linkBase =
+  "title-4 rounded-full px-3 py-2 text-muted transition-colors duration-300 ease-base hover:text-fg hover:bg-raised active:translate-y-px aria-[current=true]:text-fg aria-[current=true]:bg-raised aria-[current=page]:text-fg aria-[current=page]:bg-raised";
+---
+<header class="fixed inset-x-0 top-4 z-50 flex justify-center px-4">
+  <nav
+    aria-label="Main"
+    class="flex items-center gap-2 rounded-full border border-line bg-surface/70 p-2 pl-4 backdrop-blur-xl"
+  >
+    <a
+      href={href()}
+      class="mr-2 flex items-center rounded-full py-2 text-fg transition-opacity duration-300 ease-base hover:opacity-80"
+      aria-label="nyq home"
+      aria-current={onHome ? "page" : undefined}
+    >
+      <Logo />
+    </a>
+
+    <ul class="hidden items-center gap-1 md:flex">
+      {links.map((l) => (
+        <li>
+          <a href={l.url} class={linkBase} data-spy={onHome ? l.id : undefined}>{l.label}</a>
+        </li>
+      ))}
+      {currentLabel && (
+        <li>
+          <a href={href(current)} class={linkBase} aria-current="page">{currentLabel}</a>
+        </li>
+      )}
+      <li>
+        <a href={REPO} class={`${linkBase} inline-flex items-center gap-2`} rel="noopener">
+          <Icon name="github-logo" class="size-4" />
+          GitHub
+        </a>
+      </li>
+    </ul>
+
+    <button
+      type="button"
+      class="group relative grid size-10 place-items-center rounded-full text-fg transition-colors duration-300 ease-base hover:bg-raised active:scale-[0.98] md:hidden"
+      aria-expanded="false"
+      aria-controls="mobile-menu"
+      aria-label="Open menu"
+      data-menu-toggle
+    >
+      <span
+        class="absolute h-0.5 w-4 rounded-full bg-current transition-transform duration-500 ease-base -translate-y-1 group-aria-expanded:translate-y-0 group-aria-expanded:rotate-45"
+      ></span>
+      <span
+        class="absolute h-0.5 w-4 rounded-full bg-current transition-transform duration-500 ease-base translate-y-1 group-aria-expanded:translate-y-0 group-aria-expanded:-rotate-45"
+      ></span>
+    </button>
+  </nav>
+</header>
+
+<div
+  id="mobile-menu"
+  class="fixed inset-0 z-40 bg-black/90 px-6 pt-24 opacity-0 backdrop-blur-2xl transition-opacity duration-500 ease-base invisible data-[open]:visible data-[open]:opacity-100 md:hidden"
+  data-menu
+>
+  <ul class="flex flex-col gap-2">
+    {[
+      ...links.map((l) => ({ label: l.label, url: l.url, current: false })),
+      ...(currentLabel ? [{ label: currentLabel, url: href(current), current: true }] : []),
+      { label: "GitHub", url: REPO, current: false },
+    ].map((l, i) => (
+      <li
+        class="translate-y-6 opacity-0 transition duration-500 ease-base [[data-open]_&]:translate-y-0 [[data-open]_&]:opacity-100"
+        style={`transition-delay: ${Math.min(i * 60, 400)}ms`}
+      >
+        <a
+          href={l.url}
+          class="heading-4 block rounded-xl px-3 py-3 text-fg transition-colors duration-300 ease-base hover:bg-raised active:translate-y-px aria-[current=page]:bg-raised"
+          aria-current={l.current ? "page" : undefined}
+          data-menu-link
+        >
+          {l.label}
+        </a>
+      </li>
+    ))}
+  </ul>
+</div>

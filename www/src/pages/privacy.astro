@@ -1,0 +1,35 @@
+---
+import Base from "../layouts/Base.astro";
+import Prose from "../components/Prose.astro";
+---
+<Base
+  title="Privacy · nyq"
+  description="What the nyq website and the nyq command line tool send, and to whom."
+  current="privacy"
+>
+  <Prose title="Privacy" updated="2 November 2026">
+    <h2>This website</h2>
+    <p>
+      This site is a set of static pages. It sets no cookies, runs no analytics and loads no third
+      party scripts. The host serving the pages may keep standard request logs, such as your IP
+      address and browser, under its own privacy policy.
+    </p>
+    <h2>The nyq tool</h2>
+    <p>nyq has no telemetry and no account with us. It makes these network requests:</p>
+    <ul>
+      <li>To the model provider you choose, carrying your conversation, the files and command output the agent reads, and your credentials for that provider.</li>
+      <li>To <code>models.dev</code>, at most once a day, for public model names, context sizes and prices.</li>
+      <li>To GitHub, to look for and download new releases. Turn this off with <code>auto_upgrade = false</code> or <code>NYQ_AUTO_UPGRADE=0</code>.</li>
+      <li>To web pages and search, only when the agent uses its web tools, and to MCP servers you configure.</li>
+    </ul>
+    <p>
+      What your model provider does with your data is set by its own terms and privacy policy.
+    </p>
+    <h2>Data on your machine</h2>
+    <p>
+      Sign ins and API keys are stored under <code>~/.nyq</code> in files only your user can read.
+      Conversations are saved as JSONL under <code>~/.nyq/sessions</code>. <code>nyq logout</code>{" "}
+      removes stored sign ins, and <code>nyq session delete</code> removes a conversation.
+    </p>
+  </Prose>
+</Base>

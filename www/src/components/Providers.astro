@@ -1,0 +1,23 @@
+---
+const providers = [
+  "ChatGPT subscription",
+  "SuperGrok and X Premium",
+  "Anthropic API",
+  "xAI API",
+  "OpenCode Zen",
+  "OpenCode Go",
+  "OpenRouter",
+  "Ollama",
+  "Any OpenAI compatible API",
+];
+---
+<section class="reveal px-6 pb-24" aria-labelledby="providers-title">
+  <div class="mx-auto flex max-w-4xl flex-col items-center gap-6">
+    <h2 id="providers-title" class="caption-3 text-faint">Works with the subscriptions and keys you already have</h2>
+    <ul class="flex flex-wrap justify-center gap-2">
+      {providers.map((p) => (
+        <li class="body-5 rounded-full border border-line px-3 py-1 text-muted">{p}</li>
+      ))}
+    </ul>
+  </div>
+</section>

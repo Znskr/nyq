@@ -1,0 +1,42 @@
+---
+const steps = [
+  {
+    n: "1",
+    title: "Install",
+    body: "One command downloads a single binary for your platform and verifies its SHA256 checksum. No runtime to install.",
+    code: "curl -fsSL …/install.sh | sh",
+  },
+  {
+    n: "2",
+    title: "Sign in",
+    body: "Use the browser login for ChatGPT or Grok, paste an API key, or point nyq at Ollama.",
+    code: "nyq login",
+  },
+  {
+    n: "3",
+    title: "Ask",
+    body: "Describe the change. nyq reads, edits and tests until it can show you the answer.",
+    code: 'nyq "fix the failing test"',
+  },
+];
+---
+<section id="how" class="px-6 py-24" aria-labelledby="how-title">
+  <div class="mx-auto flex max-w-6xl flex-col gap-12">
+    <div class="reveal flex max-w-2xl flex-col gap-4">
+      <p class="caption-3 text-nyq-blue">How it works</p>
+      <h2 id="how-title" class="heading-4 sm:heading-3">From install to first fix in three commands</h2>
+    </div>
+    <ol class="grid gap-4 md:grid-cols-3">
+      {steps.map((s) => (
+        <li class="reveal flex flex-col gap-4 rounded-2xl border border-line p-6">
+          <span class="caption-3 grid size-8 place-items-center rounded-full border border-line-strong font-mono text-fg">{s.n}</span>
+          <h3 class="title-2 text-fg">{s.title}</h3>
+          <p class="body-6 flex-1 text-muted">{s.body}</p>
+          <code class="body-6 block overflow-x-auto whitespace-nowrap rounded-lg bg-surface px-3 py-2 font-mono text-fg">
+            <span class="select-none text-faint">$ </span>{s.code}
+          </code>
+        </li>
+      ))}
+    </ol>
+  </div>
+</section>

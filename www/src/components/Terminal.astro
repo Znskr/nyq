@@ -1,0 +1,51 @@
+---
+// A static rendering of nyq's fancy look (ui_style = "fancy") mid session.
+// Glyphs and colors follow src/ui/chrome.rs and src/ui/theme.rs.
+import { VERSION } from "../lib";
+---
+<figure
+  class="w-full overflow-hidden rounded-2xl border border-line bg-surface"
+  aria-label="nyq in a terminal fixing a failing test"
+>
+  <div class="flex items-center gap-2 border-b border-line px-4 py-3" aria-hidden="true">
+    <span class="size-3 rounded-full bg-line-strong"></span>
+    <span class="size-3 rounded-full bg-line-strong"></span>
+    <span class="size-3 rounded-full bg-line-strong"></span>
+    <span class="caption-5 ml-2 font-mono text-faint">~/code/ledger</span>
+  </div>
+
+  <div class="overflow-x-auto p-4 sm:p-6 [scrollbar-width:thin]">
+    <pre class="caption-5 sm:body-6 font-mono text-muted" aria-hidden="true"><span class="text-nyq-blue">█▀█ █▄█ █▀█</span>  <span class="text-fg">nyq</span> v{VERSION}
+<span class="text-nyq-blue">▀ ▀ ▄▄█ ▀▀█</span>  claude-opus-5-5 · anthropic · ~/code/ledger
+
+<span class="text-nyq-blue">›</span> <span class="text-fg">the parser test fails on "4.5", fix it</span>
+
+<span class="text-faint">• Thought for 3s</span>
+<span class="text-nyq-green">✓</span> 3 tool calls · 2 read · 1 command
+<span class="text-faint">├</span> <span class="text-nyq-green">✓</span> <span class="text-fg">read_file</span> src/parse.rs <span class="text-faint">0.1s</span>
+<span class="text-faint">├</span> <span class="text-nyq-green">✓</span> <span class="text-fg">grep</span> "fn parse_amount" <span class="text-faint">0.1s</span>
+<span class="text-faint">└</span> <span class="text-nyq-green">✓</span> <span class="text-fg">bash</span> cargo test parse <span class="text-faint">4.2s</span>
+<span class="text-nyq-green">✓</span> <span class="text-fg">edit_file</span> src/parse.rs <span class="text-nyq-green">+2</span> <span class="text-nyq-red">−1</span>
+  <span class="text-faint">41</span> <span class="text-nyq-red">-     let cents = whole * 100 + frac;</span>
+  <span class="text-faint">41</span> <span class="text-nyq-green">+     let frac = if digits == 1 {"{"} frac * 10 {"}"} else {"{"} frac {"}"};</span>
+  <span class="text-faint">42</span> <span class="text-nyq-green">+     let cents = whole * 100 + frac;</span>
+<span class="text-nyq-green">✓</span> <span class="text-fg">bash</span> cargo test <span class="text-faint">6.8s</span>
+
+<span class="text-fg">Fixed. parse_amount("4.5") read the fraction as 5 cents
+instead of 50. One digit fractions are now scaled, and
+all 38 tests pass.</span>
+</pre>
+
+    <div class="mt-4 rounded-xl border border-line-strong px-3 py-2" aria-hidden="true">
+      <p class="caption-5 sm:body-6 whitespace-nowrap font-mono text-faint">
+        <span class="text-nyq-blue">›</span> <span class="cursor inline-block h-4 w-2 translate-y-0.5 bg-fg"></span> Ask nyq anything
+      </p>
+    </div>
+    <p class="caption-5 mt-2 whitespace-nowrap font-mono text-faint" aria-hidden="true">
+      high · claude-opus-5-5 · <span class="text-muted">Fix parser test</span> · ctx <span class="text-nyq-blue">▰▰▱▱▱▱▱▱</span> 18% · <span class="text-nyq-green">ask</span> · workspace-write · main
+    </p>
+  </div>
+  <figcaption class="sr-only">
+    nyq reads the code, runs the tests, edits one line in src/parse.rs, reruns the tests, and explains the fix.
+  </figcaption>
+</figure>

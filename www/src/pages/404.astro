@@ -1,0 +1,21 @@
+---
+import Base from "../layouts/Base.astro";
+import Icon from "../components/Icon.astro";
+import { href } from "../lib";
+---
+<Base title="Page not found · nyq" description="This page does not exist." current="none" noindex>
+  <section class="mx-auto flex max-w-2xl flex-col items-center gap-6 px-6 pb-24 pt-48 text-center">
+    <pre class="body-6 rounded-2xl border border-line bg-surface px-6 py-4 text-left font-mono text-muted"><span class="text-nyq-blue">›</span> <span class="text-fg">open this page</span>
+<span class="text-nyq-red">✗</span> <span class="text-fg">read_file</span> 404 <span class="text-faint">0.0s</span>
+  No such page here.</pre>
+    <h1 class="heading-4 sm:heading-3">This page does not exist</h1>
+    <p class="body-3 text-muted">The link may be old, or the address may have a typo.</p>
+    <a
+      href={href()}
+      class="button-md inline-flex items-center gap-2 rounded-lg bg-fg px-3 py-2 text-black transition duration-300 ease-base hover:bg-[#e6e6e6] hover:-translate-y-px active:translate-y-0 active:scale-[0.98]"
+    >
+      <Icon name="arrow-left" class="size-5" />
+      Back to the home page
+    </a>
+  </section>
+</Base>

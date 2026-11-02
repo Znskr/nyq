@@ -1,0 +1,46 @@
+name: Website
+
+# Builds www/ (Astro) and deploys it to Cloudflare Workers (static assets).
+# Needs the repository secrets CLOUDFLARE_API_TOKEN (Workers Scripts: Edit)
+# and CLOUDFLARE_ACCOUNT_ID, and the repository variable SITE_URL (the
+# site's public address, for canonical links and social cards).
+on:
+  push:
+    branches: [main]
+    paths: ["www/**", "Cargo.toml", ".github/workflows/www.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: www
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: www
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: www/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: www
+          command: deploy
