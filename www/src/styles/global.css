@@ -1,0 +1,107 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+@theme {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Dark surfaces: the only background colors the site uses. */
+  --color-surface: #181818;
+  --color-raised: #1f1f1f;
+  --color-line: #272727;
+  --color-line-strong: #313131;
+
+  --color-fg: #ffffff;
+  --color-muted: #9b9b9b;
+  --color-faint: #6b6b6b;
+
+  /* nyq's own terminal palette (src/ui/theme.rs). */
+  --color-nyq-blue: #5fafd7;
+  --color-nyq-green: #87af5f;
+  --color-nyq-red: #d75f5f;
+  --color-nyq-yellow: #d7af5f;
+  --color-nyq-magenta: #af87d7;
+
+  --ease-base: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Named text styles. Each maps to one step of the Tailwind type scale. */
+@utility heading-1 { font-size: var(--text-6xl); line-height: 1; font-weight: 600; letter-spacing: -0.025em; }
+@utility heading-2 { font-size: var(--text-5xl); line-height: 1; font-weight: 600; letter-spacing: -0.025em; }
+@utility heading-3 { font-size: var(--text-4xl); line-height: 2.5rem; font-weight: 600; letter-spacing: -0.02em; }
+@utility heading-4 { font-size: var(--text-3xl); line-height: 2.25rem; font-weight: 600; letter-spacing: -0.015em; }
+@utility heading-5 { font-size: var(--text-2xl); line-height: 2rem; font-weight: 600; }
+@utility heading-6 { font-size: var(--text-xl); line-height: 1.75rem; font-weight: 600; }
+@utility title-1 { font-size: var(--text-xl); line-height: 1.75rem; font-weight: 500; }
+@utility title-2 { font-size: var(--text-lg); line-height: 1.75rem; font-weight: 500; }
+@utility title-3 { font-size: var(--text-base); line-height: 1.5rem; font-weight: 500; }
+@utility title-4 { font-size: var(--text-sm); line-height: 1.25rem; font-weight: 500; }
+@utility body-2 { font-size: var(--text-base); line-height: 1.5rem; font-weight: 500; }
+@utility body-3 { font-size: var(--text-base); line-height: 1.5rem; font-weight: 400; }
+@utility body-5 { font-size: var(--text-sm); line-height: 1.25rem; font-weight: 500; }
+@utility body-6 { font-size: var(--text-sm); line-height: 1.25rem; font-weight: 400; }
+@utility button-md { font-size: var(--text-base); line-height: 1.5rem; font-weight: 600; }
+@utility button-sm { font-size: var(--text-sm); line-height: 1.25rem; font-weight: 600; }
+@utility caption-3 { font-size: var(--text-xs); line-height: 1rem; font-weight: 600; }
+@utility caption-4 { font-size: var(--text-xs); line-height: 1rem; font-weight: 500; }
+@utility caption-5 { font-size: var(--text-xs); line-height: 1rem; font-weight: 400; }
+
+/* The hero heading: the one place a gradient is allowed, and only on text. */
+@utility text-hero {
+  background-image: linear-gradient(to right, #ffffff, #9b9b9b);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+@layer base {
+  html {
+    background: #000000;
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    scroll-behavior: smooth;
+    scroll-padding-top: 6rem;
+  }
+  h1, h2, h3, h4 { text-wrap: balance; }
+  p, li, dd { text-wrap: pretty; }
+  ::selection { background: var(--color-nyq-blue); color: #000000; }
+  :focus-visible {
+    outline: 2px solid var(--color-nyq-blue);
+    outline-offset: 2px;
+  }
+}
+
+/* Scroll reveal: sections rise 32px and fade in once. */
+.reveal {
+  opacity: 0;
+  transform: translateY(2rem);
+  transition: opacity 700ms var(--ease-base), transform 700ms var(--ease-base);
+}
+.reveal.is-visible { opacity: 1; transform: none; }
+
+/* Tagline reveal: each word goes from muted to full color. */
+.tagline-word {
+  opacity: 0.3;
+  transition: opacity 500ms var(--ease-base);
+}
+.tagline-word.is-lit { opacity: 1; }
+
+/* Terminal cursor blink in the hero mock. */
+@keyframes blink { 50% { opacity: 0; } }
+.cursor { animation: blink 1.1s steps(1) infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .reveal { transform: none; transition: opacity 400ms var(--ease-base); }
+  .tagline-word { opacity: 1; transition: none; }
+  .cursor { animation: none; }
+  *, *::before, *::after {
+    transition-property: opacity, color, background-color, border-color !important;
+  }
+}
+
+/* Without JavaScript, show everything. */
+.no-js .reveal { opacity: 1; transform: none; }
+.no-js .tagline-word { opacity: 1; }

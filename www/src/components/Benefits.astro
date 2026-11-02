@@ -1,0 +1,55 @@
+---
+import Icon from "./Icon.astro";
+
+const benefits = [
+  {
+    icon: "swap",
+    title: "Switch models without switching tools",
+    body: "<kbd>Ctrl+L</kbd> lists every model from every provider you are signed in to. Pick one and the conversation carries on with it.",
+  },
+  {
+    icon: "shield-check",
+    title: "Let it run commands without worry",
+    body: "Shell commands run in a sandbox that writes only inside your workspace, with the network off unless you allow it. Landlock on Linux, Seatbelt on macOS.",
+  },
+  {
+    icon: "terminal-window",
+    title: "Steer it while it works",
+    body: "The input never locks. <kbd>Enter</kbd> steers the current task, <kbd>Alt+Enter</kbd> queues a follow up, and <kbd>Esc</kbd> stops it.",
+  },
+  {
+    icon: "clock-counter-clockwise",
+    title: "Undo what it changed",
+    body: "<code>/undo</code> reverts nyq's file edits one at a time. Every session is saved, and <code>nyq -c</code> picks up where you left off.",
+  },
+  {
+    icon: "plugs",
+    title: "Fits the setup you have",
+    body: "MCP servers, skills, hooks and subagents work out of the box. Zed can drive nyq over the Agent Client Protocol.",
+  },
+  {
+    icon: "code-block",
+    title: "Script it in CI",
+    body: "<code>nyq -p</code> prints one answer and exits. <code>nyq ask --json</code> returns the answer, every tool call and an exit code.",
+  },
+];
+---
+<section id="features" class="px-6 py-24" aria-labelledby="features-title">
+  <div class="mx-auto flex max-w-6xl flex-col gap-12">
+    <div class="reveal flex max-w-2xl flex-col gap-4">
+      <p class="caption-3 text-nyq-blue">Features</p>
+      <h2 id="features-title" class="heading-4 sm:heading-3">Built for long sessions in a real repo</h2>
+    </div>
+    <ul class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {benefits.map((b) => (
+        <li class="reveal flex flex-col gap-4 rounded-2xl border border-line bg-surface p-6 transition-colors duration-300 ease-base hover:border-line-strong">
+          <span class="grid size-10 place-items-center rounded-lg bg-raised text-nyq-blue">
+            <Icon name={b.icon} class="size-5" />
+          </span>
+          <h3 class="title-2 text-fg">{b.title}</h3>
+          <p class="body-6 text-muted [&_code]:whitespace-nowrap [&_code]:font-mono [&_code]:text-fg [&_kbd]:whitespace-nowrap [&_kbd]:font-mono [&_kbd]:text-fg" set:html={b.body} />
+        </li>
+      ))}
+    </ul>
+  </div>
+</section>

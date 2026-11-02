@@ -1,0 +1,58 @@
+---
+import Logo from "./Logo.astro";
+import { href, REPO, VERSION as version } from "../lib";
+
+const groups = [
+  {
+    title: "Product",
+    links: [
+      { label: "Features", url: href("#features") },
+      { label: "How it works", url: href("#how") },
+      { label: "FAQ", url: href("#faq") },
+    ],
+  },
+  {
+    title: "Project",
+    links: [
+      { label: "Source on GitHub", url: REPO },
+      { label: "Releases", url: `${REPO}/releases` },
+      { label: "Documentation", url: `${REPO}#readme` },
+    ],
+  },
+  {
+    title: "Legal",
+    links: [
+      { label: "Privacy", url: href("privacy") },
+      { label: "Terms", url: href("terms") },
+    ],
+  },
+];
+---
+<footer class="border-t border-line">
+  <div class="mx-auto grid max-w-6xl gap-12 px-6 py-16 md:grid-cols-[1.5fr_repeat(3,1fr)]">
+    <div class="flex flex-col gap-3">
+      <a href={href()} class="w-fit text-fg" aria-label="nyq home"><Logo /></a>
+      <p class="body-6 max-w-xs text-muted">
+        A small coding agent for your terminal. Apache 2.0 licensed.
+      </p>
+      {version && <p class="caption-5 font-mono text-faint">v{version}</p>}
+    </div>
+    {groups.map((g) => (
+      <div class="flex flex-col gap-3">
+        <h2 class="caption-3 text-faint">{g.title}</h2>
+        <ul class="flex flex-col gap-2">
+          {g.links.map((l) => (
+            <li>
+              <a
+                href={l.url}
+                class="body-6 rounded text-muted transition-colors duration-300 ease-base hover:text-fg"
+              >
+                {l.label}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </div>
+    ))}
+  </div>
+</footer>
