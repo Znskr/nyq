@@ -221,7 +221,7 @@ pub(crate) fn codex_auth_path(home: &Path) -> PathBuf {
 /// flag, the environment, or a saved setting (settings.toml, last-model.json).
 pub fn unknown_provider(name: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "unknown provider `{name}` (expected codex, grok, anthropic, ollama, openai, opencode-go, opencode or xai). \
+        "unknown provider `{name}` (expected codex, grok, anthropic, ollama, openai, opencode-go, opencode, xai or a saved custom provider id). \
          If it is saved in settings.toml or last-model.json, choose another with `nyq provider NAME` or /model."
     )
 }
@@ -315,6 +315,21 @@ pub fn provider(
             Ok(Box::new(OpenAiProvider::with_label("ollama".into(), ollama_url(), None, model)))
         }
         Some(other) => {
+            if Service::parse(other).is_none() {
+                let definition = crate::provider::custom::get(home, other)?
+                    .ok_or_else(|| unknown_provider(other))?;
+                let model = model_flag
+                    .map(str::to_owned)
+                    .or_else(|| env("NYQ_MODEL"))
+                    .or_else(|| settings.models.get(&definition.id).cloned())
+                    .unwrap_or(definition.model);
+                return crate::provider::custom::build(
+                    home,
+                    &definition.id,
+                    &model,
+                    settings.effort.filter(|e| e != "auto"),
+                );
+            }
             let service = Service::parse(other).ok_or_else(|| unknown_provider(other))?;
             let model = model_flag
                 .map(str::to_string)
@@ -365,6 +380,96 @@ mod tests {
         ] {
             assert_eq!(ollama_url_from(host), expected);
         }
+    }
+
+    #[test]
+    fn custom_provider_startup_switching_and_restart() {
+        use crate::provider::custom::{self, Definition, Protocol};
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let keys = [
+            "NYQ_HOME",
+            "NYQ_PROVIDER",
+            "NYQ_BASE_URL",
+            "NYQ_MODEL",
+            "NYQ_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+        ];
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(keys.iter().map(|&k| (k, std::env::var_os(k))).collect());
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("NYQ_HOME", home.path());
+        let d = Definition {
+            id: "work".into(),
+            protocol: Protocol::Anthropic,
+            base_url: "http://localhost:4321/gateway/messages".into(),
+            api_key: Some("work-key".into()),
+            model: "default-model".into(),
+        };
+        custom::save(home.path(), &d).unwrap();
+        std::fs::write(
+            home.path().join("settings.toml"),
+            "provider = \"work\"\neffort = \"high\"\n[models]\nwork = \"settings-model\"\n",
+        )
+        .unwrap();
+        let selected = provider(home.path(), None, None).unwrap();
+        assert_eq!(
+            (selected.name(), selected.model(), selected.effort()),
+            ("work", "settings-model", Some("high"))
+        );
+        assert_eq!(
+            selected.endpoint().as_deref(),
+            Some("http://localhost:4321/gateway/models")
+        );
+        let switched = crate::models::ModelChoice {
+            provider: "work".into(),
+            model: "switched-model".into(),
+            ..Default::default()
+        };
+        crate::models::save_last(home.path(), &switched, Some("low")).unwrap();
+        let restarted = provider(home.path(), None, None).unwrap();
+        assert_eq!(
+            (restarted.name(), restarted.model(), restarted.effort()),
+            ("work", "switched-model", Some("low"))
+        );
+        assert_eq!(
+            provider(home.path(), Some("work"), Some("flag-model"))
+                .unwrap()
+                .model(),
+            "flag-model"
+        );
+        std::env::set_var("NYQ_MODEL", "env-model");
+        std::env::set_var("NYQ_BASE_URL", "https://unrelated.test/v1");
+        std::env::set_var("NYQ_API_KEY", "unrelated-key");
+        std::env::set_var("ANTHROPIC_API_KEY", "unrelated-anthropic-key");
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://unrelated.test/v1");
+        let explicit = provider(home.path(), Some("work"), None).unwrap();
+        assert_eq!(explicit.model(), "env-model");
+        assert_eq!(explicit.endpoint(), restarted.endpoint());
+        assert!(custom::logout(home.path(), "work").unwrap());
+        assert!(custom::get(home.path(), "work")
+            .unwrap()
+            .unwrap()
+            .api_key
+            .is_none());
+        assert!(custom::build(home.path(), "work", "", None).is_ok());
+        assert!(custom::remove(home.path(), "work").unwrap());
+        assert!(crate::models::build(home.path(), &switched, None).is_err());
     }
 
     #[test]

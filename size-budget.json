@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "targets": {
+    "aarch64-apple-darwin": {
+      "bytes": 6493936,
+      "tolerance_bytes": 65536
+    }
+  }
+}

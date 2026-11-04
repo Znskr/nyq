@@ -4,6 +4,7 @@
 mod chrome;
 pub mod clipboard;
 pub mod editor;
+pub mod effort_menu;
 mod files;
 pub mod help_menu;
 mod highlight;

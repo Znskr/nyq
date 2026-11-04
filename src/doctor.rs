@@ -27,6 +27,13 @@ fn auth_sources(home: &Path) -> Vec<String> {
             sources.push(format!("{} key ({source})", service.title()));
         }
     }
+    if let Ok(definitions) = crate::provider::custom::load(home) {
+        for definition in definitions {
+            if definition.api_key.is_some() {
+                sources.push(format!("{} key (providers.json)", definition.id));
+            }
+        }
+    }
     for (label, path) in [
         ("selected Codex auth", config::codex_auth_path(home)),
         ("profile ChatGPT auth", home.join("chatgpt-auth.json")),
@@ -288,6 +295,10 @@ pub async fn doctor(
             crate::provider::hosted::Service::parse(name)
                 .is_some_and(|s| crate::provider::hosted::api_key(home, s).is_some())
         }
+        Some(name) if name != "openai" => crate::provider::custom::get(home, name)
+            .ok()
+            .flatten()
+            .is_some(),
         Some(_) => config::openai_config(home)
             .ok()
             .is_some_and(|(url, key, _)| {
@@ -319,13 +330,23 @@ pub async fn doctor(
             "auth",
             auth,
             if auth {
-                "credentials valid, or local endpoint needs no key"
+                "credentials configured, or endpoint allows no key"
             } else {
                 "credentials missing, invalid or expired"
             },
             "run nyq login, or set NYQ_API_KEY; refresh expired tokens",
         ),
     ];
+    let definitions = crate::provider::custom::load(home);
+    checks.push(check(
+        "custom providers",
+        definitions.is_ok(),
+        match definitions {
+            Ok(definitions) => format!("{} saved endpoints", definitions.len()),
+            Err(e) => format!("{e:#}"),
+        },
+        "fix providers.json before changing custom providers",
+    ));
     let endpoint = provider.and_then(Provider::endpoint);
     let endpoint_ok = match endpoint {
         Some(url) => reachable(&url).await,
@@ -570,6 +591,31 @@ pub fn cli_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_auth_sources_report_labels_not_credentials() {
+        use crate::provider::custom::{self, Definition, Protocol};
+        let home = tempfile::tempdir().unwrap();
+        custom::save(
+            home.path(),
+            &Definition {
+                id: "private-work".into(),
+                protocol: Protocol::Openai,
+                base_url: "https://work.test/v1".into(),
+                api_key: Some("never-print-this-key".into()),
+                model: "m".into(),
+            },
+        )
+        .unwrap();
+        let sources = auth_sources(home.path());
+        assert!(sources
+            .iter()
+            .any(|s| s == "private-work key (providers.json)"));
+        assert!(!format!("{sources:?}").contains("never-print-this-key"));
+        custom::logout(home.path(), "private-work").unwrap();
+        assert!(!auth_sources(home.path())
+            .iter()
+            .any(|s| s.starts_with("private-work")));
+    }
     #[test]
     fn check_formatting() {
         assert_eq!(

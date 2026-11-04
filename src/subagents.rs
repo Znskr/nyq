@@ -150,6 +150,16 @@ pub fn list(dir: &Path) -> Vec<Record> {
 }
 
 pub fn delete(dir: &Path, name: &str) -> Result<()> {
+    if dir.join("orchestration.jsonl").exists()
+        && crate::orchestration::store(dir)?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .jobs
+            .iter()
+            .any(|j| j.name == name && matches!(j.state.as_str(), "queued" | "running"))
+    {
+        bail!("Stop `{name}` and its queued tasks before deleting it");
+    }
     if load(dir, name)?.is_none() {
         bail!("No subagent named `{name}` in this session.");
     }
@@ -161,6 +171,9 @@ pub fn delete(dir: &Path, name: &str) -> Result<()> {
 
 /// Mark a subagent stopped, cancelling it if it is working.
 pub fn stop(dir: &Path, name: &str) -> Result<String> {
+    if dir.join("orchestration.jsonl").exists() {
+        crate::orchestration::cancel(dir, name)?;
+    }
     let Some(mut record) = load(dir, name)? else {
         bail!("No subagent named `{name}` in this session.");
     };
@@ -286,7 +299,8 @@ pub fn live_lines() -> Vec<String> {
 
 // ------------------------------------------------------------ /agents
 
-pub const USAGE: &str = "Usage: /agents [list|show NAME|stop NAME|delete NAME]";
+pub const USAGE: &str =
+    "Usage: /agents [list|show NAME|send NAME MESSAGE|resume NAME|stop NAME|delete NAME]";
 
 fn ago(t: DateTime<Utc>) -> String {
     let s = (Utc::now() - t).num_seconds().max(0);
@@ -335,6 +349,27 @@ pub fn list_lines(dir: &Path) -> Vec<String> {
             .trim_end()
             .to_string(),
         );
+    }
+    if dir.join("orchestration.jsonl").exists() {
+        match crate::orchestration::store(dir) {
+            Ok(shared) => {
+                let store = shared.lock().unwrap_or_else(|e| e.into_inner());
+                for job in &store.jobs {
+                    lines.push(format!(
+                        "task {} · {} · {}{}",
+                        job.id,
+                        job.name,
+                        job.state,
+                        if job.result.is_some() && !job.delivered {
+                            " · result pending"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
+            Err(e) => lines.push(format!("Orchestration: {e:#}")),
+        }
     }
     lines
 }
@@ -403,6 +438,33 @@ pub fn command(session_path: Option<&Path>, args: &[&str]) -> Result<Vec<String>
     Ok(match args {
         [] | ["list"] => list_lines(&dir),
         ["show" | "inspect", name] => show_lines(&dir, name, 30)?,
+        ["send", name, message @ ..] if !message.is_empty() => {
+            if !valid_name(name) {
+                bail!("Invalid child name");
+            }
+            let record =
+                load(&dir, name)?.ok_or_else(|| anyhow::anyhow!("No child named `{name}`"))?;
+            if record.status == Status::Stopped {
+                bail!("Resume `{name}` first");
+            }
+            let args = serde_json::json!({"action":"send", "name":name, "task":message.join(" "), "mode":record.mode});
+            let id = crate::orchestration::enqueue(&dir, name, &args)?;
+            vec![format!(
+                "Queued task {id} for `{name}`; it starts on the next parent turn."
+            )]
+        }
+        ["resume", name] => {
+            let mut record =
+                load(&dir, name)?.ok_or_else(|| anyhow::anyhow!("No child named `{name}`"))?;
+            if is_live(&key(&dir, name)) {
+                bail!("Child is still running");
+            }
+            record.status = Status::Idle;
+            save(&dir, &record)?;
+            vec![format!(
+                "Reopened `{name}` for new messages. Interrupted tool effects are not replayed."
+            )]
+        }
         ["stop", name] => vec![stop(&dir, name)?],
         ["delete" | "remove", name] => {
             delete(&dir, name)?;
@@ -410,6 +472,22 @@ pub fn command(session_path: Option<&Path>, args: &[&str]) -> Result<Vec<String>
         }
         _ => vec![USAGE.into()],
     })
+}
+
+tokio::task_local! {
+    pub(crate) static CHECKPOINT: (PathBuf, String);
+}
+
+pub(crate) fn checkpoint(items: &[Item]) -> Result<()> {
+    CHECKPOINT
+        .try_with(|(dir, name)| -> Result<()> {
+            let mut record =
+                load(dir, name)?.ok_or_else(|| anyhow::anyhow!("Child record disappeared"))?;
+            record.items = items.to_vec();
+            record.updated = Utc::now();
+            save(dir, &record)
+        })
+        .unwrap_or(Ok(()))
 }
 
 #[cfg(test)]

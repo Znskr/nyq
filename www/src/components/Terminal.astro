@@ -1,6 +1,6 @@
 ---
 // A static rendering of nyq's fancy look (ui_style = "fancy") mid session.
-// Glyphs and colors follow src/ui/chrome.rs and src/ui/theme.rs.
+// Glyphs and colors follow src/ui/chrome.rs and src/ui/theme.rs (the logo is the foreground color).
 import { VERSION } from "../lib";
 ---
 <figure
@@ -15,8 +15,8 @@ import { VERSION } from "../lib";
   </div>
 
   <div class="overflow-x-auto p-4 sm:p-6 [scrollbar-width:thin]">
-    <pre class="caption-5 sm:body-6 font-mono text-muted" aria-hidden="true"><span class="text-nyq-blue">█▀█ █▄█ █▀█</span>  <span class="text-fg">nyq</span> v{VERSION}
-<span class="text-nyq-blue">▀ ▀ ▄▄█ ▀▀█</span>  claude-opus-5-5 · anthropic · ~/code/ledger
+    <pre class="caption-5 sm:body-6 font-mono text-muted" aria-hidden="true"><span class="text-fg">█▀█ █▄█ █▀█</span>  <span class="text-fg">nyq</span> v{VERSION}
+<span class="text-fg">▀ ▀ ▄▄█ ▀▀█</span>  claude-opus-5-5 · anthropic · ~/code/ledger
 
 <span class="text-nyq-blue">›</span> <span class="text-fg">the parser test fails on "4.5", fix it</span>
 

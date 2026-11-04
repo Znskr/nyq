@@ -1,0 +1,68 @@
+name: Size
+
+# Measures the release binary on the Linux runner, records a JSON report and
+# enforces size-budget.json. Budgets are per target triple, so a target that has
+# not been seeded yet is reported but not gated. Seed it once with
+# `./scripts/size.sh --update` on that target and commit size-budget.json.
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "scripts/size.sh"
+      - "size-budget.json"
+      - ".github/workflows/size.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "scripts/size.sh"
+      - "size-budget.json"
+      - ".github/workflows/size.yml"
+  workflow_dispatch:
+    inputs:
+      attribution:
+        description: "Run cargo-bloat attribution (adds a few minutes)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: size-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  size:
+    name: binary size
+    runs-on: [self-hosted, Linux, X64, nyq-aws]
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../nyq-size-target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustc --version && cargo --version
+      - name: Duplicate dependency versions
+        run: cargo tree -d --locked
+      - name: Attribution tool
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.attribution == 'true'
+        run: command -v cargo-bloat >/dev/null || cargo install cargo-bloat --locked
+      - name: Measure and check
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--check --summary)
+          if [ "${{ github.event.inputs.attribution }}" = "true" ]; then
+            args+=(--attribution)
+          fi
+          ./scripts/size.sh "${args[@]}"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-report
+          path: target/size/*.json
+          if-no-files-found: ignore
