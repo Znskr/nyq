@@ -13,6 +13,7 @@ use tokio::{
     net::TcpListener,
 };
 
+use crate::provider::custom;
 use crate::provider::hosted::{self, Service};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -447,7 +448,20 @@ pub async fn login_grok(
 
 /// `nyq logout <provider>`: forget nyq's stored credentials.
 pub async fn logout(home: &Path, provider: &str) -> Result<String> {
-    if provider.eq_ignore_ascii_case("grok") {
+    let provider = crate::account::canonical(provider).unwrap_or(provider);
+    if crate::account::canonical(provider).is_none() {
+        let definition = custom::get(home, provider)?
+            .with_context(|| format!("unknown provider `{provider}`"))?;
+        return Ok(if custom::logout(home, &definition.id)? {
+            format!("Removed the stored `{}` key; endpoint and model kept. Remove its configuration in /setup → Connections or `nyq setup`.", definition.id)
+        } else {
+            format!(
+                "No key stored for `{}`; endpoint and model kept.",
+                definition.id
+            )
+        });
+    }
+    if provider == "grok" {
         return crate::provider::grok::logout(home).await;
     }
     if provider == "codex" {
@@ -483,6 +497,17 @@ pub async fn logout_all(home: &Path) -> Result<String> {
             done.push(format!("Removed the stored {} key.", service.title()));
         }
     }
+    let custom = custom::load(home).with_context(|| {
+        format!(
+            "{}\nCould not read compatible-provider keys; other stored sign-ins were cleared.",
+            done.join("\n")
+        )
+    })?;
+    for definition in custom {
+        if definition.api_key.is_some() {
+            done.push(logout(home, &definition.id).await?);
+        }
+    }
     Ok(if done.is_empty() {
         "No sign-ins stored by nyq.".into()
     } else {
@@ -490,7 +515,7 @@ pub async fn logout_all(home: &Path) -> Result<String> {
     })
 }
 
-fn read_secret() -> Result<String> {
+pub(crate) fn read_secret() -> Result<String> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         let mut line = String::new();
@@ -539,14 +564,89 @@ mod tests {
         );
         std::fs::write(home.join("chatgpt-auth.json"), "{}").unwrap();
         hosted::save_key(home, Service::Xai, "xai-key").unwrap();
+        custom::save(
+            home,
+            &custom::Definition {
+                id: "work-gateway".into(),
+                protocol: custom::Protocol::Anthropic,
+                base_url: "https://gateway.example/v1".into(),
+                api_key: Some("custom-secret".into()),
+                model: "gateway-model".into(),
+            },
+        )
+        .unwrap();
         let msg = logout_all(home).await.unwrap();
         assert!(msg.contains("Signed out of ChatGPT."), "{msg}");
         assert!(msg.contains(Service::Xai.title()), "{msg}");
+        assert!(msg.contains("work-gateway"), "{msg}");
+        assert!(!msg.contains("custom-secret"));
+        let saved = custom::get(home, "work-gateway").unwrap().unwrap();
+        assert!(saved.api_key.is_none());
+        assert_eq!(saved.model, "gateway-model");
+        assert_eq!(saved.protocol, custom::Protocol::Anthropic);
+        assert_eq!(saved.base_url, "https://gateway.example/v1");
         assert!(!home.join("chatgpt-auth.json").exists());
         assert_eq!(
             logout_all(home).await.unwrap(),
             "No sign-ins stored by nyq."
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_custom_config_does_not_block_builtin_logout() {
+        let dir = tempfile::tempdir().unwrap();
+        hosted::save_key(dir.path(), Service::Xai, "test-key").unwrap();
+        std::fs::write(dir.path().join("providers.json"), "invalid json").unwrap();
+        let error = logout_all(dir.path()).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("other stored sign-ins were cleared"));
+        assert!(!hosted::remove_key(dir.path(), Service::Xai).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("providers.json")).unwrap(),
+            "invalid json"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_logout_keeps_configuration_and_other_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        for id in ["work-gateway", "other-gateway"] {
+            custom::save(
+                home,
+                &custom::Definition {
+                    id: id.into(),
+                    protocol: custom::Protocol::Openai,
+                    base_url: "https://gateway.example/v1".into(),
+                    api_key: Some("private-key".into()),
+                    model: "gateway-model".into(),
+                },
+            )
+            .unwrap();
+        }
+        hosted::save_key(home, Service::Xai, "builtin-key").unwrap();
+        let message = logout(home, "Work-Gateway").await.unwrap();
+        assert!(message.contains("endpoint and model kept"));
+        assert!(!message.contains("private-key"));
+        let saved = custom::get(home, "work-gateway").unwrap().unwrap();
+        assert!(saved.api_key.is_none());
+        assert_eq!(saved.base_url, "https://gateway.example/v1");
+        assert_eq!(saved.model, "gateway-model");
+        assert_eq!(
+            custom::get(home, "other-gateway")
+                .unwrap()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("private-key")
+        );
+        assert_eq!(hosted::read_own(home).unwrap()["xai"]["key"], "builtin-key");
+        assert!(logout(home, "work-gateway")
+            .await
+            .unwrap()
+            .contains("No key stored"));
+        assert!(logout(home, "missing").await.is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 pub mod anthropic;
 pub mod codex;
+pub mod custom;
 pub mod grok;
 pub mod hosted;
 pub mod openai;

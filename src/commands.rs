@@ -47,6 +47,7 @@ fn describe_with(keys: &ui::keys::Keymap, cmd: &str, description: &str) -> Strin
         "/paste" => KeyAction::PasteImage,
         "/transcript" => KeyAction::ExpandTools,
         "/model" => KeyAction::ModelMenu,
+        "/effort" | "/thinking" => KeyAction::CycleEffort,
         _ => return description.to_string(),
     };
     let Some(at) = description.find("{key}") else {
@@ -73,11 +74,28 @@ pub fn efforts(agent: &Agent, current: Option<&ModelChoice>) -> Vec<String> {
         Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => {
             c.efforts.clone()
         }
-        _ if agent.provider.name() == "codex" => ["low", "medium", "high", "xhigh"]
-            .map(String::from)
-            .to_vec(),
-        _ => Vec::new(),
+        _ => agent.provider.efforts(),
     }
+}
+
+/// Validate a direct effort choice before changing or saving anything.
+pub fn parse_effort(raw: &str, efforts: &[String]) -> Result<String> {
+    if raw.eq_ignore_ascii_case("auto") {
+        return Ok("auto".into());
+    }
+    efforts
+        .iter()
+        .find(|effort| effort.eq_ignore_ascii_case(raw))
+        .cloned()
+        .ok_or_else(|| {
+            let supported = std::iter::once("auto")
+                .chain(efforts.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!(
+                "unsupported reasoning effort `{raw}` (supported: {supported}); use /effort LEVEL"
+            )
+        })
 }
 
 /// Fill the footer fields this module owns.
@@ -708,6 +726,44 @@ fn refresh(agent: &mut Agent, skills: &[Skill], runtime: &workspace::Runtime) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_choices_are_validated_and_canonicalized() {
+        let efforts = ["low", "medium", "high", "xhigh"].map(String::from);
+        assert_eq!(parse_effort("auto", &efforts).unwrap(), "auto");
+        assert_eq!(parse_effort("AUTO", &efforts).unwrap(), "auto");
+        assert_eq!(parse_effort("HiGh", &efforts).unwrap(), "high");
+        assert_eq!(parse_effort("XHIGH", &efforts).unwrap(), "xhigh");
+        assert!(parse_effort("max", &efforts).is_err());
+        assert!(parse_effort("", &efforts).is_err());
+        assert!(parse_effort("high extra", &efforts).is_err());
+        assert!(parse_effort("high", &["low".into()]).is_err());
+        assert_eq!(parse_effort("MAX", &["max".into()]).unwrap(), "max");
+        assert_eq!(parse_effort("none", &["none".into()]).unwrap(), "none");
+        assert_eq!(parse_effort("AUTO", &[]).unwrap(), "auto");
+        let error = parse_effort("high", &[]).unwrap_err().to_string();
+        assert!(error.contains("supported: auto"));
+    }
+
+    #[test]
+    fn effort_descriptions_follow_the_cycle_binding() {
+        let description = "choose reasoning effort ({key}); /effort LEVEL";
+        let keys = ui::keys::Keymap::default();
+        assert_eq!(
+            describe_with(&keys, "/effort", description),
+            "choose reasoning effort (shift+tab); /effort LEVEL"
+        );
+        let (keys, _) = ui::keys::Keymap::parse("cycle_effort = \"f9\"");
+        assert_eq!(
+            describe_with(&keys, "/thinking", description),
+            "choose reasoning effort (f9); /effort LEVEL"
+        );
+        let (keys, _) = ui::keys::Keymap::parse("cycle_effort = []");
+        assert_eq!(
+            describe_with(&keys, "/effort", description),
+            "choose reasoning effort; /effort LEVEL"
+        );
+    }
 
     #[test]
     fn descriptions_name_the_bound_key() {

@@ -5,12 +5,25 @@ edition = "2021"
 description = "A small, friendly coding-agent CLI"
 license = "Apache-2.0"
 
+[features]
+default = ["tls-rustls"]
+# Pure-Rust TLS on ring: no system TLS library, identical behaviour everywhere.
+tls-rustls = ["dep:rustls", "reqwest/rustls-no-provider"]
+# Platform TLS (Security.framework on macOS, OpenSSL on Linux): smaller binary,
+# but adds an OpenSSL build/runtime dependency on Linux.
+tls-native = ["reqwest/native-tls"]
+
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Distribution build: same code, platform TLS instead of rustls/ring.
+# Build with `cargo build --profile lean --no-default-features --features tls-native`.
+[profile.lean]
+inherits = "release"
 
 [dependencies]
 agent-client-protocol = "3.1"
@@ -28,11 +41,11 @@ globset = "0.4"
 ignore = "0.4"
 nu-ansi-term = "0.50"
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
-rmcp = { version = "3.5", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 similar = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }

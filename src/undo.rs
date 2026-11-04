@@ -141,6 +141,7 @@ impl UndoLog {
         Ok(message)
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

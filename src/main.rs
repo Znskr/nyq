@@ -26,6 +26,7 @@ mod mcp_slash;
 mod mcp_sse;
 mod models;
 mod notify;
+mod orchestration;
 mod permissions;
 mod pricing;
 mod prompt;
@@ -91,13 +92,17 @@ const COMMANDS: &[(&str, &str)] = &[
         "/model",
         "switch model or provider ({key}); /model ID|QUERY [effort] [fast|normal]",
     ),
+    (
+        "/effort",
+        "choose reasoning effort ({key}); /effort LEVEL (also /thinking)",
+    ),
     ("/compact", "summarize the conversation to free up context"),
     ("/copy", "copy the last answer to the clipboard"),
     ("/undo", "revert the last file change nyq made"),
     ("/tools", "every tool, whether it is on and how it is approved (with --debug): /tools [list|info|disable|enable|trust|untrust NAME]"),
     ("/skills", "skills: browse, use and manage skills; /skills [list|install SOURCE [--project]|remove NAME|info NAME|create NAME|path]"),
     ("/agents", "named subagents: /agents [list|show NAME|stop NAME|delete NAME]"),
-    ("/login", "sign in: ChatGPT or Grok in the browser, or an API key (hidden input)"),
+    ("/login", "sign in or add a compatible provider: /login [custom|PROVIDER] (API keys hidden)"),
     ("/logout", "remove nyq's stored sign-in: /logout [provider]"),
     ("/setup", "connections, default provider, credential source"),
     ("/mcp", "MCP servers and tools: /mcp [list|add|remove|reload|path|connect|disconnect|login|logout|trust|resource|prompt]"),
@@ -430,7 +435,15 @@ async fn run() -> Result<()> {
         .iter()
         .chain(commands::COMMANDS)
         .map(|(c, _)| &c[1..])
-        .chain(["quit", "q", "clear", "img", "transcript", "paste"])
+        .chain([
+            "quit",
+            "q",
+            "clear",
+            "img",
+            "transcript",
+            "paste",
+            "thinking",
+        ])
         .collect();
     ext.reserve(reserved.iter().map(|c| c.to_string()));
     let templates = templates::discover(&home, &cwd, &reserved);
@@ -651,6 +664,13 @@ async fn run() -> Result<()> {
                 continue;
             }
             let cmd = line.split_whitespace().next().unwrap_or("");
+            if slash::canonical(cmd) == "/effort" {
+                let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+                if let Err(e) = effort_command(&home, &mut agent, &tui, current.as_ref(), &args) {
+                    ui::error(&format!("{e:#}"));
+                }
+                continue;
+            }
             if commands::handles(cmd) {
                 let args: Vec<&str> = line.split_whitespace().skip(1).collect();
                 let ctx = commands::Ctx {
@@ -981,14 +1001,40 @@ fn switch_model(home: &std::path::Path, agent: &mut Agent, choice: &models::Mode
     }
 }
 
+/// `/effort` (also `/thinking`): choose a level or open the effort menu.
+fn effort_command(
+    home: &std::path::Path,
+    agent: &mut Agent,
+    tui: &Tui,
+    current: Option<&models::ModelChoice>,
+    args: &[&str],
+) -> Result<()> {
+    match args {
+        [] if ui::menus_available() => tui.screen().open_efforts(),
+        [] => {
+            let efforts = commands::efforts(agent, current);
+            let supported = std::iter::once("auto")
+                .chain(efforts.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui::info(&format!(
+                "  Reasoning effort: {}. Supported: {supported}. Use /effort LEVEL (also /thinking LEVEL).",
+                agent.provider.effort().unwrap_or("auto")
+            ));
+        }
+        [raw] => {
+            let effort = commands::parse_effort(raw, &commands::efforts(agent, current))?;
+            commands::apply_setting(home, agent, current, settings::Id::Effort, &effort);
+            ui::info(&format!("  Reasoning effort: {effort}."));
+        }
+        _ => anyhow::bail!("usage: /effort [LEVEL] (also /thinking [LEVEL])"),
+    }
+    Ok(())
+}
+
 /// Shift+Tab: auto → each supported effort → auto.
 fn cycle_effort(home: &std::path::Path, agent: &mut Agent, current: Option<&models::ModelChoice>) {
-    let efforts: Vec<String> = match current {
-        Some(c) if c.provider == agent.provider.name() && c.model == agent.provider.model() => {
-            c.efforts.clone()
-        }
-        _ => agent.provider.efforts(),
-    };
+    let efforts = commands::efforts(agent, current);
     if efforts.is_empty() {
         ui::info("  This model has no adjustable reasoning effort.");
         return;
@@ -1001,10 +1047,13 @@ fn cycle_effort(home: &std::path::Path, agent: &mut Agent, current: Option<&mode
             .and_then(|i| efforts.get(i + 1))
             .cloned(),
     };
-    agent.provider.set_effort(next.clone());
-    if let Some(c) = current {
-        let _ = models::save_last(home, c, next.as_deref());
-    }
+    commands::apply_setting(
+        home,
+        agent,
+        current,
+        settings::Id::Effort,
+        next.as_deref().unwrap_or("auto"),
+    );
 }
 
 fn sync_footer(tui: &Tui, agent: &Agent, current: Option<&models::ModelChoice>) {
@@ -1782,6 +1831,16 @@ mod tests {
                     "-{short}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn effort_command_and_thinking_alias_are_discoverable() {
+        assert!(COMMANDS.iter().any(|(cmd, _)| *cmd == "/effort"));
+        for name in ["/effort", "/thinking"] {
+            assert!(COMMANDS
+                .iter()
+                .any(|(cmd, _)| *cmd == slash::canonical(name)));
         }
     }
 

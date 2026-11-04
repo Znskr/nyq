@@ -428,6 +428,9 @@ pub async fn read_stream(
 
 #[async_trait::async_trait]
 impl Provider for AnthropicProvider {
+    fn endpoint(&self) -> Option<String> {
+        Some(format!("{}/models", self.base_url.trim_end_matches('/')))
+    }
     fn name(&self) -> &str {
         &self.label
     }
@@ -447,7 +450,13 @@ impl Provider for AnthropicProvider {
         Box::new(self.clone())
     }
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
-        let request = crate::http::client()
+        // x-api-key is not an Authorization header: never forward it through
+        // redirects (including redirects to another host).
+        let client = crate::http::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("creating Messages client")?;
+        let request = client
             .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
             .header("anthropic-version", VERSION)
             .header("accept", "text/event-stream")

@@ -151,6 +151,54 @@ async fn hosted(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
     (choices, warnings)
 }
 
+/// User-named endpoints are independent of hosted-service and environment keys.
+async fn custom(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
+    use crate::provider::custom::{self, Protocol};
+    let definitions = match custom::load(home) {
+        Ok(definitions) => definitions,
+        Err(e) => {
+            return (
+                Vec::new(),
+                vec![format!("custom providers: {}", short(&format!("{e:#}")))],
+            )
+        }
+    };
+    let lists = futures::future::join_all(definitions.iter().map(custom::discover)).await;
+    let (mut choices, mut warnings) = (Vec::new(), Vec::new());
+    for (definition, list) in definitions.into_iter().zip(lists) {
+        match list {
+            Ok(models) => choices.extend(models),
+            Err(e) => {
+                let rejected = custom::is_auth_error(&e);
+                warnings.push(format!(
+                    "{}: {}{}",
+                    definition.id,
+                    short(&format!("{e:#}")),
+                    if rejected {
+                        ""
+                    } else {
+                        "; using configured model"
+                    }
+                ));
+                if !rejected {
+                    let efforts = if definition.protocol == Protocol::Anthropic {
+                        crate::provider::anthropic::default_efforts(&definition.model)
+                    } else {
+                        Vec::new()
+                    };
+                    choices.push(ModelChoice {
+                        provider: definition.id,
+                        model: definition.model,
+                        efforts,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    (choices, warnings)
+}
+
 /// The first line of an error, capped for the switcher.
 fn short(error: &str) -> String {
     let line = error.lines().next().unwrap_or_default();
@@ -210,8 +258,8 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
             .await
             .map_err(anyhow::Error::from)?
     };
-    let (codex, grok, ollama, openai, hosted): (_, Result<_>, _, Result<_>, _) =
-        tokio::join!(codex, grok, ollama, openai, hosted(home));
+    let (codex, grok, ollama, openai, hosted, custom): (_, Result<_>, _, Result<_>, _, _) =
+        tokio::join!(codex, grok, ollama, openai, hosted(home), custom(home));
     crate::provider::remember_listing("ollama", ollama.clone(), Vec::new());
     if let Ok((models, None)) = &openai {
         crate::provider::remember_listing("openai", models.clone(), Vec::new());
@@ -250,6 +298,8 @@ pub async fn list(home: &Path) -> (Vec<ModelChoice>, Vec<String>) {
     }
     choices.extend(hosted.0);
     warnings.extend(hosted.1);
+    choices.extend(custom.0);
+    warnings.extend(custom.1);
     (choices, warnings)
 }
 
@@ -322,7 +372,7 @@ pub fn build(
                     effort,
                 )?,
             )),
-            None => Err(crate::config::unknown_provider(other)),
+            None => crate::provider::custom::build(home, other, &choice.model, effort),
         },
     }
 }
@@ -351,6 +401,80 @@ pub fn save_last(home: &Path, choice: &ModelChoice, effort: Option<&str>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn custom_catalog_falls_back_except_for_rejected_credentials() {
+        use crate::provider::{
+            custom::{self, Definition, Protocol},
+            sse::tests::server,
+        };
+        for status in [401, 403, 404, 500, 200] {
+            let body = if status == 200 { r#"{"data":[]}"# } else { "" };
+            let (url, _requests, task) = server(vec![(status, body.into())]).await;
+            let home = tempfile::tempdir().unwrap();
+            custom::save(
+                home.path(),
+                &Definition {
+                    id: "catalog-test".into(),
+                    protocol: Protocol::Anthropic,
+                    base_url: url,
+                    api_key: Some("isolated-key".into()),
+                    model: "manual-model".into(),
+                },
+            )
+            .unwrap();
+            let (choices, warnings) = super::custom(home.path()).await;
+            assert_eq!(warnings.len(), 1);
+            assert!(!warnings[0].contains("isolated-key"));
+            if matches!(status, 401 | 403) {
+                assert!(choices.is_empty());
+                assert!(warnings[0].contains("API access denied"));
+            } else {
+                assert_eq!(choices.len(), 1);
+                assert_eq!(choices[0].provider, "catalog-test");
+                assert_eq!(choices[0].model, "manual-model");
+                assert!(!choices[0].efforts.is_empty());
+                assert!(warnings[0].contains("using configured model"));
+            }
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_catalog_discovers_and_reports_malformed_config() {
+        use crate::provider::{
+            custom::{self, Definition, Protocol},
+            sse::tests::server,
+        };
+        let (url, _requests, task) = server(vec![(
+            200,
+            r#"{"data":[{"id":"found","context_window":10000}]}"#.into(),
+        )])
+        .await;
+        let home = tempfile::tempdir().unwrap();
+        custom::save(
+            home.path(),
+            &Definition {
+                id: "discovered-test".into(),
+                protocol: Protocol::Openai,
+                base_url: url,
+                api_key: None,
+                model: "manual-model".into(),
+            },
+        )
+        .unwrap();
+        let (choices, warnings) = super::custom(home.path()).await;
+        assert!(warnings.is_empty());
+        assert_eq!(choices[0].provider, "discovered-test");
+        assert_eq!(choices[0].model, "found");
+        assert_eq!(choices[0].context_window, Some(10000));
+        task.await.unwrap();
+        std::fs::write(home.path().join("providers.json"), "malformed").unwrap();
+        let (choices, warnings) = super::custom(home.path()).await;
+        assert!(choices.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("providers.json"));
+    }
 
     fn choice(provider: &str, model: &str, efforts: &[&str]) -> ModelChoice {
         ModelChoice {

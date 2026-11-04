@@ -31,22 +31,7 @@ const READ_ONLY: &[&str] = &[
     "web_search",
 ];
 
-const DESCRIPTION: &str = "\
-Delegate a self-contained task to a subagent: a fresh agent with its own context that works \
-on its own and returns only its final report. Use it for broad codebase searches, independent \
-research, or investigations that would otherwise fill your context with file dumps; several \
-subagent calls in one response run in parallel, so only batch independent tasks. The subagent \
-sees NOTHING of this conversation, so `task` must contain complete instructions: the goal, \
-relevant paths and names, constraints, and what to report back. Modes: \"explore\" (default) gets \
-read-only tools (read, list, glob, grep, view images, skills) and needs no approval; \"general\" \
-may also edit files, run commands and use MCP tools. `model`, `effort` and `permission_mode` \
-override yours for this subagent (the permission mode can only be stricter). \
-Without `name` the subagent is one-shot. Give a `name` to keep it for this session: the first \
-call creates it, and later calls with the same name send `task` to it as a follow-up message, \
-with everything it already learned still in its context. `action` manages named subagents: \
-\"list\", \"inspect\" (status and recent transcript), \"stop\", and \"resume\" (reopen a stopped \
-one, or finish an interrupted message). \
-Don't use it for a quick lookup you can do with one or two direct tool calls.";
+const DESCRIPTION: &str = "Delegate substantial independent work. Use action spawn with name and task to run a child independently; send queues a follow-up for that name. Up to three children execute concurrently with FIFO inboxes. Reports arrive automatically between parent model requests, and finishing waits for outstanding children: do not poll. Children receive only the supplied task, so include paths, constraints and acceptance criteria. explore (default) is read-only; general can edit, run commands and use MCP after permission checks. Parent and children share one workspace writer. model and effort override inherited settings; permission_mode can only narrow authority. request_id makes an exact spawn/send retry idempotent. inspect/list show state; stop/cancel/close cancel current and queued work; resume reopens a stopped child. Legacy run executes synchronously, optionally retaining named context. Interrupted work is not automatically replayed: inspect its checkpoint and workspace before sending a replacement task. Children cannot delegate or message peers. Avoid delegation for quick lookups.";
 
 const PREAMBLE: &str = "\
 You are a subagent: another agent delegated the task below to you. You have none of its \
@@ -154,7 +139,8 @@ impl Tool for Subagent {
                     "description": {"type": "string", "description": "Short 3-6 word label for the task, shown to the user."},
                     "mode": {"type": "string", "enum": ["explore", "general"], "description": "explore (default): read-only tools. general: may also edit files and run commands. Fixed when a named subagent is created."},
                     "name": {"type": "string", "description": "Keep the subagent under this name (letters, digits, - and _) so later calls can send it follow-ups."},
-                    "action": {"type": "string", "enum": ["run", "list", "inspect", "stop", "resume"], "description": "run (default): run `task`. list: named subagents. inspect/stop/resume: act on `name`."},
+                    "action": {"type": "string", "enum": ["run", "spawn", "send", "list", "inspect", "stop", "cancel", "close", "resume"], "description": "spawn/send: queue task for name. run: synchronous task. list/inspect: state. stop/cancel/close: stop work. resume: reopen."},
+                    "request_id": {"type":"string", "description":"Stable retry key for spawn/send; reuse only for the exact same task."},
                     "model": {"type": "string", "description": "Model for this subagent (default: yours), e.g. a faster one for simple searches."},
                     "effort": {"type": "string", "description": "Reasoning effort for this subagent (e.g. low, medium, high)."},
                     "permission_mode": {"type": "string", "enum": ["ask", "auto", "yolo"], "description": "Permission mode for this subagent; never more permissive than yours."}
@@ -164,7 +150,7 @@ impl Tool for Subagent {
     }
 
     fn needs_approval(&self, args: &Value) -> bool {
-        is_general(args) && action(args) == "run"
+        is_general(args) && matches!(action(args), "run" | "spawn" | "send")
     }
 
     fn summary(&self, args: &Value) -> String {
@@ -214,12 +200,20 @@ impl Tool for Subagent {
                 "Invalid subagent name `{n}`: use letters, digits, '-' and '_' (at most {} characters).",
                 subagents::MAX_NAME
             )),
+            ("spawn" | "send", Some(n), Some(dir)) => {
+                if str_arg(&args, "task").is_none() { return ToolOutput::err("Missing task."); }
+                if ctx.provider.is_none() { return ToolOutput::err("No provider available."); }
+                match crate::orchestration::enqueue(dir, n, &args) {
+                    Ok(id) => { let _ = pump(ctx); ToolOutput::ok(format!("Queued child {n}, task {id}. Results are delivered automatically; keep working or finish to wait. Do not poll.")) }
+                    Err(e) => ToolOutput::err(format!("{e:#}")),
+                }
+            }
             ("run", Some(n), Some(dir)) => named_run(&args, n, dir, ctx).await,
             ("inspect", Some(n), Some(dir)) => match subagents::show_lines(dir, n, 20) {
                 Ok(lines) => ToolOutput::ok(lines.join("\n")),
                 Err(e) => ToolOutput::err(format!("{e:#}")),
             },
-            ("stop", Some(n), Some(dir)) => match subagents::stop(dir, n) {
+            ("stop" | "cancel" | "close", Some(n), Some(dir)) => match crate::orchestration::cancel(dir, n).and_then(|_| subagents::stop(dir, n)) {
                 Ok(msg) => ToolOutput::ok(msg),
                 Err(e) => ToolOutput::err(format!("{e:#}")),
             },
@@ -325,6 +319,12 @@ async fn drive_child(
     live: LiveGuard,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Outcome {
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
+    // Legacy synchronous children share the same execution cap.
+    let _slot = tokio::select! {
+        slot = SLOTS.acquire() => slot.ok(),
+        _ = cancel.cancelled() => None,
+    };
     let mut ui = Collector {
         calls: Vec::new(),
         approver: ctx.approver.clone(),
@@ -510,7 +510,7 @@ async fn resume(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
 }
 
 /// Run a turn of a saved subagent and save it again.
-async fn run_named(
+pub(crate) async fn run_named(
     mut record: Record,
     input: Option<Item>,
     dir: &Path,
@@ -549,15 +549,19 @@ async fn run_named(
     if let Err(e) = subagents::save(dir, &record) {
         return ToolOutput::err(format!("{e:#}"));
     }
-    let outcome = drive_child(
-        &mut agent,
-        input,
-        ctx,
-        format!("subagent {name}"),
-        live,
-        cancel,
-    )
-    .await;
+    let outcome = crate::subagents::CHECKPOINT
+        .scope(
+            (dir.to_owned(), name.clone()),
+            drive_child(
+                &mut agent,
+                input,
+                ctx,
+                format!("subagent {name}"),
+                live,
+                cancel,
+            ),
+        )
+        .await;
     record.status = match &outcome.result {
         Ok(TurnEnd::Done) => Status::Idle,
         _ if outcome.stopped => Status::Stopped,
@@ -578,6 +582,7 @@ async fn run_named(
     };
     let mut out = report(outcome, &agent, footer);
     if let Err(e) = saved {
+        out.is_error = true;
         out.content
             .push_str(&format!("\n(could not save subagent `{name}`: {e:#})"));
     }
@@ -665,6 +670,86 @@ impl Ui for Collector {
     }
 }
 
+/// Start up to three independent children. A name has one FIFO worker.
+/// No mutex is held across model execution or an approval.
+pub(crate) fn pump(ctx: &ToolCtx) -> anyhow::Result<()> {
+    let Some(dir) = ctx.subagent_dir.clone() else {
+        return Ok(());
+    };
+    let shared = crate::orchestration::store(&dir)?;
+    let mut store = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let mut next = store.jobs.clone();
+    let mut selected = Vec::new();
+    let mut names = store.active.clone();
+    for job in &mut next {
+        if names.len() >= 3 {
+            break;
+        }
+        if job.state == "queued" && !names.contains(&job.name) {
+            names.insert(job.name.clone());
+            job.state = "running".into();
+            selected.push(job.clone());
+        }
+    }
+    if selected.is_empty() {
+        return Ok(());
+    }
+    store.commit(next)?;
+    for job in &selected {
+        store.active.insert(job.name.clone());
+    }
+    drop(store);
+    for job in selected {
+        let ctx = ctx.clone();
+        let dir = dir.clone();
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let cancelled = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .jobs
+                .iter()
+                .find(|j| j.id == job.id)
+                .is_none_or(|j| j.state == "cancelled");
+            let output = if ctx.cancel.is_cancelled() || cancelled {
+                ToolOutput::err("Interrupted before child started")
+            } else {
+                use futures::FutureExt;
+                std::panic::AssertUnwindSafe(named_run(&job.args, &job.name, &dir, &ctx))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        ToolOutput::err(
+                            "Child worker panicked; inspect its checkpoint before continuing",
+                        )
+                    })
+            };
+            let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let mut next = s.jobs.clone();
+            if let Some(j) = next.iter_mut().find(|j| j.id == job.id) {
+                if j.state != "cancelled" {
+                    j.state = if ctx.cancel.is_cancelled() {
+                        "interrupted"
+                    } else if output.is_error {
+                        "failed"
+                    } else {
+                        "succeeded"
+                    }
+                    .into();
+                    j.result = Some(truncate(&output.content, MAX_REPORT));
+                }
+            }
+            if let Err(e) = s.commit(next) {
+                s.failure = Some(format!("Child result commit failed: {e:#}"));
+            }
+            s.outputs.insert(job.id.clone(), output);
+            s.active.remove(&job.name);
+            s.notify.notify_one();
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +823,158 @@ mod tests {
             provider: Some(Arc::new(fake.clone())),
             ..ToolCtx::default()
         }
+    }
+
+    #[tokio::test]
+    async fn parent_receives_completed_results_once_at_a_safe_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            resp(vec![Item::Assistant {
+                text: "Acknowledged".into(),
+            }]),
+            resp(vec![Item::Assistant {
+                text: "Next".into(),
+            }]),
+        ];
+        let ctx = ctx(&fake, dir.path());
+        let mut parent = child(&ctx, true, false, vec![], &Value::Null)
+            .unwrap_or_else(|e| panic!("{}", e.content));
+        let session = crate::session::Session::create(dir.path(), dir.path(), "fake").unwrap();
+        let store_dir = subagents::store_dir(&session.path);
+        parent.session = Some(session);
+        let shared = crate::orchestration::store(&store_dir).unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .commit(vec![crate::orchestration::Job {
+                id: "finished".into(),
+                name: "reader".into(),
+                args: Value::Null,
+                state: "succeeded".into(),
+                result: Some("Evidence from child".into()),
+                delivered: false,
+            }])
+            .unwrap();
+        parent
+            .turn(
+                Item::user("continue"),
+                &mut Collector {
+                    calls: vec![],
+                    approver: None,
+                    origin: "test".into(),
+                    live: LiveGuard::start(None, "test", Default::default()).unwrap(),
+                    note: None,
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(crate::orchestration::results(&store_dir)
+            .unwrap()
+            .is_empty());
+        let count = |items: &[Item]| {
+            items.iter().filter(|i| matches!(i, Item::User { text, .. } if text.contains("[orchestration-result:finished]"))).count()
+        };
+        assert_eq!(count(&parent.items), 1);
+        parent
+            .turn(
+                Item::user("another turn"),
+                &mut Collector {
+                    calls: vec![],
+                    approver: None,
+                    origin: "test".into(),
+                    live: LiveGuard::start(None, "test", Default::default()).unwrap(),
+                    note: None,
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count(&parent.items), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_followups_are_fifo_and_results_are_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            resp(vec![Item::Assistant {
+                text: "first".into(),
+            }]),
+            resp(vec![Item::Assistant {
+                text: "second".into(),
+            }]),
+        ];
+        let mut ctx = ctx(&fake, dir.path());
+        ctx.subagent_dir = Some(dir.path().join("children"));
+        for (key, task) in [("one", "first task"), ("two", "second task")] {
+            let out = Subagent
+                .run(
+                    json!({"action":"spawn", "name":"reader", "task":task, "request_id":key}),
+                    &ctx,
+                )
+                .await;
+            assert!(!out.is_error, "{}", out.content);
+        }
+        let path = ctx.subagent_dir.as_ref().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while crate::orchestration::pending(path).unwrap() {
+                let shared = crate::orchestration::store(path).unwrap();
+                let notify = shared.lock().unwrap().notify.clone();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                pump(&ctx).unwrap();
+                if crate::orchestration::pending(path).unwrap() {
+                    notified.await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let results = crate::orchestration::results(path).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.contains("first"));
+        assert!(results[1].1.contains("second"));
+        let record = subagents::load(path, "reader").unwrap().unwrap();
+        assert_eq!(record.turns, 2);
+        assert!(record
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::User { text, .. } if text == "first task")));
+        for (id, _) in results {
+            crate::orchestration::acknowledge(path, &id).unwrap();
+        }
+        assert!(crate::orchestration::results(path).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_child_cancels_its_queued_followup() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            hang: true,
+            ..Default::default()
+        };
+        let mut ctx = ctx(&fake, dir.path());
+        ctx.subagent_dir = Some(dir.path().join("children"));
+        let path = ctx.subagent_dir.as_ref().unwrap();
+        Subagent
+            .run(
+                json!({"action":"spawn", "name":"reader", "task":"hang"}),
+                &ctx,
+            )
+            .await;
+        Subagent
+            .run(
+                json!({"action":"send", "name":"reader", "task":"follow up"}),
+                &ctx,
+            )
+            .await;
+        crate::orchestration::cancel(path, "reader").unwrap();
+        ctx.cancel.cancel();
+        assert!(!crate::orchestration::pending(path).unwrap());
+        assert!(crate::orchestration::results(path).unwrap().is_empty());
     }
 
     #[tokio::test]

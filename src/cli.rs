@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
 use crate::account;
@@ -20,7 +20,6 @@ use crate::github;
 use crate::login;
 use crate::mcp_cli;
 use crate::permissions;
-use crate::provider;
 use crate::record_tape;
 use crate::sandbox;
 use crate::session;
@@ -54,7 +53,7 @@ pub struct Cli {
     /// Model id (overrides config).
     #[arg(short, long, global = true)]
     pub model: Option<String>,
-    /// Provider: codex, grok, anthropic, openai, ollama, opencode-go, opencode or xai.
+    /// Provider: codex, grok, anthropic, openai, ollama, opencode-go, opencode, xai or a custom id.
     #[arg(long, global = true)]
     pub provider: Option<String>,
     /// Run tools without asking for approval.
@@ -198,14 +197,14 @@ pub enum Command {
         json: bool,
     },
     /// Sign in: ChatGPT subscription (default, Codex models), a Grok
-    /// subscription, or store an API key for anthropic, opencode-go, opencode or xai.
+    /// subscription, a hosted API key, or add a compatible provider with `custom`.
     Login {
-        /// codex (default), grok, anthropic, opencode-go, opencode or xai.
+        /// codex (default), grok, anthropic, opencode-go, opencode, xai, custom or a saved id.
         provider: Option<String>,
     },
     /// Remove nyq's stored login for a provider, or every stored login.
     Logout {
-        /// codex, grok, anthropic, opencode-go, opencode or xai [default: all of them].
+        /// Built-in provider or saved custom id [default: all stored logins; configurations kept].
         provider: Option<String>,
     },
     /// Run as an Agent Client Protocol (ACP) agent over stdio, for editors like Zed.
@@ -477,29 +476,7 @@ impl Ctx<'_> {
 
     /// `nyq login [provider]`: a browser sign-in, or a stored API key.
     async fn login(&self, provider: Option<String>) -> Result<()> {
-        let msg = match provider
-            .as_deref()
-            .filter(|p| !p.eq_ignore_ascii_case("codex"))
-        {
-            Some(name) if name.eq_ignore_ascii_case("grok") => {
-                login::login_grok(self.home, provider::grok::stdin_code()).await?
-            }
-            Some(name) => {
-                let service = provider::hosted::Service::parse(name).with_context(|| {
-                    format!(
-                        "unknown provider `{name}` (expected codex, grok, anthropic, opencode-go, opencode or xai)"
-                    )
-                })?;
-                login::login_key(self.home, service).await?
-            }
-            None => {
-                login::login(self.home, |url| {
-                    eprintln!("{}", login::sign_in_prompt(url));
-                    login::open_browser(url);
-                })
-                .await?
-            }
-        };
+        let msg = account::cli_login(self.home, provider.as_deref().unwrap_or("codex")).await?;
         println!("{msg}");
         Ok(())
     }
@@ -611,4 +588,36 @@ fn list_sessions(dir: &Path, cwd: Option<&Path>, limit: Option<u16>, json: bool)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatible_account_commands_accept_ids_but_not_key_arguments() {
+        for id in ["custom", "work-gateway", "anthropic", "grok"] {
+            let cli = Cli::try_parse_from(["nyq", "login", id]).unwrap();
+            assert!(matches!(cli.command, Some(Command::Login { provider: Some(p) }) if p == id));
+        }
+        let cli = Cli::try_parse_from(["nyq", "login"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Login { provider: None })
+        ));
+        let cli = Cli::try_parse_from(["nyq", "logout", "work-gateway"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Logout { provider: Some(p) }) if p == "work-gateway")
+        );
+        let cli = Cli::try_parse_from(["nyq", "provider", "work-gateway"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Provider { name: Some(p) }) if p == "work-gateway")
+        );
+        let cli = Cli::try_parse_from(["nyq", "setup"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Setup)));
+        assert!(
+            Cli::try_parse_from(["nyq", "login", "custom", "--api-key", "not-a-real-key"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["nyq", "login", "custom", "not-a-real-key"]).is_err());
+    }
 }

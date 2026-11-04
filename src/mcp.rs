@@ -2976,6 +2976,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn callback_listener() {
+        crate::http::init();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client = tokio::spawn(async move {
