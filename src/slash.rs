@@ -59,7 +59,7 @@ pub fn category(cmd: &str) -> Category {
         "/new" | "/clear" | "/reset" | "/continue" | "/rename" | "/resume" | "/sessions"
         | "/compact" => Category::Session,
         "/login" | "/logout" | "/setup" | "/usage" | "/stats" => Category::Account,
-        "/model" | "/fast" => Category::Model,
+        "/model" | "/effort" | "/thinking" | "/fast" => Category::Model,
         "/settings" | "/statusline" | "/sound" | "/notifications" => Category::Appearance,
         "/permissions" | "/allowlist" | "/yolo" | "/hooks" => Category::Security,
         "/workspace" | "/background" | "/memory" => Category::Workspace,
@@ -77,6 +77,7 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("/q", "/exit"),
     ("/cost", "/usage"),
     ("/img", "/image"),
+    ("/thinking", "/effort"),
 ];
 
 pub fn aliases(cmd: &str) -> Vec<&'static str> {
@@ -384,6 +385,20 @@ mod tests {
         assert_eq!(canonical("/cost"), "/usage");
         assert_eq!(canonical("/usage"), "/usage");
         assert_eq!(aliases("/exit"), ["/quit", "/q"]);
+    }
+
+    #[test]
+    fn thinking_alias_discovers_the_effort_command() {
+        assert_eq!(canonical("/thinking"), "/effort");
+        assert_eq!(aliases("/effort"), ["/thinking"]);
+        assert_eq!(category("/effort"), Category::Model);
+        assert_eq!(category("/thinking"), Category::Model);
+        assert!(aliases("/effort")
+            .iter()
+            .any(|alias| rank(alias, "think") == Some(1)));
+        let known = |cmd: &str| canonical(cmd) == "/effort";
+        assert!(!is_prompt("/effort high", known));
+        assert!(!is_prompt("/thinking HIGH", known));
     }
 
     #[test]

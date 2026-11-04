@@ -200,8 +200,9 @@ struct PendingQuestion {
     reply: oneshot::Sender<Option<String>>,
 }
 
-/// A masked one-line prompt (API keys): never echoed, never in history.
+/// A one-line setup prompt: never in history; API keys are masked.
 struct PendingSecret {
+    masked: bool,
     prompt: String,
     text: String,
     reply: oneshot::Sender<Option<String>>,
@@ -338,6 +339,7 @@ pub struct Screen {
     sessions: Option<SessionMenu>,
     settings: Option<super::settings::SettingsMenu>,
     modes: Option<super::mode_menu::ModeMenu>,
+    efforts: Option<super::effort_menu::EffortMenu>,
     help: Option<super::help_menu::HelpMenu>,
     /// Key bindings for the global actions (the editor holds its own copy).
     keys: Arc<Keymap>,
@@ -692,6 +694,7 @@ impl Screen {
             sessions: None,
             settings: None,
             modes: None,
+            efforts: None,
             help: None,
             keys: super::keys::current(),
             skills: None,
@@ -1087,10 +1090,23 @@ impl Screen {
             for l in wrap(&sanitize_text(&sec.prompt), w.saturating_sub(2).max(1)) {
                 rows.push(paint(fg(BRIGHT).bold(), &l));
             }
-            let dots = "•".repeat(sec.text.chars().count().min(w.saturating_sub(3)));
+            let value = if sec.masked {
+                "•".repeat(sec.text.chars().count().min(w.saturating_sub(3)))
+            } else {
+                // Keep the end visible while typing a long endpoint URL.
+                let text = sanitize_text(&sec.text);
+                let mut tail = String::new();
+                for ch in text.chars().rev() {
+                    if visible_width(&tail) + visible_width(&ch.to_string()) > w.saturating_sub(3) {
+                        break;
+                    }
+                    tail.insert(0, ch);
+                }
+                tail
+            };
             cursor_row = rows.len();
-            cursor_col = 2 + dots.chars().count();
-            rows.push(format!("{} {dots}", paint(fg(BRIGHT), "┃")));
+            cursor_col = 2 + visible_width(&value);
+            rows.push(format!("{} {value}", paint(fg(BRIGHT), "┃")));
             rows.push(rule(w));
             rows.push(hints(&[("Enter", "Save"), ("Esc", "Cancel")]));
         } else if !fancy {
@@ -1320,6 +1336,7 @@ impl Screen {
             menu: self.menu.is_some()
                 || self.settings.is_some()
                 || self.modes.is_some()
+                || self.efforts.is_some()
                 || self.skills.is_some()
                 || self.tools_menu.is_some(),
             transcript: self.viewer.is_some(),
@@ -1477,6 +1494,38 @@ impl Screen {
                         ("Enter", "Change"),
                         ("Esc", "Close"),
                     ],
+                )
+            } else if let Some(m) = &self.efforts {
+                let visible = m.rows();
+                let prefix = format!("{}  ", paint(fg(BRIGHT).bold(), "Thinking level"));
+                let filter_text = if m.filter.is_empty() {
+                    "Type to filter"
+                } else {
+                    &m.filter
+                };
+                let header = fit_header(prefix, filter_text, m.filter.is_empty(), w);
+                let current = self.footer.effort.as_deref().unwrap_or("auto");
+                let items = visible
+                    .iter()
+                    .map(|level| MenuItem {
+                        label: (*level).to_string(),
+                        detail: if *level == "auto" {
+                            "Model default".into()
+                        } else {
+                            String::new()
+                        },
+                        tag: if *level == current {
+                            "current".into()
+                        } else {
+                            String::new()
+                        },
+                    })
+                    .collect();
+                (
+                    header,
+                    items,
+                    m.selected,
+                    vec![("↑↓", "Navigate"), ("Enter", "Use"), ("Esc", "Close")],
                 )
             } else if let Some(m) = &self.modes {
                 let visible = m.rows();
@@ -1670,6 +1719,9 @@ impl Screen {
         }
         if self.settings.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No matching settings."));
+        }
+        if self.efforts.is_some() && items.is_empty() {
+            rows.push(paint(fg(GRAY), "  No matching thinking levels."));
         }
         if self.modes.is_some() && items.is_empty() {
             rows.push(paint(fg(GRAY), "  No matching modes."));
@@ -2274,6 +2326,7 @@ impl Screen {
         self.sessions = None;
         self.settings = None;
         self.modes = None;
+        self.efforts = None;
         self.help = None;
         self.skills = None;
         self.tools_menu = None;
@@ -2324,6 +2377,7 @@ impl Screen {
         self.menu = None;
         self.settings = None;
         self.modes = None;
+        self.efforts = None;
         self.help = None;
         self.skills = None;
         self.tools_menu = None;
@@ -2402,10 +2456,27 @@ impl Screen {
         self.menu = None;
         self.sessions = None;
         self.modes = None;
+        self.efforts = None;
         self.help = None;
         self.skills = None;
         self.tools_menu = None;
         self.settings = Some(super::settings::SettingsMenu::new(category));
+        self.redraw();
+    }
+
+    /// Pick a thinking level without opening settings.
+    pub fn open_efforts(&mut self) {
+        self.menu = None;
+        self.sessions = None;
+        self.settings = None;
+        self.modes = None;
+        self.help = None;
+        self.skills = None;
+        self.tools_menu = None;
+        self.efforts = Some(super::effort_menu::EffortMenu::new(
+            &self.footer.efforts,
+            self.footer.effort.as_deref(),
+        ));
         self.redraw();
     }
 
@@ -2417,6 +2488,7 @@ impl Screen {
         self.help = None;
         self.skills = None;
         self.tools_menu = None;
+        self.efforts = None;
         self.modes = Some(super::mode_menu::ModeMenu::new());
         self.redraw();
     }
@@ -2427,6 +2499,7 @@ impl Screen {
         self.sessions = None;
         self.settings = None;
         self.modes = None;
+        self.efforts = None;
         self.skills = None;
         self.tools_menu = None;
         self.help = Some(super::help_menu::HelpMenu::new(self.editor.commands()));
@@ -2443,6 +2516,7 @@ impl Screen {
         self.sessions = None;
         self.settings = None;
         self.modes = None;
+        self.efforts = None;
         self.help = None;
         self.tools_menu = None;
         self.skills = Some(super::skills_menu::SkillsMenu::new(entries, targets));
@@ -2455,6 +2529,7 @@ impl Screen {
         self.sessions = None;
         self.settings = None;
         self.modes = None;
+        self.efforts = None;
         self.help = None;
         self.skills = None;
         self.tools_menu = Some(super::tools_menu::ToolsMenu::new(entries));
@@ -2586,6 +2661,20 @@ impl Screen {
                 } else {
                     let _ = commands.send(Command::Submit(cmd));
                 }
+            }
+        }
+        self.redraw();
+    }
+
+    fn on_efforts_key(&mut self, key: KeyEvent, commands: &mpsc::UnboundedSender<Command>) {
+        use super::effort_menu::Action;
+        let Some(m) = &mut self.efforts else { return };
+        match m.on_key(key) {
+            Action::None => {}
+            Action::Close => self.efforts = None,
+            Action::Select(value) => {
+                self.efforts = None;
+                self.submit_from_menu(format!("/effort {value}"), commands);
             }
         }
         self.redraw();
@@ -3025,6 +3114,9 @@ impl Screen {
         if self.settings.is_some() {
             return self.on_settings_key(key, commands);
         }
+        if self.efforts.is_some() {
+            return self.on_efforts_key(key, commands);
+        }
         if self.modes.is_some() {
             return self.on_modes_key(key, commands);
         }
@@ -3456,6 +3548,7 @@ impl Tui {
                                     s.approval.is_none()
                                         && s.menu.is_none()
                                         && s.modes.is_none()
+                                        && s.efforts.is_none()
                                         && s.skills.is_none()
                                         && s.sessions.is_none()
                                         && s.secret.is_none()
@@ -3609,11 +3702,21 @@ impl Tui {
     /// Ask for a secret (an API key) without echoing it; None if cancelled
     /// or empty. The text never reaches the editor, history or transcript.
     pub async fn secret(&self, prompt: &str) -> Option<String> {
+        self.prompt_text(prompt, true).await
+    }
+
+    /// Visible setup text (provider name, endpoint or model), outside chat history.
+    pub async fn input(&self, prompt: &str) -> Option<String> {
+        self.prompt_text(prompt, false).await
+    }
+
+    async fn prompt_text(&self, prompt: &str, masked: bool) -> Option<String> {
         let (tx, rx) = oneshot::channel();
         {
             let mut s = self.screen();
             s.flush_all();
             s.secret = Some(PendingSecret {
+                masked,
                 prompt: prompt.to_string(),
                 text: String::new(),
                 reply: tx,
@@ -4599,6 +4702,69 @@ mod tests {
             // The rebound review key opens the review instead.
             assert_eq!(s.viewer.is_some(), modifiers == KeyModifiers::ALT);
         }
+    }
+
+    #[test]
+    fn thinking_picker_selects_and_preserves_the_draft() {
+        let mut s = screen();
+        s.footer.efforts = vec!["low".into(), "high".into()];
+        s.footer.effort = Some("high".into());
+        s.editor.set_text("unfinished prompt");
+        s.open_efforts();
+        assert_eq!(s.efforts.as_ref().unwrap().selected, 2);
+        assert!(s.upgrade_facts().menu);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(s.efforts.is_none());
+        assert_eq!(s.editor.text(), "unfinished prompt");
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::Submit(value) if value == "/effort high")
+        );
+        s.open_efforts();
+        s.open_permission_modes();
+        assert!(s.efforts.is_none());
+        s.open_efforts();
+        assert!(s.modes.is_none());
+        s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(s.efforts.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn thinking_picker_queues_changes_while_busy() {
+        let mut s = screen();
+        s.set_busy(Some("Working"), Some(CancellationToken::new()));
+        s.open_efforts();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(s.queue.len(), 1);
+        assert_eq!(s.queue[0].1, "/effort auto");
+    }
+
+    #[test]
+    fn setup_input_keeps_text_out_of_the_editor() {
+        let mut s = screen();
+        s.editor.set_text("unfinished prompt");
+        let (tx, mut rx) = oneshot::channel();
+        s.secret = Some(PendingSecret {
+            masked: false,
+            prompt: "Endpoint".into(),
+            text: String::new(),
+            reply: tx,
+        });
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        for ch in "https://local.test/v1".chars() {
+            s.on_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &commands,
+            );
+        }
+        s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+        assert_eq!(rx.try_recv().unwrap(), Some("https://local.test/v1".into()));
+        assert_eq!(s.editor.text(), "unfinished prompt");
+        assert!(s.secret.is_none());
+        assert!(command_rx.try_recv().is_err());
     }
 
     #[test]
