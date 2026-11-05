@@ -14,18 +14,16 @@ env:
   MACOS_SDK_SHA256: 6e146275d19f027faa2e8354da5e0267513abf013b8f16ad65a231653a2b1c5d
 
 jobs:
-  # Cross-compiles every target on the AWS runner with cargo-zigbuild (no
-  # GitHub-hosted minutes): static musl Linux binaries, macOS against a pinned
-  # SDK, Windows through MinGW-w64 as provided by zig.
+  # Cross-compiles every target on one Linux runner with cargo-zigbuild:
+  # static musl Linux binaries, macOS against a pinned SDK, Windows through
+  # MinGW-w64 as provided by zig.
   release:
     name: build and release
-    runs-on: [self-hosted, Linux, X64, nyq-aws]
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
       contents: write
     env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_TARGET_DIR: ${{ github.workspace }}/../nyq-release-target
       TOOLS: ${{ github.workspace }}/../release-tools
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +53,7 @@ jobs:
           rm -rf dist && mkdir -p dist
           package() { # target-dir binary archive
             rm -rf pkg && mkdir pkg
-            cp "$CARGO_TARGET_DIR/$1/release/$2" README.md pkg/
+            cp "target/$1/release/$2" README.md pkg/
             case "$3" in
               *.zip) python3 -c 'import sys, zipfile
           with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
@@ -67,17 +65,13 @@ jobs:
             t=$arch-unknown-linux-musl
             cargo zigbuild --release --locked --target "$t"
             package "$t" nyq "nyq-$t.tar.gz"
-            # Installs from 0.4.1 and earlier look for the glibc name.
-            cp "dist/nyq-$t.tar.gz" "dist/nyq-$arch-unknown-linux-gnu.tar.gz"
           done
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
             cargo zigbuild --release --locked --target "$t"
             package "$t" nyq "nyq-$t.tar.gz"
           done
-          # Published under the existing Windows asset name so installs and
-          # self-upgrades keep finding it.
           cargo zigbuild --release --locked --target x86_64-pc-windows-gnu
-          package x86_64-pc-windows-gnu nyq.exe nyq-x86_64-pc-windows-msvc.zip
+          package x86_64-pc-windows-gnu nyq.exe nyq-x86_64-pc-windows-gnu.zip
           (cd dist && sha256sum nyq-*.tar.gz nyq-*.zip > SHA256SUMS && cat SHA256SUMS)
       - name: Smoke test
         run: |

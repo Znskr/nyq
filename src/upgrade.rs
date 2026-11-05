@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const REPO: &str = "sharqlabs/nyq";
+pub const REPO: &str = "Znskr/nyq";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const STATE_FILE: &str = "update.json";
 
@@ -126,8 +126,6 @@ pub struct Release {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Asset {
     pub name: String,
-    /// API address (works with a token for private repositories).
-    pub url: String,
     pub browser_download_url: String,
 }
 
@@ -155,7 +153,7 @@ pub fn target_for(os: &str, arch: &str) -> Option<&'static str> {
         ("linux", "aarch64") => "aarch64-unknown-linux-musl",
         ("macos", "x86_64") => "x86_64-apple-darwin",
         ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("windows", "x86_64") => "x86_64-pc-windows-gnu",
         _ => return None,
     })
 }
@@ -194,6 +192,9 @@ pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- network
 
+/// Reads public GitHub releases. A `GITHUB_TOKEN`/`GH_TOKEN` in the
+/// environment is sent with release-list requests to lift the anonymous rate
+/// limit; downloads go to the public asset links and never carry it.
 pub(crate) struct Github {
     client: reqwest::Client,
     token: Option<String>,
@@ -203,12 +204,6 @@ fn env_token() -> Option<String> {
     ["GITHUB_TOKEN", "GH_TOKEN"]
         .iter()
         .find_map(|k| std::env::var(k).ok().filter(|t| !t.trim().is_empty()))
-}
-
-fn gh_token() -> Option<String> {
-    let out = Command::new("gh").args(["auth", "token"]).output().ok()?;
-    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !token.is_empty()).then_some(token)
 }
 
 impl Github {
@@ -224,56 +219,36 @@ impl Github {
         })
     }
 
-    async fn get(&self, url: &str, accept: &str) -> Result<reqwest::Response> {
+    /// The newest releases of nyq, newest first.
+    pub(crate) async fn releases(&mut self) -> Result<Vec<Release>> {
+        let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=30");
         let mut req = self
             .client
-            .get(url)
-            .header("Accept", accept)
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
         if let Some(token) = &self.token {
             req = req.bearer_auth(token);
         }
-        Ok(req.send().await?)
-    }
-
-    /// The release list; a private repository answers 404 without a token, so
-    /// retry once with `gh auth token`.
-    pub(crate) async fn releases(&mut self) -> Result<Vec<Release>> {
-        let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=30");
-        let mut resp = self
-            .get(&url, "application/vnd.github+json")
-            .await
-            .context("contacting GitHub")?;
-        if matches!(resp.status().as_u16(), 401 | 403 | 404) && self.token.is_none() {
-            if let Some(token) = gh_token() {
-                self.token = Some(token);
-                resp = self
-                    .get(&url, "application/vnd.github+json")
-                    .await
-                    .context("contacting GitHub")?;
-            }
-        }
+        let resp = req.send().await.context("contacting GitHub")?;
         match resp.status().as_u16() {
             200 => Ok(resp.json().await.context("reading the release list")?),
-            404 | 401 => bail!(
-                "could not read releases of {REPO} (HTTP {}): if the repository is private, set GITHUB_TOKEN or run `gh auth login`",
+            403 | 429 => bail!(
+                "GitHub rate-limited the release check (HTTP {}): retry later or set GITHUB_TOKEN",
                 resp.status().as_u16()
             ),
-            403 | 429 => bail!("GitHub refused the request (HTTP {}; rate limited?): set GITHUB_TOKEN and retry", resp.status().as_u16()),
-            s => bail!("GitHub answered HTTP {s} for the release list"),
+            s => bail!("GitHub answered HTTP {s} for the releases of {REPO}"),
         }
     }
 
     async fn download(&self, asset: &Asset) -> Result<Vec<u8>> {
-        // Browser links ignore tokens; private assets need the API address.
-        let resp = match &self.token {
-            Some(_) => self.get(&asset.url, "application/octet-stream").await,
-            None => {
-                self.get(&asset.browser_download_url, "application/octet-stream")
-                    .await
-            }
-        }
-        .with_context(|| format!("downloading {}", asset.name))?;
+        let resp = self
+            .client
+            .get(&asset.browser_download_url)
+            .header("Accept", "application/octet-stream")
+            .send()
+            .await
+            .with_context(|| format!("downloading {}", asset.name))?;
         anyhow::ensure!(
             resp.status().is_success(),
             "downloading {} failed: HTTP {}",
@@ -465,18 +440,6 @@ pub(crate) fn platform_archive() -> Option<String> {
     target_for(std::env::consts::OS, std::env::consts::ARCH).map(archive_name)
 }
 
-/// `name`, or for releases made before the static Linux builds (0.4.1 and
-/// earlier), the glibc archive that stood in for it.
-fn release_asset_name(release: &Release, name: &str) -> String {
-    if release.asset(name).is_none() && name.contains("-linux-musl") {
-        let glibc = name.replace("-linux-musl", "-linux-gnu");
-        if release.asset(&glibc).is_some() {
-            return glibc;
-        }
-    }
-    name.to_string()
-}
-
 /// The newest release on `channel` and its version (without the `v`).
 pub(crate) async fn newest(gh: &mut Github, channel: Channel) -> Result<(Release, String)> {
     let release = pick_release(gh.releases().await?, channel)
@@ -492,7 +455,6 @@ pub(crate) async fn download_verified(
     release: &Release,
     name: &str,
 ) -> Result<Vec<u8>> {
-    let name = &release_asset_name(release, name);
     let asset = release
         .asset(name)
         .with_context(|| format!("release {} has no asset named {name}", release.tag_name))?;
@@ -596,7 +558,6 @@ mod tests {
                 .iter()
                 .map(|n| Asset {
                     name: n.to_string(),
-                    url: format!("api/{n}"),
                     browser_download_url: format!("dl/{n}"),
                 })
                 .collect(),
@@ -653,16 +614,16 @@ mod tests {
         assert_eq!(target_for("macos", "aarch64"), Some("aarch64-apple-darwin"));
         assert_eq!(
             target_for("windows", "x86_64"),
-            Some("x86_64-pc-windows-msvc")
+            Some("x86_64-pc-windows-gnu")
         );
         assert_eq!(target_for("freebsd", "x86_64"), None);
         assert_eq!(
-            archive_name("aarch64-unknown-linux-gnu"),
-            "nyq-aarch64-unknown-linux-gnu.tar.gz"
+            archive_name("aarch64-unknown-linux-musl"),
+            "nyq-aarch64-unknown-linux-musl.tar.gz"
         );
         assert_eq!(
-            archive_name("x86_64-pc-windows-msvc"),
-            "nyq-x86_64-pc-windows-msvc.zip"
+            archive_name("x86_64-pc-windows-gnu"),
+            "nyq-x86_64-pc-windows-gnu.zip"
         );
         let r = release(
             "v1.0.0",
@@ -677,23 +638,7 @@ mod tests {
             .asset(&archive_name(target_for("macos", "aarch64").unwrap()))
             .unwrap();
         assert_eq!(a.browser_download_url, "dl/nyq-aarch64-apple-darwin.tar.gz");
-        assert!(r.asset("nyq-x86_64-pc-windows-msvc.zip").is_none());
-        // Older releases only have glibc Linux archives; newer ones prefer musl.
-        let musl = archive_name(target_for("linux", "aarch64").unwrap());
-        let old = release("v0.4.1", false, &["nyq-aarch64-unknown-linux-gnu.tar.gz"]);
-        assert_eq!(
-            release_asset_name(&old, &musl),
-            "nyq-aarch64-unknown-linux-gnu.tar.gz"
-        );
-        let new = release(
-            "v0.5.0",
-            false,
-            &[
-                "nyq-aarch64-unknown-linux-gnu.tar.gz",
-                "nyq-aarch64-unknown-linux-musl.tar.gz",
-            ],
-        );
-        assert_eq!(release_asset_name(&new, &musl), musl);
+        assert!(r.asset("nyq-x86_64-pc-windows-gnu.zip").is_none());
         // The running platform maps to a target wherever nyq ships binaries.
         if cfg!(all(
             any(target_os = "linux", target_os = "macos"),

@@ -11,7 +11,7 @@
 //
 // Runs with `node` (22.6+ strips the types; `nyq-extension.mjs` is the same
 // code as plain JavaScript for any Node version) or `bun`. The protocol is
-// described in docs/extensions.md.
+// defined in src/extensions/protocol.rs in the nyq repository.
 
 import { createInterface } from "node:readline";
 

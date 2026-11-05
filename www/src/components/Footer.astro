@@ -16,7 +16,8 @@ const groups = [
     links: [
       { label: "Source on GitHub", url: REPO },
       { label: "Releases", url: `${REPO}/releases` },
-      { label: "Documentation", url: `${REPO}#readme` },
+      { label: "Documentation", url: href("docs") },
+      { label: "License", url: `${REPO}/blob/main/LICENSE` },
     ],
   },
   {
@@ -33,7 +34,7 @@ const groups = [
     <div class="flex flex-col gap-3">
       <a href={href()} class="w-fit text-fg" aria-label="nyq home"><Logo /></a>
       <p class="body-6 max-w-xs text-muted">
-        A small coding agent for your terminal. Apache 2.0 licensed.
+        A small coding agent for your terminal. AGPL-3.0 licensed.
       </p>
       {version && <p class="caption-5 font-mono text-faint">v{version}</p>}
     </div>

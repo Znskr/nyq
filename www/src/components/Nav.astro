@@ -4,7 +4,7 @@ import Logo from "./Logo.astro";
 import { href, REPO } from "../lib";
 
 interface Props {
-  current: "home" | "privacy" | "terms" | "none";
+  current: "home" | "docs" | "privacy" | "terms" | "none";
 }
 const { current } = Astro.props;
 const onHome = current === "home";
@@ -13,6 +13,7 @@ const links = [
   { label: "How it works", to: "#how", id: "how" },
   { label: "FAQ", to: "#faq", id: "faq" },
 ].map((l) => ({ ...l, url: onHome ? l.to : href(l.to) }));
+const docs = { label: "Docs", url: href("docs"), current: current === "docs" };
 // Legal pages are not in the menu, so they appear as the current item while open.
 const page = { privacy: "Privacy", terms: "Terms" } as Record<string, string>;
 const currentLabel = page[current];
@@ -39,6 +40,9 @@ const linkBase =
           <a href={l.url} class={linkBase} data-spy={onHome ? l.id : undefined}>{l.label}</a>
         </li>
       ))}
+      <li>
+        <a href={docs.url} class={linkBase} aria-current={docs.current ? "page" : undefined}>{docs.label}</a>
+      </li>
       {currentLabel && (
         <li>
           <a href={href(current)} class={linkBase} aria-current="page">{currentLabel}</a>
@@ -51,6 +55,17 @@ const linkBase =
         </a>
       </li>
     </ul>
+
+    <button
+      type="button"
+      class="grid size-10 place-items-center rounded-full text-muted transition-colors duration-300 ease-base hover:bg-raised hover:text-fg active:scale-[0.98]"
+      aria-label="Switch to light theme"
+      title="Switch theme"
+      data-theme-toggle
+    >
+      <span data-theme-icon="light"><Icon name="sun" class="size-5" /></span>
+      <span data-theme-icon="dark"><Icon name="moon" class="size-5" /></span>
+    </button>
 
     <button
       type="button"
@@ -72,12 +87,13 @@ const linkBase =
 
 <div
   id="mobile-menu"
-  class="fixed inset-0 z-40 bg-black/90 px-6 pt-24 opacity-0 backdrop-blur-2xl transition-opacity duration-500 ease-base invisible data-[open]:visible data-[open]:opacity-100 md:hidden"
+  class="fixed inset-0 z-40 bg-bg/90 px-6 pt-24 opacity-0 backdrop-blur-2xl transition-opacity duration-500 ease-base invisible data-[open]:visible data-[open]:opacity-100 md:hidden"
   data-menu
 >
   <ul class="flex flex-col gap-2">
     {[
       ...links.map((l) => ({ label: l.label, url: l.url, current: false })),
+      docs,
       ...(currentLabel ? [{ label: currentLabel, url: href(current), current: true }] : []),
       { label: "GitHub", url: REPO, current: false },
     ].map((l, i) => (

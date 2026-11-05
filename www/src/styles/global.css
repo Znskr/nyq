@@ -6,13 +6,15 @@
   --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
 
-  /* Dark surfaces: the only background colors the site uses. */
+  /* Dark theme (the default). Light values are below, outside @theme. */
+  --color-bg: #000000;
   --color-surface: #181818;
   --color-raised: #1f1f1f;
   --color-line: #272727;
   --color-line-strong: #313131;
 
   --color-fg: #ffffff;
+  --color-fg-hover: #e6e6e6;
   --color-muted: #9b9b9b;
   --color-faint: #6b6b6b;
 
@@ -25,6 +27,71 @@
 
   --ease-base: cubic-bezier(0.22, 1, 0.36, 1);
 }
+
+/*
+ * Light theme. The page follows the system setting until the visitor picks one
+ * with the toggle, which sets data-theme on <html>. `.theme-dark` keeps a block
+ * (the hero's terminal) dark in both themes.
+ */
+:root[data-theme="light"] {
+  --color-bg: #ffffff;
+  --color-surface: #f5f5f5;
+  --color-raised: #ebebeb;
+  --color-line: #e2e2e2;
+  --color-line-strong: #cfcfcf;
+  --color-fg: #0a0a0a;
+  --color-fg-hover: #2b2b2b;
+  --color-muted: #525252;
+  --color-faint: #707070;
+  --color-nyq-blue: #1d6a94;
+  --color-nyq-green: #4b7424;
+  --color-nyq-red: #b03636;
+  --color-nyq-yellow: #85641a;
+  --color-nyq-magenta: #7650a4;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --color-bg: #ffffff;
+    --color-surface: #f5f5f5;
+    --color-raised: #ebebeb;
+    --color-line: #e2e2e2;
+    --color-line-strong: #cfcfcf;
+    --color-fg: #0a0a0a;
+    --color-fg-hover: #2b2b2b;
+    --color-muted: #525252;
+    --color-faint: #707070;
+    --color-nyq-blue: #1d6a94;
+    --color-nyq-green: #4b7424;
+    --color-nyq-red: #b03636;
+    --color-nyq-yellow: #85641a;
+    --color-nyq-magenta: #7650a4;
+    color-scheme: light;
+  }
+}
+:root[data-theme="dark"] { color-scheme: dark; }
+.theme-dark {
+  --color-bg: #000000;
+  --color-surface: #181818;
+  --color-raised: #1f1f1f;
+  --color-line: #272727;
+  --color-line-strong: #313131;
+  --color-fg: #ffffff;
+  --color-fg-hover: #e6e6e6;
+  --color-muted: #9b9b9b;
+  --color-faint: #6b6b6b;
+  --color-nyq-blue: #5fafd7;
+  --color-nyq-green: #87af5f;
+  --color-nyq-red: #d75f5f;
+  --color-nyq-yellow: #d7af5f;
+  --color-nyq-magenta: #af87d7;
+  color: var(--color-fg);
+}
+
+/* The theme toggle shows the icon of the theme it switches to. */
+.no-js [data-theme-toggle] { display: none; }
+:root[data-theme="dark"] [data-theme-icon="dark"],
+:root[data-theme="light"] [data-theme-icon="light"] { display: none; }
 
 /* Named text styles. Each maps to one step of the Tailwind type scale. */
 @utility heading-1 { font-size: var(--text-6xl); line-height: 1; font-weight: 600; letter-spacing: -0.025em; }
@@ -49,7 +116,7 @@
 
 /* The hero heading: the one place a gradient is allowed, and only on text. */
 @utility text-hero {
-  background-image: linear-gradient(to right, #ffffff, #9b9b9b);
+  background-image: linear-gradient(to right, var(--color-fg), var(--color-muted));
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -57,7 +124,7 @@
 
 @layer base {
   html {
-    background: #000000;
+    background: var(--color-bg);
     color: var(--color-fg);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
@@ -105,3 +172,44 @@
 /* Without JavaScript, show everything. */
 .no-js .reveal { opacity: 1; transform: none; }
 .no-js .tagline-word { opacity: 1; }
+
+/* The docs page: long-form markdown from src/docs/manual.md. */
+.docs { color: var(--color-muted); font-size: var(--text-base); line-height: 1.75; }
+.docs > * + * { margin-top: 1.25rem; }
+.docs h2 {
+  color: var(--color-fg); font-size: var(--text-2xl); font-weight: 600; letter-spacing: -0.015em;
+  margin-top: 4rem; padding-top: 2rem; border-top: 1px solid var(--color-line); scroll-margin-top: 6rem;
+}
+.docs > h2:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.docs h3 { color: var(--color-fg); font-size: var(--text-lg); font-weight: 600; margin-top: 2.5rem; scroll-margin-top: 6rem; }
+.docs strong { color: var(--color-fg); font-weight: 600; }
+.docs a { color: var(--color-fg); text-decoration: underline; text-underline-offset: 4px; text-decoration-color: var(--color-line-strong); }
+.docs a:hover { text-decoration-color: var(--color-fg); }
+.docs ul, .docs ol { padding-left: 1.5rem; }
+.docs ul { list-style: disc; }
+.docs ol { list-style: decimal; }
+.docs li + li { margin-top: 0.375rem; }
+.docs :not(pre) > code {
+  font-family: var(--font-mono); font-size: 0.875em; color: var(--color-fg);
+  background: var(--color-raised); border: 1px solid var(--color-line); border-radius: 0.375rem; padding: 0.1em 0.35em;
+  overflow-wrap: anywhere;
+}
+.docs .astro-code, .docs .astro-code span { color: var(--shiki-dark); }
+:root[data-theme="light"] .docs .astro-code,
+:root[data-theme="light"] .docs .astro-code span { color: var(--shiki-light); }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) .docs .astro-code,
+  :root:not([data-theme]) .docs .astro-code span { color: var(--shiki-light); }
+}
+.docs pre {
+  font-family: var(--font-mono); font-size: var(--text-sm); line-height: 1.7;
+  background: var(--color-surface) !important; border: 1px solid var(--color-line); border-radius: 0.75rem;
+  padding: 1rem 1.25rem; overflow-x: auto;
+}
+.docs blockquote { border-left: 2px solid var(--color-line-strong); padding-left: 1rem; }
+.docs table {
+  display: block; overflow-x: auto; width: 100%; border-collapse: collapse; font-size: var(--text-sm);
+}
+.docs th, .docs td { border-bottom: 1px solid var(--color-line); padding: 0.5rem 1rem 0.5rem 0; text-align: left; vertical-align: top; }
+.docs th { color: var(--color-fg); font-weight: 600; white-space: nowrap; }
+[data-toc][aria-current] { color: var(--color-fg); background: var(--color-raised); font-weight: 500; }

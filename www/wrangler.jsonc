@@ -4,6 +4,9 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "nyq",
   "compatibility_date": "2026-11-01",
+  "account_id": "26a839ba8f2819f8b9feec6aae7b942b",
+  "routes": [{ "pattern": "nyq.zalthar.com", "custom_domain": true }],
+  "workers_dev": false,
   "assets": {
     "directory": "./dist",
     "not_found_handling": "404-page",

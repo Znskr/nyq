@@ -8,7 +8,7 @@ interface Props {
   title: string;
   description: string;
   /** Which nav item is the current page. */
-  current?: "home" | "privacy" | "terms" | "none";
+  current?: "home" | "docs" | "privacy" | "terms" | "none";
   noindex?: boolean;
 }
 const { title, description, current = "home", noindex = false } = Astro.props;
@@ -20,11 +20,21 @@ const ogImage = new URL(href("og.png"), Astro.site);
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <script is:inline>document.documentElement.classList.replace("no-js", "js");</script>
+    <script is:inline>
+      document.documentElement.classList.replace("no-js", "js");
+      // Apply the saved theme (or the system's) before the first paint.
+      (function () {
+        var t;
+        try { t = localStorage.getItem("theme"); } catch (e) {}
+        if (t !== "light" && t !== "dark") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        document.documentElement.dataset.theme = t;
+      })();
+    </script>
     <title>{title}</title>
     <meta name="description" content={description} />
     {noindex ? <meta name="robots" content="noindex" /> : <link rel="canonical" href={canonical} />}
-    <meta name="theme-color" content="#000000" />
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
     <link rel="icon" type="image/svg+xml" href={href("favicon.svg")} />
     <link rel="icon" type="image/png" sizes="32x32" href={href("favicon-32.png")} />
     <link rel="apple-touch-icon" href={href("apple-touch-icon.png")} />
@@ -44,10 +54,10 @@ const ogImage = new URL(href("og.png"), Astro.site);
     <meta name="twitter:image" content={ogImage} />
     <slot name="head" />
   </head>
-  <body class="min-h-dvh bg-black text-fg">
+  <body class="min-h-dvh bg-bg text-fg">
     <a
       href="#main"
-      class="button-sm fixed left-4 top-4 z-[60] -translate-y-24 rounded-lg bg-fg px-3 py-2 text-black focus:translate-y-0 transition-transform duration-500 ease-base"
+      class="button-sm fixed left-4 top-4 z-[60] -translate-y-24 rounded-lg bg-fg px-3 py-2 text-bg focus:translate-y-0 transition-transform duration-500 ease-base"
     >
       Skip to content
     </a>
