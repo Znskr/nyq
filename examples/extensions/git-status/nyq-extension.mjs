@@ -1,6 +1,6 @@
 // A dependency-free helper for writing nyq extensions in JavaScript: the
 // same code as nyq-extension.ts without the types, for any Node version.
-// See nyq-extension.ts for the API and docs/extensions.md for the protocol.
+// See nyq-extension.ts for the API and protocol.
 //
 //   import { extension } from "./nyq-extension.mjs";
 //   extension({ tools: [...], commands: [...], on: { tool_call(e) { ... } } });

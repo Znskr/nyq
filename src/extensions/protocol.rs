@@ -1,6 +1,5 @@
 //! The extension manifest (`extension.json`) and the shapes exchanged over
 //! JSON-RPC: what `initialize` registers, event names and tool results.
-//! The wire format is documented in `docs/extensions.md`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
