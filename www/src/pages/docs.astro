@@ -1,0 +1,106 @@
+---
+import Base from "../layouts/Base.astro";
+import Icon from "../components/Icon.astro";
+import { Content, getHeadings } from "../docs/manual.md";
+import { href, REPO, VERSION } from "../lib";
+
+const sections = getHeadings().filter((h) => h.depth === 2);
+
+// The sidebar groups the manual's sections; any section not listed lands in "More".
+const groupDefs: [string, string[]][] = [
+  ["Get started", ["install", "pick-a-model", "use-it"]],
+  ["Configure", ["settings", "key-bindings", "system-prompt", "prompt-templates"]],
+  ["Tools and safety", ["tools-and-approvals", "sandbox", "hooks"]],
+  ["Extend", ["mcp", "extensions", "editors-acp"]],
+  ["Conversations", ["sessions", "long-conversations", "images", "terminal-tapes-and-session-repair"]],
+  ["Maintain", ["pull-requests-and-issues", "upgrades", "usage-and-diagnostics"]],
+];
+const bySlug = new Map(sections.map((h) => [h.slug, h]));
+const listed = new Set(groupDefs.flatMap(([, slugs]) => slugs));
+const groups = [
+  ...groupDefs.map(([title, slugs]) => ({
+    title,
+    items: slugs.flatMap((s) => bySlug.get(s) ?? []),
+  })),
+  { title: "More", items: sections.filter((h) => !listed.has(h.slug)) },
+].filter((g) => g.items.length);
+---
+<Base
+  title="Docs · nyq"
+  description="The nyq manual: install, providers and models, settings, tools and approvals, hooks, extensions, the sandbox, MCP, sessions and editors."
+  current="docs"
+>
+  <div class="mx-auto grid max-w-6xl gap-12 px-6 pb-24 pt-32 sm:pt-40 lg:grid-cols-[220px_minmax(0,1fr)]">
+    <aside class="lg:sticky lg:top-28 lg:max-h-[calc(100dvh-8rem)] lg:self-start lg:overflow-y-auto">
+      <details class="group rounded-2xl border border-line bg-surface p-4 lg:border-0 lg:bg-transparent lg:p-0" data-toc-box>
+        <summary class="caption-3 flex cursor-pointer list-none items-center justify-between text-faint lg:pointer-events-none">
+          Contents
+          <Icon name="caret-down" class="size-4 transition-transform duration-300 ease-base group-open:rotate-180 lg:hidden" />
+        </summary>
+        <nav aria-label="Documentation sections" class="mt-4 flex flex-col gap-5">
+          {groups.map((g) => (
+            <div class="flex flex-col gap-1">
+              <h2 class="caption-4 px-2 text-fg">{g.title}</h2>
+              <ul class="flex flex-col">
+                {g.items.map((h) => (
+                  <li>
+                    <a
+                      href={`#${h.slug}`}
+                      class="body-6 block rounded-lg px-2 py-1 text-muted transition-colors duration-300 ease-base hover:bg-raised hover:text-fg"
+                      data-toc={h.slug}
+                    >
+                      {h.text}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </nav>
+      </details>
+    </aside>
+    <article class="min-w-0">
+      <a
+        href={href()}
+        class="body-5 inline-flex w-fit items-center gap-2 rounded-full text-muted transition-colors duration-300 ease-base hover:text-fg"
+      >
+        <Icon name="arrow-left" class="size-4" />
+        Back to nyq
+      </a>
+      <header class="mt-8 flex flex-col gap-3">
+        <h1 class="heading-4 sm:heading-3">nyq documentation</h1>
+        <p class="caption-5 text-faint">
+          nyq v{VERSION} · <a href={`${REPO}/edit/main/www/src/docs/manual.md`} class="underline underline-offset-4 hover:text-fg">Edit this page</a>
+        </p>
+      </header>
+      <div class="docs mt-10">
+        <Content />
+      </div>
+    </article>
+  </div>
+</Base>
+
+<script>
+  // The index starts open on wide screens and collapsed on phones.
+  const box = document.querySelector<HTMLDetailsElement>("[data-toc-box]");
+  if (box && matchMedia("(min-width: 1024px)").matches) box.open = true;
+
+  // Highlight the section in view in the table of contents.
+  const links = new Map(
+    [...document.querySelectorAll<HTMLAnchorElement>("[data-toc]")].map((a) => [a.dataset.toc!, a]),
+  );
+  const seen = new Set<string>();
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) e.isIntersecting ? seen.add(e.target.id) : seen.delete(e.target.id);
+      const first = [...links.keys()].find((id) => seen.has(id));
+      if (!first) return;
+      links.forEach((a, id) => a.toggleAttribute("aria-current", id === first));
+    },
+    { rootMargin: "-80px 0px -70% 0px" },
+  );
+  links.forEach((_, id) => {
+    const el = document.getElementById(id);
+    if (el) io.observe(el);
+  });
+</script>

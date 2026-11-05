@@ -1,9 +1,11 @@
 [package]
 name = "nyq"
-version = "0.4.21"
+version = "0.0.1"
 edition = "2021"
 description = "A small, friendly coding-agent CLI"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Znskr/nyq"
+homepage = "https://nyq.zalthar.com"
 
 [features]
 default = ["tls-rustls"]

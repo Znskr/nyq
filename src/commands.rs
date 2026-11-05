@@ -487,7 +487,7 @@ pub async fn run(cmd: &str, args: &[&str], ctx: Ctx<'_>) -> Result<()> {
         "/keys" => {
             let mut lines = ui::keys::current().lines();
             lines.push(format!(
-                "Edit {} to change these (see README).",
+                "Edit {} to change these (see https://nyq.zalthar.com/docs).",
                 crate::config::home().join("keybindings.toml").display()
             ));
             ui::list(&lines);

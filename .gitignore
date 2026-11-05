@@ -1,2 +1,10 @@
 target/
+
+# Local agent and editor state
+.claude/
+.pi/
+.codex/
+.cursor/
+.agents/
+CLAUDE.local.md
 .DS_Store

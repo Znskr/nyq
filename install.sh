@@ -1,7 +1,13 @@
 #!/bin/sh
+# Installs nyq: curl -fsSL https://nyq.zalthar.com/install.sh | sh
+#
+# Downloads the release archive for this machine from GitHub, verifies it
+# against the release's SHA256SUMS and copies the binary to ~/.local/bin.
+#   NYQ_VERSION=0.0.1     install that version instead of the newest
+#   NYQ_INSTALL_DIR=DIR   install somewhere other than ~/.local/bin
 set -eu
 
-REPO="sharqlabs/nyq"
+REPO="Znskr/nyq"
 
 err() {
     printf 'install.sh: error: %s\n' "$*" >&2
@@ -12,140 +18,62 @@ have() {
     command -v "$1" >/dev/null 2>&1
 }
 
-os=$(uname -s)
-case "$os" in
+case "$(uname -s)" in
     Linux) os_part=unknown-linux-musl ;;
     Darwin) os_part=apple-darwin ;;
-    *) err "unsupported operating system '$os': this installer ships nyq binaries for Linux and macOS only" ;;
+    *) err "unsupported operating system '$(uname -s)': this installer ships nyq for Linux and macOS (Windows: see https://github.com/$REPO/releases)" ;;
 esac
 
-arch=$(uname -m)
-case "$arch" in
+case "$(uname -m)" in
     x86_64|amd64) arch_part=x86_64 ;;
     aarch64|arm64) arch_part=aarch64 ;;
-    *) err "unsupported CPU architecture '$arch': this installer ships x86_64 and aarch64 binaries only" ;;
+    *) err "unsupported CPU architecture '$(uname -m)': nyq ships x86_64 and aarch64 binaries" ;;
 esac
 
 target="$arch_part-$os_part"
 archive="nyq-$target.tar.gz"
 
 if [ -n "${NYQ_VERSION:-}" ]; then
-    tag="v${NYQ_VERSION#v}"
-    api_url="https://api.github.com/repos/$REPO/releases/tags/$tag"
+    base="https://github.com/$REPO/releases/download/v${NYQ_VERSION#v}"
+    wanted="version ${NYQ_VERSION#v}"
 else
-    tag="latest"
-    api_url="https://api.github.com/repos/$REPO/releases/latest"
-fi
-
-auth=""
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    auth="Authorization: Bearer $GITHUB_TOKEN"
+    base="https://github.com/$REPO/releases/latest/download"
+    wanted="the latest release"
 fi
 
 if have curl; then
-    fetcher=curl
+    download() { curl -fsSL "$1"; }
 elif have wget; then
-    fetcher=wget
+    download() { wget -qO- "$1"; }
 else
     err "neither curl nor wget is installed: one of them is needed to download nyq"
 fi
 
-download() {
-    _url=$1
-    if [ "$fetcher" = curl ]; then
-        if [ -n "$auth" ]; then
-            curl -fsSL -H "$auth" "$_url"
-        else
-            curl -fsSL "$_url"
-        fi
-    else
-        if [ -n "$auth" ]; then
-            wget -qO- --header="$auth" "$_url"
-        else
-            wget -qO- "$_url"
-        fi
-    fi
-}
-
-release_json=$(download "$api_url") || err "failed to fetch release information for '$tag' from $REPO
-  $api_url
-Check that the release exists. If the repository is private, set GITHUB_TOKEN
-to a token with read access to it."
-
-asset_url() {
-    if [ -n "$auth" ]; then
-        # Private repositories: browser download links ignore tokens, so use the
-        # API address of the asset (downloaded with Accept: application/octet-stream).
-        printf '%s\n' "$release_json" | tr ',{}' '\n\n\n' | awk -v want="$1" '
-            /"url": *"https:\/\/api\.github\.com\/repos\/.*\/releases\/assets\/[0-9]+"/ {
-                u = $0; sub(/^.*"url": *"/, "", u); sub(/".*$/, "", u)
-            }
-            /"name": *"/ {
-                n = $0; sub(/^.*"name": *"/, "", n); sub(/".*$/, "", n)
-                if (n == want && u != "") { print u; exit }
-            }'
-    else
-        printf '%s\n' "$release_json" |
-            grep -oE '"browser_download_url": *"[^"]*"' |
-            sed -e 's/^"browser_download_url": *"//' -e 's/"$//' |
-            grep "/$1\$" |
-            head -n 1
-    fi
-}
-
-download_asset() {
-    if [ -z "$auth" ]; then
-        download "$1"
-    elif [ "$fetcher" = curl ]; then
-        curl -fsSL -H "$auth" -H "Accept: application/octet-stream" "$1"
-    else
-        wget -qO- --header="$auth" --header="Accept: application/octet-stream" "$1"
-    fi
-}
-
-archive_url=$(asset_url "$archive")
-if [ -z "$archive_url" ] && [ "$os_part" = unknown-linux-musl ]; then
-    # Releases up to 0.4.1 only ship glibc Linux builds.
-    target="$arch_part-unknown-linux-gnu"
-    archive="nyq-$target.tar.gz"
-    archive_url=$(asset_url "$archive")
-fi
-[ -n "$archive_url" ] || err "release '$tag' of $REPO has no asset named '$archive'"
-
-sums_url=$(asset_url SHA256SUMS)
-[ -n "$sums_url" ] || err "release '$tag' of $REPO has no SHA256SUMS asset: refusing to install without checksum verification"
-
-version=$(printf '%s\n' "$release_json" |
-    grep -oE '"tag_name": *"[^"]*"' |
-    sed -e 's/^"tag_name": *"//' -e 's/"$//' |
-    head -n 1)
-[ -n "$version" ] || version="$tag"
-
 if have sha256sum; then
-    sum_tool=sha256sum
+    sha256() { sha256sum "$1" | awk '{ print $1 }'; }
 elif have shasum; then
-    sum_tool=shasum
+    sha256() { shasum -a 256 "$1" | awk '{ print $1 }'; }
 else
     err "neither sha256sum nor shasum is installed: one of them is needed to verify the download"
 fi
 
+if [ -z "${HOME:-}" ] && [ -z "${NYQ_INSTALL_DIR:-}" ]; then
+    err "neither HOME nor NYQ_INSTALL_DIR is set: cannot tell where to install nyq"
+fi
+dest_dir=${NYQ_INSTALL_DIR:-$HOME/.local/bin}
+
 tmpdir=$(mktemp -d) || err "failed to create a temporary directory"
 trap 'rm -rf "$tmpdir"' EXIT
 
-printf 'Downloading nyq %s for %s...\n' "$version" "$target"
+printf 'Downloading nyq (%s) for %s...\n' "$wanted" "$target"
+download "$base/$archive" > "$tmpdir/$archive" ||
+    err "failed to download $base/$archive (does $wanted exist?)"
+download "$base/SHA256SUMS" > "$tmpdir/SHA256SUMS" ||
+    err "failed to download SHA256SUMS: refusing to install without checksum verification"
 
-download_asset "$archive_url" > "$tmpdir/$archive" || err "failed to download $archive from $archive_url"
-download_asset "$sums_url" > "$tmpdir/SHA256SUMS" || err "failed to download SHA256SUMS from $sums_url"
-
-expected=$(awk -v f="$archive" '$2 == f { print $1; exit }' "$tmpdir/SHA256SUMS")
-[ -n "$expected" ] || err "SHA256SUMS of release '$tag' has no entry for $archive"
-
-if [ "$sum_tool" = sha256sum ]; then
-    actual=$(sha256sum "$tmpdir/$archive" | awk '{ print $1 }')
-else
-    actual=$(shasum -a 256 "$tmpdir/$archive" | awk '{ print $1 }')
-fi
-
+expected=$(awk -v f="$archive" '$2 == f || $2 == "*" f { print $1; exit }' "$tmpdir/SHA256SUMS")
+[ -n "$expected" ] || err "SHA256SUMS has no entry for $archive"
+actual=$(sha256 "$tmpdir/$archive")
 [ "$actual" = "$expected" ] || err "checksum mismatch for $archive
   expected: $expected
   actual:   $actual
@@ -153,23 +81,16 @@ The download may be incomplete or tampered with; not installing it."
 
 tar -xzf "$tmpdir/$archive" -C "$tmpdir" || err "failed to extract $archive"
 [ -f "$tmpdir/nyq" ] || err "$archive does not contain a 'nyq' binary"
+version=$("$tmpdir/nyq" --version 2>/dev/null) || err "the downloaded nyq does not run on this machine"
 
-if [ -z "${HOME:-}" ] && [ -z "${NYQ_INSTALL_DIR:-}" ]; then
-    err "neither HOME nor NYQ_INSTALL_DIR is set: cannot tell where to install nyq"
-fi
-dest_dir=${NYQ_INSTALL_DIR:-$HOME/.local/bin}
-
-if ! mkdir -p "$dest_dir" 2>/dev/null; then
+mkdir -p "$dest_dir" 2>/dev/null ||
     err "cannot create install directory '$dest_dir': set NYQ_INSTALL_DIR to a writable location"
-fi
-
 rm -f "$dest_dir/nyq"
-if ! cp "$tmpdir/nyq" "$dest_dir/nyq" 2>/dev/null; then
+cp "$tmpdir/nyq" "$dest_dir/nyq" 2>/dev/null ||
     err "cannot write to '$dest_dir/nyq': set NYQ_INSTALL_DIR to a writable location"
-fi
 chmod 0755 "$dest_dir/nyq"
 
-printf 'Installed nyq %s to %s\n' "$version" "$dest_dir/nyq"
+printf 'Installed %s to %s\n' "$version" "$dest_dir/nyq"
 
 case ":$PATH:" in
     *":$dest_dir:"*) ;;
@@ -179,3 +100,4 @@ case ":$PATH:" in
         printf '  export PATH="%s:$PATH"\n' "$dest_dir"
         ;;
 esac
+printf 'Run nyq to get started. Docs: https://nyq.zalthar.com/docs\n'

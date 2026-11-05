@@ -2,7 +2,7 @@
 export const faq: { q: string; a: string }[] = [
   {
     q: "Is nyq free?",
-    a: "Yes. nyq is open source under the Apache 2.0 license. You pay your model provider through the subscription or API key you already have, and local models through Ollama cost nothing.",
+    a: "Yes. nyq is open source under the GNU AGPL v3. You pay your model provider through the subscription or API key you already have, and local models through Ollama cost nothing.",
   },
   {
     q: "Which models and providers does it support?",

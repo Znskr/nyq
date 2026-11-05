@@ -36,11 +36,8 @@ concurrency:
 jobs:
   size:
     name: binary size
-    runs-on: [self-hosted, Linux, X64, nyq-aws]
+    runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_TARGET_DIR: ${{ github.workspace }}/../nyq-size-target
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain

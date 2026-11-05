@@ -10,7 +10,7 @@
 //! `<home>/trusted-extensions.json`); `"extensions": {"name": false}` in
 //! settings.toml disables one. A crashed extension is restarted once.
 //!
-//! The protocol is described in `docs/extensions.md`.
+//! The wire types are defined in [`protocol`].
 
 pub mod cli;
 mod conn;

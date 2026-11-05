@@ -1,3 +1,32 @@
+/* Theme toggle: the head script already applied the saved or system theme. */
+const root = document.documentElement;
+const toggles = document.querySelectorAll<HTMLButtonElement>("[data-theme-toggle]");
+const system = window.matchMedia("(prefers-color-scheme: light)");
+const labelToggles = () => {
+  const next = root.dataset.theme === "light" ? "dark" : "light";
+  toggles.forEach((b) => b.setAttribute("aria-label", `Switch to ${next} theme`));
+};
+const setTheme = (theme: string, save: boolean) => {
+  root.dataset.theme = theme;
+  if (save) {
+    try {
+      localStorage.setItem("theme", theme);
+    } catch {}
+  }
+  labelToggles();
+};
+toggles.forEach((b) =>
+  b.addEventListener("click", () => setTheme(root.dataset.theme === "light" ? "dark" : "light", true)),
+);
+system.addEventListener("change", (e) => {
+  let saved: string | null = null;
+  try {
+    saved = localStorage.getItem("theme");
+  } catch {}
+  if (!saved) setTheme(e.matches ? "light" : "dark", false);
+});
+labelToggles();
+
 const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /* Scroll reveals: each section rises and fades in once. */
@@ -66,7 +95,7 @@ document.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((button) => 
       status.classList.remove("text-nyq-red");
       timer = window.setTimeout(() => {
         delete button.dataset.state;
-        label.textContent = "Copy install command";
+        label.textContent = "Copy";
       }, 2000);
     } catch {
       // Clipboard blocked (insecure origin or denied): select the text instead.

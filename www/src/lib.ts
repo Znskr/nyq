@@ -13,6 +13,6 @@ export function href(path = ""): string {
   return `${base}/${path.replace(/^\//, "")}`;
 }
 
-export const REPO = "https://github.com/sharqlabs/nyq";
+export const REPO = "https://github.com/Znskr/nyq";
 export const INSTALL =
-  "curl -fsSL https://raw.githubusercontent.com/sharqlabs/nyq/main/install.sh | sh";
+  "curl -fsSL https://nyq.zalthar.com/install.sh | sh";

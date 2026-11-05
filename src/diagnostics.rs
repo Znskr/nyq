@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::types::Item;
 
-pub const FEEDBACK_URL: &str = "https://github.com/sharqlabs/nyq/issues/new";
+pub const FEEDBACK_URL: &str = "https://github.com/Znskr/nyq/issues/new";
 /// Session items included in a trace.
 const RECENT_ITEMS: usize = 50;
 /// Characters of text kept per item.

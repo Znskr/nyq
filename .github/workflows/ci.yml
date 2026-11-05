@@ -23,16 +23,13 @@ jobs:
       - run: rustup component add rustfmt
       - run: cargo fmt --check
 
-  # Runs on the dedicated AWS Lightsail runner.
   linux:
-    name: test (AWS linux)
-    runs-on: [self-hosted, Linux, X64, nyq-aws]
+    name: test (linux)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_TARGET_DIR: ${{ github.workspace }}/../nyq-ci-target
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - run: rustc --version && cargo --version
       - run: cargo build --locked
       - run: cargo test --locked
