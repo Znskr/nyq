@@ -18,12 +18,13 @@
   --color-muted: #9b9b9b;
   --color-faint: #6b6b6b;
 
-  /* nyq's own terminal palette (src/ui/theme.rs). */
-  --color-nyq-blue: #5fafd7;
-  --color-nyq-green: #87af5f;
-  --color-nyq-red: #d75f5f;
-  --color-nyq-yellow: #d7af5f;
-  --color-nyq-magenta: #af87d7;
+  /* Accent tones. The site is grayscale, so these are grays named after the
+     terminal colors they stand in for (diff additions bright, removals dim). */
+  --color-nyq-blue: #d4d4d4;
+  --color-nyq-green: #e5e5e5;
+  --color-nyq-red: #7d7d7d;
+  --color-nyq-yellow: #b8b8b8;
+  --color-nyq-magenta: #c6c6c6;
 
   --ease-base: cubic-bezier(0.22, 1, 0.36, 1);
 }
@@ -43,11 +44,11 @@
   --color-fg-hover: #2b2b2b;
   --color-muted: #525252;
   --color-faint: #707070;
-  --color-nyq-blue: #1d6a94;
-  --color-nyq-green: #4b7424;
-  --color-nyq-red: #b03636;
-  --color-nyq-yellow: #85641a;
-  --color-nyq-magenta: #7650a4;
+  --color-nyq-blue: #262626;
+  --color-nyq-green: #171717;
+  --color-nyq-red: #6e6e6e;
+  --color-nyq-yellow: #4a4a4a;
+  --color-nyq-magenta: #3a3a3a;
   color-scheme: light;
 }
 @media (prefers-color-scheme: light) {
@@ -61,11 +62,11 @@
     --color-fg-hover: #2b2b2b;
     --color-muted: #525252;
     --color-faint: #707070;
-    --color-nyq-blue: #1d6a94;
-    --color-nyq-green: #4b7424;
-    --color-nyq-red: #b03636;
-    --color-nyq-yellow: #85641a;
-    --color-nyq-magenta: #7650a4;
+    --color-nyq-blue: #262626;
+    --color-nyq-green: #171717;
+    --color-nyq-red: #6e6e6e;
+    --color-nyq-yellow: #4a4a4a;
+    --color-nyq-magenta: #3a3a3a;
     color-scheme: light;
   }
 }
@@ -80,11 +81,11 @@
   --color-fg-hover: #e6e6e6;
   --color-muted: #9b9b9b;
   --color-faint: #6b6b6b;
-  --color-nyq-blue: #5fafd7;
-  --color-nyq-green: #87af5f;
-  --color-nyq-red: #d75f5f;
-  --color-nyq-yellow: #d7af5f;
-  --color-nyq-magenta: #af87d7;
+  --color-nyq-blue: #d4d4d4;
+  --color-nyq-green: #e5e5e5;
+  --color-nyq-red: #7d7d7d;
+  --color-nyq-yellow: #b8b8b8;
+  --color-nyq-magenta: #c6c6c6;
   color: var(--color-fg);
 }
 
@@ -133,9 +134,9 @@
   }
   h1, h2, h3, h4 { text-wrap: balance; }
   p, li, dd { text-wrap: pretty; }
-  ::selection { background: var(--color-nyq-blue); color: #000000; }
+  ::selection { background: var(--color-fg); color: var(--color-bg); }
   :focus-visible {
-    outline: 2px solid var(--color-nyq-blue);
+    outline: 2px solid var(--color-fg);
     outline-offset: 2px;
   }
 }
@@ -201,6 +202,7 @@
   :root:not([data-theme]) .docs .astro-code,
   :root:not([data-theme]) .docs .astro-code span { color: var(--shiki-light); }
 }
+.docs .astro-code { filter: grayscale(1); }
 .docs pre {
   font-family: var(--font-mono); font-size: var(--text-sm); line-height: 1.7;
   background: var(--color-surface) !important; border: 1px solid var(--color-line); border-radius: 0.75rem;
