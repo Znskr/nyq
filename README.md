@@ -8,8 +8,16 @@ sandboxed shell commands.
 
 ## Install
 
+macOS and Linux:
+
 ```sh
 curl -fsSL https://nyq.zalthar.com/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://nyq.zalthar.com/install.ps1 | iex
 ```
 
 Binaries for macOS, Linux and Windows are on the

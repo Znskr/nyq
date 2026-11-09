@@ -9,56 +9,51 @@ interface Props {
 const { current } = Astro.props;
 const onHome = current === "home";
 const links = [
-  { label: "Features", to: "#features", id: "features" },
-  { label: "How it works", to: "#how", id: "how" },
-  { label: "FAQ", to: "#faq", id: "faq" },
-].map((l) => ({ ...l, url: onHome ? l.to : href(l.to) }));
-const docs = { label: "Docs", url: href("docs"), current: current === "docs" };
-// Legal pages are not in the menu, so they appear as the current item while open.
-const page = { privacy: "Privacy", terms: "Terms" } as Record<string, string>;
-const currentLabel = page[current];
-const linkBase =
-  "title-4 rounded-full px-3 py-2 text-muted transition-colors duration-300 ease-base hover:text-fg hover:bg-raised active:translate-y-px aria-[current=true]:text-fg aria-[current=true]:bg-raised aria-[current=page]:text-fg aria-[current=page]:bg-raised";
+  { label: "Features", url: onHome ? "#features" : href("#features"), spy: "features" },
+  { label: "FAQ", url: onHome ? "#faq" : href("#faq"), spy: "faq" },
+  { label: "Docs", url: href("docs"), current: current === "docs" },
+  { label: "GitHub", url: REPO },
+];
+const linkCls =
+  "title-4 px-3 py-2 text-muted transition-colors duration-200 ease-base hover:text-fg aria-[current=true]:text-fg aria-[current=page]:text-fg";
 ---
-<header class="fixed inset-x-0 top-4 z-50 flex justify-center px-4">
-  <nav
-    aria-label="Main"
-    class="flex items-center gap-2 rounded-full border border-line bg-surface/70 p-2 pl-4 backdrop-blur-xl"
-  >
+<!-- On the home page the bar floats over the (always dark) hero; elsewhere it sticks to the top. -->
+<header
+  class:list={[
+    "inset-x-0 top-0 z-50",
+    onHome ? "theme-dark absolute" : "sticky border-b border-line bg-bg/85 backdrop-blur-xl",
+  ]}
+>
+  <nav aria-label="Main" class="mx-auto flex h-16 max-w-6xl items-center gap-2 px-6 sm:h-20">
     <a
       href={href()}
-      class="mr-2 flex items-center rounded-full py-2 text-fg transition-opacity duration-300 ease-base hover:opacity-80"
+      class="mr-auto flex items-center gap-3 py-2 text-fg transition-opacity duration-200 ease-base hover:opacity-80"
       aria-label="nyq home"
       aria-current={onHome ? "page" : undefined}
     >
-      <Logo />
+      <Logo size={18} />
+      <span class="title-1 font-mono tracking-tight">nyq</span>
     </a>
 
-    <ul class="hidden items-center gap-1 md:flex">
+    <ul class="hidden items-center md:flex">
       {links.map((l) => (
         <li>
-          <a href={l.url} class={linkBase} data-spy={onHome ? l.id : undefined}>{l.label}</a>
+          <a
+            href={l.url}
+            class={linkCls}
+            data-spy={onHome && l.spy ? l.spy : undefined}
+            aria-current={l.current ? "page" : undefined}
+            rel={l.url.startsWith("http") ? "noopener" : undefined}
+          >
+            {l.label}
+          </a>
         </li>
       ))}
-      <li>
-        <a href={docs.url} class={linkBase} aria-current={docs.current ? "page" : undefined}>{docs.label}</a>
-      </li>
-      {currentLabel && (
-        <li>
-          <a href={href(current)} class={linkBase} aria-current="page">{currentLabel}</a>
-        </li>
-      )}
-      <li>
-        <a href={REPO} class={`${linkBase} inline-flex items-center gap-2`} rel="noopener">
-          <Icon name="github-logo" class="size-4" />
-          GitHub
-        </a>
-      </li>
     </ul>
 
     <button
       type="button"
-      class="grid size-10 place-items-center rounded-full text-muted transition-colors duration-300 ease-base hover:bg-raised hover:text-fg active:scale-[0.98]"
+      class="grid size-10 place-items-center text-muted transition-colors duration-200 ease-base hover:text-fg"
       aria-label="Switch to light theme"
       title="Switch theme"
       data-theme-toggle
@@ -67,44 +62,45 @@ const linkBase =
       <span data-theme-icon="dark"><Icon name="moon" class="size-5" /></span>
     </button>
 
+    <a
+      href={onHome ? "#install" : href("#install")}
+      class="button-sm ml-1 hidden bg-fg px-4 py-2.5 text-bg transition-colors duration-200 ease-base hover:bg-fg-hover sm:inline-flex"
+    >
+      Install
+    </a>
+
     <button
       type="button"
-      class="group relative grid size-10 place-items-center rounded-full text-fg transition-colors duration-300 ease-base hover:bg-raised active:scale-[0.98] md:hidden"
+      class="group relative grid size-10 place-items-center text-fg md:hidden"
       aria-expanded="false"
       aria-controls="mobile-menu"
       aria-label="Open menu"
       data-menu-toggle
     >
-      <span
-        class="absolute h-0.5 w-4 rounded-full bg-current transition-transform duration-500 ease-base -translate-y-1 group-aria-expanded:translate-y-0 group-aria-expanded:rotate-45"
-      ></span>
-      <span
-        class="absolute h-0.5 w-4 rounded-full bg-current transition-transform duration-500 ease-base translate-y-1 group-aria-expanded:translate-y-0 group-aria-expanded:-rotate-45"
-      ></span>
+      <span class="absolute h-0.5 w-4 bg-current transition-transform duration-500 ease-base -translate-y-1 group-aria-expanded:translate-y-0 group-aria-expanded:rotate-45"></span>
+      <span class="absolute h-0.5 w-4 bg-current transition-transform duration-500 ease-base translate-y-1 group-aria-expanded:translate-y-0 group-aria-expanded:-rotate-45"></span>
     </button>
   </nav>
 </header>
 
 <div
   id="mobile-menu"
-  class="fixed inset-0 z-40 bg-bg/90 px-6 pt-24 opacity-0 backdrop-blur-2xl transition-opacity duration-500 ease-base invisible data-[open]:visible data-[open]:opacity-100 md:hidden"
+  class:list={[
+    "invisible fixed inset-0 z-40 px-6 pt-24 opacity-0 backdrop-blur-2xl transition-opacity duration-500 ease-base data-[open]:visible data-[open]:opacity-100 md:hidden",
+    onHome ? "theme-dark bg-[#0f0f0f]/95" : "bg-bg/95",
+  ]}
   data-menu
 >
-  <ul class="flex flex-col gap-2">
-    {[
-      ...links.map((l) => ({ label: l.label, url: l.url, current: false })),
-      docs,
-      ...(currentLabel ? [{ label: currentLabel, url: href(current), current: true }] : []),
-      { label: "GitHub", url: REPO, current: false },
-    ].map((l, i) => (
+  <ul class="flex flex-col gap-1">
+    {[...links, { label: "Install", url: onHome ? "#install" : href("#install") }].map((l, i) => (
       <li
         class="translate-y-6 opacity-0 transition duration-500 ease-base [[data-open]_&]:translate-y-0 [[data-open]_&]:opacity-100"
         style={`transition-delay: ${Math.min(i * 60, 400)}ms`}
       >
         <a
           href={l.url}
-          class="heading-4 block rounded-xl px-3 py-3 text-fg transition-colors duration-300 ease-base hover:bg-raised active:translate-y-px aria-[current=page]:bg-raised"
-          aria-current={l.current ? "page" : undefined}
+          class="heading-4 block border-b border-line py-4 text-fg"
+          aria-current={"current" in l && l.current ? "page" : undefined}
           data-menu-link
         >
           {l.label}

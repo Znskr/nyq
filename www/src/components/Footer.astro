@@ -1,5 +1,7 @@
 ---
+import Icon from "./Icon.astro";
 import Logo from "./Logo.astro";
+import Wordmark from "./Wordmark.astro";
 import { href, REPO, VERSION as version } from "../lib";
 
 const groups = [
@@ -8,7 +10,18 @@ const groups = [
     links: [
       { label: "Features", url: href("#features") },
       { label: "How it works", url: href("#how") },
+      { label: "Install", url: href("#install") },
       { label: "FAQ", url: href("#faq") },
+    ],
+  },
+  {
+    title: "Docs",
+    links: [
+      { label: "Getting started", url: href("docs#install") },
+      { label: "Pick a model", url: href("docs#pick-a-model") },
+      { label: "Sandbox", url: href("docs#sandbox") },
+      { label: "MCP", url: href("docs#mcp") },
+      { label: "Extensions", url: href("docs#extensions") },
     ],
   },
   {
@@ -16,7 +29,7 @@ const groups = [
     links: [
       { label: "Source on GitHub", url: REPO },
       { label: "Releases", url: `${REPO}/releases` },
-      { label: "Documentation", url: href("docs") },
+      { label: "Report an issue", url: `${REPO}/issues/new` },
       { label: "License", url: `${REPO}/blob/main/LICENSE` },
     ],
   },
@@ -28,32 +41,87 @@ const groups = [
     ],
   },
 ];
+const social = [
+  { label: "GitHub", icon: "github-logo", url: REPO },
+  { label: "Releases", icon: "tag", url: `${REPO}/releases` },
+  { label: "Documentation", icon: "book-open-text", url: href("docs") },
+];
+const linkCls = "rounded text-muted transition-colors duration-200 ease-base hover:text-fg";
 ---
-<footer class="border-t border-line">
-  <div class="mx-auto grid max-w-6xl gap-12 px-6 py-16 md:grid-cols-[1.5fr_repeat(3,1fr)]">
-    <div class="flex flex-col gap-3">
-      <a href={href()} class="w-fit text-fg" aria-label="nyq home"><Logo /></a>
-      <p class="body-6 max-w-xs text-muted">
-        A small coding agent for your terminal. AGPL-3.0 licensed.
-      </p>
-      {version && <p class="caption-5 font-mono text-faint">v{version}</p>}
-    </div>
-    {groups.map((g) => (
-      <div class="flex flex-col gap-3">
-        <h2 class="caption-3 text-faint">{g.title}</h2>
-        <ul class="flex flex-col gap-2">
-          {g.links.map((l) => (
-            <li>
-              <a
-                href={l.url}
-                class="body-6 rounded text-muted transition-colors duration-300 ease-base hover:text-fg"
-              >
-                {l.label}
+<footer class="theme-dark border-t border-line bg-[#0f0f0f] text-fg">
+  <div class="band !border-t-0">
+    <div class="rail px-5 pb-14 pt-16 sm:px-10">
+      <div class="flex flex-col justify-between gap-10 md:flex-row">
+        <div class="flex flex-col gap-5">
+          <a href={href()} class="flex w-fit items-center gap-3 text-fg" aria-label="nyq home">
+            <Logo size={20} />
+            <span class="title-1 font-mono">nyq</span>
+          </a>
+          <p class="body-3 max-w-sm text-muted">
+            A small coding agent for your terminal.<br />Any model, sandboxed, open source.
+          </p>
+          <div class="flex flex-wrap items-center gap-4">
+            {social.map((s) => (
+              <a href={s.url} class={linkCls} aria-label={s.label} title={s.label}>
+                <Icon name={s.icon} class="size-5" />
               </a>
-            </li>
-          ))}
-        </ul>
+            ))}
+            <span class="h-4 w-px bg-line-strong" aria-hidden="true"></span>
+            <span class="caption-4 font-mono text-faint">Built in Rust</span>
+          </div>
+        </div>
+        <div class="flex flex-col items-start gap-4 md:items-end">
+          <!-- A pixel badge: the license, in the logo's style. -->
+          <a href={`${REPO}/blob/main/LICENSE`} class="block border border-line-strong bg-raised px-3 py-2 text-center transition-colors duration-200 ease-base hover:border-muted" aria-label="Licensed under AGPL-3.0">
+            <span class="block font-mono text-[11px] font-semibold leading-tight tracking-widest text-fg">AGPL-3.0</span>
+            <span class="block font-mono text-[9px] leading-tight tracking-[0.2em] text-faint">OPEN SOURCE</span>
+          </a>
+          <p class="caption-4 flex items-center gap-2 font-mono text-muted">
+            <a href={`${REPO}/releases/latest`} class={linkCls}>v{version} latest release</a>
+            <span class="size-1.5 rounded-full bg-fg" aria-hidden="true"></span>
+            <a href={`${REPO}/actions`} class={linkCls}>Build status</a>
+          </p>
+        </div>
       </div>
-    ))}
+
+      <div class="mt-12 grid grid-cols-2 gap-10 border-t border-line pt-10 md:grid-cols-4">
+        {groups.map((g) => (
+          <div class="flex flex-col gap-4">
+            <h2 class="title-4 text-fg">{g.title}</h2>
+            <ul class="flex flex-col gap-3">
+              {g.links.map((l) => (
+                <li><a href={l.url} class:list={["body-6", linkCls]}>{l.label}</a></li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </div>
+  </div>
+
+  <div class="band">
+    <div class="rail flex flex-col items-center justify-between gap-3 px-5 py-5 sm:flex-row sm:px-10">
+      <p class="caption-5 text-muted">© {new Date().getFullYear()} Znskr</p>
+      <p class="caption-5 font-mono text-faint">made for the terminal</p>
+      <p class="caption-5 flex gap-4">
+        <a href={href("terms")} class={linkCls}>Terms</a>
+        <a href={href("privacy")} class={linkCls}>Privacy</a>
+      </p>
+    </div>
+  </div>
+
+  <div class="band">
+    <div class="relative mx-auto max-w-[110rem] px-4 pb-10 pt-12 sm:px-10 sm:pb-16">
+      <div class="text-[#d4d4d4]">
+        <Wordmark />
+      </div>
+      <a
+        href={href("#install")}
+        class="title-4 absolute left-1/2 top-1/2 inline-flex -translate-x-1/2 -translate-y-1/2 items-center gap-2 rounded-full border border-line-strong bg-[#0f0f0f]/90 px-4 py-2 text-fg backdrop-blur transition-colors duration-300 ease-base hover:border-fg"
+      >
+        <Icon name="terminal-window" class="size-4" />
+        Install nyq
+      </a>
+    </div>
   </div>
 </footer>

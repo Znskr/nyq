@@ -77,32 +77,60 @@ if (reduced) {
   ).observe(section);
 }
 
-/* Copy the install command. */
-document.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((button) => {
+/* Install box: platform tabs switch the command; the copy button copies it. */
+document.querySelectorAll<HTMLElement>("[data-install]").forEach((root) => {
+  const tabs = [...root.querySelectorAll<HTMLButtonElement>("[data-os-tab]")];
+  const panel = root.querySelector<HTMLElement>("[role=tabpanel]")!;
+  const text = root.querySelector<HTMLElement>("[data-cmd-text]")!;
+  const button = root.querySelector<HTMLButtonElement>("[data-copy]")!;
   const label = button.querySelector<HTMLElement>("[data-copy-label]")!;
-  const root = button.closest("[data-install]")!;
   const status = root.querySelector<HTMLElement>("[data-copy-status]")!;
-  const note = status.innerHTML;
+  let note = status.textContent ?? "";
   let timer: number | undefined;
+
+  const select = (tab: HTMLButtonElement, focus = false) => {
+    tabs.forEach((t) => {
+      const on = t === tab;
+      t.setAttribute("aria-selected", String(on));
+      t.tabIndex = on ? 0 : -1;
+    });
+    panel.setAttribute("aria-labelledby", tab.id);
+    text.textContent = tab.dataset.cmd!;
+    button.dataset.copy = tab.dataset.cmd!;
+    note = tab.dataset.note ?? "";
+    status.textContent = note;
+    if (focus) tab.focus();
+  };
+  tabs.forEach((tab, i) => {
+    tab.addEventListener("click", () => select(tab));
+    tab.addEventListener("keydown", (e) => {
+      const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+      if (!step) return;
+      e.preventDefault();
+      select(tabs[(i + step + tabs.length) % tabs.length], true);
+    });
+  });
+  // Start on the visitor's platform.
+  const ua = navigator.userAgent;
+  const guess = /Windows/.test(ua) ? "Windows" : /Mac/.test(ua) ? "macOS" : /Linux|X11/.test(ua) ? "Linux" : null;
+  const start = tabs.find((t) => t.textContent?.trim() === guess);
+  if (start) select(start);
 
   button.addEventListener("click", async () => {
     window.clearTimeout(timer);
     try {
       await navigator.clipboard.writeText(button.dataset.copy!);
       button.dataset.state = "copied";
-      label.textContent = "Copied";
-      status.innerHTML = note;
-      status.classList.remove("text-nyq-red");
+      label.textContent = "copied";
+      status.textContent = note;
       timer = window.setTimeout(() => {
         delete button.dataset.state;
-        label.textContent = "Copy";
+        label.textContent = "copy";
       }, 2000);
     } catch {
       // Clipboard blocked (insecure origin or denied): select the text instead.
-      const code = root.querySelector("code");
-      if (code) window.getSelection()?.selectAllChildren(code);
+      window.getSelection()?.selectAllChildren(text);
       status.textContent = "Copy failed. The command is selected, so press Cmd+C or Ctrl+C to copy it.";
-      status.classList.add("text-nyq-red");
     }
   });
 });
