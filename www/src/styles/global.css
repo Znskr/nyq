@@ -8,23 +8,23 @@
 
   /* Dark theme (the default). Light values are below, outside @theme. */
   --color-bg: #000000;
-  --color-surface: #181818;
-  --color-raised: #1f1f1f;
+  --color-surface: #000000;
+  --color-raised: #000000;
   --color-line: #272727;
   --color-line-strong: #313131;
 
   --color-fg: #ffffff;
-  --color-fg-hover: #e6e6e6;
+  --color-fg-hover: #ffffff;
   --color-muted: #9b9b9b;
   --color-faint: #6b6b6b;
 
-  /* Accent tones. The site is grayscale, so these are grays named after the
-     terminal colors they stand in for (diff additions bright, removals dim). */
-  --color-nyq-blue: #d4d4d4;
-  --color-nyq-green: #e5e5e5;
-  --color-nyq-red: #7d7d7d;
-  --color-nyq-yellow: #b8b8b8;
-  --color-nyq-magenta: #c6c6c6;
+  /* Accent tones. The site is black and white, so every accent is the
+     foreground color; the names match the terminal colors they stand in for. */
+  --color-nyq-blue: #ffffff;
+  --color-nyq-green: #ffffff;
+  --color-nyq-red: #ffffff;
+  --color-nyq-yellow: #ffffff;
+  --color-nyq-magenta: #ffffff;
 
   --ease-base: cubic-bezier(0.22, 1, 0.36, 1);
 }
@@ -36,56 +36,56 @@
  */
 :root[data-theme="light"] {
   --color-bg: #ffffff;
-  --color-surface: #f5f5f5;
-  --color-raised: #ebebeb;
+  --color-surface: #ffffff;
+  --color-raised: #ffffff;
   --color-line: #e2e2e2;
   --color-line-strong: #cfcfcf;
-  --color-fg: #0a0a0a;
-  --color-fg-hover: #2b2b2b;
+  --color-fg: #000000;
+  --color-fg-hover: #000000;
   --color-muted: #525252;
   --color-faint: #707070;
-  --color-nyq-blue: #262626;
-  --color-nyq-green: #171717;
-  --color-nyq-red: #6e6e6e;
-  --color-nyq-yellow: #4a4a4a;
-  --color-nyq-magenta: #3a3a3a;
+  --color-nyq-blue: #000000;
+  --color-nyq-green: #000000;
+  --color-nyq-red: #000000;
+  --color-nyq-yellow: #000000;
+  --color-nyq-magenta: #000000;
   color-scheme: light;
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
     --color-bg: #ffffff;
-    --color-surface: #f5f5f5;
-    --color-raised: #ebebeb;
+    --color-surface: #ffffff;
+    --color-raised: #ffffff;
     --color-line: #e2e2e2;
     --color-line-strong: #cfcfcf;
-    --color-fg: #0a0a0a;
-    --color-fg-hover: #2b2b2b;
+    --color-fg: #000000;
+    --color-fg-hover: #000000;
     --color-muted: #525252;
     --color-faint: #707070;
-    --color-nyq-blue: #262626;
-    --color-nyq-green: #171717;
-    --color-nyq-red: #6e6e6e;
-    --color-nyq-yellow: #4a4a4a;
-    --color-nyq-magenta: #3a3a3a;
+    --color-nyq-blue: #000000;
+    --color-nyq-green: #000000;
+    --color-nyq-red: #000000;
+    --color-nyq-yellow: #000000;
+    --color-nyq-magenta: #000000;
     color-scheme: light;
   }
 }
 :root[data-theme="dark"] { color-scheme: dark; }
 .theme-dark {
   --color-bg: #000000;
-  --color-surface: #181818;
-  --color-raised: #1f1f1f;
+  --color-surface: #000000;
+  --color-raised: #000000;
   --color-line: #272727;
   --color-line-strong: #313131;
   --color-fg: #ffffff;
-  --color-fg-hover: #e6e6e6;
+  --color-fg-hover: #ffffff;
   --color-muted: #9b9b9b;
   --color-faint: #6b6b6b;
-  --color-nyq-blue: #d4d4d4;
-  --color-nyq-green: #e5e5e5;
-  --color-nyq-red: #7d7d7d;
-  --color-nyq-yellow: #b8b8b8;
-  --color-nyq-magenta: #c6c6c6;
+  --color-nyq-blue: #ffffff;
+  --color-nyq-green: #ffffff;
+  --color-nyq-red: #ffffff;
+  --color-nyq-yellow: #ffffff;
+  --color-nyq-magenta: #ffffff;
   color: var(--color-fg);
 }
 
@@ -245,14 +245,7 @@
   font-family: var(--font-mono); font-size: 0.8em; color: var(--color-fg);
   border: 1px solid var(--color-line-strong); border-bottom-width: 2px; padding: 0.05em 0.4em; background: var(--color-raised);
 }
-.docs .astro-code, .docs .astro-code span { color: var(--shiki-dark); }
-:root[data-theme="light"] .docs .astro-code,
-:root[data-theme="light"] .docs .astro-code span { color: var(--shiki-light); }
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme]) .docs .astro-code,
-  :root:not([data-theme]) .docs .astro-code span { color: var(--shiki-light); }
-}
-.docs .astro-code { filter: grayscale(1); }
+.docs .astro-code, .docs .astro-code span { color: var(--color-fg) !important; }
 /* Code blocks get a header bar (language and copy) from the docs page script. */
 .docs .code {
   border: 1px solid var(--color-line); background: var(--color-surface);

@@ -10,7 +10,7 @@ const { id } = Astro.props;
 const first = INSTALLS[0];
 ---
 <div class="flex w-full min-w-0 max-w-[36rem] flex-col" data-install>
-  <div role="tablist" aria-label="Platform" class="flex font-mono text-[13px]">
+  <div role="tablist" aria-label="Platform" class="flex w-fit bg-bg font-mono text-[13px]">
     {INSTALLS.map((p, i) => (
       <button
         type="button"
@@ -19,7 +19,7 @@ const first = INSTALLS[0];
         aria-selected={i === 0 ? "true" : "false"}
         aria-controls={`${id}-panel`}
         tabindex={i === 0 ? 0 : -1}
-        class="px-3 py-1.5 text-muted transition-colors duration-200 ease-base hover:text-fg aria-selected:bg-surface aria-selected:text-fg"
+        class="px-3 py-1.5 text-muted transition-colors duration-200 ease-base hover:text-fg aria-selected:bg-fg aria-selected:text-bg"
         data-os-tab
         data-cmd={p.cmd}
         data-note={p.note}
@@ -46,7 +46,7 @@ const first = INSTALLS[0];
       <span data-copy-label>copy</span>
     </button>
   </div>
-  <p id={`${id}-status`} class="caption-5 mt-2 font-mono text-muted [text-shadow:0_1px_8px_rgb(0_0_0/0.6)]" aria-live="polite" data-copy-status>
+  <p id={`${id}-status`} class="caption-5 mt-2 w-fit bg-bg font-mono text-muted" aria-live="polite" data-copy-status>
     {first.note}
   </p>
 </div>

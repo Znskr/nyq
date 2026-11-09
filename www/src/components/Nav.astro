@@ -21,7 +21,7 @@ const linkCls =
 <header
   class:list={[
     "inset-x-0 top-0 z-50",
-    onHome ? "theme-dark absolute" : "sticky border-b border-line bg-bg/85 backdrop-blur-xl",
+    onHome ? "theme-dark absolute" : "sticky border-b border-line bg-bg",
   ]}
 >
   <nav aria-label="Main" class="mx-auto flex h-16 max-w-6xl items-center gap-2 px-6 sm:h-20">
@@ -86,8 +86,8 @@ const linkCls =
 <div
   id="mobile-menu"
   class:list={[
-    "invisible fixed inset-0 z-40 px-6 pt-24 opacity-0 backdrop-blur-2xl transition-opacity duration-500 ease-base data-[open]:visible data-[open]:opacity-100 md:hidden",
-    onHome ? "theme-dark bg-[#0f0f0f]/95" : "bg-bg/95",
+    "invisible fixed inset-0 z-40 px-6 pt-24 opacity-0 transition-opacity duration-500 ease-base data-[open]:visible data-[open]:opacity-100 md:hidden",
+    onHome ? "theme-dark bg-black" : "bg-bg",
   ]}
   data-menu
 >

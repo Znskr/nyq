@@ -45,22 +45,21 @@ const quick = [
   current="docs"
 >
   <!-- Banner: a strip of the hero's night scene. -->
-  <section class="theme-dark relative isolate overflow-hidden border-b border-line bg-[#141414]">
+  <section class="theme-dark relative isolate overflow-hidden border-b border-line bg-[#000000]">
     <img
       src={href("art/hero.png")}
       alt=""
       width="1920"
       height="1000"
-      class="pixelated absolute inset-0 -z-10 h-full w-full object-cover object-[62%_78%]"
+      class="pixelated absolute inset-0 -z-10 h-full w-full object-cover object-[62%_18%]"
     />
-    <div class="absolute inset-0 -z-10 bg-gradient-to-r from-[#141414]/90 via-[#141414]/50 to-transparent" aria-hidden="true"></div>
-    <div class="rail !border-line/60 px-5 pb-12 pt-14 sm:px-10 sm:pb-16 sm:pt-20">
+    <div class="rail px-5 pb-12 pt-14 sm:px-10 sm:pb-16 sm:pt-20">
       <p class="caption-3 font-mono text-muted">nyq v{VERSION} · manual</p>
       <h1 class="heading-3 sm:heading-2 mt-4 text-fg">Documentation</h1>
-      <p class="body-3 mt-4 max-w-xl text-fg/80">
-        Everything nyq can do, on one page. Press <kbd class="border border-line-strong bg-black/40 px-1.5 font-mono text-sm">/</kbd> to filter the sections.
+      <p class="body-3 mt-4 max-w-xl text-fg">
+        Everything nyq can do, on one page. Press <kbd class="border border-line-strong bg-black px-1.5 font-mono text-sm">/</kbd> to filter the sections.
       </p>
-      <div class="mt-8 flex max-w-xl items-center gap-3 border border-line-strong bg-black/50 py-1 pl-4 pr-1 font-mono text-[13px] backdrop-blur">
+      <div class="mt-8 flex max-w-xl items-center gap-3 border border-line-strong bg-black py-1 pl-4 pr-1 font-mono text-[13px]">
         <span class="select-none text-faint">$</span>
         <code class="min-w-0 flex-1 overflow-x-auto whitespace-nowrap py-2 text-fg [scrollbar-width:none]">{INSTALL}</code>
         <button type="button" class="shrink-0 px-3 py-2 text-muted transition-colors hover:text-fg" data-code-copy data-text={INSTALL}>copy</button>
