@@ -4,7 +4,7 @@ import { href, REPO, VERSION } from "../lib";
 ---
 <section class="relative isolate overflow-hidden" aria-labelledby="hero-title">
   <!-- The night scene stays dark in both themes and fades into the page below. -->
-  <div class="theme-dark absolute inset-0 -z-10 bg-[#141414]" aria-hidden="true">
+  <div class="theme-dark absolute inset-0 -z-10 bg-[#000000]" aria-hidden="true">
     <img
       src={href("art/hero.png")}
       alt=""
@@ -13,23 +13,21 @@ import { href, REPO, VERSION } from "../lib";
       fetchpriority="high"
       class="pixelated absolute inset-0 h-full w-full object-cover object-[62%_100%]"
     />
-    <div class="absolute inset-x-0 top-0 h-56 bg-gradient-to-b from-[#141414]/70 to-transparent"></div>
   </div>
-  <div class="absolute inset-x-0 bottom-0 -z-10 h-40 bg-gradient-to-b from-transparent to-bg" aria-hidden="true"></div>
 
   <div class="theme-dark mx-auto flex min-h-[46rem] max-w-6xl flex-col px-6 pb-48 pt-32 sm:pb-64 sm:min-h-[54rem] sm:pt-40">
     <a
       href={`${REPO}/releases/tag/v${VERSION}`}
-      class="caption-4 w-fit border border-line-strong bg-black/40 px-2.5 py-1 font-mono text-muted backdrop-blur transition-colors duration-200 ease-base hover:text-fg"
+      class="caption-4 w-fit border border-line-strong bg-black px-2.5 py-1 font-mono text-muted transition-colors duration-200 ease-base hover:text-fg"
     >
       v{VERSION} · open source · AGPL-3.0
     </a>
-    <h1 id="hero-title" class="heading-3 sm:heading-2 lg:heading-1 mt-6 max-w-[15ch] text-fg [text-shadow:0_2px_24px_rgb(0_0_0/0.5)]">
+    <h1 id="hero-title" class="heading-3 sm:heading-2 lg:heading-1 mt-6 max-w-[15ch] text-fg">
       Code with any model, from your terminal
     </h1>
-    <p class="body-3 sm:title-2 mt-6 max-w-[38rem] !font-normal text-fg/80">
-      nyq is a coding agent that reads your code, runs your tests and edits files.
-      Bring the ChatGPT or Grok plan you pay for, an API key, or a local model.
+    <p class="body-3 sm:title-2 mt-6 max-w-[38rem] !font-normal text-fg">
+      <span class="bg-black [box-decoration-break:clone]">nyq is a coding agent that reads your code, runs your tests and edits files.
+      Bring the ChatGPT or Grok plan you pay for, an API key, or a local model.</span>
     </p>
     <div class="mt-10" id="install">
       <Install id="install-top" />
