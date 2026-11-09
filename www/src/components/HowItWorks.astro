@@ -20,19 +20,19 @@ const steps = [
   },
 ];
 ---
-<section id="how" class="px-6 py-24" aria-labelledby="how-title">
-  <div class="mx-auto flex max-w-6xl flex-col gap-12">
-    <div class="reveal flex max-w-2xl flex-col gap-4">
-      <p class="caption-3 text-nyq-blue">How it works</p>
+<section id="how" class="band" aria-labelledby="how-title">
+  <div class="rail">
+    <div class="reveal flex max-w-2xl flex-col gap-4 px-5 pb-12 pt-20 sm:px-10">
+      <p class="caption-3 font-mono text-faint">03 / How it works</p>
       <h2 id="how-title" class="heading-4 sm:heading-3">From install to first fix in three commands</h2>
     </div>
-    <ol class="grid gap-4 md:grid-cols-3">
+    <ol class="grid gap-px border-t border-line bg-line md:grid-cols-3">
       {steps.map((s) => (
-        <li class="reveal flex flex-col gap-4 rounded-2xl border border-line p-6">
-          <span class="caption-3 grid size-8 place-items-center rounded-full border border-line-strong font-mono text-fg">{s.n}</span>
-          <h3 class="title-2 text-fg">{s.title}</h3>
+        <li class="flex min-w-0 flex-col gap-4 bg-bg p-6 sm:p-8">
+          <span class="caption-3 font-mono text-faint">STEP {s.n}</span>
+          <h3 class="title-1 text-fg">{s.title}</h3>
           <p class="body-6 flex-1 text-muted">{s.body}</p>
-          <code class="body-6 block overflow-x-auto whitespace-nowrap rounded-lg bg-surface px-3 py-2 font-mono text-fg">
+          <code class="block overflow-x-auto whitespace-nowrap border border-line bg-surface px-3 py-2 font-mono text-[13px] text-fg [scrollbar-width:none]">
             <span class="select-none text-faint">$ </span>{s.code}
           </code>
         </li>

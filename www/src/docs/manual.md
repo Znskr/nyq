@@ -16,9 +16,15 @@ The installer picks the build for your machine from the latest
 with a ChatGPT subscription (see [Pick a model](#pick-a-model)).
 
 Prebuilt binaries cover Linux (static musl builds: no particular glibc needed) and
-macOS on x86_64 and arm64, plus Windows on x86_64. On Windows, download the zip from
-the releases page; shell commands use Git Bash when it is installed, otherwise
-`cmd /C`, and there is no sandbox.
+macOS on x86_64 and arm64, plus Windows on x86_64. On Windows, install from PowerShell:
+
+```powershell
+irm https://nyq.zalthar.com/install.ps1 | iex
+```
+
+It verifies the checksum the same way, installs to `%LOCALAPPDATA%\nyq\bin` (or
+`NYQ_INSTALL_DIR`) and adds that directory to your user `PATH`. On Windows shell
+commands use Git Bash when it is installed, otherwise `cmd /C`, and there is no sandbox.
 
 ### Build from source
 

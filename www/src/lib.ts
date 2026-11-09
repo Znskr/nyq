@@ -14,5 +14,12 @@ export function href(path = ""): string {
 }
 
 export const REPO = "https://github.com/Znskr/nyq";
-export const INSTALL =
-  "curl -fsSL https://nyq.zalthar.com/install.sh | sh";
+export const INSTALL = "curl -fsSL https://nyq.zalthar.com/install.sh | sh";
+export const INSTALL_WINDOWS = "irm https://nyq.zalthar.com/install.ps1 | iex";
+
+/** The install command per platform, for the tabbed install box. */
+export const INSTALLS = [
+  { os: "macOS", cmd: INSTALL, note: "Apple Silicon and Intel" },
+  { os: "Linux", cmd: INSTALL, note: "x86_64 and arm64, static binary" },
+  { os: "Windows", cmd: INSTALL_WINDOWS, note: "PowerShell, x86_64" },
+];

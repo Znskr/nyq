@@ -1,0 +1,56 @@
+---
+import { href } from "../lib";
+
+const cards = [
+  {
+    img: "art/models.png",
+    alt: "A pixel art terminal over a moonlit lake, listing models: claude-opus-5-5, gpt-5.5, grok-5 and qwen3 on Ollama.",
+    caption: "~/code/ledger · ctrl+l",
+    cmd: "nyq --provider ollama -m qwen3",
+    title: "Any model, one tool",
+    body: "Ctrl+L lists every model from every provider you are signed in to. Switch in the middle of a conversation and keep going.",
+  },
+  {
+    img: "art/sandbox.png",
+    alt: "A pixel art terminal inside a brick wall, running cargo test, labelled workspace-write and network off.",
+    caption: "landlock · seatbelt",
+    cmd: "nyq --sandbox workspace-write",
+    title: "Sandboxed by default",
+    body: "Shell commands can write only inside your workspace, and the network stays off unless you allow it.",
+  },
+  {
+    img: "art/steer.png",
+    alt: "A pixel art nyq session editing a file while the user types a follow up that is queued.",
+    caption: "you → nyq",
+    cmd: "nyq -c",
+    title: "Steer it while it works",
+    body: "The input never locks. Enter steers the current task, Alt+Enter queues a follow up, and Esc stops it.",
+  },
+];
+---
+<section id="features" class="band" aria-labelledby="features-title">
+  <div class="rail px-5 py-20 sm:px-10">
+    <div class="reveal flex max-w-2xl flex-col gap-4">
+      <p class="caption-3 font-mono text-faint">01 / Features</p>
+      <h2 id="features-title" class="heading-4 sm:heading-3">Built for long sessions in a real repo</h2>
+    </div>
+    <ul class="mt-14 grid gap-12 md:grid-cols-3 md:gap-8">
+      {cards.map((c) => (
+        <li class="reveal flex flex-col">
+          <p class="caption-5 mb-2 font-mono text-faint">{c.caption}</p>
+          <img
+            src={href(c.img)}
+            alt={c.alt}
+            width="840"
+            height="468"
+            loading="lazy"
+            class="pixelated aspect-[840/468] w-full border border-line-strong bg-[#141414]"
+          />
+          <p class="caption-5 mt-2 truncate font-mono text-faint"><span class="select-none">$ </span>{c.cmd}</p>
+          <h3 class="title-1 mt-6 text-fg">{c.title}</h3>
+          <p class="body-6 mt-2 text-muted">{c.body}</p>
+        </li>
+      ))}
+    </ul>
+  </div>
+</section>

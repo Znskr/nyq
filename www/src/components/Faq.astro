@@ -2,20 +2,20 @@
 import Icon from "./Icon.astro";
 import { faq } from "../faq";
 ---
-<section id="faq" class="px-6 py-24" aria-labelledby="faq-title">
-  <div class="mx-auto grid max-w-6xl gap-12 md:grid-cols-[1fr_2fr] md:gap-16">
+<section id="faq" class="band" aria-labelledby="faq-title">
+  <div class="rail grid gap-12 px-5 py-20 sm:px-10 md:grid-cols-[1fr_2fr] md:gap-16">
     <div class="reveal flex flex-col gap-4">
-      <p class="caption-3 text-nyq-blue">FAQ</p>
+      <p class="caption-3 font-mono text-faint">04 / FAQ</p>
       <h2 id="faq-title" class="heading-4 sm:heading-3">Questions people ask before installing</h2>
     </div>
-    <div class="reveal flex flex-col gap-2">
+    <div class="reveal flex flex-col border-t border-line">
       {faq.map((item) => (
-        <details class="group rounded-2xl border border-line transition-colors duration-300 ease-base open:bg-surface hover:border-line-strong">
-          <summary class="title-3 flex cursor-pointer list-none items-center justify-between gap-4 rounded-2xl px-6 py-4 text-fg [&::-webkit-details-marker]:hidden">
+        <details class="group border-b border-line">
+          <summary class="title-3 flex cursor-pointer list-none items-center justify-between gap-4 py-5 text-fg transition-colors duration-200 ease-base hover:text-muted [&::-webkit-details-marker]:hidden">
             {item.q}
             <Icon name="plus" class="size-5 shrink-0 text-muted transition-transform duration-500 ease-base group-open:rotate-45" />
           </summary>
-          <p class="body-6 px-6 pb-6 text-muted">{item.a}</p>
+          <p class="body-6 pb-6 pr-8 text-muted">{item.a}</p>
         </details>
       ))}
     </div>

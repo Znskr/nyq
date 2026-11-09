@@ -2,9 +2,11 @@
 import Base from "../layouts/Base.astro";
 import Icon from "../components/Icon.astro";
 import { Content, getHeadings } from "../docs/manual.md";
-import { href, REPO, VERSION } from "../lib";
+import { href, INSTALL, REPO, VERSION } from "../lib";
 
-const sections = getHeadings().filter((h) => h.depth === 2);
+const headings = getHeadings();
+const sections = headings.filter((h) => h.depth === 2);
+const number = new Map(sections.map((h, i) => [h.slug, String(i + 1).padStart(2, "0")]));
 
 // The sidebar groups the manual's sections; any section not listed lands in "More".
 const groupDefs: [string, string[]][] = [
@@ -18,65 +20,151 @@ const groupDefs: [string, string[]][] = [
 const bySlug = new Map(sections.map((h) => [h.slug, h]));
 const listed = new Set(groupDefs.flatMap(([, slugs]) => slugs));
 const groups = [
-  ...groupDefs.map(([title, slugs]) => ({
-    title,
-    items: slugs.flatMap((s) => bySlug.get(s) ?? []),
-  })),
+  ...groupDefs.map(([title, slugs]) => ({ title, items: slugs.flatMap((s) => bySlug.get(s) ?? []) })),
   { title: "More", items: sections.filter((h) => !listed.has(h.slug)) },
 ].filter((g) => g.items.length);
+
+// Each section's subsections, for the "On this page" column.
+const subs: Record<string, { slug: string; text: string }[]> = {};
+let open = "";
+for (const h of headings) {
+  if (h.depth === 2) open = h.slug;
+  else if (h.depth === 3 && open) (subs[open] ??= []).push({ slug: h.slug, text: h.text });
+}
+
+const quick = [
+  { slug: "install", icon: "download-simple", title: "Install", body: "One command, a single binary." },
+  { slug: "pick-a-model", icon: "swap", title: "Pick a model", body: "Plans, API keys or Ollama." },
+  { slug: "sandbox", icon: "shield-check", title: "Sandbox", body: "What commands may touch." },
+  { slug: "extensions", icon: "plugs", title: "Extend", body: "MCP, hooks and extensions." },
+].filter((q) => bySlug.has(q.slug));
 ---
 <Base
   title="Docs · nyq"
   description="The nyq manual: install, providers and models, settings, tools and approvals, hooks, extensions, the sandbox, MCP, sessions and editors."
   current="docs"
 >
-  <div class="mx-auto grid max-w-6xl gap-12 px-6 pb-24 pt-32 sm:pt-40 lg:grid-cols-[220px_minmax(0,1fr)]">
-    <aside class="lg:sticky lg:top-28 lg:max-h-[calc(100dvh-8rem)] lg:self-start lg:overflow-y-auto">
-      <details class="group rounded-2xl border border-line bg-surface p-4 lg:border-0 lg:bg-transparent lg:p-0" data-toc-box>
-        <summary class="caption-3 flex cursor-pointer list-none items-center justify-between text-faint lg:pointer-events-none">
-          Contents
-          <Icon name="caret-down" class="size-4 transition-transform duration-300 ease-base group-open:rotate-180 lg:hidden" />
-        </summary>
-        <nav aria-label="Documentation sections" class="mt-4 flex flex-col gap-5">
-          {groups.map((g) => (
-            <div class="flex flex-col gap-1">
-              <h2 class="caption-4 px-2 text-fg">{g.title}</h2>
-              <ul class="flex flex-col">
-                {g.items.map((h) => (
-                  <li>
-                    <a
-                      href={`#${h.slug}`}
-                      class="body-6 block rounded-lg px-2 py-1 text-muted transition-colors duration-300 ease-base hover:bg-raised hover:text-fg"
-                      data-toc={h.slug}
-                    >
-                      {h.text}
-                    </a>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </nav>
-      </details>
-    </aside>
-    <article class="min-w-0">
-      <a
-        href={href()}
-        class="body-5 inline-flex w-fit items-center gap-2 rounded-full text-muted transition-colors duration-300 ease-base hover:text-fg"
-      >
-        <Icon name="arrow-left" class="size-4" />
-        Back to nyq
-      </a>
-      <header class="mt-8 flex flex-col gap-3">
-        <h1 class="heading-4 sm:heading-3">nyq documentation</h1>
-        <p class="caption-5 text-faint">
-          nyq v{VERSION} · <a href={`${REPO}/edit/main/www/src/docs/manual.md`} class="underline underline-offset-4 hover:text-fg">Edit this page</a>
-        </p>
-      </header>
-      <div class="docs mt-10">
-        <Content />
+  <!-- Banner: a strip of the hero's night scene. -->
+  <section class="theme-dark relative isolate overflow-hidden border-b border-line bg-[#141414]">
+    <img
+      src={href("art/hero.png")}
+      alt=""
+      width="1920"
+      height="1000"
+      class="pixelated absolute inset-0 -z-10 h-full w-full object-cover object-[62%_78%]"
+    />
+    <div class="absolute inset-0 -z-10 bg-gradient-to-r from-[#141414]/90 via-[#141414]/50 to-transparent" aria-hidden="true"></div>
+    <div class="rail !border-line/60 px-5 pb-12 pt-14 sm:px-10 sm:pb-16 sm:pt-20">
+      <p class="caption-3 font-mono text-muted">nyq v{VERSION} · manual</p>
+      <h1 class="heading-3 sm:heading-2 mt-4 text-fg">Documentation</h1>
+      <p class="body-3 mt-4 max-w-xl text-fg/80">
+        Everything nyq can do, on one page. Press <kbd class="border border-line-strong bg-black/40 px-1.5 font-mono text-sm">/</kbd> to filter the sections.
+      </p>
+      <div class="mt-8 flex max-w-xl items-center gap-3 border border-line-strong bg-black/50 py-1 pl-4 pr-1 font-mono text-[13px] backdrop-blur">
+        <span class="select-none text-faint">$</span>
+        <code class="min-w-0 flex-1 overflow-x-auto whitespace-nowrap py-2 text-fg [scrollbar-width:none]">{INSTALL}</code>
+        <button type="button" class="shrink-0 px-3 py-2 text-muted transition-colors hover:text-fg" data-code-copy data-text={INSTALL}>copy</button>
       </div>
-    </article>
+    </div>
+  </section>
+
+  <div class="rail">
+    <!-- Quick links -->
+    <ul class="grid grid-cols-2 gap-px border-b border-line bg-line lg:grid-cols-4">
+      {quick.map((q) => (
+        <li class="bg-bg">
+          <a href={`#${q.slug}`} class="group flex h-full flex-col gap-2 p-5 transition-colors duration-200 ease-base hover:bg-surface sm:p-6">
+            <span class="flex items-center justify-between">
+              <Icon name={q.icon} class="size-5 text-fg" />
+              <span class="caption-5 font-mono text-faint">{number.get(q.slug)}</span>
+            </span>
+            <span class="title-3 mt-2 text-fg">{q.title}</span>
+            <span class="body-6 hidden text-muted sm:block">{q.body}</span>
+          </a>
+        </li>
+      ))}
+    </ul>
+
+    <div class="grid lg:grid-cols-[240px_minmax(0,1fr)] xl:grid-cols-[240px_minmax(0,1fr)_200px]">
+      <aside class="border-b border-line lg:sticky lg:top-20 lg:max-h-[calc(100dvh-5rem)] lg:self-start lg:overflow-y-auto lg:border-b-0 lg:border-r [scrollbar-width:thin]">
+        <details class="group" data-toc-box>
+          <summary class="caption-3 flex cursor-pointer list-none items-center justify-between px-5 py-4 font-mono text-faint lg:hidden [&::-webkit-details-marker]:hidden">
+            Contents
+            <Icon name="caret-down" class="size-4 transition-transform duration-300 ease-base group-open:rotate-180" />
+          </summary>
+          <div class="px-4 pb-8 lg:pt-6">
+            <label class="flex items-center gap-2 border border-line bg-surface px-3 py-2 text-muted focus-within:border-fg">
+              <Icon name="magnifying-glass" class="size-4 shrink-0" />
+              <input
+                type="search"
+                placeholder="Filter sections"
+                aria-label="Filter sections"
+                class="body-6 w-full min-w-0 bg-transparent text-fg outline-none placeholder:text-faint"
+                data-toc-filter
+              />
+              <kbd class="caption-5 border border-line-strong px-1.5 font-mono text-faint">/</kbd>
+            </label>
+            <nav aria-label="Documentation sections" class="mt-6 flex flex-col gap-6">
+              {groups.map((g) => (
+                <div class="flex flex-col gap-1" data-toc-group>
+                  <h2 class="caption-3 px-3 pb-1 font-mono uppercase tracking-wider text-faint">{g.title}</h2>
+                  <ul class="flex flex-col">
+                    {g.items.map((h) => (
+                      <li>
+                        <a
+                          href={`#${h.slug}`}
+                          class="body-6 flex items-baseline gap-2 border-l border-line px-3 py-1.5 text-muted transition-colors duration-200 ease-base hover:border-muted hover:text-fg"
+                          data-toc={h.slug}
+                          data-terms={[h.text, ...(subs[h.slug] ?? []).map((s) => s.text)].join(" ").toLowerCase()}
+                        >
+                          {h.text}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+              <p class="body-6 hidden px-3 text-faint" data-toc-empty>No sections match.</p>
+            </nav>
+          </div>
+        </details>
+      </aside>
+
+      <article class="min-w-0 px-5 py-12 sm:px-10 lg:py-14">
+        <div class="docs">
+          <Content />
+        </div>
+        <div class="mt-20 flex flex-col gap-4 border-t border-line pt-8 sm:flex-row sm:items-center sm:justify-between">
+          <p class="body-6 text-muted">Found something wrong or missing?</p>
+          <div class="flex gap-2">
+            <a href={`${REPO}/edit/main/www/src/docs/manual.md`} class="body-5 inline-flex items-center gap-2 border border-line px-3 py-2 text-fg transition-colors duration-200 hover:bg-surface">
+              <Icon name="pencil-simple" class="size-4" /> Edit this page
+            </a>
+            <a href={`${REPO}/issues/new`} class="body-5 inline-flex items-center gap-2 border border-line px-3 py-2 text-fg transition-colors duration-200 hover:bg-surface">
+              <Icon name="chat-circle" class="size-4" /> Open an issue
+            </a>
+          </div>
+        </div>
+      </article>
+
+      <aside class="hidden border-l border-line xl:block xl:sticky xl:top-20 xl:max-h-[calc(100dvh-5rem)] xl:self-start xl:overflow-y-auto">
+        <div class="px-5 py-14">
+          <p class="caption-3 font-mono uppercase tracking-wider text-faint">On this page</p>
+          <p class="title-4 mt-3 text-fg" data-subtoc-title>{sections[0]?.text}</p>
+          {sections.map((h) => (
+            <ul class="mt-3 flex flex-col gap-1.5" data-subtoc-list={h.slug} hidden={h !== sections[0]}>
+              {(subs[h.slug] ?? []).map((s) => (
+                <li><a href={`#${s.slug}`} class="body-6 block text-muted transition-colors duration-200 hover:text-fg" data-subtoc>{s.text}</a></li>
+              ))}
+            </ul>
+          ))}
+          <div class="mt-8 flex flex-col gap-2 border-t border-line pt-6">
+            <a href="#top" class="body-6 inline-flex items-center gap-2 text-muted hover:text-fg" data-to-top><Icon name="arrow-up" class="size-4" /> Back to top</a>
+            <a href={`${REPO}/edit/main/www/src/docs/manual.md`} class="body-6 inline-flex items-center gap-2 text-muted hover:text-fg"><Icon name="pencil-simple" class="size-4" /> Edit this page</a>
+          </div>
+        </div>
+      </aside>
+    </div>
   </div>
 </Base>
 
@@ -85,22 +173,117 @@ const groups = [
   const box = document.querySelector<HTMLDetailsElement>("[data-toc-box]");
   if (box && matchMedia("(min-width: 1024px)").matches) box.open = true;
 
-  // Highlight the section in view in the table of contents.
-  const links = new Map(
-    [...document.querySelectorAll<HTMLAnchorElement>("[data-toc]")].map((a) => [a.dataset.toc!, a]),
-  );
-  const seen = new Set<string>();
-  const io = new IntersectionObserver(
-    (entries) => {
-      for (const e of entries) e.isIntersecting ? seen.add(e.target.id) : seen.delete(e.target.id);
-      const first = [...links.keys()].find((id) => seen.has(id));
-      if (!first) return;
-      links.forEach((a, id) => a.toggleAttribute("aria-current", id === first));
-    },
-    { rootMargin: "-80px 0px -70% 0px" },
-  );
-  links.forEach((_, id) => {
-    const el = document.getElementById(id);
-    if (el) io.observe(el);
+  // Heading links and code block bars (language and copy).
+  document.querySelectorAll<HTMLElement>(".docs h2[id], .docs h3[id]").forEach((h) => {
+    const a = document.createElement("a");
+    a.className = "anchor";
+    a.href = `#${h.id}`;
+    a.textContent = "#";
+    a.setAttribute("aria-label", `Link to ${h.textContent}`);
+    h.append(a);
   });
+  document.querySelectorAll<HTMLPreElement>(".docs pre").forEach((pre) => {
+    const lang = pre.dataset.language;
+    const wrap = document.createElement("div");
+    wrap.className = "code";
+    const bar = document.createElement("div");
+    bar.className = "code-bar";
+    const label = document.createElement("span");
+    label.textContent = !lang || lang === "plaintext" || lang === "txt" ? "text" : lang;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "copy";
+    btn.dataset.codeCopy = "";
+    btn.setAttribute("aria-label", "Copy code");
+    bar.append(label, btn);
+    pre.before(wrap);
+    wrap.append(bar, pre);
+  });
+
+  // Copy buttons on code blocks and the install command.
+  document.querySelectorAll<HTMLButtonElement>("[data-code-copy]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const code = b.dataset.text ?? b.closest(".code")?.querySelector("pre")?.textContent ?? "";
+      try {
+        await navigator.clipboard.writeText(code.replace(/\n$/, ""));
+        b.textContent = "copied";
+      } catch {
+        b.textContent = "failed";
+      }
+      setTimeout(() => (b.textContent = "copy"), 1600);
+    });
+  });
+
+  // Filter the sidebar; "/" focuses the filter.
+  const filter = document.querySelector<HTMLInputElement>("[data-toc-filter]");
+  const tocLinks = [...document.querySelectorAll<HTMLAnchorElement>("[data-toc]")];
+  const empty = document.querySelector<HTMLElement>("[data-toc-empty]");
+  filter?.addEventListener("input", () => {
+    const words = filter.value.toLowerCase().split(/\s+/).filter(Boolean);
+    let shown = 0;
+    tocLinks.forEach((a) => {
+      const hit = words.every((w) => a.dataset.terms!.includes(w));
+      a.parentElement!.hidden = !hit;
+      if (hit) shown++;
+    });
+    document.querySelectorAll<HTMLElement>("[data-toc-group]").forEach((g) => {
+      g.hidden = !g.querySelector("li:not([hidden])");
+    });
+    empty?.classList.toggle("hidden", shown > 0);
+  });
+  filter?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const first = tocLinks.find((a) => !a.parentElement!.hidden);
+      if (first) location.hash = first.dataset.toc!;
+    } else if (e.key === "Escape") {
+      filter.value = "";
+      filter.dispatchEvent(new Event("input"));
+      filter.blur();
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    const t = e.target as HTMLElement;
+    if (e.key !== "/" || t.closest("input, textarea, [contenteditable]")) return;
+    e.preventDefault();
+    if (box) box.open = true;
+    filter?.focus();
+  });
+
+  document.querySelector("[data-to-top]")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    window.scrollTo({ top: 0 });
+    history.replaceState(null, "", location.pathname);
+  });
+
+  // Highlight the section in view, and show its subsections on the right.
+  const links = new Map(tocLinks.map((a) => [a.dataset.toc!, a]));
+  const subTitle = document.querySelector<HTMLElement>("[data-subtoc-title]");
+  const lists = document.querySelectorAll<HTMLElement>("[data-subtoc-list]");
+  const heads = [...links.keys()].flatMap((id) => document.getElementById(id) ?? []);
+  let current = "";
+  // The current section is the last one whose heading is above 30% of the viewport.
+  const update = () => {
+    const line = innerHeight * 0.3;
+    let id = heads[0]?.id ?? "";
+    for (const h of heads) if (h.getBoundingClientRect().top <= line) id = h.id;
+    if (id === current) return;
+    current = id;
+    links.forEach((a, k) => a.toggleAttribute("aria-current", k === id));
+    if (subTitle) subTitle.textContent = links.get(id)?.textContent?.trim() ?? "";
+    lists.forEach((l) => (l.hidden = l.dataset.subtocList !== id));
+  };
+  let ticking = false;
+  addEventListener("scroll", () => {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(() => ((ticking = false), update()));
+  }, { passive: true });
+  // The code bars above moved things down; land on the linked section again.
+  const land = () => {
+    if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView({ behavior: "instant" });
+    update();
+  };
+  land();
+  // Web fonts can reflow the page after the first scroll.
+  document.fonts?.ready.then(land);
 </script>

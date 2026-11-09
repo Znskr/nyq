@@ -1,15 +1,17 @@
 ---
 import Install from "./Install.astro";
+import { href } from "../lib";
 ---
-<section class="reveal px-6 py-24" aria-labelledby="cta-title">
-  <div class="mx-auto flex min-w-0 max-w-4xl flex-col items-center gap-8 rounded-3xl border border-line bg-surface px-6 py-16 text-center sm:px-12">
-    <h2 id="cta-title" class="heading-4 sm:heading-3 max-w-[680px]">
-      Try it on your next bug
-    </h2>
-    <p class="body-3 max-w-xl text-muted">
-      Free and open source. No account with us and no telemetry, and{" "}
-      <code class="font-mono text-fg">nyq logout</code> removes every key it stored.
-    </p>
-    <Install id="install-bottom" align="center" tone="bg-bg" />
+<section class="band" aria-labelledby="cta-title">
+  <div class="rail grid gap-10 px-5 py-20 sm:px-10 md:grid-cols-[1fr_auto] md:items-end">
+    <div class="flex flex-col gap-4">
+      <h2 id="cta-title" class="heading-4 sm:heading-3 max-w-[16ch]">Try it on your next bug</h2>
+      <p class="body-3 max-w-xl text-muted">
+        Free and open source. No account with us and no telemetry, and{" "}
+        <code class="font-mono text-fg">nyq logout</code> removes every key it stored.
+      </p>
+      <a href={href("docs")} class="body-5 w-fit text-fg underline decoration-line-strong underline-offset-4 transition-colors duration-200 hover:decoration-fg">Read the docs →</a>
+    </div>
+    <Install id="install-bottom" />
   </div>
 </section>
