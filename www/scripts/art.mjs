@@ -1,4 +1,4 @@
-// Draws the site's grayscale pixel art: the hero night scene and the three
+// Draws the site's soft black-and-white pixel art: the hero night scene and the three
 // feature illustrations. Run: node scripts/art.mjs
 // Everything is drawn at low resolution, then scaled up 4x with hard edges.
 import sharp from "sharp";
@@ -58,25 +58,14 @@ class Canvas {
   text(s, x, y, v) {
     drawText(s, x, y, (px, py) => this.set(px, py, v));
   }
-  /** Reduce to pure black and white with an 8x8 ordered dither. */
-  oneBit() {
-    const B2 = [[0, 2], [3, 1]];
-    const B8 = (x, y) => BAYER[y & 3][x & 3] * 4 + B2[(y >> 2) & 1][(x >> 2) & 1];
-    const out = new Uint8Array(this.px.length);
-    for (let y = 0; y < this.h; y++)
-      for (let x = 0; x < this.w; x++) {
-        const v = this.px[y * this.w + x];
-        // Light lines and text stay solid; only mid tones (glows, sky) dither.
-        const t = v >= 150 ? 1 : v <= 20 ? 0 : (v - 20) / 130;
-        out[y * this.w + x] = t * 64 > B8(x, y) + 0.5 ? 255 : 0;
-      }
-    this.px = out;
+  /** Brighten (v > 0) a pixel smoothly. */
+  lift(x, y, v) {
+    this.set(x, y, this.get(x, y) + v);
   }
   async save(file, scale = SCALE) {
-    this.oneBit();
     await sharp(Buffer.from(this.px), { raw: { width: this.w, height: this.h, channels: 1 } })
       .resize(this.w * scale, this.h * scale, { kernel: "nearest" })
-      .png({ compressionLevel: 9, palette: true, colours: 2 })
+      .png({ compressionLevel: 9, palette: true, colours: 64 })
       .toFile(file);
     console.log("wrote", file);
   }
@@ -85,11 +74,11 @@ class Canvas {
 const lerp = (a, b, t) => a + (b - a) * t;
 
 /** Night sky: a banded, dithered gradient with stars and streaky clouds. */
-function sky(c, horizon, { seed, top = 0, bottom = 66, stars = 140, clouds = [] }) {
+function sky(c, horizon, { seed, top = 2, bottom = 30, stars = 140, clouds = [] }) {
   const r = rng(seed);
-  const bands = 7;
+  const bands = 28;
   for (let y = 0; y < horizon; y++) {
-    const t = Math.pow(y / horizon, 3.2) * bands;
+    const t = Math.pow(y / horizon, 1.8) * bands;
     const band = Math.floor(t);
     const a = lerp(top, bottom, band / bands);
     const b = lerp(top, bottom, (band + 1) / bands);
@@ -98,13 +87,13 @@ function sky(c, horizon, { seed, top = 0, bottom = 66, stars = 140, clouds = [] 
   for (let i = 0; i < stars; i++) {
     const x = Math.floor(r() * c.w);
     const y = Math.floor(Math.pow(r(), 1.3) * (horizon - 12));
-    const v = r() > 0.5 ? 255 : 160;
+    const v = 50 + r() * 90;
     c.set(x, y, v);
-    if (v > 225 && r() > 0.4) {
-      c.set(x - 1, y, v * 0.45);
-      c.set(x + 1, y, v * 0.45);
-      c.set(x, y - 1, v * 0.45);
-      c.set(x, y + 1, v * 0.45);
+    if (v > 125 && r() > 0.5) {
+      c.lift(x - 1, y, v * 0.2);
+      c.lift(x + 1, y, v * 0.2);
+      c.lift(x, y - 1, v * 0.2);
+      c.lift(x, y + 1, v * 0.2);
     }
   }
   // Clouds: stacks of thin horizontal streaks, lighter than the sky behind.
@@ -116,7 +105,7 @@ function sky(c, horizon, { seed, top = 0, bottom = 66, stars = 140, clouds = [] 
       while (x < end) {
         const len = 3 + Math.floor(r() * cl.w * 0.25);
         const lift = cl.lift * (0.5 + r() * 0.5);
-        for (let i = 0; i < len; i++) c.set(x + i, y, Math.max(c.get(x + i, y) + lift, lift > 18 ? 150 : 0));
+        for (let i = 0; i < len; i++) c.lift(x + i, y, lift);
         x += len + 2 + Math.floor(r() * 10);
       }
     }
@@ -130,12 +119,11 @@ function moon(c, cx, cy, r, glow = 26) {
       if (d <= r) {
         // Lit disc with a soft terminator on the lower left.
         const shade = ((x - cx) + (cy - y)) / (r * 2);
-        let v = 228 + shade * 18;
+        let v = 196 + shade * 16;
         c.set(x, y, v);
       } else if (d <= r + glow) {
         const t = 1 - (d - r) / glow;
-        const bg = c.get(x, y);
-        c.dither(x, y, bg, bg + 26 * t + 6, t * t * 1.4);
+        c.lift(x, y, 34 * t * t * t);
       }
     }
   }
@@ -144,7 +132,7 @@ function moon(c, cx, cy, r, glow = 26) {
     for (let y = -cr; y <= cr; y++)
       for (let x = -cr; x <= cr; x++)
         if (Math.hypot(x, y) <= cr && Math.hypot(cx + dx + x - cx, cy + dy + y - cy) < r - 1)
-          c.set(cx + dx + x, cy + dy + y, 60);
+          c.set(cx + dx + x, cy + dy + y, 168);
   }
 }
 
@@ -205,7 +193,7 @@ function water(c, horizon, { seed, darken = 0.5, base = 14, glintX = null, glint
     const y = horizon + 2 + Math.floor(r() * (c.h - horizon - 2));
     const x = Math.floor(r() * c.w);
     const len = 2 + Math.floor(r() * 10);
-    for (let k = 0; k < len; k++) c.set(x + k, y, 160);
+    for (let k = 0; k < len; k++) c.lift(x + k, y, 10);
   }
   // A broken column of light under the moon.
   if (glintX != null) {
@@ -214,7 +202,7 @@ function water(c, horizon, { seed, darken = 0.5, base = 14, glintX = null, glint
       const half = Math.round((2 + depth * 9) * (0.4 + r() * 0.8));
       const off = Math.round((r() - 0.5) * 4 * (1 + depth * 2));
       const v = lerp(glint, glint * 0.5, depth);
-      for (let k = -half; k <= half; k++) if (r() > 0.18) c.set(glintX + off + k, y, Math.max(c.get(glintX + off + k, y), v));
+      for (let k = -half; k <= half; k++) if (r() > 0.18) c.set(glintX + off + k, y, Math.max(c.get(glintX + off + k, y), v * (1 - Math.abs(k) / (half + 2) * 0.6)));
     }
   }
 }
@@ -224,17 +212,17 @@ function cabin(c, x, base) {
   c.rect(x, base - H, W, H, 0);
   for (let i = 0; i < 6; i++) {
     c.rect(x - 2 + i, base - H - 1 - i, W + 4 - i * 2, 1, 0);
-    c.set(x - 2 + i, base - H - 1 - i, 255);
-    c.set(x + W + 1 - i, base - H - 1 - i, 255);
+    c.set(x - 2 + i, base - H - 1 - i, 46);
+    c.set(x + W + 1 - i, base - H - 1 - i, 46);
   }
   c.rect(x + 11, base - H - 8, 2, 5, 0); // chimney
   // Lit window with a little glow.
   for (let y = -4; y <= 6; y++)
     for (let xx = -5; xx <= 7; xx++) {
       const d = Math.hypot(xx - 1, y - 1);
-      if (d < 6) c.dither(x + 4 + xx, base - 7 + y, c.get(x + 4 + xx, base - 7 + y), c.get(x + 4 + xx, base - 7 + y) + 30, (1 - d / 6) * 0.7);
+      if (d < 6) c.lift(x + 4 + xx, base - 7 + y, 22 * (1 - d / 6) ** 2);
     }
-  c.rect(x + 3, base - 7, 4, 3, 236);
+  c.rect(x + 3, base - 7, 4, 3, 190);
   c.rect(x + 5, base - 7, 1, 3, 0);
   c.rect(x + 10, base - 5, 3, 5, 0); // door
   // Smoke.
@@ -243,21 +231,21 @@ function cabin(c, x, base) {
     const t = i / 26;
     const sx = x + 12 + Math.round(Math.sin(t * 5) * 3 + t * 10);
     const sy = base - H - 9 - i;
-    if (r() > t * 0.8) c.set(sx, sy, 150);
+    if (r() > t * 0.8) c.lift(sx, sy, 22 * (1 - t));
   }
 }
 
 function jetty(c, x, base, len) {
-  c.rect(x, base, len, 1, 255);
-  for (let i = 0; i < len; i += 5) c.rect(x + i, base + 1, 1, 3, 150);
+  c.rect(x, base, len, 1, 54);
+  for (let i = 0; i < len; i += 5) c.rect(x + i, base + 1, 1, 3, 30);
   // A lantern at the end.
-  c.rect(x + len - 2, base - 6, 1, 6, 255);
-  c.rect(x + len - 3, base - 8, 3, 2, 240);
+  c.rect(x + len - 2, base - 6, 1, 6, 54);
+  c.rect(x + len - 3, base - 8, 3, 2, 180);
   for (let y = -6; y <= 6; y++)
     for (let xx = -6; xx <= 6; xx++) {
       const d = Math.hypot(xx, y);
       const px = x + len - 2 + xx, py = base - 7 + y;
-      if (d < 6 && d > 1.5) c.dither(px, py, c.get(px, py), c.get(px, py) + 34, (1 - d / 6) * 0.6);
+      if (d < 6 && d > 1.5) c.lift(px, py, 26 * (1 - d / 6) ** 2);
     }
 }
 
@@ -268,10 +256,10 @@ async function hero() {
   sky(c, horizon, {
     seed: 11,
     clouds: [
-      { x: 250, y: 46, w: 210, rows: 6, lift: 26 },
-      { x: 290, y: 96, w: 190, rows: 5, lift: 20 },
-      { x: 10, y: 120, w: 160, rows: 4, lift: 16 },
-      { x: 320, y: 140, w: 160, rows: 4, lift: 16 },
+      { x: 250, y: 46, w: 210, rows: 6, lift: 7 },
+      { x: 290, y: 96, w: 190, rows: 5, lift: 6 },
+      { x: 10, y: 120, w: 160, rows: 4, lift: 5 },
+      { x: 320, y: 140, w: 160, rows: 4, lift: 5 },
     ],
   });
   moon(c, 372, 72, 18, 40);
@@ -280,17 +268,17 @@ async function hero() {
     // High at both edges, low in the middle so the moon shows over the water.
     return Math.min(1, 0.18 + Math.pow(Math.abs(t - 0.58) * 2.1, 1.6));
   };
-  mountains(c, horizon, { seed: 3, height: 70, value: 0, edge: 255, mask: sides });
-  mountains(c, horizon, { seed: 9, height: 38, rough: 3, value: 50, edge: 255, mask: sides });
+  mountains(c, horizon, { seed: 3, height: 70, value: 20, edge: 38, mask: sides });
+  mountains(c, horizon, { seed: 9, height: 38, rough: 3, value: 9, edge: 22, mask: sides });
   // Tree lines on both shores.
   const r = rng(21);
-  for (let x = 0; x < 120; x += 3 + Math.floor(r() * 3)) pine(c, x, horizon, 10 + Math.floor(r() * 18) * (1 - x / 160), 0);
-  for (let x = 400; x < 480; x += 3 + Math.floor(r() * 3)) pine(c, x, horizon, 8 + Math.floor(r() * 22) * ((x - 380) / 100), 0);
-  c.rect(0, horizon - 2, 130, 2, 0);
-  c.rect(392, horizon - 2, 88, 2, 0);
+  for (let x = 0; x < 120; x += 3 + Math.floor(r() * 3)) pine(c, x, horizon, 10 + Math.floor(r() * 18) * (1 - x / 160), 4);
+  for (let x = 400; x < 480; x += 3 + Math.floor(r() * 3)) pine(c, x, horizon, 8 + Math.floor(r() * 22) * ((x - 380) / 100), 4);
+  c.rect(0, horizon - 2, 130, 2, 4);
+  c.rect(392, horizon - 2, 88, 2, 4);
   cabin(c, 132, horizon);
-  water(c, horizon, { seed: 5, darken: 0.5, base: 0, glintX: 372, glint: 255 });
-  c.rect(0, horizon, c.w, 1, 255);
+  water(c, horizon, { seed: 5, darken: 0.5, base: 2, glintX: 372, glint: 120 });
+  c.rect(0, horizon, c.w, 1, 34);
   jetty(c, 140, horizon + 3, 34);
   await c.save("public/art/hero.png");
 }
@@ -304,35 +292,33 @@ function scene(seed, { moonX = 230, moonY = 34 } = {}) {
     seed,
     stars: 90,
     clouds: [
-      { x: 10, y: 26, w: 130, rows: 4, lift: 22 },
-      { x: 150, y: 74, w: 130, rows: 4, lift: 18 },
+      { x: 10, y: 26, w: 130, rows: 4, lift: 7 },
+      { x: 150, y: 74, w: 130, rows: 4, lift: 6 },
     ],
   });
   moon(c, moonX, moonY, 10, 24);
-  mountains(c, horizon, { seed: seed + 1, height: 28, value: 0, edge: 255 });
-  mountains(c, horizon, { seed: seed + 7, height: 14, rough: 3, value: 50, edge: 255 });
-  water(c, horizon, { seed: seed + 2, darken: 0.5, base: 0, glintX: moonX, glint: 255 });
-  c.rect(0, horizon, c.w, 1, 255);
+  mountains(c, horizon, { seed: seed + 1, height: 28, value: 20, edge: 38 });
+  mountains(c, horizon, { seed: seed + 7, height: 14, rough: 3, value: 9, edge: 22 });
+  water(c, horizon, { seed: seed + 2, darken: 0.5, base: 2, glintX: moonX, glint: 110 });
+  c.rect(0, horizon, c.w, 1, 34);
   return c;
 }
 
 /** A pixel terminal window with a title bar. */
 function window_(c, x, y, w, h, title) {
-  c.rect(x + 3, y + 3, w, h, 255); // hard shadow
-  c.rect(x + 3, y + 3, w, h, 0);
-  for (let j = 3; j < h + 3; j++) for (let i = 3; i < w + 3; i++) if (i >= w || j >= h) c.set(x + i, y + j, (i + j) % 2 ? 255 : 0);
-  c.box(x, y, w, h, 255, 0);
-  c.rect(x + 1, y + 11, w - 2, 1, 255);
-  for (let i = 0; i < 3; i++) c.rect(x + 4 + i * 5, y + 4, 3, 3, 255);
-  if (title) c.text(title, x + w - 4 - textWidth(title), y + 2, 255);
+  c.rect(x + 3, y + 3, w, h, 0); // soft drop shadow
+  c.box(x, y, w, h, 70, 10);
+  c.rect(x + 1, y + 11, w - 2, 1, 44);
+  for (let i = 0; i < 3; i++) c.rect(x + 4 + i * 5, y + 4, 3, 3, 70);
+  if (title) c.text(title, x + w - 4 - textWidth(title), y + 2, 110);
 }
 
 /** A label tag: inverted text on a light block, or light text in a frame. */
 function tag(c, s, x, y, inverted = true) {
   const w = textWidth(s) + 6;
-  c.rect(x, y, w, 11, inverted ? 255 : 0);
-  if (!inverted) c.box(x, y, w, 11, 255, null);
-  c.text(s, x + 3, y + 1, inverted ? 0 : 255);
+  c.rect(x, y, w, 11, inverted ? 200 : 6);
+  if (!inverted) c.box(x, y, w, 11, 80, null);
+  c.text(s, x + 3, y + 1, inverted ? 10 : 190);
   return w;
 }
 
@@ -344,10 +330,10 @@ async function models() {
   rows.forEach((name, i) => {
     const ry = y + 15 + i * 11;
     if (i === 0) {
-      c.rect(x + 2, ry - 1, w - 4, 11, 255);
-      c.text("›", x + 4, ry, 0);
-      c.text(name, x + 11, ry, 0);
-    } else c.text(name, x + 11, ry, 255);
+      c.rect(x + 2, ry - 1, w - 4, 11, 200);
+      c.text("›", x + 4, ry, 10);
+      c.text(name, x + 11, ry, 10);
+    } else c.text(name, x + 11, ry, 150);
   });
   tag(c, "any model", 176, 136, false);
   await c.save("public/art/models.png", 3);
@@ -363,13 +349,13 @@ async function sandbox() {
       if (!wall) continue;
       const row = (y - top) >> 2;
       const mortar = (y - top) % 4 === 3 || (x - x0 + (row % 2) * 3) % 6 === 5;
-      c.set(x, y, mortar ? 0 : 255);
+      c.set(x, y, mortar ? 8 : 52);
     }
-  for (let x = x0; x < x1 - 2; x += 6) c.rect(x, top - 3, 4, 3, 255); // crenels
+  for (let x = x0; x < x1 - 2; x += 6) c.rect(x, top - 3, 4, 3, 52); // crenels
   window_(c, x0 + 22, top + 6, 136, 52, "~/code/ledger");
-  c.text("$ cargo test", x0 + 28, top + 22, 255);
-  c.text("38 passed", x0 + 28, top + 34, 255);
-  c.rect(x0 + 28 + textWidth("38 passed") + 3, top + 35, 4, 7, 255);
+  c.text("$ cargo test", x0 + 28, top + 22, 190);
+  c.text("38 passed", x0 + 28, top + 34, 150);
+  c.rect(x0 + 28 + textWidth("38 passed") + 3, top + 35, 4, 7, 190);
   tag(c, "workspace-write", 8, 140);
   tag(c, "network: off", 186, 140, false);
   await c.save("public/art/sandbox.png", 3);
@@ -380,18 +366,18 @@ async function steer() {
   const x = 26, y = 22;
   window_(c, x, y, 160, 86, "nyq");
   [
-    ["✓", "read_file src/parse.rs", 255],
-    ["✓", "bash cargo test parse", 255],
-    ["•", "editing src/parse.rs", 255],
+    ["✓", "read_file src/parse.rs", 130],
+    ["✓", "bash cargo test parse", 130],
+    ["•", "editing src/parse.rs", 200],
   ].forEach(([mark, s, v], i) => {
     c.text(mark, x + 6, y + 16 + i * 11, v);
     c.text(s, x + 14, y + 16 + i * 11, v);
   });
   // The input stays open: the user steers while the agent works.
-  c.box(x + 4, y + 66, 152, 14, 255, 0);
+  c.box(x + 4, y + 66, 152, 14, 70, 14);
   const msg = "› also update the docs";
-  c.text(msg, x + 8, y + 68, 255);
-  c.rect(x + 8 + textWidth(msg) + 2, y + 68, 4, 8, 255);
+  c.text(msg, x + 8, y + 68, 190);
+  c.rect(x + 8 + textWidth(msg) + 2, y + 68, 4, 8, 190);
   tag(c, "queued", 196, 112);
   await c.save("public/art/steer.png", 3);
 }
