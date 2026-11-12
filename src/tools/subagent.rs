@@ -297,6 +297,7 @@ fn child(
         hooks: std::sync::Arc::new(ctx.hooks.for_subagent()),
         sandbox: ctx.sandbox.clone(),
         undo: Default::default(),
+        taint: Default::default(),
     })
 }
 

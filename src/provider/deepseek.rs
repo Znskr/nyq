@@ -698,6 +698,7 @@ mod tests {
                 id: "t1".into(),
                 output: String::new(),
                 is_error: false,
+                labels: Vec::new(),
             },
             Item::user("again"),
         ];
