@@ -194,7 +194,16 @@ pub fn enqueue(dir: &Path, name: &str, args: &Value) -> Result<String> {
         bail!("request_id must be 1–128 letters, digits, dash, underscore or dot");
     }
     if let Some(job) = s.jobs.iter().find(|j| j.id == id) {
-        if job.name != name || job.args != *args {
+        // The work is the model's arguments; the taint dispatch attached
+        // may differ between retries of the same work.
+        let work = |args: &Value| {
+            let mut args = args.clone();
+            if let Some(map) = args.as_object_mut() {
+                map.remove(crate::tools::subagent::DELEGATION_ARG);
+            }
+            args
+        };
+        if job.name != name || work(&job.args) != work(args) {
             bail!("request_id already belongs to different work");
         }
         return Ok(id);

@@ -570,7 +570,11 @@ impl Tool for Open {
                 }
             }
         };
-        ToolOutput::ok(lock(&ctx.workset).open(&ctx.cwd, path, mode))
+        let msg = lock(&ctx.workset).open(&ctx.cwd, path.clone(), mode);
+        // The file is shown to the model from now on: it counts as read
+        // for the read-before-edit guard.
+        ctx.file_ledger.note(&path);
+        ToolOutput::ok(msg)
     }
 }
 
@@ -619,7 +623,9 @@ impl Tool for Focus {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let msg = lock(&ctx.workset).open(&ctx.cwd, path, Mode::Focused);
+        let msg = lock(&ctx.workset).open(&ctx.cwd, path.clone(), Mode::Focused);
+        // Shown in full from now on: it counts as read for the guard.
+        ctx.file_ledger.note(&path);
         ToolOutput::ok(
             msg.replacen("opened", "focused", 1)
                 .replacen("updated", "focused", 1),
@@ -898,6 +904,30 @@ mod tests {
             list_lines(&ws)
         };
         assert_eq!(lines, vec!["a.rs (focused)", "spec.md (pinned)"]);
+    }
+
+    /// A file opened or focused in the working set is shown to the model,
+    /// so it counts as read for the read-before-edit guard.
+    #[test]
+    fn open_and_focus_count_as_reads_for_the_edit_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let ws = Shared::default();
+        let c = ctx(dir.path(), &ws);
+        let check = |p: &str| c.file_ledger.check("edit_file", &dir.path().join(p));
+        assert!(check("a.rs").is_err() && check("b.rs").is_err());
+        let out = futures::executor::block_on(Open.run(json!({"path": "a.rs"}), &c));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(check("a.rs").is_ok());
+        let out = futures::executor::block_on(Focus.run(json!({"path": "b.rs"}), &c));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(check("b.rs").is_ok());
+        // A failed open notes nothing.
+        let out = futures::executor::block_on(Open.run(json!({"path": "c.rs"}), &c));
+        assert!(out.is_error);
+        std::fs::write(dir.path().join("c.rs"), "fn c() {}\n").unwrap();
+        assert!(check("c.rs").is_err());
     }
 
     #[test]

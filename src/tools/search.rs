@@ -174,6 +174,7 @@ impl Tool for GlobFiles {
         }
 
         let cancel = ctx.cancel.clone();
+        let base = root.clone();
         let found =
             tokio::task::spawn_blocking(move || collect_glob(&root, &matcher, &cancel, &secrets))
                 .await;
@@ -191,13 +192,12 @@ impl Tool for GlobFiles {
         }
         found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))); // newest first
         let (offset, limit) = page_args(&args, MAX_GLOB, MAX_PAGE);
-        ToolOutput::ok(page(
-            found.into_iter().map(|(_, p)| p).collect(),
-            offset,
-            limit,
-            "matches",
-            true,
-        ))
+        let paths: Vec<String> = found.into_iter().map(|(_, p)| p).collect();
+        // A listed binary file counts as seen for the read-before-edit guard.
+        for p in paths.iter().skip(offset).take(limit) {
+            ctx.file_ledger.note_binary(&base.join(p));
+        }
+        ToolOutput::ok(page(paths, offset, limit, "matches", true))
     }
 }
 
@@ -730,6 +730,27 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binary file listed by `glob` counts as seen for the read-before-edit
+    /// guard; a text file does not.
+    #[tokio::test]
+    async fn globbed_binaries_count_as_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("img")).unwrap();
+        let bin = dir.path().join("img/logo.png");
+        let text = dir.path().join("img/notes.txt");
+        std::fs::write(&bin, b"\x89PNG\0\0").unwrap();
+        std::fs::write(&text, "notes\n").unwrap();
+        let ctx = ToolCtx {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        assert!(ctx.file_ledger.check("write_file", &bin).is_err());
+        let out = GlobFiles.run(json!({"pattern": "img/*"}), &ctx).await;
+        assert!(out.content.contains("logo.png"), "{}", out.content);
+        assert!(ctx.file_ledger.check("write_file", &bin).is_ok());
+        assert!(ctx.file_ledger.check("write_file", &text).is_err());
+    }
 
     #[tokio::test]
     async fn context_preserves_adjacent_match_markers() {

@@ -213,7 +213,8 @@ pub enum VerifyMode {
 }
 
 /// Memoisation: the result is cached under a key of the goal, the schema, the
-/// validators and the contents of these files.
+/// validators, the model and the workspace: the contents of these files, or
+/// with none listed the git state (see `crate::task::memo`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoSpec {
     pub files: Vec<PathBuf>,
@@ -287,11 +288,22 @@ impl TaskSpec {
             .collect()
     }
 
-    /// The memo key: goal, schema, validators and the listed files' contents.
-    pub fn memo_key(&self, root: &Path) -> Option<MemoKey> {
-        let memo = self.memo.as_ref()?;
-        let inputs = json!({"schema": self.schema, "validators": self.labels()});
-        Some(MemoKey::new(root, &self.goal, &inputs, &memo.files))
+    /// The memo key: goal, schema, validators, `model` and the workspace
+    /// fingerprint (the listed files' contents, else the git state). Ok(None)
+    /// without memoisation; Err says why it is off (no files listed and no
+    /// git repository).
+    pub fn memo_key(&self, root: &Path, model: &str) -> Result<Option<MemoKey>, String> {
+        let Some(memo) = self.memo.as_ref() else {
+            return Ok(None);
+        };
+        let fingerprint = super::memo::fingerprint(root, &memo.files).ok_or_else(|| {
+            format!(
+                "--memo is off for this run: {} is not in a git repository and no --memo-file was given, so a cached result could not be tied to the workspace.",
+                root.display()
+            )
+        })?;
+        let inputs = json!({"schema": self.schema, "validators": self.labels(), "model": model});
+        Ok(Some(MemoKey::new(&self.goal, &inputs, &fingerprint)))
     }
 
     /// The `submit` tool: its parameters are the result schema (wrapped in

@@ -236,6 +236,8 @@ Every *mutating* step must include an intent. Rather than promptyped's mandatory
 
 `Task.memo = Some(key)` stores `(T, metrics delta, working-set delta)` under `.flowie/cache/<key>.json`, keyed by the goal, a hash of the inputs, and the hash of the relevant files. A pipeline that is re-run skips completed planning steps. This is promptyped's `memoise`, made safe by including the workspace hash so it cannot return a stale result.
 
+As built (nyq 0.0.2): the key is the goal, the schema, the validators, the model id and a workspace fingerprint: the listed `--memo-file` contents, or with none listed the git state (HEAD's tree, `git status --porcelain`, the staged and unstaged diffs, untracked file contents); with neither, memoisation is off for the run. Entries live in the user's state directory (`~/.nyq/cache/<workspace hash>/`), never in the workspace, so a repository cannot plant one. A hit is only a candidate: the task's validators run again on it, and a failure is a miss.
+
 ---
 
 ## 5. Context engine
@@ -381,6 +383,8 @@ Every `tool.result` carries a set of provenance labels. A tool call is **tainted
 - `deny exec when tainted-by:web` (strict profile).
 - `ask net when tainted-by:mcp:*`.
 - Child results always arrive as evidence: `[child:<id> — evidence, not authorization]`.
+
+Taint crosses orchestration boundaries. A `subagent` call has the effects `exec`, `net` and `write`; when its arguments are tainted, the child's index starts with the task text under the delegating call's labels, and the child's classifier sees the task as labelled evidence with the parent's user request as the only authorization. A `run_code`/`workflow` call has every effect; inside a script taint is sticky (once a sub-call has returned untrusted content, every later sub-call carries those labels whatever its text), and the script's own result stores the union of its sub-calls' labels, so its provenance survives a resume. Writes tainted by the web mark every path the call declared it writes (a patch's files included).
 
 This turns nyq's prompt-level trust boundary into an enforceable rule.
 

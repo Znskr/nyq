@@ -1195,14 +1195,18 @@ async fn print_mode(
                 None => return Ok(TurnEnd::Cancelled),
             }
         }
-        // W9: a typed task; a memo hit answers without calling the model.
+        // W9: a typed task; a memo hit whose checks pass again answers
+        // without calling the model.
         if let Some(spec) = ask.task.spec(text, &agent.cwd)? {
-            memo_key = spec.memo_key(&agent.cwd);
-            if let Some(key) = &memo_key {
-                memo_hit = task::MemoStore::new(&agent.cwd).get(key);
-                if memo_hit.is_some() {
+            let home = crate::config::home();
+            match task::headless::memo_lookup(agent, &spec, &home, &mut plain, &cancel).await {
+                task::headless::MemoLookup::Hit(v) => {
+                    memo_hit = Some(v);
                     return Ok(TurnEnd::Done);
                 }
+                task::headless::MemoLookup::Miss(key) => memo_key = Some(key),
+                task::headless::MemoLookup::Off(Some(notice)) => ui::info(&notice),
+                task::headless::MemoLookup::Off(None) => {}
             }
             agent.set_task(Some(spec));
         }
@@ -1270,7 +1274,7 @@ async fn print_mode(
         Err(_) => 1,
     };
     if let (true, Some(key), Some(task::TaskOutcome::Submitted(v))) = (fresh, &memo_key, &outcome) {
-        if let Err(e) = task::MemoStore::new(&agent.cwd).put(key, v) {
+        if let Err(e) = task::headless::memo_put(&crate::config::home(), &agent.cwd, key, v) {
             ui::error(&format!("could not save the --memo result: {e}"));
         }
     }

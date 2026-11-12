@@ -119,6 +119,25 @@ impl FileLedger {
         }
     }
 
+    /// Record `path` when it is a binary file (judged by its head): one the
+    /// model saw listed (`list_dir`, `glob`) but can never read as text, so
+    /// seeing it is what lets it be overwritten or deleted. Text files
+    /// still need a read.
+    pub(crate) fn note_binary(&self, path: &Path) {
+        use std::io::Read;
+        if !fs::metadata(path).is_ok_and(|m| m.is_file()) {
+            return;
+        }
+        let mut head = Vec::with_capacity(8192);
+        let read = fs::File::open(path).and_then(|f| f.take(8192).read_to_end(&mut head));
+        let binary = read.is_ok()
+            && (head.contains(&0)
+                || std::str::from_utf8(&head).is_err_and(|e| e.error_len().is_some()));
+        if binary {
+            self.note(path);
+        }
+    }
+
     /// Forget every record: a fresh conversation has read nothing.
     pub(crate) fn clear(&self) {
         self.seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -428,6 +447,16 @@ impl Tool for ReadFile {
             Ok(f) => f,
             Err(e) => return e,
         };
+        // Reported as binary (or not text): the model has seen the file, so
+        // it may overwrite or delete it.
+        let unreadable = |e: ToolOutput| {
+            if e.content.ends_with(" is a binary file.")
+                || e.content.ends_with(" is not UTF-8 text.")
+            {
+                ctx.file_ledger.note(&path);
+            }
+            e
+        };
         let mut reader = std::io::BufReader::new(file);
         let mut out = String::new();
         let mut line_no: u64 = 0;
@@ -438,7 +467,7 @@ impl Tool for ReadFile {
         loop {
             let scanned = match next_line(&mut reader, &path) {
                 Ok(s) => s,
-                Err(e) => return e,
+                Err(e) => return unreadable(e),
             };
             let (bytes, exceeds) = match scanned {
                 ScanLine::Eof => break,
@@ -447,7 +476,7 @@ impl Tool for ReadFile {
             };
             let text = match line_text(&bytes, &path, exceeds) {
                 Ok(t) => t,
-                Err(e) => return e,
+                Err(e) => return unreadable(e),
             };
             line_no += 1;
             if line_no < offset {
@@ -553,6 +582,10 @@ impl Tool for ListDir {
             })
             .collect();
         names.sort();
+        // A listed binary file counts as seen for the read-before-edit guard.
+        for name in names.iter().take(500).filter(|n| !n.ends_with('/')) {
+            ctx.file_ledger.note_binary(&path.join(name));
+        }
         let total = names.len();
         if total == 0 {
             return ToolOutput::ok(format!("list_dir: {} is empty.", display_path(&path)));
@@ -2102,6 +2135,62 @@ diff --git a/a.txt b/a.txt
         assert!(out.is_error);
         let out = run_ctx(&ApplyPatch, json!({}), &c);
         assert!(out.is_error);
+    }
+
+    /// A binary file can never be read as text, so `read_file` reporting
+    /// it as binary, or a `list_dir` listing it, counts as seeing it: it may
+    /// then be overwritten or deleted. A listed text file still needs a read.
+    #[test]
+    fn binary_files_seen_by_read_or_list_may_be_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        std::fs::write(dir.path().join("a.bin"), b"PK\x03\x04\0\0zip data").unwrap();
+        std::fs::write(dir.path().join("b.bin"), b"\0\x01\x02").unwrap();
+        std::fs::write(dir.path().join("latin1.txt"), b"caf\xe9\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "text\n").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let write = |path: &str| {
+            run_ctx(
+                &WriteFile,
+                json!({"path": path, "content": "replaced\n"}),
+                &c,
+            )
+        };
+        let refused = |out: ToolOutput| out.is_error && out.content.contains("read it first");
+        for path in ["a.bin", "b.bin", "latin1.txt", "notes.txt"] {
+            assert!(refused(write(path)), "{path} was never seen");
+        }
+        // read_file says it is binary (or not text): that counts.
+        let out = run_ctx(&ReadFile, json!({"path": "a.bin"}), &c);
+        assert!(
+            out.is_error && out.content.contains("binary"),
+            "{}",
+            out.content
+        );
+        let out = write("a.bin");
+        assert!(!out.is_error, "{}", out.content);
+        let out = run_ctx(&ReadFile, json!({"path": "latin1.txt"}), &c);
+        assert!(
+            out.is_error && out.content.contains("not UTF-8"),
+            "{}",
+            out.content
+        );
+        assert!(!write("latin1.txt").is_error);
+        // A listing counts for binaries only.
+        let out = run_ctx(&ListDir, json!({}), &c);
+        assert!(out.content.contains("b.bin"), "{}", out.content);
+        assert!(!write("b.bin").is_error);
+        assert!(refused(write("notes.txt")));
+        // A binary changed on disk since it was seen must be seen again.
+        std::fs::write(dir.path().join("c.bin"), b"\0one").unwrap();
+        run_ctx(&ListDir, json!({}), &c);
+        std::fs::write(dir.path().join("c.bin"), b"\0two, longer").unwrap();
+        let out = write("c.bin");
+        assert!(
+            out.is_error && out.content.contains("changed on disk"),
+            "{}",
+            out.content
+        );
     }
 
     #[test]

@@ -9,10 +9,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::{Agent, Ui};
 
 use super::budget::BudgetLimits;
 use super::engine::{parse_budget, MemoSpec, TaskSpec, ValidatorSpec};
-use super::memo::MemoStore;
+use super::memo::{MemoKey, MemoStore};
 
 /// The task flags of `nyq -p` / `nyq ask`.
 #[derive(clap::Args, Clone, Debug, Default)]
@@ -26,10 +29,10 @@ pub struct TaskOpts {
     /// Limits for a typed task: syntax=N,semantic=N,steps=N,tokens=N,cost=X,wall=S (implies -p).
     #[arg(long, value_name = "LIMITS")]
     pub budget: Option<String>,
-    /// Reuse the cached result of an identical earlier task (same prompt, schema, checks and --memo-file contents) (implies -p).
+    /// Reuse the cached result of an identical earlier task (same prompt, schema, checks, model and workspace: the --memo-file contents, else the git state); the checks run again on it (implies -p).
     #[arg(long)]
     pub memo: bool,
-    /// A file whose contents are part of the --memo key. Repeatable.
+    /// A file whose contents are part of the --memo key, in place of the git state. Repeatable.
     #[arg(long = "memo-file", value_name = "PATH")]
     pub memo_file: Vec<PathBuf>,
 }
@@ -116,18 +119,51 @@ pub fn load_schema(arg: &str, cwd: &Path) -> Result<Value> {
     Ok(schema)
 }
 
-/// The cached result for this task, if it has `--memo` and an entry.
-pub fn memo_get(spec: &TaskSpec, root: &Path) -> Option<Value> {
-    let key = spec.memo_key(root)?;
-    MemoStore::new(root).get(&key)
+/// What `--memo` found for a task.
+#[derive(Debug, PartialEq)]
+pub enum MemoLookup {
+    /// No `--memo`, or memoisation is off for this run (the notice says why).
+    Off(Option<String>),
+    /// A cached result that passed the task's checks again: use it.
+    Hit(Value),
+    /// Run the task, and store its result under this key.
+    Miss(MemoKey),
 }
 
-/// Cache a validated result (no-op without `--memo`).
-pub fn memo_put(spec: &TaskSpec, root: &Path, value: &Value) -> std::io::Result<()> {
-    match spec.memo_key(root) {
-        Some(key) => MemoStore::new(root).put(&key, value),
-        None => Ok(()),
+/// The model a memo key is tied to: provider and model id.
+fn model_id(agent: &Agent) -> String {
+    format!("{}/{}", agent.provider.name(), agent.provider.model())
+}
+
+/// Look up `spec`'s cached result in `home`'s cache for the agent's
+/// workspace. A cached value counts only when the task's checks (schema,
+/// validators, TaskValidate hooks) pass on it again; one that fails is
+/// dropped and the task runs.
+pub async fn memo_lookup(
+    agent: &mut Agent,
+    spec: &TaskSpec,
+    home: &Path,
+    ui: &mut dyn Ui,
+    cancel: &CancellationToken,
+) -> MemoLookup {
+    let key = match spec.memo_key(&agent.cwd, &model_id(agent)) {
+        Ok(Some(key)) => key,
+        Ok(None) => return MemoLookup::Off(None),
+        Err(notice) => return MemoLookup::Off(Some(notice)),
+    };
+    let store = MemoStore::for_workspace(home, &agent.cwd);
+    if let Some(value) = store.get::<Value>(&key) {
+        if agent.recheck(spec, &value, ui, cancel).await {
+            return MemoLookup::Hit(value);
+        }
+        store.invalidate(&key);
     }
+    MemoLookup::Miss(key)
+}
+
+/// Cache a validated result under `key` in `home`'s cache for `root`.
+pub fn memo_put(home: &Path, root: &Path, key: &MemoKey, value: &Value) -> std::io::Result<()> {
+    MemoStore::for_workspace(home, root).put(key, value)
 }
 
 #[cfg(test)]
@@ -220,9 +256,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn memo_hits_until_an_input_changes() {
+    /// A test agent in `cwd` (its model id is `fake/fake`).
+    fn memo_agent(cwd: &Path) -> Agent {
+        let mut agent = crate::agent::test_support::test_agent();
+        agent.cwd = cwd.to_path_buf();
+        agent
+    }
+
+    async fn lookup(agent: &mut Agent, spec: &TaskSpec, home: &Path) -> MemoLookup {
+        let mut ui = crate::agent::test_support::QuietUi;
+        memo_lookup(agent, spec, home, &mut ui, &CancellationToken::new()).await
+    }
+
+    #[tokio::test]
+    async fn memo_hits_until_an_input_changes() {
         let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("in.txt"), "v1").unwrap();
         let o = TaskOpts {
             schema: Some(r#"{"type":"object"}"#.into()),
@@ -231,17 +280,36 @@ mod tests {
             ..opts()
         };
         let spec = o.spec("summarise in.txt", dir.path()).unwrap().unwrap();
-        assert_eq!(memo_get(&spec, dir.path()), None);
-        memo_put(&spec, dir.path(), &json!({"s": 1})).unwrap();
-        assert_eq!(memo_get(&spec, dir.path()), Some(json!({"s": 1})));
+        let mut agent = memo_agent(dir.path());
+        let MemoLookup::Miss(key) = lookup(&mut agent, &spec, home.path()).await else {
+            panic!("a first lookup misses");
+        };
+        memo_put(home.path(), dir.path(), &key, &json!({"s": 1})).unwrap();
+        assert_eq!(
+            lookup(&mut agent, &spec, home.path()).await,
+            MemoLookup::Hit(json!({"s": 1}))
+        );
         // Another check list is another task.
         let mut other = spec.clone();
-        other.validators.push(ValidatorSpec::Build);
-        assert_eq!(memo_get(&other, dir.path()), None);
+        other.validators.push(ValidatorSpec::Cmd("true".into()));
+        assert!(matches!(
+            lookup(&mut agent, &other, home.path()).await,
+            MemoLookup::Miss(_)
+        ));
+        // So is another model.
+        let model = spec.memo_key(dir.path(), "fake/fake").unwrap().unwrap();
+        assert_eq!(model, key);
+        assert_ne!(
+            spec.memo_key(dir.path(), "fake/other").unwrap().unwrap(),
+            key
+        );
         // A changed input file misses.
         std::fs::write(dir.path().join("in.txt"), "v2").unwrap();
-        assert_eq!(memo_get(&spec, dir.path()), None);
-        // Without --memo nothing is stored or found.
+        assert!(matches!(
+            lookup(&mut agent, &spec, home.path()).await,
+            MemoLookup::Miss(_)
+        ));
+        // Without --memo nothing is looked up.
         let plain = TaskOpts {
             schema: Some(r#"{"type":"object"}"#.into()),
             ..opts()
@@ -249,7 +317,106 @@ mod tests {
         .spec("summarise in.txt", dir.path())
         .unwrap()
         .unwrap();
-        memo_put(&plain, dir.path(), &json!(1)).unwrap();
-        assert_eq!(memo_get(&plain, dir.path()), None);
+        assert_eq!(
+            lookup(&mut agent, &plain, home.path()).await,
+            MemoLookup::Off(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn memo_without_files_or_git_is_off_with_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let spec = TaskOpts {
+            schema: Some(r#"{"type":"object"}"#.into()),
+            memo: true,
+            ..opts()
+        }
+        .spec("g", dir.path())
+        .unwrap()
+        .unwrap();
+        let mut agent = memo_agent(dir.path());
+        match lookup(&mut agent, &spec, home.path()).await {
+            MemoLookup::Off(Some(notice)) => assert!(notice.contains("not in a git repository")),
+            other => panic!("{other:?}"),
+        }
+        // In a repository the git state keys it, and a change misses.
+        let repo = crate::worktree::tests::repo();
+        let mut agent = memo_agent(repo.path());
+        let MemoLookup::Miss(key) = lookup(&mut agent, &spec, home.path()).await else {
+            panic!("a first lookup misses");
+        };
+        memo_put(home.path(), repo.path(), &key, &json!({"ok": true})).unwrap();
+        assert_eq!(
+            lookup(&mut agent, &spec, home.path()).await,
+            MemoLookup::Hit(json!({"ok": true}))
+        );
+        std::fs::write(repo.path().join("a.txt"), "changed\n").unwrap();
+        assert!(matches!(
+            lookup(&mut agent, &spec, home.path()).await,
+            MemoLookup::Miss(_)
+        ));
+    }
+
+    /// A hit runs the task's checks again: a cached value they now reject
+    /// is a miss, and is dropped from the cache.
+    #[tokio::test]
+    async fn a_cached_result_that_fails_its_checks_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.txt"), "v1").unwrap();
+        std::fs::write(dir.path().join("report.md"), "done").unwrap();
+        let spec = TaskOpts {
+            schema: Some(
+                r#"{"type":"object","properties":{"file":{"type":"string"}},"required":["file"]}"#
+                    .into(),
+            ),
+            validate: vec!["exists:/file".into()],
+            memo: true,
+            memo_file: vec!["in.txt".into()],
+            ..opts()
+        }
+        .spec("write the report", dir.path())
+        .unwrap()
+        .unwrap();
+        let mut agent = memo_agent(dir.path());
+        let MemoLookup::Miss(key) = lookup(&mut agent, &spec, home.path()).await else {
+            panic!("a first lookup misses");
+        };
+        memo_put(home.path(), dir.path(), &key, &json!({"file": "report.md"})).unwrap();
+        assert_eq!(
+            lookup(&mut agent, &spec, home.path()).await,
+            MemoLookup::Hit(json!({"file": "report.md"}))
+        );
+        // The file the result names is gone (not a --memo-file, so the key
+        // is unchanged): the `exists` check fails and it is a miss.
+        std::fs::remove_file(dir.path().join("report.md")).unwrap();
+        assert_eq!(
+            lookup(&mut agent, &spec, home.path()).await,
+            MemoLookup::Miss(key.clone())
+        );
+        assert!(
+            MemoStore::for_workspace(home.path(), dir.path())
+                .get::<Value>(&key)
+                .is_none(),
+            "the failing entry was dropped"
+        );
+        // A value that does not match the schema is a miss too.
+        memo_put(home.path(), dir.path(), &key, &json!({"nope": 1})).unwrap();
+        assert!(matches!(
+            lookup(&mut agent, &spec, home.path()).await,
+            MemoLookup::Miss(_)
+        ));
+        // A `cmd:` check runs again as well.
+        let mut failing = spec.clone();
+        failing.validators = vec![ValidatorSpec::Cmd("false".into())];
+        let MemoLookup::Miss(fkey) = lookup(&mut agent, &failing, home.path()).await else {
+            panic!("a first lookup misses");
+        };
+        memo_put(home.path(), dir.path(), &fkey, &json!({"file": "x"})).unwrap();
+        assert!(matches!(
+            lookup(&mut agent, &failing, home.path()).await,
+            MemoLookup::Miss(_)
+        ));
     }
 }

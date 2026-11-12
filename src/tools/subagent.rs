@@ -15,11 +15,15 @@ use crate::agent::{Agent, Approval, ApprovalRequest, Approver, TurnEnd, Ui};
 use crate::subagents::{self, LiveGuard, Record, Status};
 use crate::types::{Item, StreamEvent, ToolSpec, Usage};
 
-const NAME: &str = "subagent";
+pub(crate) const NAME: &str = "subagent";
 const TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// How long a timed-out subagent gets to kill its tools before we drop it.
 const CLEANUP: Duration = Duration::from_secs(5);
 const MAX_REPORT: usize = 20_000;
+/// The argument that carries a tainted delegation (`crate::taint::Delegation`)
+/// to the child, and with a queued job into the orchestration store. Always
+/// replaced from the dispatch context: a model-supplied value is dropped.
+pub(crate) const DELEGATION_ARG: &str = "_delegation";
 
 /// Tools no child gets: children don't delegate further. Name-based on
 /// purpose: these two start agents, which no declared effect describes
@@ -114,15 +118,33 @@ fn label(args: &Value) -> &str {
         .trim()
 }
 
+/// The tainted delegation a call's arguments carry (see [`DELEGATION_ARG`]).
+fn delegation_of(args: &Value) -> Option<crate::taint::Delegation> {
+    args.get(DELEGATION_ARG)
+        .and_then(|v| serde_json::from_value::<crate::taint::Delegation>(v.clone()).ok())
+        .filter(crate::taint::Delegation::is_tainted)
+}
+
+/// `args` with the delegation dispatch derived for this call, whatever the
+/// model put under that key.
+fn with_delegation(mut args: Value, ctx: &ToolCtx) -> Value {
+    if let Some(map) = args.as_object_mut() {
+        map.remove(DELEGATION_ARG);
+        if let Some(d) = ctx.delegation.as_ref().filter(|d| d.is_tainted()) {
+            if let Ok(v) = serde_json::to_value(d) {
+                map.insert(DELEGATION_ARG.into(), v);
+            }
+        }
+    }
+    args
+}
+
 /// The child's tools: builtins (minus mutating ones for explore), never
-/// itself, plus the session's skills and (for general) MCP tools.
-fn child_tools(
-    general: bool,
-    shared: &[Arc<dyn Tool>],
-    ledger: std::sync::Arc<crate::tools::FileLedger>,
-) -> Registry {
+/// itself, plus the session's skills and (for general) MCP tools. The child
+/// has its own file ledger, empty: it must read a file before editing it
+/// even when the parent read it (and the parent likewise).
+fn child_tools(general: bool, shared: &[Arc<dyn Tool>]) -> Registry {
     let mut tools = Registry::builtin();
-    tools.share_file_ledger(ledger);
     let none = Value::Object(Default::default());
     let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
     let keep: Vec<String> = names
@@ -265,6 +287,7 @@ impl Tool for Subagent {
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
+        let args = with_delegation(args, ctx);
         let name = name_arg(&args);
         let dir = ctx.subagent_dir.as_deref();
         if let Err(e) = crate::tools::typed::Typed::from_args(&args) {
@@ -376,7 +399,7 @@ fn child(
     }
     Ok(Agent {
         provider,
-        tools: child_tools(general, &ctx.shared_tools, ctx.file_ledger.clone()),
+        tools: child_tools(general, &ctx.shared_tools),
         system,
         items,
         session: None,
@@ -684,6 +707,9 @@ async fn one_shot(args: &Value, ctx: &ToolCtx) -> ToolOutput {
         Ok(a) => a,
         Err(e) => return e,
     };
+    if let Some(d) = delegation_of(args) {
+        agent.taint.delegate(d, task);
+    }
     let id = fresh_id("run");
     let typed = TypedRun::from_args(args, &ctx.cwd, ctx);
     if let Some(t) = &typed {
@@ -816,6 +842,11 @@ pub(crate) async fn run_named(
         Some(Item::User { text, .. }) => text.clone(),
         _ => String::new(),
     };
+    // A new message brings its own delegation; a resumed turn keeps the one
+    // its message came with.
+    if input.is_some() {
+        record.delegation = delegation_of(args);
+    }
     let input = match input {
         Some(Item::User { text, images }) => Some(Item::User {
             text: with_instructions(&text, typed.as_ref()),
@@ -846,6 +877,22 @@ pub(crate) async fn run_named(
         Ok(a) => a,
         Err(e) => return e,
     };
+    if let Some(d) = record.delegation.clone() {
+        let task = if input.is_some() {
+            goal.clone()
+        } else {
+            agent
+                .items
+                .iter()
+                .rev()
+                .find_map(|i| match i {
+                    Item::User { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        agent.taint.delegate(d, &task);
+    }
     if let Some(t) = &typed {
         t.arm(&mut agent, &goal, record.mode == "general");
     }
@@ -959,6 +1006,8 @@ async fn merge(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
         content: text,
         is_error,
         changed: applied,
+        // Its snapshots name the merged files: the parent's typed task
+        // counts them as touched (see `Agent::exec_wave`).
         undo,
         ..Default::default()
     }
@@ -1580,7 +1629,7 @@ mod tests {
         let shared: Vec<Arc<dyn Tool>> =
             vec![Arc::new(Named("skill")), Arc::new(Named("mcp__wiki__ask"))];
         let names = |general| -> Vec<String> {
-            child_tools(general, &shared, Default::default())
+            child_tools(general, &shared)
                 .specs()
                 .into_iter()
                 .map(|s| s.name)
@@ -1616,7 +1665,7 @@ mod tests {
     fn general_mode_needs_approval_and_has_write_tools() {
         assert!(!Subagent.needs_approval(&json!({"task": "x"})));
         assert!(Subagent.needs_approval(&json!({"task": "x", "mode": "general"})));
-        let names: Vec<String> = child_tools(true, &[], Default::default())
+        let names: Vec<String> = child_tools(true, &[])
             .specs()
             .into_iter()
             .map(|s| s.name)
@@ -2302,6 +2351,49 @@ mod tests {
         }])
     }
 
+    /// A child has its own read-before-edit ledger, empty at the start: the
+    /// parent's reads don't let it edit, and its reads don't let the
+    /// parent edit.
+    #[tokio::test]
+    async fn a_child_reads_before_editing_whatever_the_parent_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bee\n").unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            write_call("1", "a.txt", "child\n"),
+            answer("tried"),
+            read_call("r", "b.txt"),
+            answer("read b"),
+        ];
+        let mut c = ctx(&fake, dir.path());
+        c.yolo = true;
+        // The parent read a.txt.
+        c.file_ledger.note(&dir.path().join("a.txt"));
+        let out = Subagent
+            .run(json!({"task": "overwrite a.txt", "mode": "general"}), &c)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let shown = fake.seen_results.lock().unwrap().join("\n");
+        assert!(
+            shown.contains("has not been read in this session"),
+            "{shown}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "old\n"
+        );
+        // The child read b.txt; the parent has not.
+        let out = Subagent.run(json!({"task": "read b.txt"}), &c).await;
+        assert!(!out.is_error, "{}", out.content);
+        let b = dir.path().join("b.txt");
+        assert!(c.file_ledger.check("write_file", &b).is_err());
+        assert!(c
+            .file_ledger
+            .check("write_file", &dir.path().join("a.txt"))
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn worktree_child_is_isolated_then_merged_or_conflicts() {
         let repo = crate::worktree::tests::repo();
@@ -2358,6 +2450,11 @@ mod tests {
             .await;
         assert!(!merged.is_error, "{}", merged.content);
         assert!(merged.changed && !merged.undo.is_empty());
+        // Its undo records name the merged files, which the parent's typed
+        // task counts as touched.
+        let merged_paths = merged.undo.paths();
+        assert_eq!(merged_paths.len(), 1, "{merged_paths:?}");
+        assert!(merged_paths[0].ends_with("a.txt"), "{merged_paths:?}");
         assert_eq!(read("a.txt"), "one\nchild\nthree\n");
         assert!(!wt.path.exists());
         let record = subagents::load(store.path(), "w1").unwrap().unwrap();
@@ -2382,6 +2479,7 @@ mod tests {
         assert!(
             conflict.content.contains("a.txt") && conflict.content.contains("nothing was written")
         );
+        assert!(conflict.undo.is_empty());
         assert_eq!(read("a.txt"), "one\nchild\nthree\n");
         let wt2 = subagents::load(store.path(), "w2")
             .unwrap()

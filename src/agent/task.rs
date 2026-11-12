@@ -556,6 +556,64 @@ impl Agent {
                 return self.reject(FailKind::Syntax, &feedback, "schema");
             }
         };
+        let Some((verdict, by, records)) = self.run_checks(&spec, schema, &value, ui, cancel).await
+        else {
+            return ToolOutput::err("Cancelled by user.");
+        };
+        self.record_checks(Some(value.clone()), records);
+        match verdict {
+            Verdict::Pass => {
+                if let Some(st) = &self.task.state {
+                    crate::trace::log("task", || {
+                        format!("submit accepted after {} rejections", st.failures)
+                    });
+                }
+                self.task.outcome = Some(TaskOutcome::Submitted(value));
+                ToolOutput::ok("Accepted: the result passed every check. The task is complete.")
+            }
+            Verdict::Fail { kind, feedback } => self.reject(kind, &feedback, &by),
+            Verdict::Escalate(why) => {
+                if let Some(st) = &mut self.task.state {
+                    st.note_error(&format!("[{by}] {why}"));
+                    st.escalation = Some(format!("the `{by}` check could not decide: {why}"));
+                }
+                ToolOutput::err(format!(
+                    "The `{by}` check could not decide ({why}). The harness is escalating the task."
+                ))
+            }
+        }
+    }
+
+    /// Re-run `spec`'s checks (schema, validators, TaskValidate hooks) on a
+    /// result cached by an earlier run, outside any task turn: a `--memo`
+    /// hit is used only when they all pass again.
+    pub async fn recheck(
+        &mut self,
+        spec: &TaskSpec,
+        value: &Value,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let Some(schema) = spec.schema.clone() else {
+            return false;
+        };
+        matches!(
+            self.run_checks(spec, schema, value, ui, cancel).await,
+            Some((Verdict::Pass, ..))
+        )
+    }
+
+    /// The schema check, then `spec`'s validators in order, then the
+    /// TaskValidate hooks, stopping at the first that does not pass: its
+    /// verdict, its label and every check's record. None when cancelled.
+    async fn run_checks(
+        &mut self,
+        spec: &TaskSpec,
+        schema: Value,
+        value: &Value,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> Option<(Verdict, String, Vec<CheckRecord>)> {
         let cx = self.validate_cx(cancel);
         let mut judges: Vec<Arc<llm::LlmJudge>> = Vec::new();
         let mut checks: Vec<(String, Box<dyn Validator>)> =
@@ -586,7 +644,7 @@ impl Agent {
             let writer = crate::orchestration::writer(&self.cwd);
             tokio::select! {
                 lock = writer.lock_unknown() => Some(lock),
-                _ = cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
+                _ = cancel.cancelled() => return None,
             }
         } else {
             None
@@ -596,9 +654,9 @@ impl Agent {
         let mut records = Vec::new();
         for (label, check) in &checks {
             if cancel.is_cancelled() {
-                return ToolOutput::err("Cancelled by user.");
+                return None;
             }
-            let v = check.check(&value, &cx).await;
+            let v = check.check(value, &cx).await;
             records.push(CheckRecord::of(label, &v));
             if !v.is_pass() {
                 verdict = v;
@@ -607,7 +665,6 @@ impl Agent {
             }
         }
         drop(_lease);
-        self.record_checks(Some(value.clone()), records);
         for j in judges {
             let used: Vec<Usage> =
                 std::mem::take(&mut *j.usage.lock().unwrap_or_else(|e| e.into_inner()));
@@ -615,27 +672,7 @@ impl Agent {
                 self.task_account(Some(u), ui);
             }
         }
-        match verdict {
-            Verdict::Pass => {
-                if let Some(st) = &self.task.state {
-                    crate::trace::log("task", || {
-                        format!("submit accepted after {} rejections", st.failures)
-                    });
-                }
-                self.task.outcome = Some(TaskOutcome::Submitted(value));
-                ToolOutput::ok("Accepted: the result passed every check. The task is complete.")
-            }
-            Verdict::Fail { kind, feedback } => self.reject(kind, &feedback, &by),
-            Verdict::Escalate(why) => {
-                if let Some(st) = &mut self.task.state {
-                    st.note_error(&format!("[{by}] {why}"));
-                    st.escalation = Some(format!("the `{by}` check could not decide: {why}"));
-                }
-                ToolOutput::err(format!(
-                    "The `{by}` check could not decide ({why}). The harness is escalating the task."
-                ))
-            }
-        }
+        Some((verdict, by, records))
     }
 
     /// Keep the latest submission and its check verdicts on the turn state.
@@ -754,6 +791,26 @@ impl Agent {
         let text = path.to_string_lossy();
         if let Some(rel) = self.workspace_relative(&text) {
             return Some(rel);
+        }
+        // The same file through another spelling of the workspace (git
+        // reports a symlinked checkout by its real path, as a merge does).
+        if path.is_absolute() {
+            let real = |p: &Path| -> Option<PathBuf> {
+                std::fs::canonicalize(p).ok().or_else(|| {
+                    Some(
+                        std::fs::canonicalize(p.parent()?)
+                            .ok()?
+                            .join(p.file_name()?),
+                    )
+                })
+            };
+            if let (Some(full), Ok(base)) = (real(path), std::fs::canonicalize(&self.cwd)) {
+                if let Ok(rel) = full.strip_prefix(&base) {
+                    if !rel.as_os_str().is_empty() {
+                        return Some(rel.to_path_buf());
+                    }
+                }
+            }
         }
         let full = super::lexical(&self.cwd, &text)?;
         self.sandbox
@@ -1966,6 +2023,59 @@ mod tests {
         );
     }
 
+    /// A call that writes files it never declared (a worktree merge, a
+    /// shared child) keeps undo snapshots of them: those files are touched,
+    /// so `touched:` accepts the merge's work.
+    #[tokio::test]
+    async fn files_a_merge_writes_are_touched() {
+        struct Merge;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Merge {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "merge_stub".into(),
+                    description: String::new(),
+                    parameters: json!({}),
+                }
+            }
+            fn summary(&self, _: &Value) -> String {
+                String::new()
+            }
+            async fn run(&self, _: Value, ctx: &crate::tools::ToolCtx) -> ToolOutput {
+                let mut undo = crate::undo::UndoLog::default();
+                undo.snapshot(
+                    &ctx.cwd,
+                    crate::sandbox::Mode::Off,
+                    &[PathBuf::from("src/merged.rs")],
+                );
+                std::fs::create_dir_all(ctx.cwd.join("src")).unwrap();
+                std::fs::write(ctx.cwd.join("src/merged.rs"), "pub fn m() {}\n").unwrap();
+                ToolOutput {
+                    changed: true,
+                    undo,
+                    ..ToolOutput::ok("Applied the child's changes (1 file).")
+                }
+            }
+        }
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call("1", "merge_stub", json!({}))]),
+                submit("2", json!({"answer": 1})),
+            ],
+            Some(touched_task("src/merged.rs")),
+        );
+        f.agent.tools.add(Box::new(Merge));
+        f.run("go").await;
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"answer": 1}))),
+            "{:?}",
+            results(&f.agent)
+        );
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.touched, [PathBuf::from("src/merged.rs")]);
+    }
+
     /// What counts as a write, from the dispatch footprint and the result.
     #[tokio::test]
     async fn observed_writes_follow_the_footprint_and_reported_changes() {
@@ -1989,14 +2099,20 @@ mod tests {
         f.agent
             .task_observe("subagent", "{}", &ok, Some((&Concurrency::Barrier, &[])));
         assert_eq!(writes(f.agent.task_state().unwrap()), 1);
-        // A worktree merge that applied did.
+        // A worktree merge that applied did; the files it merged come from
+        // its undo records (see the test below).
+        let merged = f.dir.path().join("merged.rs");
         f.agent.task_observe(
             "subagent",
             "{}",
             &changed,
-            Some((&Concurrency::Barrier, &[])),
+            Some((&Concurrency::Barrier, &[merged])),
         );
         assert_eq!(writes(f.agent.task_state().unwrap()), 2);
+        assert_eq!(
+            f.agent.task_state().unwrap().touched,
+            [PathBuf::from("merged.rs")]
+        );
         // A script call is not a write itself: its sub-calls are observed.
         #[cfg(feature = "scripting")]
         {
@@ -2022,7 +2138,10 @@ mod tests {
         );
         let st = f.agent.task_state().unwrap();
         assert_eq!(st.writes, 3);
-        assert_eq!(st.touched, [PathBuf::from("src/x.rs")]);
+        assert_eq!(
+            st.touched,
+            [PathBuf::from("merged.rs"), PathBuf::from("src/x.rs")]
+        );
     }
 
     /// Every section once, in order: task, verify, working set, intents,
