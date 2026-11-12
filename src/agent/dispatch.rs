@@ -18,7 +18,7 @@ use crate::tools::{Registry, ToolCtx, ToolOutput};
 use crate::types::Item;
 
 /// A failing call repeated this many times gets told to change approach.
-pub(super) const REPEAT_LIMIT: usize = 3;
+const REPEAT_LIMIT: usize = 3;
 
 /// Nested instruction files are cut to this many characters.
 const NESTED_INSTRUCTIONS_MAX: usize = 64 * 1024;
@@ -38,7 +38,7 @@ const PARALLEL_TOOLS: &[&str] = &[
 
 /// Whether this call may run alongside its read-only neighbours: read tools,
 /// and subagent runs (independent by contract).
-pub(super) fn runs_in_parallel(name: &str, arguments: &str) -> bool {
+fn runs_in_parallel(name: &str, arguments: &str) -> bool {
     if PARALLEL_TOOLS.contains(&name) {
         return true;
     }
@@ -119,9 +119,69 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
 }
 
 impl Agent {
+    /// Run one response's tool calls in order, consecutive read-only calls
+    /// together, and record their results. `failures` is the repeat guard's
+    /// count of failing calls for the turn. Returns the images the calls
+    /// produced, or None if cancelled (every call left then gets a result).
+    pub(super) async fn run_calls(
+        &mut self,
+        calls: &[(String, String, String)],
+        failures: &mut HashMap<(String, String), usize>,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> Option<Vec<crate::types::Image>> {
+        let mut images = Vec::new();
+        let mut i = 0;
+        while i < calls.len() {
+            if cancel.is_cancelled() {
+                // Every call needs a result or the next request is invalid.
+                for (id, ..) in &calls[i..] {
+                    self.push(Item::ToolResult {
+                        id: id.clone(),
+                        output: "Cancelled by user.".into(),
+                        is_error: true,
+                    });
+                }
+                return None;
+            }
+            // Consecutive read-only calls (and subagents) run together.
+            let run = calls[i..]
+                .iter()
+                .take_while(|(_, name, arguments)| runs_in_parallel(name, arguments))
+                .count()
+                .max(1);
+            let batch = &calls[i..i + run];
+            let outs = if run > 1 {
+                self.call_parallel(batch, ui, cancel).await
+            } else {
+                let (id, name, arguments) = &batch[0];
+                vec![self.call_tool(id, name, arguments, ui, cancel).await]
+            };
+            for ((id, name, arguments), mut out) in batch.iter().zip(outs) {
+                if out.is_error {
+                    let n = failures
+                        .entry((name.clone(), arguments.clone()))
+                        .or_default();
+                    *n += 1;
+                    if *n >= REPEAT_LIMIT {
+                        out.content.push_str(&format!(
+                            "\n\n[This exact call has now failed {n} times. Do not repeat it: \
+                                 change your approach, or stop and explain the blocker.]"
+                        ));
+                    }
+                } else {
+                    self.add_nested_instructions(name, arguments, &mut out);
+                }
+                images.extend(self.record_result(id, name, out));
+            }
+            i += run;
+        }
+        Some(images)
+    }
+
     /// Store a tool result in the transcript (credentials scrubbed, large
     /// output spilled) and return the images it carried.
-    pub(super) fn record_result(
+    fn record_result(
         &mut self,
         id: &str,
         name: &str,
@@ -160,12 +220,7 @@ impl Agent {
     /// After a successful file or search call, append any `AGENTS.md` (or
     /// `CLAUDE.md`) from workspace subdirectories it touched, once per
     /// conversation (an earlier copy in the transcript counts).
-    pub(super) fn add_nested_instructions(
-        &self,
-        name: &str,
-        arguments: &str,
-        out: &mut ToolOutput,
-    ) {
+    fn add_nested_instructions(&self, name: &str, arguments: &str, out: &mut ToolOutput) {
         let file_tool = matches!(name, "read_file" | "edit_file" | "write_file");
         if !file_tool && !matches!(name, "list_dir" | "glob" | "grep") {
             return;
@@ -306,7 +361,7 @@ impl Agent {
         result
     }
 
-    pub(super) async fn call_tool(
+    async fn call_tool(
         &mut self,
         id: &str,
         name: &str,
@@ -328,7 +383,7 @@ impl Agent {
     /// Run a batch of read-only calls (and subagents) concurrently. They are
     /// approved one by one first; the UI then sees each start and finish in
     /// order while all of them make progress.
-    pub(super) async fn call_parallel(
+    async fn call_parallel(
         &mut self,
         batch: &[(String, String, String)],
         ui: &mut dyn Ui,

@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
-use super::dispatch::{runs_in_parallel, REPEAT_LIMIT};
 use super::note::with_trailing_note;
 use super::{Agent, TurnEnd, Ui};
 use crate::tools::ToolCtx;
@@ -335,52 +334,9 @@ impl Agent {
                 continue;
             }
 
-            let mut images = Vec::new();
-            let mut i = 0;
-            while i < calls.len() {
-                if cancel.is_cancelled() {
-                    // Every call needs a result or the next request is invalid.
-                    for (id, ..) in &calls[i..] {
-                        self.push(Item::ToolResult {
-                            id: id.clone(),
-                            output: "Cancelled by user.".into(),
-                            is_error: true,
-                        });
-                    }
-                    return Ok(TurnEnd::Cancelled);
-                }
-                // Consecutive read-only calls (and subagents) run together.
-                let run = calls[i..]
-                    .iter()
-                    .take_while(|(_, name, arguments)| runs_in_parallel(name, arguments))
-                    .count()
-                    .max(1);
-                let batch = &calls[i..i + run];
-                let outs = if run > 1 {
-                    self.call_parallel(batch, ui, &cancel).await
-                } else {
-                    let (id, name, arguments) = &batch[0];
-                    vec![self.call_tool(id, name, arguments, ui, &cancel).await]
-                };
-                for ((id, name, arguments), mut out) in batch.iter().zip(outs) {
-                    if out.is_error {
-                        let n = failures
-                            .entry((name.clone(), arguments.clone()))
-                            .or_default();
-                        *n += 1;
-                        if *n >= REPEAT_LIMIT {
-                            out.content.push_str(&format!(
-                                "\n\n[This exact call has now failed {n} times. Do not repeat it: \
-                                 change your approach, or stop and explain the blocker.]"
-                            ));
-                        }
-                    } else {
-                        self.add_nested_instructions(name, arguments, &mut out);
-                    }
-                    images.extend(self.record_result(id, name, out));
-                }
-                i += run;
-            }
+            let Some(images) = self.run_calls(&calls, &mut failures, ui, &cancel).await else {
+                return Ok(TurnEnd::Cancelled);
+            };
             self.submitted = self.items.len();
             // Tool results are text-only in both APIs, so images a tool
             // produced are handed over in a follow-up user message.
