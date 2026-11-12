@@ -1,0 +1,1742 @@
+//! W9: the task engine in the loop (design §4).
+//!
+//! A task ends when a validator accepts a typed result, not when the model
+//! stops calling tools. The step loop, dispatch and the trailing note reach
+//! the task engine only through the methods here, each from one delimited
+//! call site:
+//!
+//! | call site | method | what it does |
+//! |---|---|---|
+//! | `step.rs` `drive`, start | [`Agent::task_begin`] | new [`TaskState`]; start the verifier and its baseline |
+//! | `step.rs`, before each request | [`Agent::task_before_request`] | wait briefly for a running verify, fold it in, climb the ladder, charge the step budget |
+//! | `step.rs`, tool specs | [`Agent::task_specs`] | add `submit`; add the `intent` field |
+//! | `step.rs`, trailing note | [`Agent::task_note`] | task, budget, repair framing, verify state |
+//! | `step.rs`, after a response | [`Agent::task_spent`] | token and cost budgets |
+//! | `step.rs`, no tool calls | [`Agent::task_no_submit`] | "you must call submit" nudge, or end |
+//! | `step.rs`, after a tool round | [`Agent::task_after_round`] | submitted / exhausted / ladder |
+//! | `step.rs`, step limit | [`Agent::task_out_of_steps`] | an unfinished typed task is exhausted |
+//! | `dispatch.rs` `run_calls` | [`Agent::task_owns`], [`Agent::task_submit`] | the `submit` tool |
+//! | `dispatch.rs` `run_calls` | [`Agent::task_observe`] | touched files, verify scheduling, cycle detector |
+//! | `dispatch.rs` `prepare` | [`Agent::task_prepare_call`] | strip and record `intent`; snapshot files for the judge |
+//!
+//! With no task set ([`Agent::set_task`]) and verification off, which is the
+//! default for interactive chat, every one of these is a no-op: a chat turn is
+//! the task with no schema and the always-pass validator.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Result;
+use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
+
+use super::{Agent, TurnEnd, Ui, ASK_USER};
+use crate::task::engine::{self, TaskOutcome, TaskSpec, TaskState, Tier, VerifyMode, SUBMIT};
+use crate::task::intent::{self, IntentKind, IntentLog};
+use crate::task::{
+    llm, tier, AlwaysPass, BuildSystem, BuildValidator, CommandRunner, CustomCommandValidator,
+    Exec, ExistsValidator, FailKind, FilesTouchedValidator, JudgeRunner, JudgeValidator,
+    LadderAction, LadderEvent, LintValidator, SchemaValidator, ShellRunner, StallReason,
+    TaskOptions, TestScope, TestsValidator, ValidateCx, Validator, ValidatorSpec, Verdict,
+    Verifier,
+};
+use crate::tools::ToolOutput;
+use crate::types::{Item, Usage};
+
+/// Recent tool calls shown to the diagnosis.
+const DIAGNOSE_ACTIONS: usize = 12;
+
+/// The task engine's per-agent state.
+#[derive(Default)]
+pub struct TaskRuntime {
+    /// The active task; None is a plain chat turn.
+    spec: Option<TaskSpec>,
+    /// The running turn's state; None when the turn is not managed.
+    state: Option<TaskState>,
+    outcome: Option<TaskOutcome>,
+    /// The background verifier, once started; it outlives turns so the
+    /// build state carries over.
+    verifier: Option<Verifier>,
+    /// The workspace's build system, detected once.
+    build_system: Option<Option<Arc<dyn BuildSystem>>>,
+    /// The options in effect for this turn (read at its start).
+    turn_options: Option<TaskOptions>,
+    /// Intents stated on mutating calls. TODO(W10): the session's store.
+    pub intents: IntentLog,
+    /// Test seams: settings, the command runner and the judge.
+    pub(crate) options: Option<TaskOptions>,
+    pub(crate) runner: Option<Arc<dyn CommandRunner>>,
+    pub(crate) judge: Option<Arc<dyn JudgeRunner>>,
+}
+
+/// What the loop does when a typed task's model stops without `submit`.
+pub(super) enum NoSubmit {
+    /// Send this and keep going.
+    Nudge(Item),
+    /// The budget ran out; the outcome is recorded.
+    End,
+}
+
+impl Agent {
+    // -----------------------------------------------------------------
+    // Public surface
+    // -----------------------------------------------------------------
+
+    /// Make `spec` the task for the following turns (None: plain chat).
+    pub fn set_task(&mut self, spec: Option<TaskSpec>) {
+        self.task.spec = spec;
+        self.task.state = None;
+        self.task.outcome = None;
+    }
+
+    pub fn task_spec(&self) -> Option<&TaskSpec> {
+        self.task.spec.as_ref()
+    }
+
+    /// How the last turn's task ended: a validated value, or why it gave up.
+    pub fn take_task_outcome(&mut self) -> Option<TaskOutcome> {
+        self.task.outcome.take()
+    }
+
+    /// The last turn's state (budget, ladder, touched files). For typed
+    /// subagents (W11) and tests.
+    #[allow(dead_code)]
+    pub fn task_state(&self) -> Option<&TaskState> {
+        self.task.state.as_ref()
+    }
+
+    /// Stop the background verifier (cancelling a running build).
+    pub fn stop_verifier(&mut self) {
+        self.task.verifier = None;
+    }
+
+    // -----------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------
+
+    fn task_options(&self) -> TaskOptions {
+        self.task
+            .options
+            .clone()
+            .or_else(|| self.task.turn_options.clone())
+            .unwrap_or_else(TaskOptions::current)
+    }
+
+    fn task_typed(&self) -> bool {
+        self.task.spec.as_ref().is_some_and(TaskSpec::is_typed)
+    }
+
+    /// A task with its own budget: typed, or a headless run. An untyped
+    /// interactive spec (`TaskSpec::chat()`) behaves like no task at all.
+    fn task_explicit(&self) -> bool {
+        self.task
+            .spec
+            .as_ref()
+            .is_some_and(|s| s.is_typed() || s.headless)
+    }
+
+    fn task_build_system(&mut self) -> Option<Arc<dyn BuildSystem>> {
+        if self.task.build_system.is_none() {
+            self.task.build_system =
+                Some(crate::task::detect_build_system(&self.cwd).map(Arc::from));
+        }
+        self.task.build_system.clone().flatten()
+    }
+
+    fn task_runner(&self) -> Arc<dyn CommandRunner> {
+        self.task
+            .runner
+            .clone()
+            .unwrap_or_else(|| Arc::new(ShellRunner::new((*self.sandbox).clone())))
+    }
+
+    /// Whether the background verifier should run for this turn, starting it
+    /// when it should.
+    fn task_ensure_verifier(&mut self, opts: &TaskOptions) -> bool {
+        let spec = self.task.spec.as_ref();
+        // A subagent (it records usage against its parent) verifies only when
+        // its own task asks; settings alone start the root's verifier.
+        let root = self.usage_session_id.is_none();
+        let wanted = match spec.map_or(VerifyMode::Auto, |s| s.verify) {
+            VerifyMode::Off => false,
+            VerifyMode::On => true,
+            VerifyMode::Auto => {
+                spec.is_some_and(TaskSpec::has_check)
+                    || (root
+                        && match opts.verify_auto {
+                            Some(false) => opts.verify_required,
+                            Some(true) => true,
+                            None => opts.verify_required,
+                        })
+            }
+        };
+        if !wanted {
+            self.task.verifier = None;
+            return false;
+        }
+        let tests = opts.verify_tests || spec.is_some_and(TaskSpec::wants_tests);
+        let Some(bs) = self.task_build_system() else {
+            return false;
+        };
+        if self.task.verifier.is_none() {
+            let exec = Exec::new(self.task_runner());
+            self.task.verifier = Some(Verifier::start(bs, exec, tests, opts.verify_debounce));
+        }
+        true
+    }
+
+    fn intents_on(&self, opts: &TaskOptions) -> bool {
+        opts.intents_required || opts.intents_enabled.unwrap_or(self.task_explicit())
+    }
+
+    /// Record helper-call usage in the session and against the budget.
+    fn task_account(&mut self, usage: Option<Usage>, ui: &mut dyn Ui) {
+        self.account_usage(usage, ui);
+        self.task_spent(usage);
+    }
+
+    fn finish_exhausted(&mut self, why: &str, ui: &mut dyn Ui) -> TurnEnd {
+        if let Some(st) = &self.task.state {
+            let report = st.report("exhausted", why);
+            ui.notice(&report.summary());
+            self.task.outcome = Some(TaskOutcome::Exhausted(report));
+        }
+        self.task_turn_end();
+        TurnEnd::Done
+    }
+
+    /// Extensions hear that the turn ended, as they do for a normal end.
+    fn task_turn_end(&self) {
+        if let Some(ext) = self.hooks.extensions() {
+            let last = self.items.iter().rev().find_map(|i| match i {
+                Item::Assistant { text } => Some(text.as_str()),
+                _ => None,
+            });
+            ext.turn_end(last.unwrap_or(""));
+        }
+    }
+
+    fn relative(&self, path: &str) -> Option<PathBuf> {
+        if path.is_empty() {
+            return None;
+        }
+        let full = super::lexical(&self.cwd, path)?;
+        let base = super::lexical(&self.cwd, "").unwrap_or_else(|| self.cwd.clone());
+        let rel = full
+            .strip_prefix(&base)
+            .map(Path::to_path_buf)
+            .unwrap_or(full);
+        Some(rel)
+    }
+
+    // -----------------------------------------------------------------
+    // Step loop
+    // -----------------------------------------------------------------
+
+    /// The loop's step limit, raised to a task's own step budget.
+    pub(super) fn task_max_steps(&self, limit: usize) -> usize {
+        match &self.task.spec {
+            Some(s) if self.task_explicit() => limit.max(s.limits.steps as usize),
+            _ => limit,
+        }
+    }
+
+    /// Start of a turn: a fresh [`TaskState`] when the turn is managed (a
+    /// typed task, or the verifier is on).
+    pub(super) fn task_begin(&mut self) {
+        self.task.state = None;
+        self.task.outcome = None;
+        let opts = self
+            .task
+            .options
+            .clone()
+            .unwrap_or_else(TaskOptions::current);
+        self.task.turn_options = Some(opts.clone());
+        let verify = self.task_ensure_verifier(&opts);
+        if !self.task_typed() && !verify {
+            return;
+        }
+        let spec = self.task.spec.as_ref();
+        let goal = spec
+            .map(|s| s.goal.clone())
+            .filter(|g| !g.trim().is_empty())
+            .or_else(|| {
+                self.items.iter().rev().find_map(|i| match i {
+                    Item::User { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        let limits = spec.map(|s| s.limits).unwrap_or_default();
+        let tier_available = spec.is_none_or(|s| s.tier.allow_bump && s.tier.run != Tier::High)
+            && tier::bump_available(self.provider.as_ref(), &opts);
+        let mut st = TaskState::new(goal, limits, tier_available);
+        if let Some(v) = &self.task.verifier {
+            let snap = v.snapshot();
+            st.verify_seen = snap.runs;
+            st.verify_base_writes = snap.writes;
+            st.verify_streak_seen = snap.verify.consecutive_build_failures;
+            st.was_red = snap.verify.build_is_red();
+            if !snap.running && !snap.pending {
+                if snap.runs > 0 {
+                    st.started_red = Some(snap.verify.build_is_red());
+                } else {
+                    // Nothing known yet: a baseline build tells whether the
+                    // task starts red.
+                    v.run_now();
+                }
+            }
+        }
+        self.task.state = Some(st);
+    }
+
+    /// Before each request: wait briefly for a running verify, fold its
+    /// result in, act on the ladder, and charge the step budget.
+    pub(super) async fn task_before_request(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TurnEnd>> {
+        if self.task.state.is_none() {
+            return Ok(None);
+        }
+        let opts = self.task_options();
+        if let Some(v) = &self.task.verifier {
+            v.settle(opts.verify_wait).await;
+        }
+        self.fold_verify(&opts);
+        if let Some(end) = self.climb(ui, cancel).await? {
+            return Ok(Some(end));
+        }
+        if self.task_explicit() {
+            let Some(st) = &mut self.task.state else {
+                return Ok(None);
+            };
+            if let Some(ex) = st.budget.exhausted() {
+                return Ok(Some(
+                    self.finish_exhausted(engine::exhaustion_reason(ex), ui),
+                ));
+            }
+            st.budget.record_step();
+        }
+        Ok(None)
+    }
+
+    /// Fold new verifier results into the turn: the starting state, red
+    /// streaks (which climb the ladder) and recoveries.
+    fn fold_verify(&mut self, opts: &TaskOptions) {
+        let (Some(v), Some(st)) = (&self.task.verifier, &mut self.task.state) else {
+            return;
+        };
+        let snap = v.snapshot();
+        if snap.runs == st.verify_seen {
+            return;
+        }
+        st.verify_seen = snap.runs;
+        let red = snap.verify.build_is_red();
+        if st.started_red.is_none() {
+            // Only a run that saw the workspace as the turn found it says
+            // whether the task started red.
+            st.started_red = Some(red && snap.ran_at_writes == st.verify_base_writes);
+        }
+        if red {
+            if let Some(b) = &snap.verify.build {
+                st.note_error(&format!("[build] {}", b.summary));
+            }
+            let streak = snap.verify.consecutive_build_failures;
+            if snap.verify.progress_check_due(opts.verify_progress_every)
+                && streak != st.verify_streak_seen
+            {
+                st.verify_streak_seen = streak;
+                let note = engine::stall_note(StallReason::ConsecutiveFailures, st);
+                st.stall(StallReason::ConsecutiveFailures, note);
+            }
+        } else if st.was_red {
+            st.ladder.step(LadderEvent::Recovered);
+            st.verify_streak_seen = 0;
+        }
+        if let Some(t) = snap.verify.tests.as_ref().filter(|t| !t.ok) {
+            st.note_error(&format!("[tests] {}", t.summary));
+        }
+        st.was_red = red;
+    }
+
+    /// The tools to offer: `submit` for a typed task, and the `intent` field
+    /// on mutating tools when intents are on.
+    pub(super) fn task_specs(&self, specs: &mut Vec<crate::types::ToolSpec>) {
+        if let Some(submit) = self.task.spec.as_ref().and_then(TaskSpec::submit_spec) {
+            specs.retain(|s| s.name != SUBMIT);
+            specs.push(submit);
+        }
+        let opts = self.task_options();
+        if self.intents_on(&opts) {
+            for s in specs.iter_mut() {
+                intent::wrap(s, opts.intents_required);
+            }
+        }
+    }
+
+    /// `base` (the session notes) plus the task section, when there is one.
+    pub(super) fn task_note(&self, mut base: String) -> String {
+        let Some(st) = &self.task.state else {
+            return base;
+        };
+        let snap = self.task.verifier.as_ref().map(Verifier::snapshot);
+        let red = snap.as_ref().is_some_and(|s| {
+            s.verify.build_is_red() || s.verify.tests.as_ref().is_some_and(|t| !t.ok)
+        });
+        let older = snap
+            .as_ref()
+            .filter(|_| red)
+            .map(|s| s.older_failures.clone())
+            .unwrap_or_default();
+        let section = engine::task_note(
+            self.task.spec.as_ref(),
+            st,
+            snap.as_ref().map(|s| &s.verify),
+            &older,
+        );
+        if !section.is_empty() {
+            if !base.is_empty() {
+                base.push_str("\n\n");
+            }
+            base.push_str(&section);
+        }
+        base
+    }
+
+    /// Charge a response's tokens and cost to the task's budget.
+    pub(super) fn task_spent(&mut self, usage: Option<Usage>) {
+        if !self.task_explicit() {
+            return;
+        }
+        let (Some(u), Some(st)) = (usage, &mut self.task.state) else {
+            return;
+        };
+        st.budget.spend_tokens(u.input_tokens + u.output_tokens);
+        if st.budget.cost_left.is_some() {
+            if let Some(price) = crate::pricing::lookup(
+                &crate::config::home(),
+                self.provider.pricing_provider(),
+                self.provider.model(),
+            ) {
+                st.budget.spend_cost(price.cost(u));
+            }
+        }
+    }
+
+    /// The model answered without tool calls. A typed task does not end that
+    /// way: nudge it to call `submit` (a syntax charge), or end when the
+    /// budget is gone. None: not a typed task, carry on as usual.
+    pub(super) fn task_no_submit(&mut self, ui: &mut dyn Ui) -> Option<NoSubmit> {
+        let spec = self.task.spec.as_ref().filter(|s| s.is_typed())?;
+        let nudge = engine::no_submit_nudge(spec);
+        let st = self.task.state.as_mut()?;
+        st.budget.record_syntax_error();
+        st.nudges += 1;
+        st.note_error("[submit] The model stopped without calling submit.");
+        if let Some(ex) = st.budget.exhausted() {
+            self.finish_exhausted(engine::exhaustion_reason(ex), ui);
+            return Some(NoSubmit::End);
+        }
+        Some(NoSubmit::Nudge(Item::user(nudge)))
+    }
+
+    /// After a tool round: the task may be finished (submitted, exhausted)
+    /// or stuck (climb the ladder).
+    pub(super) async fn task_after_round(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TurnEnd>> {
+        if self.task.outcome.is_some() {
+            self.task_turn_end();
+            return Ok(Some(TurnEnd::Done));
+        }
+        let Some(st) = &self.task.state else {
+            return Ok(None);
+        };
+        if self.task_explicit() {
+            if let Some(ex) = st.budget.exhausted() {
+                return Ok(Some(
+                    self.finish_exhausted(engine::exhaustion_reason(ex), ui),
+                ));
+            }
+        }
+        self.climb(ui, cancel).await
+    }
+
+    /// The loop's step limit ended a typed task that never submitted.
+    pub(super) fn task_out_of_steps(&mut self, ui: &mut dyn Ui) {
+        if self.task_typed() && self.task.outcome.is_none() {
+            self.finish_exhausted("step limit reached without an accepted submission", ui);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Dispatch
+    // -----------------------------------------------------------------
+
+    /// Whether a call is the task engine's (`submit` while a schema is
+    /// active) rather than the tool registry's.
+    pub(super) fn task_owns(&self, name: &str) -> bool {
+        name == SUBMIT && self.task_typed()
+    }
+
+    /// Whether the task already has its result (later calls do not run).
+    pub(super) fn task_done(&self) -> bool {
+        matches!(self.task.outcome, Some(TaskOutcome::Submitted(_)))
+    }
+
+    /// Run `submit`: parse, check the schema, then the task's validators in
+    /// order. A pass records the value; a failure charges the budget and
+    /// comes back as an error result with the feedback.
+    pub(super) async fn task_submit(
+        &mut self,
+        arguments: &str,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
+        ui.tool_start(SUBMIT, "result");
+        let out = self.check_submission(arguments, ui, cancel).await;
+        ui.tool_end(SUBMIT, &out);
+        out
+    }
+
+    async fn check_submission(
+        &mut self,
+        arguments: &str,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
+        let Some(spec) = self.task.spec.clone() else {
+            return ToolOutput::err("There is no task to submit.");
+        };
+        let Some(schema) = spec.schema.clone() else {
+            return ToolOutput::err("This task has no result to submit.");
+        };
+        let args: Value = match serde_json::from_str(if arguments.trim().is_empty() {
+            "{}"
+        } else {
+            arguments
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                return self.reject(
+                    FailKind::Syntax,
+                    &format!("The submit arguments are not valid JSON: {e}"),
+                    "json",
+                )
+            }
+        };
+        let value = match spec.submitted_value(args) {
+            Ok(v) => v,
+            Err(e) => {
+                return self.reject(
+                    FailKind::Syntax,
+                    &format!("The submitted value does not match the required schema:\n- {e}"),
+                    "schema",
+                )
+            }
+        };
+        let cx = self.validate_cx(cancel);
+        let mut judges: Vec<Arc<llm::LlmJudge>> = Vec::new();
+        let mut checks: Vec<(String, Box<dyn Validator>)> =
+            vec![("schema".into(), Box::new(SchemaValidator::new(schema)))];
+        for v in &spec.validators {
+            checks.push((v.label(), self.validator(v, &mut judges, cancel)));
+        }
+        // TODO(W12): run `run_task_validate_hooks` (the `TaskValidate` hook)
+        // here as one more validator once hooks land on this branch.
+        let mut verdict = Verdict::Pass;
+        let mut by = String::new();
+        for (label, check) in &checks {
+            if cancel.is_cancelled() {
+                return ToolOutput::err("Cancelled by user.");
+            }
+            let v = check.check(&value, &cx).await;
+            if !v.is_pass() {
+                verdict = v;
+                by = label.clone();
+                break;
+            }
+        }
+        for j in judges {
+            let used: Vec<Usage> =
+                std::mem::take(&mut *j.usage.lock().unwrap_or_else(|e| e.into_inner()));
+            for u in used {
+                self.task_account(Some(u), ui);
+            }
+        }
+        match verdict {
+            Verdict::Pass => {
+                if let Some(st) = &self.task.state {
+                    crate::trace::log("task", || {
+                        format!("submit accepted after {} rejections", st.failures)
+                    });
+                }
+                self.task.outcome = Some(TaskOutcome::Submitted(value));
+                ToolOutput::ok("Accepted: the result passed every check. The task is complete.")
+            }
+            Verdict::Fail { kind, feedback } => self.reject(kind, &feedback, &by),
+            Verdict::Escalate(why) => {
+                if let Some(st) = &mut self.task.state {
+                    st.note_error(&format!("[{by}] {why}"));
+                    st.escalation = Some(format!("the `{by}` check could not decide: {why}"));
+                }
+                ToolOutput::err(format!(
+                    "The `{by}` check could not decide ({why}). The harness is escalating the task."
+                ))
+            }
+        }
+    }
+
+    /// A rejected submission: charge the budget, maybe queue a stall, and
+    /// tell the model what to fix.
+    fn reject(&mut self, kind: FailKind, feedback: &str, by: &str) -> ToolOutput {
+        let Some(st) = &mut self.task.state else {
+            return ToolOutput::err(feedback.to_string());
+        };
+        match kind {
+            FailKind::Syntax => st.budget.record_syntax_error(),
+            FailKind::Semantic => st.budget.record_semantic_error(),
+        }
+        st.failures += 1;
+        st.note_error(&format!("[{by}] {feedback}"));
+        if st.budget.exhausted().is_none() {
+            if st.budget.is_low() {
+                let note = engine::stall_note(StallReason::BudgetLow, st);
+                st.stall(StallReason::BudgetLow, note);
+            } else if st.failures >= 2 {
+                let note = engine::stall_note(StallReason::ConsecutiveFailures, st);
+                st.stall(StallReason::ConsecutiveFailures, note);
+            }
+        }
+        let kind = match kind {
+            FailKind::Syntax => "malformed",
+            FailKind::Semantic => "rejected",
+        };
+        let b = &st.budget;
+        ToolOutput::err(format!(
+            "{feedback}\n\n[submit {kind} by the `{by}` check. Left: {} malformed and {} rejected submissions. \
+             Fix the problem and call submit again.]",
+            b.syntax_left, b.semantic_left
+        ))
+    }
+
+    fn validate_cx(&mut self, cancel: &CancellationToken) -> ValidateCx {
+        let exec = Exec::new(self.task_runner()).with_cancel(cancel.clone());
+        let touched = self
+            .task
+            .state
+            .as_ref()
+            .map(|s| s.touched.clone())
+            .unwrap_or_default();
+        let mut cx = ValidateCx::new(&self.cwd, exec).with_touched(touched);
+        if let Some(bs) = self.task_build_system() {
+            cx = cx.with_build_system(bs);
+        }
+        cx
+    }
+
+    fn validator(
+        &self,
+        v: &ValidatorSpec,
+        judges: &mut Vec<Arc<llm::LlmJudge>>,
+        cancel: &CancellationToken,
+    ) -> Box<dyn Validator> {
+        match v {
+            ValidatorSpec::AlwaysPass => Box::new(AlwaysPass),
+            ValidatorSpec::Build => Box::new(BuildValidator),
+            ValidatorSpec::Tests => Box::new(TestsValidator::new(TestScope::All)),
+            ValidatorSpec::Lint => Box::new(LintValidator),
+            ValidatorSpec::Cmd(c) => Box::new(CustomCommandValidator::new(c.clone())),
+            ValidatorSpec::Exists(p) => Box::new(ExistsValidator::in_value(p.clone())),
+            ValidatorSpec::FilesTouched(p) => Box::new(FilesTouchedValidator::new(p.clone())),
+            ValidatorSpec::Judge(rubric) => {
+                let runner: Arc<dyn JudgeRunner> = match &self.task.judge {
+                    Some(j) => j.clone(),
+                    None => {
+                        let opts = self.task_options();
+                        let (provider, _) =
+                            tier::provider_for(self.provider.as_ref(), Tier::High, &opts);
+                        let st = self.task.state.as_ref();
+                        let judge = Arc::new(llm::LlmJudge::new(
+                            provider,
+                            st.map(|s| s.goal.clone()).unwrap_or_default(),
+                            st.map(|s| s.originals.clone()).unwrap_or_default(),
+                            cancel.clone(),
+                        ));
+                        judges.push(judge.clone());
+                        judge
+                    }
+                };
+                Box::new(JudgeValidator::new(rubric.clone(), runner))
+            }
+        }
+    }
+
+    /// Before a call is approved and run: take the `intent` field off a
+    /// mutating call and record it; reject the call when intents are
+    /// required and it has none. Snapshot a file the judge will diff.
+    pub(super) fn task_prepare_call(&mut self, name: &str, args: &mut Value) -> Option<ToolOutput> {
+        if !intent::is_mutating(name) {
+            return None;
+        }
+        match intent::take(name, args) {
+            Some(Some(i)) => {
+                if let Some(st) = &mut self.task.state {
+                    if let Some(c) = st.cycles.push_intent(&i.line()) {
+                        st.stall(StallReason::Cycle, c.note());
+                    }
+                }
+                // TODO(W10): `record_intent()` into the session's store.
+                self.task.intents.record(name, i, IntentKind::Action);
+            }
+            _ => {
+                let opts = self.task_options();
+                if opts.intents_required {
+                    if let Some(st) = &mut self.task.state {
+                        if self.task.spec.is_some() {
+                            st.budget.record_syntax_error();
+                        }
+                        st.note_error(&format!("[intent] `{name}` was called without an intent."));
+                    }
+                    return Some(ToolOutput::err(format!(
+                        "`{name}` changes the workspace, so it must include `intent`: {{\"did\": …, \"why\": …, \"next\": …}}. \
+                         It did not run: make the call again with an intent."
+                    )));
+                }
+                self.task.intents.missing += 1;
+            }
+        }
+        let judge = self.task.spec.as_ref().is_some_and(TaskSpec::has_judge);
+        if judge && intent::writes_path(name) {
+            let rel = args
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|p| self.relative(p));
+            if let (Some(rel), Some(st)) = (rel, &mut self.task.state) {
+                let path = self.cwd.join(&rel);
+                st.originals
+                    .entry(rel)
+                    .or_insert_with(|| std::fs::read_to_string(path).ok());
+            }
+        }
+        None
+    }
+
+    /// After a call ran: feed the cycle detector, and on a write track the
+    /// file and schedule the verifier.
+    pub(super) fn task_observe(&mut self, name: &str, arguments: &str, out: &ToolOutput) {
+        if self.task.state.is_none() {
+            return;
+        }
+        let mut args: Value = serde_json::from_str(arguments).unwrap_or_default();
+        intent::take(name, &mut args);
+        let wrote = out.changed
+            || (!out.is_error
+                && (intent::edits_files(name)
+                    || (name == "bash"
+                        && args
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(|c| {
+                                crate::command_effect::read_only(
+                                    c,
+                                    &self.cwd,
+                                    &self.sandbox.writable,
+                                )
+                                .is_none()
+                            }))));
+        let rel = (wrote && intent::writes_path(name))
+            .then(|| {
+                args.get("path")
+                    .and_then(Value::as_str)
+                    .and_then(|p| self.relative(p))
+            })
+            .flatten();
+        let Some(st) = &mut self.task.state else {
+            return;
+        };
+        let step = crate::task::Step::new(name, &args, &out.content, out.is_error);
+        if let Some(c) = st.cycles.push_step(step) {
+            st.stall(StallReason::Cycle, c.note());
+        }
+        if !wrote {
+            return;
+        }
+        st.writes += 1;
+        if let Some(rel) = rel {
+            st.touch(rel);
+        }
+        if let Some(v) = &self.task.verifier {
+            v.schedule();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The escalation ladder
+    // -----------------------------------------------------------------
+
+    /// Feed a queued stall (or a validator's escalation) to the ladder and
+    /// carry out what it says. Some: the turn ends.
+    async fn climb(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TurnEnd>> {
+        let Some(st) = &mut self.task.state else {
+            return Ok(None);
+        };
+        if let Some(why) = st.escalation.take() {
+            return self.escalate(&why, ui, cancel).await;
+        }
+        let Some((reason, note)) = st.stall.take() else {
+            return Ok(None);
+        };
+        let mut action = st.ladder.step(LadderEvent::Stalled(reason));
+        crate::trace::log("task", || format!("stalled ({reason:?}) → {action:?}"));
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(Some(TurnEnd::Cancelled));
+            }
+            let next = match action {
+                LadderAction::Continue => return Ok(None),
+                LadderAction::Nudge => {
+                    self.push_counted(Item::user(note));
+                    return Ok(None);
+                }
+                LadderAction::RunProgressCheck => {
+                    let made = self.progress_check(ui, cancel).await;
+                    LadderEvent::ProgressChecked { made }
+                }
+                LadderAction::RunDiagnose => {
+                    let has_solution = self.diagnose(ui, cancel).await;
+                    LadderEvent::Diagnosed { has_solution }
+                }
+                LadderAction::ResetContext => {
+                    self.reset_task_context(ui, cancel).await;
+                    return Ok(None);
+                }
+                LadderAction::BumpTier => {
+                    self.bump_tier(ui);
+                    return Ok(None);
+                }
+                LadderAction::Escalate => {
+                    let why = match reason {
+                        StallReason::Cycle => "it keeps repeating itself",
+                        StallReason::BudgetLow => "its budget is nearly gone",
+                        StallReason::ConsecutiveFailures => "it keeps failing without progress",
+                    };
+                    return self.escalate(why, ui, cancel).await;
+                }
+            };
+            let Some(st) = &mut self.task.state else {
+                return Ok(None);
+            };
+            action = st.ladder.step(next);
+            crate::trace::log("task", || format!("{next:?} → {action:?}"));
+        }
+    }
+
+    /// Rung 2: a cheap low-tier call over the recent errors. An error counts
+    /// as progress, so a broken helper never makes the ladder climb.
+    async fn progress_check(&mut self, ui: &mut dyn Ui, cancel: &CancellationToken) -> bool {
+        let Some(st) = &self.task.state else {
+            return true;
+        };
+        let goal = st.goal.clone();
+        let errors: Vec<String> = st.errors.iter().cloned().collect();
+        let opts = self.task_options();
+        let (provider, warning) = tier::provider_for(self.provider.as_ref(), Tier::Low, &opts);
+        if let Some(w) = warning {
+            ui.notice(&w);
+        }
+        ui.notice("The task keeps failing; checking whether it is making progress…");
+        match llm::progress_check(provider.as_ref(), &goal, &errors, cancel).await {
+            Ok((p, usage)) => {
+                self.task_account(usage, ui);
+                ui.notice(&format!(
+                    "Progress check: {}{}",
+                    if p.made { "progress" } else { "no progress" },
+                    if p.why.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", p.why)
+                    }
+                ));
+                p.made
+            }
+            Err(e) => {
+                ui.notice(&format!("The progress check failed ({e}); carrying on."));
+                true
+            }
+        }
+    }
+
+    /// Rung 3: a high-tier, read-only look at the evidence. A plan goes in
+    /// as a SYSTEM INTERVENTION and an approach-correction intent.
+    async fn diagnose(&mut self, ui: &mut dyn Ui, cancel: &CancellationToken) -> bool {
+        let Some(st) = &self.task.state else {
+            return false;
+        };
+        let goal = st.goal.clone();
+        let failures = st.failures.max(st.verify_streak_seen);
+        let errors: Vec<String> = st.errors.iter().cloned().collect();
+        let files: Vec<(String, String)> = st
+            .touched
+            .iter()
+            .filter_map(|p| {
+                let text = std::fs::read_to_string(self.cwd.join(p)).ok()?;
+                Some((crate::tools::slash_path(p), text))
+            })
+            .collect();
+        let actions = recent_actions(&self.items, DIAGNOSE_ACTIONS);
+        let opts = self.task_options();
+        let (provider, warning) = tier::provider_for(self.provider.as_ref(), Tier::High, &opts);
+        if let Some(w) = warning {
+            ui.notice(&w);
+        }
+        ui.notice("No progress: asking for a diagnosis…");
+        let ev = llm::Evidence {
+            goal: &goal,
+            errors: &errors,
+            actions: &actions,
+            files: &files,
+        };
+        match llm::diagnose(provider.as_ref(), &ev, cancel).await {
+            Ok((d, usage)) => {
+                self.task_account(usage, ui);
+                if d.has_solution && !d.plan.is_empty() {
+                    ui.notice("The diagnosis found a way forward.");
+                    self.push_counted(Item::user(engine::intervention(&d.plan, failures)));
+                    self.task.intents.record(
+                        "diagnose",
+                        intent::Intent {
+                            did: d.plan,
+                            why: "approach correction after repeated failures".into(),
+                            next: None,
+                        },
+                        IntentKind::ApproachCorrection,
+                    );
+                    true
+                } else {
+                    ui.notice("The diagnosis found no way forward.");
+                    false
+                }
+            }
+            Err(e) => {
+                ui.notice(&format!("The diagnosis failed ({e})."));
+                false
+            }
+        }
+    }
+
+    /// Rung 4: summarise into a handoff note through the compaction path and
+    /// start again from it. The working set lives outside the transcript.
+    async fn reset_task_context(&mut self, ui: &mut dyn Ui, cancel: &CancellationToken) {
+        ui.notice(
+            "The task keeps failing the same way; resetting the context with a handoff summary.",
+        );
+        match self.compact(ui, cancel).await {
+            Ok(true) => {
+                if let Some(st) = &mut self.task.state {
+                    st.cycles.clear();
+                    let note = engine::reset_note(&st.goal);
+                    self.push_counted(Item::user(note));
+                }
+            }
+            Ok(false) => {}
+            Err(e) => ui.notice(&format!("The context reset failed: {e:#}")),
+        }
+    }
+
+    /// Rung 5: switch to the `tier.high` model for the rest of the turn.
+    fn bump_tier(&mut self, ui: &mut dyn Ui) {
+        let opts = self.task_options();
+        match tier::bumped(self.provider.as_ref(), &opts) {
+            Ok(p) => {
+                ui.notice(&format!(
+                    "Switching to the high tier ({}/{}) for this task.",
+                    p.name(),
+                    p.model()
+                ));
+                let window = crate::config::context_window_for(p.name(), p.context_window());
+                self.provider = p;
+                self.set_context_window(window);
+            }
+            Err(e) => ui.notice(&format!("Could not switch to the high tier: {e:#}")),
+        }
+        if let Some(st) = &mut self.task.state {
+            st.ladder.set_tier_available(false);
+        }
+    }
+
+    /// Rung 6: give up. Interactive runs ask the user when they can; otherwise
+    /// the turn ends with a report (headless: exit 2).
+    async fn escalate(
+        &mut self,
+        why: &str,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TurnEnd>> {
+        let headless = self.task.spec.as_ref().is_some_and(|s| s.headless);
+        if !headless && self.tools.get(ASK_USER).is_some() {
+            let question = format!("The task seems stuck: {why}. How should it continue?");
+            let args = json!({"questions": [{
+                "question": question,
+                "options": [
+                    {"label": "Keep trying", "description": "Reset the escalation and let it try again."},
+                    {"label": "Stop", "description": "End the task here with a report."}
+                ]
+            }]});
+            self.attention("question", &question);
+            let answer = super::ask::ask_user(&args, ui, cancel).await;
+            if cancel.is_cancelled() {
+                return Ok(Some(TurnEnd::Cancelled));
+            }
+            let text = answer
+                .content
+                .strip_prefix("The user answered: ")
+                .map(str::trim)
+                .unwrap_or("");
+            if !answer.is_error && !text.is_empty() && text != "Stop" {
+                if let Some(st) = &mut self.task.state {
+                    st.ladder.step(LadderEvent::Recovered);
+                }
+                if text != "Keep trying" {
+                    self.push_counted(Item::user(format!(
+                        "[The user's guidance for the stuck task]\n{text}"
+                    )));
+                }
+                return Ok(None);
+            }
+        }
+        if let Some(st) = &self.task.state {
+            let report = st.report("escalated", why);
+            ui.notice(&report.summary());
+            self.task.outcome = Some(TaskOutcome::Escalated(report));
+        }
+        self.task_turn_end();
+        Ok(Some(TurnEnd::Done))
+    }
+}
+
+/// The last `n` tool calls with the first line of their results, oldest
+/// first, for the diagnosis.
+fn recent_actions(items: &[Item], n: usize) -> String {
+    let mut lines = Vec::new();
+    for (i, item) in items.iter().enumerate().rev() {
+        if lines.len() == n {
+            break;
+        }
+        let Item::ToolCall {
+            id,
+            name,
+            arguments,
+        } = item
+        else {
+            continue;
+        };
+        let args: String = arguments.chars().take(200).collect();
+        let result = items[i..].iter().find_map(|r| match r {
+            Item::ToolResult {
+                id: rid,
+                output,
+                is_error,
+                ..
+            } if rid == id => Some(format!(
+                "{} {}",
+                if *is_error { "error:" } else { "ok:" },
+                output
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            )),
+            _ => None,
+        });
+        lines.push(format!(
+            "- {name}({args}) → {}",
+            result.unwrap_or_else(|| "no result".into())
+        ));
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::agent::test_support::*;
+    use crate::provider::{EventSink, Provider};
+    use crate::task::build::FakeRunner;
+    use crate::task::verifier::tests::FakeBuild;
+    use crate::task::{BudgetLimits, CommandOutput, JudgeVerdict, Rung};
+    use crate::types::{Request, Response, ToolSpec};
+
+    /// What one request carried.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        tools: Vec<ToolSpec>,
+        /// The newest item's text, trailing note included.
+        last: String,
+    }
+
+    impl Seen {
+        fn names(&self) -> Vec<&str> {
+            self.tools.iter().map(|t| t.name.as_str()).collect()
+        }
+    }
+
+    /// A scripted provider that records each request; forks share both.
+    struct Recording {
+        left: Arc<Mutex<Vec<Response>>>,
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Recording {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn model(&self) -> &str {
+            "fake"
+        }
+        fn set_model(&mut self, _: String) {}
+        fn fork(&self) -> Box<dyn Provider> {
+            Box::new(Recording {
+                left: self.left.clone(),
+                seen: self.seen.clone(),
+            })
+        }
+        async fn stream(&self, req: Request<'_>, _: EventSink<'_>) -> anyhow::Result<Response> {
+            let last = match req.items.last() {
+                Some(Item::User { text, .. }) => text.clone(),
+                Some(Item::ToolResult { output, .. }) => output.clone(),
+                _ => String::new(),
+            };
+            self.seen.lock().unwrap().push(Seen {
+                tools: req.tools.to_vec(),
+                last,
+            });
+            let mut left = self.left.lock().unwrap();
+            anyhow::ensure!(!left.is_empty(), "script exhausted");
+            Ok(left.remove(0))
+        }
+    }
+
+    /// A tool under `name` that answers with its arguments and counts runs.
+    struct Echo(&'static str, Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for Echo {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.0.into(),
+                description: String::new(),
+                parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            }
+        }
+        fn summary(&self, _: &Value) -> String {
+            String::new()
+        }
+        async fn run(&self, args: Value, _: &crate::tools::ToolCtx) -> ToolOutput {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ToolOutput::ok(args.to_string())
+        }
+    }
+
+    struct Fixture {
+        agent: Agent,
+        seen: Arc<Mutex<Vec<Seen>>>,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new(script: Vec<Response>, spec: Option<TaskSpec>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut agent = scripted(Vec::new());
+            agent.items.clear();
+            agent.cwd = dir.path().to_path_buf();
+            agent.provider = Box::new(Recording {
+                left: Arc::new(Mutex::new(script)),
+                seen: seen.clone(),
+            });
+            agent.tools.add(Box::new(Echo("edit_file", runs.clone())));
+            agent.task.options = Some(TaskOptions::default());
+            // No build system unless a test brings one.
+            agent.task.build_system = Some(None);
+            agent.set_task(spec);
+            Self {
+                agent,
+                seen,
+                runs,
+                dir,
+            }
+        }
+
+        async fn run(&mut self, prompt: &str) -> (TurnEnd, Vec<String>) {
+            let mut ui = NoticeCatch(Vec::new());
+            let end = self
+                .agent
+                .turn(Item::user(prompt), &mut ui, CancellationToken::new())
+                .await
+                .unwrap();
+            (end, ui.0)
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn answer_schema() -> Value {
+        json!({"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]})
+    }
+
+    fn file_task(limits: BudgetLimits) -> TaskSpec {
+        let mut spec = TaskSpec::typed(
+            "name an existing file",
+            json!({"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]}),
+        );
+        spec.validators = vec![ValidatorSpec::Exists("/file".into())];
+        spec.limits = limits;
+        spec.headless = true;
+        spec
+    }
+
+    fn submit(id: &str, args: Value) -> Response {
+        reply(vec![call(id, SUBMIT, args)])
+    }
+
+    fn text(t: &str) -> Response {
+        reply(vec![Item::Assistant { text: t.into() }])
+    }
+
+    #[tokio::test]
+    async fn a_chat_turn_is_untouched() {
+        // No task, and the explicit chat task, behave the same.
+        for spec in [None, Some(TaskSpec::chat())] {
+            let mut f = Fixture::new(vec![text("hi")], spec);
+            let (end, notices) = f.run("hello").await;
+            assert!(matches!(end, TurnEnd::Done));
+            assert!(notices.is_empty(), "{notices:?}");
+            let seen = f.seen();
+            assert_eq!(seen[0].names(), ["edit_file"], "no submit");
+            assert!(seen[0].tools[0].parameters["properties"]
+                .get("intent")
+                .is_none());
+            assert!(!seen[0].last.contains("[Task]"), "{}", seen[0].last);
+            assert!(f.agent.task_state().is_none());
+            assert!(f.agent.take_task_outcome().is_none());
+            assert_eq!(f.agent.task_max_steps(7), 7);
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_auto_starts_the_verifier_for_the_root_agent_only() {
+        let fake = FakeRunner::new().on("fake-build", vec![CommandOutput::ok("")]);
+        for (subagent, started) in [(false, true), (true, false)] {
+            let mut f = Fixture::new(Vec::new(), None);
+            f.agent.task.runner = Some(fake.clone());
+            f.agent.task.build_system = Some(Some(Arc::new(FakeBuild(f.dir.path().into()))));
+            f.agent.task.options = Some(TaskOptions {
+                verify_auto: Some(true),
+                ..TaskOptions::default()
+            });
+            if subagent {
+                f.agent.usage_session_id = Some("parent".into());
+            }
+            f.agent.items.push(Item::user("fix it"));
+            f.agent.task_begin();
+            assert_eq!(
+                f.agent.task.verifier.is_some(),
+                started,
+                "subagent: {subagent}"
+            );
+            // A chat turn with the verifier on is managed, but has no submit
+            // and no budget of its own.
+            assert_eq!(f.agent.task_state().is_some(), started);
+            if started {
+                assert_eq!(f.agent.task_state().unwrap().goal, "fix it");
+                let mut specs = Vec::new();
+                f.agent.task_specs(&mut specs);
+                assert!(specs.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_submit_ends_the_turn_with_the_value() {
+        let spec = TaskSpec::typed("what is six times seven", answer_schema());
+        let mut f = Fixture::new(vec![submit("1", json!({"answer": 42}))], Some(spec));
+        let (end, _) = f.run("go").await;
+        assert!(matches!(end, TurnEnd::Done));
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"answer": 42})))
+        );
+        let seen = f.seen();
+        assert_eq!(seen.len(), 1, "one request");
+        assert!(seen[0].names().contains(&SUBMIT));
+        let submit = seen[0].tools.iter().find(|t| t.name == SUBMIT).unwrap();
+        assert_eq!(submit.parameters, answer_schema());
+        assert!(
+            seen[0]
+                .last
+                .contains("[Task]\nYOUR CURRENT TASK: what is six times seven"),
+            "{}",
+            seen[0].last
+        );
+        assert!(seen[0].last.contains("Finish by calling `submit`"));
+        assert!(results(&f.agent)[0].starts_with("Accepted"));
+    }
+
+    #[tokio::test]
+    async fn rejected_submits_charge_syntax_then_semantic_which_resets_syntax() {
+        let mut f = Fixture::new(
+            vec![
+                submit("1", json!({"file": 3})),
+                submit("2", json!({"file": "missing.txt"})),
+                submit("3", json!({"file": "here.txt"})),
+            ],
+            Some(file_task(BudgetLimits::default())),
+        );
+        std::fs::write(f.dir.path().join("here.txt"), "x").unwrap();
+        f.run("go").await;
+        let r = results(&f.agent);
+        // A schema failure is a syntax charge…
+        assert!(
+            r[0].contains("does not match the required schema"),
+            "{}",
+            r[0]
+        );
+        assert!(
+            r[0].contains("malformed by the `schema` check. Left: 2 malformed and 5 rejected"),
+            "{}",
+            r[0]
+        );
+        // …a validator failure a semantic one, which resets the syntax count.
+        assert!(
+            r[1].contains("These paths do not exist: missing.txt"),
+            "{}",
+            r[1]
+        );
+        assert!(
+            r[1].contains("rejected by the `exists:/file` check. Left: 3 malformed and 4 rejected"),
+            "{}",
+            r[1]
+        );
+        let is_error: Vec<bool> = f
+            .agent
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolResult { is_error, .. } => Some(*is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(is_error, [true, true, false]);
+        let st = f.agent.task_state().unwrap();
+        assert_eq!((st.budget.syntax_left, st.budget.semantic_left), (3, 4));
+        assert_eq!(st.failures, 2);
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"file": "here.txt"})))
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_without_submit_gets_a_nudge() {
+        let spec = TaskSpec::typed("answer", answer_schema());
+        let mut f = Fixture::new(
+            vec![
+                text("The answer is 42."),
+                submit("1", json!({"answer": 42})),
+            ],
+            Some(spec),
+        );
+        f.run("go").await;
+        let seen = f.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[1].last.starts_with("[Task] You must call `submit`"),
+            "{}",
+            seen[1].last
+        );
+        let st = f.agent.task_state().unwrap();
+        assert_eq!((st.nudges, st.budget.syntax_left), (1, 2));
+        assert!(matches!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_ends_the_task_with_a_report() {
+        let mut spec = TaskSpec::typed("answer", answer_schema());
+        spec.limits.syntax = 2;
+        spec.headless = true;
+        // Two replies without submit spend the syntax budget; a third
+        // request would fail the turn ("script exhausted").
+        let mut f = Fixture::new(vec![text("a"), text("b")], Some(spec));
+        let (end, notices) = f.run("go").await;
+        assert!(matches!(end, TurnEnd::Done));
+        let outcome = f.agent.take_task_outcome().unwrap();
+        assert_eq!(outcome.exit_code(), 2);
+        let TaskOutcome::Exhausted(report) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(
+            report.reason.starts_with("syntax budget exhausted"),
+            "{}",
+            report.reason
+        );
+        assert_eq!(report.budget.syntax_left, 0);
+        assert!(
+            notices.iter().any(|n| n.starts_with("Task exhausted")),
+            "{notices:?}"
+        );
+
+        // The step budget ends a task that keeps calling tools.
+        let mut spec = TaskSpec::typed("answer", answer_schema());
+        spec.limits.steps = 1;
+        let mut f = Fixture::new(
+            vec![reply(vec![call("1", "edit_file", json!({"path": "a"}))])],
+            Some(spec),
+        );
+        f.run("go").await;
+        let Some(TaskOutcome::Exhausted(report)) = f.agent.take_task_outcome() else {
+            panic!()
+        };
+        assert_eq!(report.reason, "step budget exhausted");
+        assert_eq!(f.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_red_build_after_a_write_reframes_the_task() {
+        let mut spec = TaskSpec::typed("add the parser", answer_schema());
+        spec.validators = vec![ValidatorSpec::Build];
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call("1", "edit_file", json!({"path": "src/lib.rs"}))]),
+                text("thinking"),
+            ],
+            Some(spec),
+        );
+        // Green at the start (the baseline), red after the write.
+        let fake = FakeRunner::new().on(
+            "fake-build",
+            vec![
+                CommandOutput::ok(""),
+                CommandOutput::failed(1, "error: expected `;`"),
+            ],
+        );
+        f.agent.task.runner = Some(fake.clone());
+        f.agent.task.build_system = Some(Some(Arc::new(FakeBuild(f.dir.path().into()))));
+        f.agent.task.options = Some(TaskOptions {
+            verify_debounce: std::time::Duration::ZERO,
+            verify_wait: std::time::Duration::from_secs(10),
+            ..TaskOptions::default()
+        });
+        // The second reply has no submit; the third request (the nudge) ends
+        // the script, which fails the turn. Only the requests matter here.
+        let mut ui = NoticeCatch(Vec::new());
+        let _ = f
+            .agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await;
+        let seen = f.seen();
+        assert!(
+            seen[0].last.contains("YOUR CURRENT TASK: add the parser"),
+            "{}",
+            seen[0].last
+        );
+        assert!(
+            seen[0].last.contains("Last compilation: Succeeded!"),
+            "{}",
+            seen[0].last
+        );
+        assert!(
+            seen[1].last.contains(
+                "[Task]\nFix the build before continuing. Your original task: add the parser"
+            ),
+            "{}",
+            seen[1].last
+        );
+        assert!(
+            seen[1].last.contains("Last compilation: Failed."),
+            "{}",
+            seen[1].last
+        );
+        assert!(!seen[1].last.contains("YOUR CURRENT TASK"));
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.started_red, Some(false));
+        assert_eq!(st.touched, [PathBuf::from("src/lib.rs")]);
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|c| c.contains("fake-build"))
+                .count(),
+            2,
+            "the baseline and one build after the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_climb_the_ladder() {
+        let mut f = Fixture::new(
+            vec![
+                submit("1", json!({"file": "x1"})),
+                // Failure 2 → nudge.
+                submit("2", json!({"file": "x2"})),
+                // Failure 3 → progress check (none) → diagnosis (a plan).
+                submit("3", json!({"file": "x3"})),
+                reply(vec![call(
+                    "p",
+                    llm::PROGRESS_TOOL,
+                    json!({"made": false, "why": "same error"}),
+                )]),
+                reply(vec![call(
+                    "d",
+                    llm::DIAGNOSE_TOOL,
+                    json!({"has_solution": true, "plan": "Create the file first."}),
+                )]),
+                // Failure 4 → context reset (a compaction).
+                submit("4", json!({"file": "x4"})),
+                text("Summary: tried x1..x4, none exist."),
+                submit("5", json!({"file": "ok.txt"})),
+            ],
+            Some(file_task(BudgetLimits {
+                semantic: 10,
+                ..BudgetLimits::default()
+            })),
+        );
+        std::fs::write(f.dir.path().join("ok.txt"), "x").unwrap();
+        let (_, notices) = f.run("go").await;
+        let seen = f.seen();
+        assert_eq!(seen.len(), 8, "{notices:?}");
+        assert!(!seen[1].last.contains("[Task] This has now failed"));
+        assert!(
+            seen[2].last.contains("[Task] This has now failed 2 times"),
+            "{}",
+            seen[2].last
+        );
+        assert_eq!(seen[3].names(), [llm::PROGRESS_TOOL]);
+        assert_eq!(seen[4].names(), [llm::DIAGNOSE_TOOL]);
+        assert!(
+            seen[5].last.starts_with("SYSTEM INTERVENTION"),
+            "{}",
+            seen[5].last
+        );
+        assert!(seen[5].last.contains("Create the file first."));
+        assert!(seen[6].names().is_empty(), "the compaction request");
+        assert!(
+            seen[7]
+                .last
+                .starts_with("[Task] The harness reset the context"),
+            "{}",
+            seen[7].last
+        );
+        assert!(matches!(f.agent.items[0], Item::Compaction { .. }));
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.ladder.rung(), Rung::ContextReset);
+        assert_eq!(st.failures, 4);
+        assert!(f
+            .agent
+            .task
+            .intents
+            .recent(1)
+            .any(|r| r.kind == IntentKind::ApproachCorrection));
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("no progress (same error)")),
+            "{notices:?}"
+        );
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"file": "ok.txt"})))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_intent_field_is_offered_stripped_and_recorded() {
+        let spec = TaskSpec::typed("edit", answer_schema());
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call(
+                    "1",
+                    "edit_file",
+                    json!({"path": "a.txt", "intent": {"did": "fix a", "why": "it is wrong", "next": "submit"}}),
+                )]),
+                submit("2", json!({"answer": 1})),
+            ],
+            Some(spec),
+        );
+        f.run("go").await;
+        let seen = f.seen();
+        let edit = seen[0]
+            .tools
+            .iter()
+            .find(|t| t.name == "edit_file")
+            .unwrap();
+        assert_eq!(
+            edit.parameters["properties"]["intent"]["required"],
+            json!(["did", "why"])
+        );
+        assert!(
+            edit.parameters.get("required").is_none(),
+            "optional by default"
+        );
+        // The tool saw its own arguments only.
+        assert_eq!(results(&f.agent)[0], r#"{"path":"a.txt"}"#);
+        let rec: Vec<_> = f.agent.task.intents.recent(5).collect();
+        assert_eq!(rec.len(), 1);
+        assert_eq!(
+            rec[0].intent.line(),
+            "fix a — because it is wrong — next: submit"
+        );
+        assert_eq!(
+            f.agent.task_state().unwrap().touched,
+            [PathBuf::from("a.txt")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_required_intent_rejects_the_call_with_a_syntax_charge() {
+        let spec = TaskSpec::typed("edit", answer_schema());
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call("1", "edit_file", json!({"path": "a.txt"}))]),
+                submit("2", json!({"answer": 1})),
+            ],
+            Some(spec),
+        );
+        f.agent.task.options = Some(TaskOptions {
+            intents_required: true,
+            ..TaskOptions::default()
+        });
+        f.run("go").await;
+        let edit = f.seen()[0]
+            .tools
+            .iter()
+            .find(|t| t.name == "edit_file")
+            .unwrap()
+            .clone();
+        assert_eq!(edit.parameters["required"], json!(["intent"]));
+        let r = results(&f.agent);
+        assert!(r[0].contains("must include `intent`"), "{}", r[0]);
+        assert_eq!(
+            f.runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "did not run"
+        );
+        assert_eq!(f.agent.task_state().unwrap().budget.syntax_left, 2);
+    }
+
+    struct FakeJudge(Mutex<Vec<Result<JudgeVerdict, String>>>);
+
+    #[async_trait::async_trait]
+    impl JudgeRunner for FakeJudge {
+        async fn judge(&self, _: &str, _: &Value, _: &ValidateCx) -> Result<JudgeVerdict, String> {
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_judge_rejects_then_passes_and_a_broken_judge_escalates() {
+        let mut spec = TaskSpec::typed("document it", answer_schema());
+        spec.validators = vec![ValidatorSpec::Judge("the README mentions it".into())];
+        spec.headless = true;
+        let mut f = Fixture::new(
+            vec![
+                submit("1", json!({"answer": 1})),
+                submit("2", json!({"answer": 2})),
+            ],
+            Some(spec.clone()),
+        );
+        f.agent.task.judge = Some(Arc::new(FakeJudge(Mutex::new(vec![
+            Ok(JudgeVerdict {
+                complete: false,
+                feedback: "the README is unchanged".into(),
+            }),
+            Ok(JudgeVerdict {
+                complete: true,
+                feedback: String::new(),
+            }),
+        ]))));
+        f.run("go").await;
+        assert!(results(&f.agent)[0].contains("the README is unchanged"));
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"answer": 2})))
+        );
+
+        let mut f = Fixture::new(vec![submit("1", json!({"answer": 1}))], Some(spec));
+        f.agent.task.judge = Some(Arc::new(FakeJudge(Mutex::new(vec![
+            Err("no model".into()),
+        ]))));
+        f.run("go").await;
+        let Some(TaskOutcome::Escalated(report)) = f.agent.take_task_outcome() else {
+            panic!()
+        };
+        assert!(
+            report
+                .reason
+                .contains("could not decide: judge could not run: no model"),
+            "{}",
+            report.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_after_an_accepted_submit_do_not_run() {
+        let spec = TaskSpec::typed("answer", answer_schema());
+        let mut f = Fixture::new(
+            vec![reply(vec![
+                call("1", SUBMIT, json!({"answer": 1})),
+                call("2", "edit_file", json!({"path": "a"})),
+            ])],
+            Some(spec),
+        );
+        f.run("go").await;
+        assert_eq!(f.runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(results(&f.agent)[1].starts_with("Not run"));
+        assert!(matches!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(_))
+        ));
+    }
+
+    #[test]
+    fn recent_actions_pair_calls_with_results() {
+        let items = vec![
+            call("1", "bash", json!({"command": "ls"})),
+            Item::ToolResult {
+                id: "1".into(),
+                output: "a\nb".into(),
+                is_error: false,
+                labels: Vec::new(),
+            },
+            call("2", "edit_file", json!({"path": "x"})),
+        ];
+        assert_eq!(
+            recent_actions(&items, 5),
+            "- bash({\"command\":\"ls\"}) → ok: a\n- edit_file({\"path\":\"x\"}) → no result"
+        );
+        assert_eq!(
+            recent_actions(&items, 1),
+            "- edit_file({\"path\":\"x\"}) → no result"
+        );
+    }
+}

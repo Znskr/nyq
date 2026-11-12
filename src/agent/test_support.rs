@@ -70,6 +70,7 @@ pub(crate) fn test_agent() -> Agent {
         undo: Default::default(),
         taint: Default::default(),
         workset: Default::default(),
+        task: Default::default(),
     }
 }
 
@@ -125,6 +126,7 @@ pub(crate) fn agent(response: Response, cancel: Option<CancellationToken>) -> Ag
         undo: Default::default(),
         taint: Default::default(),
         workset: Default::default(),
+        task: Default::default(),
     }
 }
 

@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::compact::Reduced;
 use super::note::with_trailing_note;
+use super::task::NoSubmit;
 use super::{Agent, TurnEnd, Ui};
 use crate::tools::ToolCtx;
 use crate::types::{Item, Request, StreamEvent};
@@ -182,7 +183,10 @@ impl Agent {
         cancel: CancellationToken,
         continue_note: bool,
     ) -> Result<TurnEnd> {
-        let max_steps = max_steps();
+        // W9: a task's own step budget may raise the limit.
+        let max_steps = self.task_max_steps(max_steps());
+        // W9: a fresh task state (budget, ladder, verifier baseline).
+        self.task_begin();
         // A Stop hook may keep the turn going once.
         let mut stop_continued = false;
         // Failing calls by (tool, arguments), to stop the model looping on one.
@@ -198,13 +202,19 @@ impl Agent {
             if !self.auto_compact(ui, &cancel).await? {
                 return Ok(TurnEnd::Cancelled);
             }
+            // W9: verifier results, the escalation ladder and the budget.
+            if let Some(end) = self.task_before_request(ui, &cancel).await? {
+                return Ok(end);
+            }
             // MCP servers that connected or changed their tools since the last step.
             self.tools.refresh();
-            let specs = self.advertised();
+            let mut specs = self.advertised();
+            // W9: `submit` for a typed task; the `intent` field.
+            self.task_specs(&mut specs);
             let system = self.request_system(continue_note);
             // Older items as pruned by compaction (tier 1), then the note.
             let projected = super::compact::project(&self.items, &self.compaction);
-            let items = with_trailing_note(&projected, &self.session_notes());
+            let items = with_trailing_note(&projected, &self.task_note(self.session_notes()));
             // To calibrate the token estimate on the reported usage.
             let raw = self.raw_request(&system, &items, &specs);
             crate::trace::log("provider", || {
@@ -276,6 +286,8 @@ impl Agent {
                 ui.notice("The reply was cut off at the output limit.");
             }
             self.account_usage(response.usage, ui);
+            // W9: token and cost budgets.
+            self.task_spent(response.usage);
             if let Some(u) = response.usage {
                 self.calibrate(raw, u.input_tokens);
                 self.context_tokens = u.input_tokens + u.output_tokens;
@@ -332,6 +344,15 @@ impl Agent {
                     if cancel.is_cancelled() {
                         return Ok(TurnEnd::Cancelled);
                     }
+                    // W9: a typed task ends only through `submit` (or its budget).
+                    match self.task_no_submit(ui) {
+                        Some(NoSubmit::Nudge(nudge)) => {
+                            self.push_counted(nudge);
+                            continue;
+                        }
+                        Some(NoSubmit::End) => return Ok(TurnEnd::Done),
+                        None => {}
+                    }
                     self.sync_estimate();
                     let reason = crate::hooks::stop(self, &cancel).await;
                     match reason.filter(|_| !stop_continued) {
@@ -373,10 +394,17 @@ impl Agent {
                 );
                 self.push_counted(Item::User { text, images });
             }
+            // W9: an accepted `submit` or a spent budget ends the task; a
+            // stall climbs the escalation ladder.
+            if let Some(end) = self.task_after_round(ui, &cancel).await? {
+                return Ok(end);
+            }
             for item in self.take_steering(ui) {
                 self.push_counted(item);
             }
         }
+        // W9: a typed task that never got a result is exhausted.
+        self.task_out_of_steps(ui);
         // Not an error: the work so far is kept and the user can go on.
         ui.notice(&format!(
             "Stopped after {max_steps} model steps without a final answer. Send a message to continue \

@@ -592,6 +592,7 @@ async fn open(
         undo: Default::default(),
         taint: Default::default(),
         workset: Default::default(),
+        task: Default::default(),
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());

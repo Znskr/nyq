@@ -296,6 +296,7 @@ fn child(
         undo: Default::default(),
         taint: Default::default(),
         workset: Default::default(),
+        task: Default::default(),
     })
 }
 

@@ -114,12 +114,15 @@ pub struct AskOpts {
     /// Continue the interrupted or cut-off response of the resumed session (with -r ID or -c).
     #[arg(long)]
     pub continue_recovery: bool,
+    // W9: typed tasks (`--schema`, `--validate`, `--budget`, `--memo`).
+    #[command(flatten)]
+    pub task: crate::task::headless::TaskOpts,
 }
 
 impl AskOpts {
     /// Options that only make sense without the interactive terminal.
     pub fn print_only(&self) -> bool {
-        self.json || self.quiet || self.no_save || self.continue_recovery
+        self.json || self.quiet || self.no_save || self.continue_recovery || self.task.is_task()
     }
 }
 
