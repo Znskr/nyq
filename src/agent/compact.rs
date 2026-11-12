@@ -732,6 +732,16 @@ impl Agent {
                 ));
             }
         }
+        let session = self.session.as_ref().map(|s| s.id.clone());
+        for extra in self
+            .hooks
+            .pre_compact(&self.cwd, session.as_deref(), cancel)
+            .await
+        {
+            prompt.push_str(&format!(
+                "\n\nAdditional instructions for this summary:\n{extra}"
+            ));
+        }
         let mut items = self.projected()[..split].to_vec();
         items.push(Item::user(prompt));
         let system = self.request_system(false);

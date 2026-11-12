@@ -349,6 +349,8 @@ pub(crate) const VALUE_LONG: &[&str] = &[
     "--validate",
     "--budget",
     "--memo-file",
+    "--profile",
+    "--set",
 ];
 pub(crate) const VALUE_SHORT: &[char] = &['m'];
 /// Flags that must not carry over: they pick or start a conversation, or (a

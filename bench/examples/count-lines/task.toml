@@ -1,0 +1,4 @@
+prompt = "Count the lines in data.txt and write just the number to a file named answer.txt"
+fixture = "fixture"
+check = "check.sh"
+timeout_secs = 300

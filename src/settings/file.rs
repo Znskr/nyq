@@ -43,6 +43,15 @@ pub fn read_user(home: &Path) -> Result<Map<String, Value>, String> {
     read(&user_path(home))
 }
 
+/// Parse settings TOML text as an object, the same shape [`read`] returns.
+/// Used for built-in profile overlays that have no path.
+pub fn parse_str(text: &str) -> Result<Map<String, Value>, String> {
+    let doc = text
+        .parse::<DocumentMut>()
+        .map_err(|e| e.to_string().trim_end().to_string())?;
+    Ok(table_to_json(doc.as_table()))
+}
+
 /// Apply `changes` to the user file, keeping everything else in it
 /// (comments and formatting included). Written atomically, mode 0600.
 pub fn write_changes(home: &Path, changes: &[Change]) -> Result<()> {

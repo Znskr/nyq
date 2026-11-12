@@ -1,0 +1,12 @@
+# Benchmark profile: the smallest useful tool surface.
+enabled_tools = ["bash", "view_image", "submit"]
+disabled_tools = []
+command_timeout_secs = 300
+auto_compact = 80
+permission_mode = "yolo"
+
+[features]
+mcp = false
+extensions = false
+skills = false
+memory = false

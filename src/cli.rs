@@ -13,8 +13,10 @@ use clap::{Parser, Subcommand};
 
 use crate::account;
 use crate::acp;
+use crate::bench;
 use crate::config;
 use crate::doctor;
+use crate::export;
 use crate::extensions;
 use crate::github;
 use crate::login;
@@ -86,6 +88,17 @@ pub struct Cli {
     /// Show developer-only commands (`/tools`) for this run. Also NYQ_DEBUG=1.
     #[arg(long, global = true)]
     pub debug: bool,
+    /// Settings profile for this run: default, minimal, ci, sdk, or a file
+    /// in ~/.nyq/profiles. Also NYQ_PROFILE.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub profile: Option<String>,
+    /// Print the resolved settings with each key's source layer, then exit.
+    #[arg(long, global = true)]
+    pub dump_config: bool,
+    /// Override a resolved setting for this run: KEY=VALUE (dotted keys for
+    /// nested fields, values parse as JSON). Repeatable.
+    #[arg(long = "set", value_name = "KEY=VALUE", global = true)]
+    pub set: Vec<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -265,6 +278,52 @@ pub enum Command {
         #[command(subcommand)]
         action: extensions::cli::ExtCommand,
     },
+    /// Export a saved conversation locally (never uploaded anywhere).
+    Export {
+        /// Session id, a unique prefix, or `last`; omit with --all.
+        which: Option<String>,
+        /// Export every saved conversation (-o names a directory then).
+        #[arg(long)]
+        all: bool,
+        /// Scrub credentials, anonymize paths (~ for home, <ws> for the
+        /// workspace) and drop images.
+        #[arg(long)]
+        redact: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "jsonl")]
+        format: export::Format,
+        /// Output file (or directory for --all); `-` is stdout.
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+    /// Run benchmark tasks headlessly, or compare two result files.
+    Bench {
+        #[command(subcommand)]
+        action: BenchCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BenchCommand {
+    /// Run every task directory under DIR (one `task.toml` each) headless
+    /// and record one JSONL result per task.
+    Run {
+        /// Directory of task folders (see bench/examples).
+        dir: PathBuf,
+        /// Override a resolved setting in each task run: key=value. Repeatable.
+        #[arg(long = "ablate", value_name = "KEY=VALUE")]
+        ablate: Vec<String>,
+        /// Write results to this file (default: stdout).
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+    /// Compare two bench JSONL result files side by side.
+    Report {
+        /// First results file (the baseline, column A).
+        a: PathBuf,
+        /// Second results file (column B).
+        b: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -423,6 +482,39 @@ impl Ctx<'_> {
             Command::Extensions { action } => {
                 extensions::cli::run(self.home, self.cwd, action).await?
             }
+            Command::Export {
+                which,
+                all,
+                redact,
+                format,
+                output,
+            } => export::run(
+                self.sessions_dir,
+                self.cwd,
+                which.as_deref(),
+                all,
+                redact,
+                format,
+                output.as_deref(),
+            )?,
+            Command::Bench { action } => match action {
+                BenchCommand::Run {
+                    dir,
+                    ablate,
+                    output,
+                } => {
+                    bench::run(
+                        &dir,
+                        self.cli.profile.clone(),
+                        &ablate,
+                        output.as_deref(),
+                        self.cli.model.as_deref(),
+                        self.cli.provider.as_deref(),
+                    )
+                    .await?
+                }
+                BenchCommand::Report { a, b } => bench::report(&a, &b)?,
+            },
         }
         Ok(true)
     }

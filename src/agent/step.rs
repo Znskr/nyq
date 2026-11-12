@@ -194,7 +194,7 @@ impl Agent {
         let mut failures: HashMap<(String, String), usize> = HashMap::new();
         // A context-overflow error is retried once after compacting.
         let mut overflow_retried = false;
-        for _ in 0..max_steps {
+        for step in 0..max_steps {
             if cancel.is_cancelled() {
                 return Ok(TurnEnd::Cancelled);
             }
@@ -209,6 +209,10 @@ impl Agent {
             }
             // MCP servers that connected or changed their tools since the last step.
             self.tools.refresh();
+            if let Some(reason) = crate::hooks::pre_step(self, step, &cancel).await {
+                ui.notice(&reason);
+                return Ok(TurnEnd::Done);
+            }
             let mut specs = self.advertised();
             // W9: `submit` for a typed task; the `intent` field.
             self.task_specs(&mut specs);
