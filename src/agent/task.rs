@@ -10,7 +10,7 @@
 //! | `step.rs` `drive`, start | [`Agent::task_begin`] | new [`TaskState`]; start the verifier and its baseline |
 //! | `step.rs`, before each request | [`Agent::task_before_request`] | wait briefly for a running verify, fold it in, climb the ladder, charge the step budget |
 //! | `step.rs`, tool specs | [`Agent::task_specs`] | add `submit`; add the `intent` field |
-//! | `step.rs`, trailing note | [`Agent::task_note`] | task, budget, repair framing, verify state |
+//! | `note.rs`, trailing note | [`Agent::task_note_sections`] | task, budget, repair framing; verify state |
 //! | `step.rs`, after a response | [`Agent::task_spent`] | token and cost budgets |
 //! | `step.rs`, no tool calls | [`Agent::task_no_submit`] | "you must call submit" nudge, or end |
 //! | `step.rs`, after a tool round | [`Agent::task_after_round`] | submitted / exhausted / ladder |
@@ -18,6 +18,13 @@
 //! | `dispatch.rs` `run_calls` | [`Agent::task_owns`], [`Agent::task_submit`] | the `submit` tool |
 //! | `dispatch.rs` `run_calls` | [`Agent::task_observe`] | touched files, verify scheduling, cycle detector |
 //! | `dispatch.rs` `prepare` | [`Agent::task_prepare_call`] | strip and record `intent`; snapshot files for the judge |
+//! | `compact.rs`, summary prompt | [`Agent::task_compaction_brief`] | goal, schema, verify state for the summary |
+//!
+//! Intents have one store, the session working set's (`crate::tools::workset`):
+//! the `intent` field and `note_intent` both record there, it is persisted with
+//! the session, the trailing note renders it, and the cycle detector reads
+//! new entries from it after each call. Which tools are mutating, and which
+//! paths a call writes, come from their declared effects (`Tool::effects`).
 //!
 //! With no task set ([`Agent::set_task`]) and verification off, which is the
 //! default for interactive chat, every one of these is a no-op: a chat turn is
@@ -32,15 +39,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Agent, TurnEnd, Ui, ASK_USER};
 use crate::task::engine::{self, TaskOutcome, TaskSpec, TaskState, Tier, VerifyMode, SUBMIT};
-use crate::task::intent::{self, IntentKind, IntentLog};
+use crate::task::intent;
 use crate::task::{
-    llm, tier, AlwaysPass, BuildSystem, BuildValidator, CommandRunner, CustomCommandValidator,
-    Exec, ExistsValidator, FailKind, FilesTouchedValidator, JudgeRunner, JudgeValidator,
-    LadderAction, LadderEvent, LintValidator, SchemaValidator, ShellRunner, StallReason,
-    TaskOptions, TestScope, TestsValidator, ValidateCx, Validator, ValidatorSpec, Verdict,
-    Verifier,
+    llm, tier, AlwaysPass, BuildSystem, CheckRecord, CommandRunner, Exec, FailKind, JudgeRunner,
+    JudgeValidator, LadderAction, LadderEvent, SchemaValidator, ShellRunner, StallReason,
+    TaskOptions, ValidateCx, Validator, ValidatorSpec, Verdict, Verifier,
 };
-use crate::tools::ToolOutput;
+use crate::tools::workset::{Intent, IntentKind};
+use crate::tools::{Concurrency, ToolOutput};
 use crate::types::{Item, Usage};
 
 /// Recent tool calls shown to the diagnosis.
@@ -61,8 +67,6 @@ pub struct TaskRuntime {
     build_system: Option<Option<Arc<dyn BuildSystem>>>,
     /// The options in effect for this turn (read at its start).
     turn_options: Option<TaskOptions>,
-    /// Intents stated on mutating calls. TODO(W10): the session's store.
-    pub intents: IntentLog,
     /// Test seams: settings, the command runner and the judge.
     pub(crate) options: Option<TaskOptions>,
     pub(crate) runner: Option<Arc<dyn CommandRunner>>,
@@ -216,17 +220,17 @@ impl Agent {
         }
     }
 
-    fn relative(&self, path: &str) -> Option<PathBuf> {
+    /// `path` relative to the workspace; None when it is empty or outside.
+    fn workspace_relative(&self, path: &str) -> Option<PathBuf> {
         if path.is_empty() {
             return None;
         }
         let full = super::lexical(&self.cwd, path)?;
         let base = super::lexical(&self.cwd, "").unwrap_or_else(|| self.cwd.clone());
-        let rel = full
-            .strip_prefix(&base)
+        full.strip_prefix(&base)
+            .ok()
+            .filter(|rel| !rel.as_os_str().is_empty())
             .map(Path::to_path_buf)
-            .unwrap_or(full);
-        Some(rel)
     }
 
     // -----------------------------------------------------------------
@@ -271,6 +275,8 @@ impl Agent {
         let tier_available = spec.is_none_or(|s| s.tier.allow_bump && s.tier.run != Tier::High)
             && tier::bump_available(self.provider.as_ref(), &opts);
         let mut st = TaskState::new(goal, limits, tier_available);
+        // The cycle detector sees the intents stated from here on.
+        st.intents_seen = crate::tools::workset::lock(&self.workset).intents_recorded();
         if let Some(v) = &self.task.verifier {
             let snap = v.snapshot();
             st.verify_seen = snap.runs;
@@ -371,15 +377,19 @@ impl Agent {
         let opts = self.task_options();
         if self.intents_on(&opts) {
             for s in specs.iter_mut() {
-                intent::wrap(s, opts.intents_required);
+                if self.tools.get(&s.name).is_some_and(intent::is_mutating) {
+                    intent::wrap(s, opts.intents_required);
+                }
             }
         }
     }
 
-    /// `base` (the session notes) plus the task section, when there is one.
-    pub(super) fn task_note(&self, mut base: String) -> String {
+    /// The task engine's two sections of the trailing note: the task (goal,
+    /// how to finish, budget, or the repair framing) and the latest verify
+    /// state. Either is empty when there is nothing to show.
+    pub(super) fn task_note_sections(&self) -> (String, String) {
         let Some(st) = &self.task.state else {
-            return base;
+            return (String::new(), String::new());
         };
         let snap = self.task.verifier.as_ref().map(Verifier::snapshot);
         let red = snap.as_ref().is_some_and(|s| {
@@ -390,19 +400,29 @@ impl Agent {
             .filter(|_| red)
             .map(|s| s.older_failures.clone())
             .unwrap_or_default();
-        let section = engine::task_note(
-            self.task.spec.as_ref(),
-            st,
-            snap.as_ref().map(|s| &s.verify),
-            &older,
-        );
-        if !section.is_empty() {
-            if !base.is_empty() {
-                base.push_str("\n\n");
-            }
-            base.push_str(&section);
-        }
-        base
+        let verify = snap.as_ref().map(|s| &s.verify);
+        (
+            engine::task_section(self.task.spec.as_ref(), st, verify),
+            engine::verify_section(verify, &older),
+        )
+    }
+
+    /// What a compaction summary must carry over from the task engine: the
+    /// task's goal, result schema and checks, and the latest verify state.
+    pub(super) fn task_compaction_brief(&self) -> String {
+        let goal = self.task.state.as_ref().map_or("", |s| s.goal.as_str());
+        let task = engine::compaction_brief(self.task.spec.as_ref(), goal);
+        let verify = self
+            .task
+            .verifier
+            .as_ref()
+            .map(|v| engine::verify_section(Some(&v.snapshot().verify), &[]))
+            .unwrap_or_default();
+        [task, verify]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// Charge a response's tokens and cost to the task's budget.
@@ -522,21 +542,18 @@ impl Agent {
         }) {
             Ok(v) => v,
             Err(e) => {
-                return self.reject(
-                    FailKind::Syntax,
-                    &format!("The submit arguments are not valid JSON: {e}"),
-                    "json",
-                )
+                let feedback = format!("The submit arguments are not valid JSON: {e}");
+                self.record_checks(None, vec![CheckRecord::failed("json", &feedback)]);
+                return self.reject(FailKind::Syntax, &feedback, "json");
             }
         };
-        let value = match spec.submitted_value(args) {
+        let value = match spec.submitted_value(args.clone()) {
             Ok(v) => v,
             Err(e) => {
-                return self.reject(
-                    FailKind::Syntax,
-                    &format!("The submitted value does not match the required schema:\n- {e}"),
-                    "schema",
-                )
+                let feedback =
+                    format!("The submitted value does not match the required schema:\n- {e}");
+                self.record_checks(Some(args), vec![CheckRecord::failed("schema", &feedback)]);
+                return self.reject(FailKind::Syntax, &feedback, "schema");
             }
         };
         let cx = self.validate_cx(cancel);
@@ -546,21 +563,51 @@ impl Agent {
         for v in &spec.validators {
             checks.push((v.label(), self.validator(v, &mut judges, cancel)));
         }
-        // TODO(W12): run `run_task_validate_hooks` (the `TaskValidate` hook)
-        // here as one more validator once hooks land on this branch.
+        // W12: the TaskValidate hooks are one more check, after the
+        // built-in ones.
+        if self.hooks.has_task_validate() {
+            checks.push((
+                "hook".into(),
+                Box::new(HookValidator {
+                    hooks: self.hooks.clone(),
+                    cwd: self.cwd.clone(),
+                    session: self
+                        .session
+                        .as_ref()
+                        .map(|s| s.id.clone())
+                        .or_else(|| self.usage_session_id.clone()),
+                    cancel: cancel.clone(),
+                }),
+            ));
+        }
+        // Checks that run commands see a quiescent workspace: no other
+        // writer (a parallel child, say) changes it under them.
+        let _lease = if spec.validators.iter().any(ValidatorSpec::executes) {
+            let writer = crate::orchestration::writer(&self.cwd);
+            tokio::select! {
+                lock = writer.lock_unknown() => Some(lock),
+                _ = cancel.cancelled() => return ToolOutput::err("Cancelled by user."),
+            }
+        } else {
+            None
+        };
         let mut verdict = Verdict::Pass;
         let mut by = String::new();
+        let mut records = Vec::new();
         for (label, check) in &checks {
             if cancel.is_cancelled() {
                 return ToolOutput::err("Cancelled by user.");
             }
             let v = check.check(&value, &cx).await;
+            records.push(CheckRecord::of(label, &v));
             if !v.is_pass() {
                 verdict = v;
                 by = label.clone();
                 break;
             }
         }
+        drop(_lease);
+        self.record_checks(Some(value.clone()), records);
         for j in judges {
             let used: Vec<Usage> =
                 std::mem::take(&mut *j.usage.lock().unwrap_or_else(|e| e.into_inner()));
@@ -588,6 +635,14 @@ impl Agent {
                     "The `{by}` check could not decide ({why}). The harness is escalating the task."
                 ))
             }
+        }
+    }
+
+    /// Keep the latest submission and its check verdicts on the turn state.
+    fn record_checks(&mut self, value: Option<Value>, checks: Vec<CheckRecord>) {
+        if let Some(st) = &mut self.task.state {
+            st.last_submission = value;
+            st.checks = checks;
         }
     }
 
@@ -645,56 +700,86 @@ impl Agent {
         judges: &mut Vec<Arc<llm::LlmJudge>>,
         cancel: &CancellationToken,
     ) -> Box<dyn Validator> {
-        match v {
-            ValidatorSpec::AlwaysPass => Box::new(AlwaysPass),
-            ValidatorSpec::Build => Box::new(BuildValidator),
-            ValidatorSpec::Tests => Box::new(TestsValidator::new(TestScope::All)),
-            ValidatorSpec::Lint => Box::new(LintValidator),
-            ValidatorSpec::Cmd(c) => Box::new(CustomCommandValidator::new(c.clone())),
-            ValidatorSpec::Exists(p) => Box::new(ExistsValidator::in_value(p.clone())),
-            ValidatorSpec::FilesTouched(p) => Box::new(FilesTouchedValidator::new(p.clone())),
-            ValidatorSpec::Judge(rubric) => {
-                let runner: Arc<dyn JudgeRunner> = match &self.task.judge {
-                    Some(j) => j.clone(),
-                    None => {
-                        let opts = self.task_options();
-                        let (provider, _) =
-                            tier::provider_for(self.provider.as_ref(), Tier::High, &opts);
-                        let st = self.task.state.as_ref();
-                        let judge = Arc::new(llm::LlmJudge::new(
-                            provider,
-                            st.map(|s| s.goal.clone()).unwrap_or_default(),
-                            st.map(|s| s.originals.clone()).unwrap_or_default(),
-                            cancel.clone(),
-                        ));
-                        judges.push(judge.clone());
-                        judge
-                    }
-                };
-                Box::new(JudgeValidator::new(rubric.clone(), runner))
-            }
+        if let Some(built) = v.validator() {
+            return built;
         }
+        let ValidatorSpec::Judge(rubric) = v else {
+            return Box::new(AlwaysPass);
+        };
+        let runner: Arc<dyn JudgeRunner> = match &self.task.judge {
+            Some(j) => j.clone(),
+            None => {
+                let opts = self.task_options();
+                let (provider, _) = tier::provider_for(self.provider.as_ref(), Tier::High, &opts);
+                let st = self.task.state.as_ref();
+                let judge = Arc::new(llm::LlmJudge::new(
+                    provider,
+                    st.map(|s| s.goal.clone()).unwrap_or_default(),
+                    st.map(|s| s.originals.clone()).unwrap_or_default(),
+                    cancel.clone(),
+                ));
+                judges.push(judge.clone());
+                judge
+            }
+        };
+        Box::new(JudgeValidator::new(rubric.clone(), runner))
+    }
+
+    /// Whether `intent` in a call to `name` is the task engine's field: the
+    /// tool is mutating by its declared effects and has no argument of that
+    /// name itself.
+    fn intent_field_of(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(intent::is_mutating)
+            && !self.tools.spec_of(name).is_some_and(intent::declares_field)
+    }
+
+    /// The files a call writes, by its declared effects, as the task tracks
+    /// them (see [`Agent::tracked`]).
+    fn written_files(&self, name: &str, args: &Value) -> Vec<PathBuf> {
+        let Some(tool) = self.tools.get(name) else {
+            return Vec::new();
+        };
+        tool.effects(args)
+            .writes
+            .paths()
+            .iter()
+            .filter_map(|p| self.tracked(p))
+            .collect()
+    }
+
+    /// A written path as the task tracks it: relative to the workspace, or
+    /// absolute under another writable root (`--add-dir`); None elsewhere
+    /// (nyq's own stores, such as the memory file).
+    fn tracked(&self, path: &Path) -> Option<PathBuf> {
+        let text = path.to_string_lossy();
+        if let Some(rel) = self.workspace_relative(&text) {
+            return Some(rel);
+        }
+        let full = super::lexical(&self.cwd, &text)?;
+        self.sandbox
+            .writable
+            .iter()
+            .any(|root| full.starts_with(root))
+            .then_some(full)
     }
 
     /// Before a call is approved and run: take the `intent` field off a
-    /// mutating call and record it; reject the call when intents are
-    /// required and it has none. Snapshot a file the judge will diff.
+    /// mutating call and record it in the session's intent store; reject the
+    /// call when intents are required and it has none. Snapshot a file the
+    /// judge will diff.
     pub(super) fn task_prepare_call(&mut self, name: &str, args: &mut Value) -> Option<ToolOutput> {
-        if !intent::is_mutating(name) {
+        if !self.intent_field_of(name) {
             return None;
         }
-        match intent::take(name, args) {
+        let opts = self.task_options();
+        match intent::take(args) {
             Some(Some(i)) => {
-                if let Some(st) = &mut self.task.state {
-                    if let Some(c) = st.cycles.push_intent(&i.line()) {
-                        st.stall(StallReason::Cycle, c.note());
-                    }
-                }
-                // TODO(W10): `record_intent()` into the session's store.
-                self.task.intents.record(name, i, IntentKind::Action);
+                crate::tools::workset::lock(&self.workset).record(Intent {
+                    tool: name.to_string(),
+                    ..i
+                });
             }
-            _ => {
-                let opts = self.task_options();
+            _ if self.intents_on(&opts) => {
                 if opts.intents_required {
                     if let Some(st) = &mut self.task.state {
                         if self.task.spec.is_some() {
@@ -707,58 +792,83 @@ impl Agent {
                          It did not run: make the call again with an intent."
                     )));
                 }
-                self.task.intents.missing += 1;
+                if let Some(st) = &mut self.task.state {
+                    st.intents_missing += 1;
+                }
             }
+            _ => {}
         }
         let judge = self.task.spec.as_ref().is_some_and(TaskSpec::has_judge);
-        if judge && intent::writes_path(name) {
-            let rel = args
-                .get("path")
-                .and_then(Value::as_str)
-                .and_then(|p| self.relative(p));
-            if let (Some(rel), Some(st)) = (rel, &mut self.task.state) {
+        if judge && self.task.state.is_some() {
+            for rel in self.written_files(name, args) {
                 let path = self.cwd.join(&rel);
-                st.originals
-                    .entry(rel)
-                    .or_insert_with(|| std::fs::read_to_string(path).ok());
+                if let Some(st) = &mut self.task.state {
+                    st.originals
+                        .entry(rel)
+                        .or_insert_with(|| std::fs::read_to_string(path).ok());
+                }
             }
         }
         None
     }
 
-    /// After a call ran: feed the cycle detector, and on a write track the
-    /// file and schedule the verifier.
-    pub(super) fn task_observe(&mut self, name: &str, arguments: &str, out: &ToolOutput) {
+    /// After a call ran (a model call, or a script's sub-call): feed the
+    /// cycle detector (the intents stated since the last call, then the call
+    /// itself), and on a write track the files and schedule the verifier.
+    /// `ran` is the call's final footprint from dispatch (its schedule class
+    /// and normalized write paths, from its declared effects after hooks);
+    /// None when it did not run through a wave.
+    pub(super) fn task_observe(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        out: &ToolOutput,
+        ran: Option<(&Concurrency, &[PathBuf])>,
+    ) {
         if self.task.state.is_none() {
             return;
         }
         let mut args: Value = serde_json::from_str(arguments).unwrap_or_default();
-        intent::take(name, &mut args);
-        let wrote = out.changed
-            || (!out.is_error
-                && (intent::edits_files(name)
-                    || (name == "bash"
-                        && args
-                            .get("command")
-                            .and_then(Value::as_str)
-                            .is_some_and(|c| {
-                                crate::command_effect::read_only(
-                                    c,
-                                    &self.cwd,
-                                    &self.sandbox.writable,
-                                )
-                                .is_none()
-                            }))));
-        let rel = (wrote && intent::writes_path(name))
-            .then(|| {
-                args.get("path")
-                    .and_then(Value::as_str)
-                    .and_then(|p| self.relative(p))
-            })
-            .flatten();
+        if self.intent_field_of(name) {
+            intent::take(&mut args);
+        }
+        let files: Vec<PathBuf> = ran
+            .map(|(_, writes)| writes.iter().filter_map(|p| self.tracked(p)).collect())
+            .unwrap_or_default();
+        let coordination = self
+            .tools
+            .get(name)
+            .is_some_and(|t| t.kind() == crate::tools::ToolKind::Coordination);
+        // Whether the call changed the workspace: a declared write to a
+        // tracked file, a process (not a read-only command), an undeclared
+        // tool, or a tool that reports a change itself (a shared subagent, a
+        // worktree merge). A script's sub-calls are observed one by one, so
+        // the script call itself is only a step for the cycle detector.
+        let done = |ok: bool| ok && (out.changed || !out.is_error);
+        let wrote = crate::scripting::kind_of(name).is_none()
+            && match ran.map(|(class, _)| class) {
+                Some(Concurrency::WriteFs(_)) => done(!files.is_empty()),
+                Some(Concurrency::Exec) => done(true),
+                Some(Concurrency::Barrier) => out.changed || (!out.is_error && !coordination),
+                Some(Concurrency::Pure | Concurrency::ReadFs) | None => out.changed,
+            };
+        let intents: Vec<String> = {
+            let ws = crate::tools::workset::lock(&self.workset);
+            let seen = self.task.state.as_ref().map_or(0, |s| s.intents_seen);
+            let new = ws.intents_since(seen).iter().map(Intent::line).collect();
+            if let Some(st) = &mut self.task.state {
+                st.intents_seen = ws.intents_recorded();
+            }
+            new
+        };
         let Some(st) = &mut self.task.state else {
             return;
         };
+        for line in intents {
+            if let Some(c) = st.cycles.push_intent(&line) {
+                st.stall(StallReason::Cycle, c.note());
+            }
+        }
         let step = crate::task::Step::new(name, &args, &out.content, out.is_error);
         if let Some(c) = st.cycles.push_step(step) {
             st.stall(StallReason::Cycle, c.note());
@@ -767,7 +877,8 @@ impl Agent {
             return;
         }
         st.writes += 1;
-        if let Some(rel) = rel {
+        // A failed call that still changed its files touched them too.
+        for rel in files {
             st.touch(rel);
         }
         if let Some(v) = &self.task.verifier {
@@ -911,15 +1022,11 @@ impl Agent {
                 if d.has_solution && !d.plan.is_empty() {
                     ui.notice("The diagnosis found a way forward.");
                     self.push_counted(Item::user(engine::intervention(&d.plan, failures)));
-                    self.task.intents.record(
-                        "diagnose",
-                        intent::Intent {
-                            did: d.plan,
-                            why: "approach correction after repeated failures".into(),
-                            next: None,
-                        },
-                        IntentKind::ApproachCorrection,
-                    );
+                    crate::tools::workset::lock(&self.workset).record(Intent {
+                        tool: "diagnose".into(),
+                        kind: IntentKind::ApproachCorrection,
+                        ..Intent::new(&d.plan, "approach correction after repeated failures", "")
+                    });
                     true
                 } else {
                     ui.notice("The diagnosis found no way forward.");
@@ -1068,6 +1175,40 @@ fn recent_actions(items: &[Item], n: usize) -> String {
     lines.join("\n")
 }
 
+/// The TaskValidate hooks as a validator (design §9): exit 0 passes; a
+/// block decision or non-zero exit fails the submission with its reason.
+struct HookValidator {
+    hooks: Arc<crate::hooks::Hooks>,
+    cwd: PathBuf,
+    session: Option<String>,
+    cancel: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl Validator for HookValidator {
+    async fn check(&self, value: &Value, _cx: &ValidateCx) -> Verdict {
+        match crate::hooks::run_task_validate_hooks(
+            &self.hooks,
+            value,
+            &self.cwd,
+            self.session.as_deref(),
+            &self.cancel,
+        )
+        .await
+        {
+            Ok(()) => Verdict::Pass,
+            Err(feedback) => Verdict::Fail {
+                kind: FailKind::Semantic,
+                feedback,
+            },
+        }
+    }
+
+    fn name(&self) -> &str {
+        "hook"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1132,6 +1273,7 @@ mod tests {
     }
 
     /// A tool under `name` that answers with its arguments and counts runs.
+    /// It declares what `edit_file` declares: it writes its `path`.
     struct Echo(&'static str, Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait::async_trait]
@@ -1142,6 +1284,11 @@ mod tests {
                 description: String::new(),
                 parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             }
+        }
+        fn effects(&self, args: &Value) -> crate::tools::Effects {
+            crate::tools::Effects::writes_to(vec![PathBuf::from(
+                args.get("path").and_then(Value::as_str).unwrap_or_default(),
+            )])
         }
         fn summary(&self, _: &Value) -> String {
             String::new()
@@ -1551,12 +1698,12 @@ mod tests {
         let st = f.agent.task_state().unwrap();
         assert_eq!(st.ladder.rung(), Rung::ContextReset);
         assert_eq!(st.failures, 4);
-        assert!(f
-            .agent
-            .task
-            .intents
-            .recent(1)
-            .any(|r| r.kind == IntentKind::ApproachCorrection));
+        // The diagnosis went into the session's one intent store.
+        let ws = crate::tools::workset::lock(&f.agent.workset);
+        let last = &ws.recent_intents(1)[0];
+        assert_eq!(last.kind, IntentKind::ApproachCorrection);
+        assert_eq!(last.did, "Create the file first.");
+        drop(ws);
         assert!(
             notices
                 .iter()
@@ -1600,16 +1747,338 @@ mod tests {
         );
         // The tool saw its own arguments only.
         assert_eq!(results(&f.agent)[0], r#"{"path":"a.txt"}"#);
-        let rec: Vec<_> = f.agent.task.intents.recent(5).collect();
+        let rec = crate::tools::workset::lock(&f.agent.workset)
+            .recent_intents(5)
+            .to_vec();
         assert_eq!(rec.len(), 1);
-        assert_eq!(
-            rec[0].intent.line(),
-            "fix a — because it is wrong — next: submit"
-        );
+        assert_eq!(rec[0].line(), "fix a — because it is wrong — next: submit");
+        assert_eq!(rec[0].tool, "edit_file");
         assert_eq!(
             f.agent.task_state().unwrap().touched,
             [PathBuf::from("a.txt")]
         );
+        // Rendered once, in its own section of the next request's note.
+        let last = &seen[1].last;
+        assert_eq!(last.matches("[Recent intents]").count(), 1, "{last}");
+        assert_eq!(last.matches("did: fix a").count(), 1, "{last}");
+        assert!(
+            last.find("[Task]") < last.find("[Recent intents]"),
+            "{last}"
+        );
+        assert!(
+            last.find("[Recent intents]") < last.find("[Session state]"),
+            "{last}"
+        );
+        // A read-only tool gets no intent field.
+        f.agent.tools.add(Box::new(ReadOnly));
+        let mut specs = f.agent.advertised();
+        f.agent.task_specs(&mut specs);
+        let read = specs.iter().find(|t| t.name == "peek").unwrap();
+        assert!(read.parameters["properties"].get("intent").is_none());
+    }
+
+    /// A tool that only reads.
+    struct ReadOnly;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ReadOnly {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "peek".into(),
+                description: String::new(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn effects(&self, _: &Value) -> crate::tools::Effects {
+            crate::tools::Effects::reads_only()
+        }
+        fn summary(&self, _: &Value) -> String {
+            String::new()
+        }
+        async fn run(&self, _: Value, _: &crate::tools::ToolCtx) -> ToolOutput {
+            ToolOutput::ok("peeked")
+        }
+    }
+
+    #[tokio::test]
+    async fn note_intent_feeds_the_cycle_detector_from_the_same_store() {
+        let spec = TaskSpec::typed("edit", answer_schema());
+        let note = |id: &str| {
+            reply(vec![call(
+                id,
+                "note_intent",
+                json!({"did": "retry the same fix", "why": "it failed"}),
+            )])
+        };
+        let mut f = Fixture::new(
+            vec![
+                note("1"),
+                note("2"),
+                note("3"),
+                submit("4", json!({"answer": 1})),
+            ],
+            Some(spec),
+        );
+        crate::tools::workset::register(&mut f.agent.tools);
+        f.run("go").await;
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(
+            st.intents_seen,
+            crate::tools::workset::lock(&f.agent.workset).intents_recorded()
+        );
+        // Three identical intents in a row are a cycle: rung 1, a nudge.
+        assert_ne!(st.ladder.rung(), Rung::Idle);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn task_validate_hooks_run_after_the_built_in_checks() {
+        let spec = TaskSpec::typed("answer", answer_schema());
+        let mut f = Fixture::new(
+            vec![
+                submit("1", json!({"answer": 1})),
+                submit("2", json!({"answer": 42})),
+            ],
+            Some(spec),
+        );
+        f.agent.hooks = hooks_with(
+            crate::hooks::Event::TaskValidate,
+            r#"grep -q '"answer":42' || { echo '{"decision":"block","reason":"the answer is 42"}'; }"#,
+        );
+        f.run("go").await;
+        let r = results(&f.agent);
+        assert!(r[0].contains("the answer is 42"), "{}", r[0]);
+        assert!(r[0].contains("rejected by the `hook` check"), "{}", r[0]);
+        let st = f.agent.task_state().unwrap();
+        let verdicts: Vec<(&str, &str)> = st
+            .checks
+            .iter()
+            .map(|c| (c.validator.as_str(), c.verdict))
+            .collect();
+        assert_eq!(verdicts, [("schema", "pass"), ("hook", "pass")]);
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"answer": 42})))
+        );
+    }
+
+    /// The real built-in tools and a fake build the verifier runs: the
+    /// runner counts the builds.
+    fn with_builtins_and_verifier(f: &mut Fixture) -> Arc<FakeRunner> {
+        f.agent.tools = crate::tools::Registry::builtin();
+        let fake = FakeRunner::new().on("fake-build", vec![CommandOutput::ok("")]);
+        f.agent.task.runner = Some(fake.clone());
+        f.agent.task.build_system = Some(Some(Arc::new(FakeBuild(f.dir.path().into()))));
+        f.agent.task.options = Some(TaskOptions {
+            verify_auto: Some(true),
+            verify_debounce: std::time::Duration::ZERO,
+            verify_wait: std::time::Duration::from_secs(10),
+            ..TaskOptions::default()
+        });
+        fake
+    }
+
+    fn builds(fake: &FakeRunner) -> usize {
+        fake.calls()
+            .iter()
+            .filter(|c| c.contains("fake-build"))
+            .count()
+    }
+
+    fn touched_task(file: &str) -> TaskSpec {
+        let mut spec = TaskSpec::typed("make the file", answer_schema());
+        spec.validators = vec![ValidatorSpec::FilesTouched(vec![PathBuf::from(file)])];
+        spec
+    }
+
+    /// An `apply_patch` edit is a write like any other: its files (from
+    /// the patch) are touched, so `touched:` accepts it, and the verifier
+    /// runs after it.
+    #[tokio::test]
+    async fn an_apply_patch_edit_is_touched_and_verified() {
+        let patch = "*** Begin Patch\n*** Add File: a.rs\n+pub fn a() {}\n*** End Patch\n";
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call("1", "apply_patch", json!({"patch": patch}))]),
+                submit("2", json!({"answer": 1})),
+            ],
+            Some(touched_task("a.rs")),
+        );
+        let fake = with_builtins_and_verifier(&mut f);
+        f.run("go").await;
+        assert!(
+            results(&f.agent)[0].contains("a.rs"),
+            "{:?}",
+            results(&f.agent)
+        );
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"answer": 1}))),
+            "{:?}",
+            results(&f.agent)
+        );
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.touched, [PathBuf::from("a.rs")]);
+        assert_eq!(
+            builds(&fake),
+            2,
+            "the baseline and one build after the patch"
+        );
+    }
+
+    /// Writes a `run_code` script makes through its tools count: the file
+    /// is touched and the verifier runs, though the script call itself is
+    /// not a write.
+    #[cfg(feature = "scripting")]
+    #[tokio::test]
+    async fn a_scripts_writes_are_observed_one_by_one() {
+        let code = r#"await tools.write_file({path: "b.txt", content: "x\n"}); return "ok";"#;
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call(
+                    "1",
+                    crate::scripting::RUN_CODE,
+                    json!({"code": code}),
+                )]),
+                submit("2", json!({"answer": 1})),
+            ],
+            Some(touched_task("b.txt")),
+        );
+        let fake = with_builtins_and_verifier(&mut f);
+        f.run("go").await;
+        assert_eq!(
+            std::fs::read_to_string(f.dir.path().join("b.txt")).unwrap(),
+            "x\n"
+        );
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"answer": 1}))),
+            "{:?}",
+            results(&f.agent)
+        );
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.touched, [PathBuf::from("b.txt")]);
+        assert_eq!(st.writes, 1, "the sub-call, not the script as well");
+        assert_eq!(
+            builds(&fake),
+            2,
+            "the baseline and one build after the write"
+        );
+    }
+
+    /// What counts as a write, from the dispatch footprint and the result.
+    #[tokio::test]
+    async fn observed_writes_follow_the_footprint_and_reported_changes() {
+        let mut f = Fixture::new(Vec::new(), Some(TaskSpec::typed("g", answer_schema())));
+        f.agent.tools = crate::tools::Registry::builtin();
+        f.agent.items.push(Item::user("go"));
+        f.agent.task_begin();
+        let changed = ToolOutput {
+            changed: true,
+            ..ToolOutput::ok("done")
+        };
+        let ok = ToolOutput::ok("done");
+        let writes = |st: &TaskState| st.writes;
+        // A shared general subagent reports its change (it schedules Pure).
+        f.agent
+            .task_observe("subagent", "{}", &changed, Some((&Concurrency::Pure, &[])));
+        assert_eq!(writes(f.agent.task_state().unwrap()), 1);
+        // An explore child, or a spawn/list action, changed nothing.
+        f.agent
+            .task_observe("subagent", "{}", &ok, Some((&Concurrency::Pure, &[])));
+        f.agent
+            .task_observe("subagent", "{}", &ok, Some((&Concurrency::Barrier, &[])));
+        assert_eq!(writes(f.agent.task_state().unwrap()), 1);
+        // A worktree merge that applied did.
+        f.agent.task_observe(
+            "subagent",
+            "{}",
+            &changed,
+            Some((&Concurrency::Barrier, &[])),
+        );
+        assert_eq!(writes(f.agent.task_state().unwrap()), 2);
+        // A script call is not a write itself: its sub-calls are observed.
+        #[cfg(feature = "scripting")]
+        {
+            f.agent
+                .task_observe(crate::scripting::RUN_CODE, "{}", &changed, None);
+            assert_eq!(writes(f.agent.task_state().unwrap()), 2);
+        }
+        // A declared write inside the workspace is tracked; one into nyq's
+        // own stores (the memory file) is not a workspace change.
+        let inside = f.dir.path().join("src/x.rs");
+        f.agent.task_observe(
+            "write_file",
+            "{}",
+            &changed,
+            Some((&Concurrency::WriteFs(vec![inside.clone()]), &[inside])),
+        );
+        let outside = PathBuf::from("/nonexistent/.nyq/memory.json");
+        f.agent.task_observe(
+            "memory",
+            "{}",
+            &changed,
+            Some((&Concurrency::WriteFs(vec![outside.clone()]), &[outside])),
+        );
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.writes, 3);
+        assert_eq!(st.touched, [PathBuf::from("src/x.rs")]);
+    }
+
+    /// Every section once, in order: task, verify, working set, intents,
+    /// session state.
+    #[tokio::test]
+    async fn the_note_has_each_section_once_in_order() {
+        let mut f = Fixture::new(Vec::new(), Some(TaskSpec::typed("add a", answer_schema())));
+        f.agent.context_window = 200_000;
+        std::fs::write(f.dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let fake = FakeRunner::new().on("fake-build", vec![CommandOutput::ok("")]);
+        f.agent.task.runner = Some(fake);
+        f.agent.task.build_system = Some(Some(Arc::new(FakeBuild(f.dir.path().into()))));
+        f.agent.task.options = Some(TaskOptions {
+            verify_auto: Some(true),
+            ..TaskOptions::default()
+        });
+        f.agent.items.push(Item::user("go"));
+        f.agent.task_begin();
+        f.agent
+            .task
+            .verifier
+            .as_ref()
+            .unwrap()
+            .settle(std::time::Duration::from_secs(10))
+            .await;
+        f.agent.fold_verify(&f.agent.task_options());
+        {
+            let mut ws = crate::tools::workset::lock(&f.agent.workset);
+            ws.open(
+                f.dir.path(),
+                f.dir.path().join("a.rs"),
+                crate::tools::workset::Mode::Focused,
+            );
+            ws.record_intent("opened a.rs", "to edit it", "");
+        }
+        let note = f.agent.trailing_note();
+        let mut at = 0;
+        for header in [
+            "[Task]",
+            "[Verify]",
+            "[Working set]",
+            "[Recent intents]",
+            "[Session state]",
+        ] {
+            assert_eq!(note.matches(header).count(), 1, "{header} once:\n{note}");
+            let pos = note.find(header).unwrap();
+            assert!(pos >= at, "{header} out of order:\n{note}");
+            at = pos;
+        }
+        assert_eq!(note.matches("did: opened a.rs").count(), 1, "{note}");
+        assert!(note.contains("Last compilation: Succeeded!"), "{note}");
+        // The compaction brief carries the goal, the schema and the build.
+        let brief = f.agent.task_compaction_brief();
+        assert!(brief.contains("Task goal: add a"), "{brief}");
+        assert!(brief.contains(r#""required":["answer"]"#), "{brief}");
+        assert!(brief.contains("Last compilation: Succeeded!"), "{brief}");
     }
 
     #[tokio::test]

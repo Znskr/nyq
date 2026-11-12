@@ -1394,6 +1394,12 @@ impl Tool for ApplyPatch {
         )
     }
 
+    /// Its paths come from `patch`, so a probe of its effects without one
+    /// would see a read: it writes the files the patch names.
+    fn kind(&self) -> super::ToolKind {
+        super::ToolKind::FileWrite
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "apply_patch".into(),

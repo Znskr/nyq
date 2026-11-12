@@ -81,6 +81,11 @@ impl Tool for Script {
         true
     }
 
+    /// Each sub-call goes through dispatch and takes the lease itself.
+    fn kind(&self) -> super::ToolKind {
+        super::ToolKind::Coordination
+    }
+
     async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
         ToolOutput::err(
             "Scripts run only inside the agent loop, which dispatches their tool calls.",

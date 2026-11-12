@@ -21,14 +21,18 @@ const TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const CLEANUP: Duration = Duration::from_secs(5);
 const MAX_REPORT: usize = 20_000;
 
-/// Tools no child gets: children don't delegate further.
-const NO_CHILD: &[&str] = &[NAME, "workflow"];
+/// Tools no child gets: children don't delegate further. Name-based on
+/// purpose: these two start agents, which no declared effect describes
+/// (the other coordination tools, e.g. the team graph, stay available).
+const NO_CHILD: &[&str] = &[NAME, crate::scripting::WORKFLOW];
 
-/// Not read-only by their declared effects, but allowed in explore children:
-/// a script's sub-calls only reach the child's own (read-only) tools.
-const EXPLORE_EXTRA: &[&str] = &["run_code", "team_task_list"];
+/// Not read-only by its declared effects, but allowed in explore children:
+/// a script's sub-calls only reach the child's own (read-only) tools, so
+/// what it may do depends on the child, not on the tool. Name-based for that
+/// reason; everything else is kept or dropped by its declared effects.
+const EXPLORE_EXTRA: &[&str] = &[crate::scripting::RUN_CODE];
 
-const DESCRIPTION: &str = "Delegate substantial independent work. Typed children: output_schema makes the child finish with JSON matching that schema, and validators (build, tests, lint, cmd:<shell>, exists:<json pointer>) check it; a failing check gets one retry and the result comes back as JSON labelled as evidence. isolation \"worktree\" gives the child its own git worktree and branch from HEAD; you get a diff summary, then action merge (name) applies it as a patch (conflicts are reported, never resolved) and stop discards it. mode \"external:<name>\" runs one task on an external ACP agent configured as agents.external.<name> in the user's settings (action run only). Use action spawn with name and task to run a child independently; send queues a follow-up for that name. Up to three children execute concurrently with FIFO inboxes. Reports arrive automatically between parent model requests, and finishing waits for outstanding children: do not poll. Children receive only the supplied task, so include paths, constraints and acceptance criteria. explore (default) is read-only; general can edit, run commands and use MCP after permission checks. Parent and children share one workspace writer. model and effort override inherited settings; permission_mode can only narrow authority. request_id makes an exact spawn/send retry idempotent. inspect/list show state; stop/cancel/close cancel current and queued work; resume reopens a stopped child. Legacy run executes synchronously, optionally retaining named context. Interrupted work is not automatically replayed: inspect its checkpoint and workspace before sending a replacement task. Children cannot delegate or message peers. Avoid delegation for quick lookups.";
+const DESCRIPTION: &str = "Delegate substantial independent work. Typed children: output_schema makes the child a typed task that finishes by calling submit with a result matching that schema, and validators (build, tests, lint, cmd:<shell>, exists:<json pointer>) check each submission; failed checks go back to the child within its task budget, and the result comes back as JSON labelled as evidence. isolation \"worktree\" gives the child its own git worktree and branch from HEAD; you get a diff summary, then action merge (name) applies it as a patch (conflicts are reported, never resolved) and stop discards it. mode \"external:<name>\" runs one task on an external ACP agent configured as agents.external.<name> in the user's settings (action run only). Use action spawn with name and task to run a child independently; send queues a follow-up for that name. Up to three children execute concurrently with FIFO inboxes. Reports arrive automatically between parent model requests, and finishing waits for outstanding children: do not poll. Children receive only the supplied task, so include paths, constraints and acceptance criteria. explore (default) is read-only; general can edit, run commands and use MCP after permission checks. Parent and children share one workspace writer. model and effort override inherited settings; permission_mode can only narrow authority. request_id makes an exact spawn/send retry idempotent. inspect/list show state; stop/cancel/close cancel current and queued work; resume reopens a stopped child. Legacy run executes synchronously, optionally retaining named context. Interrupted work is not automatically replayed: inspect its checkpoint and workspace before sending a replacement task. Children cannot delegate or message peers. Avoid delegation for quick lookups.";
 
 const PREAMBLE: &str = "\
 You are a subagent: another agent delegated the task below to you. You have none of its \
@@ -212,6 +216,12 @@ impl Tool for Subagent {
 
     fn handles_cancel(&self) -> bool {
         true
+    }
+
+    /// The child's own calls take the writer lease; the delegating call
+    /// never does.
+    fn kind(&self) -> super::ToolKind {
+        super::ToolKind::Coordination
     }
 
     /// A run or resume hosts a nested agent whose own calls take the
@@ -405,7 +415,7 @@ struct Outcome {
     undo: crate::undo::UndoLog,
     /// Cancelled by a `stop` (not by the parent or a timeout).
     stopped: bool,
-    /// A typed child's checked answer and how many answers it took.
+    /// A typed child's checked result and how many submissions it made.
     typed: Option<(crate::tools::typed::Checked, u32)>,
 }
 
@@ -427,8 +437,15 @@ impl TypedRun {
         })
     }
 
-    /// Check an answer; validators that run commands hold the workspace
-    /// writer so they see a quiescent tree.
+    /// Make the child's next turn a typed task (W9): it finishes through
+    /// `submit` with the schema, and the validators run on each submission
+    /// inside the child, holding the workspace writer while commands run.
+    fn arm(&self, agent: &mut Agent, goal: &str, writes: bool) {
+        agent.set_task(Some(self.typed.task_spec(goal, writes)));
+    }
+
+    /// The external-agent fallback: check its final message. Validators that
+    /// run commands hold the workspace writer so they see a quiescent tree.
     async fn check(
         &self,
         text: &str,
@@ -449,10 +466,10 @@ impl TypedRun {
     }
 }
 
-/// Typed children's task text: the task plus how to finish.
+/// A typed nyq child's task text: the task plus how to finish (`submit`).
 fn with_instructions(task: &str, typed: Option<&TypedRun>) -> String {
     match typed {
-        Some(t) => format!("{task}{}", t.typed.instructions()),
+        Some(t) => format!("{task}{}", t.typed.submit_instructions()),
         None => task.to_string(),
     }
 }
@@ -500,7 +517,7 @@ async fn drive_child(
     origin: String,
     live: LiveGuard,
     cancel: tokio_util::sync::CancellationToken,
-    typed: Option<&TypedRun>,
+    typed: bool,
 ) -> Outcome {
     // Legacy synchronous children share the same execution cap.
     let _slot = tokio::select! {
@@ -514,7 +531,7 @@ async fn drive_child(
         live,
         note: None,
     };
-    let mut result = match input {
+    let result = match input {
         Some(item) => {
             drive_turn(
                 agent.turn(item, &mut ui, cancel.clone()),
@@ -534,27 +551,15 @@ async fn drive_child(
             .await
         }
     };
-    // A typed child's answer is checked; a failure goes back to it once.
-    let mut checked = None;
-    if let Some(t) = typed {
-        let mut attempts = 0;
-        while matches!(result, Ok(TurnEnd::Done)) {
-            attempts += 1;
-            let c = t.check(last_answer(agent), &cancel).await;
-            let retry = c
-                .failure
-                .clone()
-                .filter(|_| attempts < crate::tools::typed::ATTEMPTS && !cancel.is_cancelled());
-            checked = Some((c, attempts));
-            let Some(feedback) = retry else { break };
-            result = drive_turn(
-                agent.turn(Item::user(feedback), &mut ui, cancel.clone()),
-                TIMEOUT,
-                CLEANUP,
-                cancel.clone(),
-            )
-            .await;
-        }
+    // A typed child's turn ended through its task: an accepted `submit`,
+    // or a budget or escalation that gave up (failed checks already went
+    // back to it as `submit` errors).
+    let checked = (typed && matches!(result, Ok(TurnEnd::Done))).then(|| {
+        let outcome = agent.take_task_outcome();
+        crate::tools::typed::Typed::outcome(outcome.as_ref(), agent.task_state())
+    });
+    if typed {
+        agent.set_task(None);
     }
     if !ctx.cancel.is_cancelled() {
         let last = agent.items.iter().rev().find_map(|i| match i {
@@ -606,9 +611,13 @@ fn report(
 ) -> ToolOutput {
     let display = Some(display(&outcome.calls));
     let undo = outcome.undo;
+    // The child's undo records are its writes: the workspace changed (an
+    // isolated child's caller clears this; its writes are in its worktree).
+    let changed = !undo.is_empty();
     let fail = |msg: String| ToolOutput {
         display: display.clone(),
         undo: undo.clone(),
+        changed,
         ..ToolOutput::err(msg)
     };
     match outcome.result {
@@ -637,6 +646,7 @@ fn report(
         return ToolOutput {
             display,
             undo,
+            changed,
             is_error: checked.failure.is_some(),
             ..ToolOutput::ok(truncate(&content, MAX_REPORT * 2))
         };
@@ -657,6 +667,7 @@ fn report(
     ToolOutput {
         display,
         undo,
+        changed,
         ..ToolOutput::ok(content)
     }
 }
@@ -675,6 +686,9 @@ async fn one_shot(args: &Value, ctx: &ToolCtx) -> ToolOutput {
     };
     let id = fresh_id("run");
     let typed = TypedRun::from_args(args, &ctx.cwd, ctx);
+    if let Some(t) = &typed {
+        t.arm(&mut agent, task, is_general(args));
+    }
     let label = one_line(label(args));
     let cancel = ctx.cancel.child_token();
     let Some(live) = LiveGuard::start(None, &label, cancel.clone()) else {
@@ -690,7 +704,7 @@ async fn one_shot(args: &Value, ctx: &ToolCtx) -> ToolOutput {
             format!("subagent: {label}"),
             live,
             cancel,
-            typed.as_ref(),
+            typed.is_some(),
         ),
     )
     .await;
@@ -798,6 +812,10 @@ pub(crate) async fn run_named(
         .map(|w| w.path.clone())
         .unwrap_or_else(|| ctx.cwd.clone());
     let typed = TypedRun::from_args(args, &cwd, ctx);
+    let goal = match &input {
+        Some(Item::User { text, .. }) => text.clone(),
+        _ => String::new(),
+    };
     let input = match input {
         Some(Item::User { text, images }) => Some(Item::User {
             text: with_instructions(&text, typed.as_ref()),
@@ -828,6 +846,9 @@ pub(crate) async fn run_named(
         Ok(a) => a,
         Err(e) => return e,
     };
+    if let Some(t) = &typed {
+        t.arm(&mut agent, &goal, record.mode == "general");
+    }
     // Saved as running with the new message, so a crash leaves it resumable.
     record.items = agent.items.clone();
     record.items.extend(input.clone());
@@ -848,7 +869,7 @@ pub(crate) async fn run_named(
                 format!("subagent {name}"),
                 live,
                 cancel,
-                typed.as_ref(),
+                typed.is_some(),
             ),
         ),
     )
@@ -882,6 +903,11 @@ pub(crate) async fn run_named(
         _ => format!("; `{name}` can finish this with action \"resume\""),
     };
     let mut out = report(outcome, &agent, footer, &name, changes);
+    // An isolated child changed its worktree, not this workspace: only a
+    // merge does that.
+    if record.isolation.is_some() {
+        out.changed = false;
+    }
     if let Err(e) = saved {
         out.is_error = true;
         out.content
@@ -991,8 +1017,13 @@ async fn external(args: &Value, ext: &str, ctx: &ToolCtx) -> ToolOutput {
         .and_then(|(r, _)| r.worktree.as_ref())
         .map(|w| w.path.clone())
         .unwrap_or_else(|| ctx.cwd.clone());
+    // An external agent has no `submit` tool: it is told to answer with
+    // JSON, and its final message is checked once (the fallback).
     let typed = TypedRun::from_args(args, &cwd, ctx);
-    let prompt = with_instructions(task, typed.as_ref());
+    let prompt = match &typed {
+        Some(t) => format!("{task}{}", t.typed.instructions()),
+        None => task.to_string(),
+    };
     let cancel = ctx.cancel.child_token();
     let Some(live) = LiveGuard::start(None, &format!("{ext}: {label}"), cancel.clone()) else {
         return ToolOutput::err("Subagent could not start.");
@@ -1021,9 +1052,13 @@ async fn external(args: &Value, ext: &str, ctx: &ToolCtx) -> ToolOutput {
         Ok(o) => Some(display(&o.tool_calls)),
         Err(_) => None,
     };
+    // An external agent edits with its own tools, which nyq cannot see: a
+    // finished run in this workspace may have changed it.
+    let shared = !wants_worktree(args);
     let finish = |content: String, is_error: bool| ToolOutput {
         content,
         is_error,
+        changed: shared && !is_error,
         display: display.clone(),
         ..Default::default()
     };
@@ -1658,6 +1693,8 @@ mod tests {
             std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
             "x"
         );
+        // A shared child's writes are this workspace's changes.
+        assert!(out.changed);
         let mut parent_undo = crate::undo::UndoLog::default();
         parent_undo.append(out.undo);
         assert_eq!(parent_undo.len(), 1);
@@ -2125,12 +2162,30 @@ mod tests {
         users(items).last().cloned().unwrap_or_default()
     }
 
+    fn submit(id: &str, args: Value) -> Response {
+        resp(vec![Item::ToolCall {
+            id: id.into(),
+            name: crate::task::SUBMIT.into(),
+            arguments: args.to_string(),
+        }])
+    }
+
+    fn tool_results(items: &[Item]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn typed_child_returns_checked_json_evidence() {
+    async fn typed_child_submits_and_returns_checked_json_evidence() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
         let fake = Fake::default();
-        *fake.script.lock().unwrap() = vec![answer(r#"{"files": ["a.txt"]}"#)];
+        *fake.script.lock().unwrap() = vec![submit("s1", json!({"files": ["a.txt"]}))];
         let out = Subagent
             .run(
                 typed_args(json!(["exists:/files"])),
@@ -2138,6 +2193,7 @@ mod tests {
             )
             .await;
         assert!(!out.is_error, "{}", out.content);
+        assert!(!out.changed, "an explore child changes nothing");
         let v: Value = serde_json::from_str(&out.content).unwrap();
         assert_eq!(v["status"], "passed");
         assert_eq!(v["attempts"], 1);
@@ -2145,10 +2201,23 @@ mod tests {
         let child = v["child"].as_str().unwrap();
         assert!(child.starts_with("run-"));
         assert_eq!(v["evidence"], crate::tools::typed::evidence(child));
-        assert_eq!(v["checks"].as_array().unwrap().len(), 2);
-        // The child was told how to finish.
+        assert_eq!(
+            v["checks"],
+            json!([
+                {"validator": "schema", "verdict": "pass"},
+                {"validator": "exists:/files", "verdict": "pass"}
+            ])
+        );
+        // The child ran as a typed task: it was offered `submit` with the
+        // parent's schema, told how to finish, and shown its task section.
         let first = fake.requests.lock().unwrap()[0].clone();
-        assert!(last_user(&first).contains("Required result"));
+        let prompt = last_user(&first);
+        assert!(prompt.contains("Required result"), "{prompt}");
+        assert!(
+            prompt.contains("[Task]\nYOUR CURRENT TASK: list the relevant files"),
+            "{prompt}"
+        );
+        assert!(fake.seen_tools.lock().unwrap()[0].contains(&"submit".to_string()));
         // Executing validators make the call ask; exists alone doesn't.
         assert!(!Subagent.needs_approval(&typed_args(json!(["exists:/files"]))));
         assert!(Subagent.needs_approval(&typed_args(json!(["cmd:make check"]))));
@@ -2160,13 +2229,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_child_gets_one_retry_with_feedback() {
+    async fn typed_child_resubmits_after_a_failed_check() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
         let fake = Fake::default();
         *fake.script.lock().unwrap() = vec![
-            answer("I looked around; a.txt is the one."),
-            answer(r#"{"files": ["a.txt"]}"#),
+            submit("s1", json!({"files": ["ghost.rs"]})),
+            submit("s2", json!({"files": ["a.txt"]})),
         ];
         let out = Subagent
             .run(
@@ -2180,16 +2249,24 @@ mod tests {
         assert_eq!(v["attempts"], 2);
         let requests = fake.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);
-        assert!(last_user(&requests[1]).contains("not valid JSON"));
+        // The failed check came back as the `submit` error.
+        let fed_back = tool_results(&requests[1]).join("\n");
+        assert!(fed_back.contains("ghost.rs"), "{fed_back}");
+        assert!(
+            fed_back.contains("rejected by the `exists:/files` check"),
+            "{fed_back}"
+        );
     }
 
     #[tokio::test]
-    async fn typed_child_fails_after_its_retry() {
+    async fn typed_child_that_never_submits_fails_with_a_report() {
         let dir = tempfile::tempdir().unwrap();
         let fake = Fake::default();
+        // Each reply without `submit` costs the syntax budget (3).
         *fake.script.lock().unwrap() = vec![
-            answer(r#"{"files": ["ghost.rs"]}"#),
-            answer(r#"{"files": ["still-ghost.rs"]}"#),
+            answer("I looked around; a.txt is the one."),
+            answer(r#"{"files": ["a.txt"]}"#),
+            answer("done"),
         ];
         let out = Subagent
             .run(
@@ -2200,14 +2277,12 @@ mod tests {
         assert!(out.is_error, "{}", out.content);
         let v: Value = serde_json::from_str(&out.content).unwrap();
         assert_eq!(v["status"], "failed");
-        assert_eq!(v["attempts"], 2);
-        assert!(v["checks"][1]["feedback"]
-            .as_str()
-            .unwrap()
-            .contains("still-ghost.rs"));
+        assert_eq!(v["attempts"], 0);
+        let why = v["failure"].as_str().unwrap();
+        assert!(why.contains("syntax budget exhausted"), "{why}");
         let requests = fake.requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2, "exactly one retry");
-        assert!(last_user(&requests[1]).contains("ghost.rs"));
+        assert_eq!(requests.len(), 3, "the budget, not a retry count, ends it");
+        assert!(last_user(&requests[1]).contains("You must call `submit`"));
     }
 
     /// Edits need a prior read in the session (the read-before-edit guard).
@@ -2254,6 +2329,8 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("+child"), "{}", out.content);
         assert!(out.content.contains("action \"merge\""));
+        // Its writes are in its worktree: only the merge changes this one.
+        assert!(!out.changed);
         // The child wrote its worktree, not the parent's files.
         assert_eq!(read("a.txt"), "one\ntwo\nthree\n");
         let record = subagents::load(store.path(), "w1").unwrap().unwrap();

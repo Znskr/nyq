@@ -543,7 +543,10 @@ fn shimmer(label: &str, frame: usize) -> String {
         .collect()
 }
 
-/// How a tool call reads in the transcript: a verb and its target.
+/// How a tool call reads in the transcript: a verb and its target. Keyed
+/// by name on purpose (as are the kinds, file links and diffs below): it is
+/// presentation, and depends on what each built-in tool's summary shows (a
+/// path, a command), not on its effects.
 fn describe_tool(tool: &str, summary: &str) -> (String, String) {
     let verb = match tool {
         "read_file" => "Read",

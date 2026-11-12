@@ -192,16 +192,30 @@ impl Default for Workset {
 }
 
 /// The `intents` table: the intent log (`note_intent` and tool intents).
+/// One table for both workstreams' keys: the note (`show`) and the task
+/// engine's `intent` field (`enabled`, `required`, read by
+/// `crate::task::TaskOptions`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Intents {
     /// How many recent intents the trailing note shows (0 hides it).
     pub show: usize,
+    /// Offer the `intent` field on mutating tools (unset: only for typed or
+    /// headless tasks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Reject a mutating call that has no intent.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
 }
 
 impl Default for Intents {
     fn default() -> Self {
-        Self { show: 8 }
+        Self {
+            show: 8,
+            enabled: None,
+            required: false,
+        }
     }
 }
 

@@ -92,6 +92,13 @@ Key precedence: `ANTHROPIC_API_KEY`, then `ANTHROPIC_AUTH_TOKEN`, then the key f
 sign in with Claude Pro/Max subscriptions, because Anthropic's terms do not allow
 third-party tools to use consumer subscriptions.
 
+**DeepSeek API.** Run `nyq login deepseek` (or set `DEEPSEEK_API_KEY`), then
+`--provider deepseek`. This native provider speaks DeepSeek's Messages API with its
+extensions: reasoning effort `off`, `low`, `high` (default) or `max`; models that
+support it get system-prompt and tool-list changes appended in the history, so the
+cached prefix survives; and DeepSeek's own cache-hit counters show in usage. The
+Anthropic-compatible setup above still works too.
+
 **Any OpenAI-compatible API** (OpenAI, OpenRouter, vLLM, Ollama, llama.cpp, …):
 
 ```sh
@@ -320,6 +327,60 @@ The exit status is 0 on success, 1 on errors, 130 after Ctrl-C and 143 after
 SIGTERM, including while waiting for piped stdin to finish; background processes
 and MCP servers are stopped either way.
 
+### Typed tasks
+
+With `--schema`, a run is a task that ends only when a result passes its checks:
+
+```sh
+nyq -p "list the public functions of src/lib.rs" \
+  --schema '{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}}},"required":["names"]}' \
+  --validate build --budget steps=40
+```
+
+The model finishes by calling `submit`, whose arguments are the result. A value
+that doesn't match the schema, or fails a check, goes back to the model as an error
+to fix. On success nyq prints the value alone on stdout and exits 0; when the budget
+runs out or the task escalates it exits 2 with a JSON report on stderr.
+
+| Option | |
+|---|---|
+| `--schema FILE\|JSON` | the result's JSON Schema |
+| `--validate CHECK` | repeatable, run in order on each submission: `build`, `tests`, `lint`, `cmd:<shell>` (exit 0 passes), `exists:<json-pointer>` (paths in the result must exist), `judge:<rubric>` (a model checks the change is present and complete), `touched:<path,…>` (the task must have changed them). `TaskValidate` [hooks](#hooks) run after these |
+| `--budget LIMITS` | `syntax=N` malformed submissions (3), `semantic=N` rejected ones (5), `steps=N` (100), `tokens=N`, `cost=X` dollars, `wall=S` (or `90s`, `5m`, `1h`) |
+| `--memo`, `--memo-file PATH` | reuse the cached result of an identical earlier task: same prompt, schema, checks and contents of the listed files |
+
+When a task stalls (repeated rejections, a red build that doesn't improve, or the
+same actions in a loop), nyq climbs an escalation ladder: a nudge, a cheap progress
+check, a diagnosis by a stronger model, a context reset from a summary, a switch to
+the `tier.high` model, and finally escalation (exit 2). Mutating tools offer an
+`intent` field (what the call does, why, what comes next) during tasks; the recent
+intents are shown back to the model on every request.
+
+**Background verifier.** For a task with a `build`, `tests` or `lint` check (or
+with `[verify] auto = true`, or under the `ci` profile), nyq builds the project in
+the background after each change (cargo, go, uv/pytest, npm/pnpm, cmake or make,
+detected from the workspace) and shows the model the latest build and test state
+on every request. If the build breaks during a task, the model is told to fix it
+before going on.
+
+```toml
+# ~/.nyq/settings.toml
+[verify]
+auto = true          # also for plain chat turns
+tests = false        # run the tests too
+debounce_ms = 1500
+wait_ms = 2000       # how long a request waits for a running build
+
+[intents]
+show = 8             # recent intents in each request (0 hides them)
+enabled = true       # offer the intent field outside tasks too
+required = false     # reject mutating calls without one
+
+[tier]               # models for the ladder: provider/model or a model id
+low = "openai/gpt-5-mini"
+high = "anthropic/claude-opus-5-5"
+```
+
 ## Settings
 
 `/settings` opens a menu like the model switcher (`↑↓` navigate, `Tab` category,
@@ -349,6 +410,14 @@ Two layers can sit on top of that file, later ones winning:
 
 `/settings` marks values that come from a layer (`· project`, `· workspace`), and
 a change that a layer overrides is saved with a notice saying which layer wins.
+
+**Profiles.** `--profile NAME` (or `NYQ_PROFILE`) applies an overlay between your
+settings and the project's: `default` (no change), `minimal` (only `bash`,
+`view_image` and `submit`, no MCP, extensions, skills or memory; for benchmarks),
+`ci` (headless, yolo, workspace-write sandbox, verification required) or `sdk`
+(headless). `~/.nyq/profiles/NAME.toml` overrides a built-in or adds your own.
+`nyq --profile ci --dump-config` prints every resolved setting with the layer it
+came from (`default`, `user`, `profile:ci`, `project`, `workspace`, `cli`).
 
 `disabled_tools` lists tools that are never offered to the model or run, and
 `disabled_skills` skills (by the id `/skills` shows) that are neither offered to the
@@ -514,16 +583,41 @@ win. `/alias` lists them, `/alias NAME` shows one.
 
 Built-in tools: `read_file`, `list_dir`, `glob`, `grep` (gitignore-aware; `grep` can
 count matches per file or show context lines, and both page with `offset`/`limit`),
-`write_file`, `edit_file`, `bash`, `view_image`, `web_fetch` (public URLs only, connected
+`write_file`, `edit_file`, `multi_edit` (several exact replacements in one file, all
+or nothing), `apply_patch` (a unified or Codex-style patch over several files),
+`edit_range` (replace the lines between a start and an end regex, nearest to a line
+hint), `bash`, `view_image`, `web_fetch` (public URLs only, connected
 directly with no HTTP proxy; private and local addresses are blocked; marked as untrusted
 content and reused for 15 minutes within a session; PDFs, images and other non-text
 responses up to 50 MB are saved under `~/.nyq/artifacts/<session>/` and the model gets
 the path, plus the image itself for PNG/JPEG/GIF/WebP), `web_search` (Codex's native search,
 DuckDuckGo otherwise, with optional allowed/blocked domains), `subagent` (delegates a
 self-contained task to a fresh agent: read-only `explore`, or `general` after approval),
-`skill`, `install_skill`, and `ask_user_question` (up to four multiple-choice questions,
-each option with a short description, shown as menus). `/undo` reverts nyq's file
-changes one at a time; `/copy` copies the last answer.
+`skill`, `install_skill`, `session_search` (searches the whole saved conversation,
+including parts compacted into a summary), `run_code` (a JavaScript program, in an
+embedded QuickJS without file, network or process access, that calls your tools as
+`await tools.grep({…})`; each call goes through the normal checks), and
+`ask_user_question` (up to four multiple-choice questions, each option with a short
+description, shown as menus). `/undo` reverts nyq's file changes one at a time;
+`/copy` copies the last answer.
+
+Edits and overwrites of an existing file need a read of it earlier in the session,
+and are refused when the file changed on disk since (`read_before_edit = false`
+turns this off).
+
+**Working set.** `open` adds a file to the working set, `focus` shows it in full,
+`unfocus` turns it back into an outline, `close` drops it, and `workset` lists them.
+Every request shows the working set as it is on disk now: focused files in full
+with line numbers, source files as outlines (signatures and types), docs pinned in
+full. It is saved with the session. `note_intent` records what the model just did
+and why; recent intents are shown back on every request and survive compaction.
+
+```toml
+[workset]
+enabled = true
+max_focused = 4      # more focused files show as outlines
+max_tokens_pct = 25  # share of the context window for file contents
+```
 
 **Tools menu** (with `--debug` or `NYQ_DEBUG=1`; otherwise `/tools` only says so and
 stays out of `/`, `/help` and completion). `/tools` lists every tool in tabs: built-in,
@@ -540,16 +634,20 @@ can't be overridden from here. Without a terminal, `/tools` prints the same list
 text; `/tools list|info NAME|disable NAME|enable NAME|trust NAME|untrust NAME` do the
 rest.
 
-Consecutive read-only calls in one reply (reads, searches, web fetches, skills) and
-subagent calls run concurrently; results keep their order. `bash` keeps the beginning
+Calls in one reply run in waves by their declared effects: reads, searches, web
+fetches and subagent runs together, writes to different files together, shell
+commands and anything undeclared alone; results keep their order. Arguments are
+checked against the tool's schema before a call runs or asks. `bash` keeps the beginning
 and end of long output and stores the whole of it for `read_tool_result`; `grep`/`rg`
 finding nothing, `diff`/`cmp` finding differences and a false `test` (exit code 1) are
 not reported as failures. API keys, GitHub/GitLab/Slack/AWS tokens, bearer tokens,
 `*_TOKEN=`/`*_SECRET=`-style assignments and private key blocks are replaced with
 `[redacted]` in every tool result before the model or the session file sees it. When
 the same call fails three times, the model is told to change approach. Each request also
-ends with a short note telling the model the permission mode, whether it can ask questions, and which background
-processes are running (with any server URL they printed). Pressing Esc while a reply
+ends with a note that is never saved (so the cached prompt prefix stays the same):
+the task and its budget, the latest build state, the working set, recent intents,
+and the session state (permission mode, whether it can ask questions, and which
+background processes are running, with any server URL they printed). Pressing Esc while a reply
 streams keeps the partial text, marked `[interrupted by the user]`, and a turn that
 reaches the step limit (100, or `max_agent_steps` / `NYQ_MAX_AGENT_STEPS`) stops with a
 notice instead of an error. If a file changes
@@ -688,6 +786,30 @@ and `permission_mode` (never more permissive than the session's). Subagents get 
 session's skills, and `general` ones its MCP tools too. Approval prompts from
 subagents running in parallel are shown one at a time.
 
+**Typed, isolated and external subagents.** With `output_schema` (and optionally
+`validators`: `build`, `tests`, `lint`, `cmd:<shell>`, `exists:<pointer>`) the child
+runs as a [typed task](#typed-tasks): it finishes by calling `submit`, the checks run
+inside it within its budget, and the parent gets a JSON result (`status`, `result`,
+`checks`, `attempts`) labelled as evidence. `isolation: "worktree"` gives the child
+its own git worktree and branch under `.nyq/worktrees/<name>`; the parent sees a diff
+summary, `action: "merge"` applies it as a patch (a conflict is reported and nothing
+is written), and `stop` discards it. `mode: "external:<name>"` runs one task on an
+external ACP agent from your own settings.toml (it runs outside nyq's sandbox, with
+its permission requests sent to you; a typed result is parsed from its final
+message):
+
+```toml
+[agents.external.claude]
+command = "claude-code-acp"
+```
+
+Children and the parent can share a task graph: `team_task_create` (with `deps`, an
+optional result `schema` and an advisory `write_scope`), `team_task_list`,
+`team_task_claim` and `team_task_update` (compare-and-set on `rev`), plus
+`send_message` and `wait_agent`. `workflow` runs a JavaScript program over
+subagents: `await task(goal, {schema, validators, mode, isolation})`,
+`parallel([...])`, `pipeline(items, fn)` and `phase(name)`.
+
 Reading and searching inside the workspace run freely, and so do read-only shell
 commands: pipelines of up to 8 `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`,
 `pwd`, `echo`, `printf` and read-only `git` (`status`, `log`, `diff`, `show`,
@@ -738,7 +860,8 @@ Path-scoped rules limit file tools to paths: `edit_file:src/**`,
 `write_file:docs/*.md`, `read_file:secrets/*`, `read:~/notes/**`,
 `edit:/tmp/scratch/**`. The part before `:` picks a category — `read_file`,
 `list_dir`, `glob`, `grep`, `view_image` and `read` cover every read tool;
-`write_file`, `edit_file` and `edit` cover both writing tools — so a
+`write_file`, `edit_file` and `edit` cover every file-writing tool (`multi_edit`,
+`edit_range`, and `apply_patch` for each file its patch names) — so a
 `deny: ["read_file:secrets/*"]` also stops `grep` there. Relative patterns are
 relative to the workspace; `*` matches within a path segment and `**` across
 segments. Ask and deny rules match the path as written or with symlinks
@@ -795,6 +918,21 @@ for every workspace and `l` for this workspace only.
 `nyq permissions` prints the mode and the persistent rules (`--json` for JSON).
 `/yolo` toggles between yolo and ask and saves the choice. `/mcp` shows each
 connected server's resulting default.
+
+**Taint rules.** Every tool result is labelled with where its content came from
+(`web:<host>`, `file:<path>`, `mcp:<server>`, `child:<id>`, `exec`). An `ask` or
+`deny` rule may add a condition, and then applies only to a call whose arguments
+copy text from a matching result, in every mode including yolo:
+
+```json
+{ "deny": ["exec when tainted-by:web"],
+  "ask":  ["net when tainted-by:mcp:*", "write_file when tainted-by:web:*.example.com"] }
+```
+
+The part before `when` is any rule pattern or an effect (`exec`, `net`, `write`,
+`read`). `"taint": {"mode": "strict"}` adds two built-in rules (`ask` for
+`exec when tainted-by:web` and `net when tainted-by:mcp`), and
+`"workspace_files": "untrusted"` treats workspace files as untrusted too.
 
 A project may add rules in `.nyq/permissions.json`, but only `ask` and `deny`: an
 `allow` there is ignored, so a repository can't grant itself permissions. A
@@ -873,6 +1011,14 @@ its stderr is shown to you. `matcher` is a tool-name glob (`bash`, `write_*`,
 - `SessionStart` runs at startup, `/new` and `/resume`.
 - `AttentionRequired` runs in the background whenever nyq waits for you (an
   approval or a question), with `kind` (`approval`/`question`) and `message`.
+- `PreStep` runs before each model request in a turn: `{"context":"…"}` is added
+  to the conversation first, `{"decision":"block"}` ends the turn.
+- `PreCompact` runs before a summary: its stdout (or `{"context":"…"}`) is added
+  to the summary's instructions.
+- `TaskValidate` runs when a [typed task](#typed-tasks) submits a result (as
+  `value`), after the built-in checks: exit 0 passes, a non-zero exit or
+  `{"decision":"block","reason":"…"}` rejects it and the reason goes to the model.
+- `SubagentStop` sees each subagent finish (`subagent`, `ok`, its last text).
 
 A hook that fails to start, times out or is interrupted (Ctrl-C) never blocks
 anything and never stops the turn. Hooks run in print mode and over ACP too.
@@ -1074,6 +1220,17 @@ or cut-off response, without adding a new user message. `/reset` clears the
 transcript and stops background processes but keeps this session. `/clear` starts a
 fresh session the way `/new` does; both keep background processes running.
 
+Sessions survive crashes: calls with side effects are journalled before they run,
+and a session reopened after a crash tells the model which calls never started,
+which may have run (check before repeating), and which reads are safe to repeat;
+nyq never re-runs a call by itself. Failed model requests are kept in the session
+for audit but never shown to the model.
+
+`nyq export ID|last [--redact] [--format jsonl|sharegpt] [-o PATH]` writes a
+session (or every session with `--all -o DIR`) for your own use; nothing is
+uploaded. `--redact` scrubs credentials, replaces your home with `~` and the
+workspace with `<ws>`, and drops images.
+
 `nyq session show [last|id]` prints every turn of the transcript with the
 model settings, last update and history length, `nyq session resume
 [last|id]` is the same as `-r`, and `nyq session delete <last|id>` removes the
@@ -1083,11 +1240,17 @@ names them (and sessions over 64 MB) with a recovery hint.
 
 ## Long conversations
 
-When a request uses 80% of the context window (the "Auto-compact at" setting), nyq asks the model to summarize the
-conversation and continues from the summary; `/compact` does it on demand. The
+When a request uses 80% of the context window (the "Auto-compact at" setting), nyq
+compacts, cheapest step first: it prunes old tool output from the request (long
+results, superseded file reads, old errors and images; no model call), and only if
+that isn't enough asks the model to summarize the oldest messages while the newest
+stay verbatim. The summary keeps the intent log, the task's goal and schema, and the
+latest build state. A request the provider rejects as too long compacts and retries
+once, and compaction never switches itself off. `/compact` summarizes on demand. The
 window defaults to 272k tokens for Codex and 128k otherwise; set
 `NYQ_CONTEXT_WINDOW` to match your model (0 disables automatic compaction).
-Resumed sessions start from the latest summary.
+Resumed sessions start from the latest summary, with the working set and intents
+restored.
 
 ## Images
 
@@ -1208,6 +1371,13 @@ and step limit, whether the
 folder is a git repository and whether `gh` is installed (informational).
 `nyq doctor`, `models`, `usage`, `sessions`, `session show`, `session migrate|recover`,
 `workspace`, `upgrade` and `mcp list` accept `--json`. `nyq -v` prints the version.
+
+`nyq bench run DIR [--ablate KEY=VALUE] [-o results.jsonl]` runs every task folder
+under DIR headless (a `task.toml` with `prompt`, an optional `fixture` folder copied
+into a scratch workspace, a `check` script and `timeout_secs`; see
+`bench/examples`), one JSONL result per task; `--profile` and `--ablate` (repeatable)
+change settings for every run, to measure one mechanism. `nyq bench report A B`
+compares two result files.
 
 ### Environment and limits
 

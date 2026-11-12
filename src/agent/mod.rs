@@ -134,9 +134,8 @@ impl Agent {
             }
         }
         for intent in intents {
-            if let Err(e) = s.append_intent(&serde_json::json!({
-                "did": intent.did, "why": intent.why, "next": intent.next,
-            })) {
+            let record = serde_json::to_value(&intent).unwrap_or_default();
+            if let Err(e) = s.append_intent(&record) {
                 crate::ui::error(&format!("could not save an intent: {e:#}"));
             }
         }

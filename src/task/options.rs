@@ -119,9 +119,21 @@ impl Default for TaskOptions {
 }
 
 impl TaskOptions {
-    /// The options in effect.
+    /// The options in effect. `[intents]` is a typed settings table (it
+    /// also holds the note's `show`), so it is read from there; a profile's
+    /// `verify.required` (the `ci` profile) turns verification on.
     pub fn current() -> Self {
-        Self::from_extra(&crate::settings::current().extra)
+        let mut o = Self::from_settings(&crate::settings::current());
+        o.verify_required |= crate::profiles::verify_required();
+        o
+    }
+
+    /// The options a resolved settings tree sets.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        let mut o = Self::from_extra(&settings.extra);
+        o.intents_enabled = settings.intents.enabled.or(o.intents_enabled);
+        o.intents_required |= settings.intents.required;
+        o
     }
 
     pub fn from_extra(extra: &Map<String, Value>) -> Self {
@@ -147,8 +159,6 @@ impl TaskOptions {
                 o.verify_progress_every = n.min(u64::from(u32::MAX)) as u32;
             }
         }
-        // TODO(W12): read the `ci` profile's "verification required" key
-        // once profiles land; until then `verify.required` stands in for it.
         if let Some(i) = table("intents") {
             o.intents_enabled = i.get("enabled").and_then(Value::as_bool);
             o.intents_required = i.get("required").and_then(Value::as_bool).unwrap_or(false);
@@ -181,6 +191,35 @@ mod tests {
         assert_eq!(ModelRef::parse("  "), None);
         assert!(ModelRef::parse("m").unwrap().is("any", "m"));
         assert!(!ModelRef::parse("p/m").unwrap().is("q", "m"));
+    }
+
+    #[test]
+    fn the_ci_profile_requires_verification_and_intents_keys_are_kept() {
+        let ci = crate::profiles::resolve(std::path::Path::new("/nonexistent"), Some("ci"))
+            .unwrap()
+            .unwrap();
+        let settings: crate::settings::Settings =
+            serde_json::from_value(Value::Object(ci.settings)).unwrap();
+        let o = TaskOptions::from_settings(&settings);
+        assert!(o.verify_required, "the ci profile turns the verifier on");
+        // `[intents]` is a typed table: its task-engine keys survive parsing
+        // (and saving) next to the note's `show`.
+        let text = "[intents]\nshow = 3\nenabled = true\nrequired = true\n";
+        let map = crate::settings::file::parse_str(text).unwrap();
+        let settings: crate::settings::Settings =
+            serde_json::from_value(Value::Object(map)).unwrap();
+        assert_eq!(settings.intents.show, 3);
+        let o = TaskOptions::from_settings(&settings);
+        assert_eq!(o.intents_enabled, Some(true));
+        assert!(o.intents_required);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["intents"]["required"], true);
+        let plain = serde_json::to_value(crate::settings::Settings::default()).unwrap();
+        assert_eq!(plain["intents"], json!({"show": 8}));
+        assert_eq!(
+            TaskOptions::from_settings(&crate::settings::Settings::default()),
+            TaskOptions::default()
+        );
     }
 
     #[test]

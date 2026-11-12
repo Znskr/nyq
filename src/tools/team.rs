@@ -252,6 +252,27 @@ impl Tool for Team {
         matches!(self.0, Kind::Wait)
     }
 
+    /// Listing only reads the session's team graph (outside the workspace);
+    /// the other actions change it and keep the conservative default.
+    fn effects(&self, args: &Value) -> crate::tools::Effects {
+        match self.0 {
+            Kind::List => crate::tools::Effects::none(),
+            _ => {
+                let _ = args;
+                crate::tools::Effects::default()
+            }
+        }
+    }
+
+    /// Listing changes nothing; the other actions coordinate children
+    /// (and `wait_agent` waits on them), so they never hold the lease.
+    fn kind(&self) -> crate::tools::ToolKind {
+        match self.0 {
+            Kind::List => crate::tools::ToolKind::Pure,
+            _ => crate::tools::ToolKind::Coordination,
+        }
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let (dir, who) = match caller(ctx) {
             Ok(c) => c,

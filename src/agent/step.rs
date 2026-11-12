@@ -219,7 +219,7 @@ impl Agent {
             let system = self.request_system(continue_note);
             // Older items as pruned by compaction (tier 1), then the note.
             let projected = super::compact::project(&self.items, &self.compaction);
-            let items = with_trailing_note(&projected, &self.task_note(self.session_notes()));
+            let items = with_trailing_note(&projected, &self.trailing_note());
             // To calibrate the token estimate on the reported usage.
             let raw = self.raw_request(&system, &items, &specs);
             crate::trace::log("provider", || {

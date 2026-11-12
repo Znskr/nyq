@@ -116,6 +116,63 @@ impl ValidatorSpec {
     pub fn is_check(&self) -> bool {
         matches!(self, Self::Build | Self::Tests | Self::Lint)
     }
+
+    /// Whether the check runs a command in the workspace (and so should see
+    /// it quiescent: the caller holds the workspace writer while it runs).
+    pub fn executes(&self) -> bool {
+        matches!(self, Self::Build | Self::Tests | Self::Lint | Self::Cmd(_))
+    }
+
+    /// The validator for every spec but the judge, which needs a model
+    /// (the agent builds that one).
+    pub fn validator(&self) -> Option<Box<dyn super::Validator>> {
+        use super::validate::*;
+        Some(match self {
+            Self::AlwaysPass => Box::new(AlwaysPass),
+            Self::Build => Box::new(BuildValidator),
+            Self::Tests => Box::new(TestsValidator::new(super::TestScope::All)),
+            Self::Lint => Box::new(LintValidator),
+            Self::Cmd(c) => Box::new(CustomCommandValidator::new(c.clone())),
+            Self::Exists(p) => Box::new(ExistsValidator::in_value(p.clone())),
+            Self::FilesTouched(p) => Box::new(FilesTouchedValidator::new(p.clone())),
+            Self::Judge(_) => return None,
+        })
+    }
+}
+
+/// How one check judged a submission (`{validator, verdict, feedback?}`),
+/// kept for reports and typed subagent results.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CheckRecord {
+    pub validator: String,
+    /// `pass`, `fail` or `escalate`.
+    pub verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+}
+
+impl CheckRecord {
+    pub fn of(validator: &str, verdict: &super::Verdict) -> Self {
+        use super::Verdict;
+        let (verdict, feedback) = match verdict {
+            Verdict::Pass => ("pass", None),
+            Verdict::Fail { feedback, .. } => ("fail", Some(feedback.clone())),
+            Verdict::Escalate(why) => ("escalate", Some(why.clone())),
+        };
+        Self {
+            validator: validator.into(),
+            verdict,
+            feedback,
+        }
+    }
+
+    pub fn failed(validator: &str, feedback: &str) -> Self {
+        Self {
+            validator: validator.into(),
+            verdict: "fail",
+            feedback: Some(feedback.into()),
+        }
+    }
 }
 
 /// Model tiers (design §10): the classifier, progress check and syntax repair
@@ -221,7 +278,8 @@ impl TaskSpec {
         self.validators.contains(&ValidatorSpec::Tests)
     }
 
-    fn labels(&self) -> Vec<String> {
+    /// The validators as `--validate` names them (the always-pass one left out).
+    pub fn labels(&self) -> Vec<String> {
         self.validators
             .iter()
             .filter(|v| **v != ValidatorSpec::AlwaysPass)
@@ -348,6 +406,15 @@ pub struct TaskState {
     pub was_red: bool,
     /// File contents before this turn first wrote them (for the judge's diff).
     pub originals: HashMap<PathBuf, Option<String>>,
+    /// Intents in the session's store already fed to the cycle detector
+    /// (see `crate::tools::workset::Workset::intents_since`).
+    pub intents_seen: u64,
+    /// Mutating calls made without an intent while intents were offered:
+    /// accepted, but counted (design §4.4).
+    pub intents_missing: u32,
+    /// The latest submission, parsed, and how each check judged it.
+    pub last_submission: Option<Value>,
+    pub checks: Vec<CheckRecord>,
 }
 
 impl TaskState {
@@ -370,6 +437,10 @@ impl TaskState {
             verify_streak_seen: 0,
             was_red: false,
             originals: HashMap::new(),
+            intents_seen: 0,
+            intents_missing: 0,
+            last_submission: None,
+            checks: Vec::new(),
         }
     }
 
@@ -427,6 +498,7 @@ impl TaskState {
                 .iter()
                 .map(|p| crate::tools::slash_path(p))
                 .collect(),
+            intents_missing: self.intents_missing,
         }
     }
 }
@@ -484,6 +556,8 @@ pub struct TaskReport {
     /// The latest failures, newest last; older ones shortened.
     pub errors: Vec<String>,
     pub touched: Vec<String>,
+    /// Mutating calls made without the offered `intent`.
+    pub intents_missing: u32,
 }
 
 impl TaskReport {
@@ -562,13 +636,12 @@ fn budget_line(b: &Budget) -> String {
 }
 
 /// The task section of the trailing note: the task (or the repair framing),
-/// how to finish, the budget, and the latest verify state with older errors
-/// shortened. Empty for a plain chat turn whose build is fine.
-pub fn task_note(
+/// how to finish, and the budget. Empty for a plain chat turn whose build
+/// is fine.
+pub fn task_section(
     spec: Option<&TaskSpec>,
     state: &TaskState,
     verify: Option<&VerifyState>,
-    older_errors: &[String],
 ) -> String {
     let typed = spec.is_some_and(TaskSpec::is_typed);
     let repair =
@@ -594,37 +667,87 @@ pub fn task_note(
         }
         out.push(line);
     }
-    if let Some(v) = verify {
-        let block = v.trailing_note();
-        if !block.is_empty() {
-            let mut block = block.trim_end().to_string();
-            // Only the newest error is in the block itself; earlier distinct
-            // ones are listed cut down (promptyped `shortenOldErrorMessages`).
-            let older: Vec<String> = older_errors
-                .iter()
-                .map(|e| {
-                    let one: String = e.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if one.chars().count() > OLD_ERROR_CHARS {
-                        format!("{}…", one.chars().take(OLD_ERROR_CHARS).collect::<String>())
-                    } else {
-                        one
-                    }
-                })
-                .collect();
-            if !older.is_empty() {
-                block.push_str("\nEarlier failures (shortened, oldest first):");
-                for e in older {
-                    block.push_str("\n- ");
-                    block.push_str(&e);
-                }
-            }
-            out.push(block);
-        }
-    }
     if out.is_empty() {
         return String::new();
     }
     format!("[Task]\n{}", out.join("\n"))
+}
+
+/// The verify section of the trailing note: the latest build and test state
+/// (promptyped's LATEST COMPILE/TEST STATE), with older distinct failures
+/// shortened. Empty until the verifier has a result.
+pub fn verify_section(verify: Option<&VerifyState>, older_errors: &[String]) -> String {
+    let Some(v) = verify else {
+        return String::new();
+    };
+    let block = v.trailing_note();
+    if block.is_empty() {
+        return String::new();
+    }
+    let mut block = block.trim_end().to_string();
+    // Only the newest error is in the block itself; earlier distinct ones
+    // are listed cut down (promptyped `shortenOldErrorMessages`).
+    let older: Vec<String> = older_errors
+        .iter()
+        .map(|e| {
+            let one: String = e.split_whitespace().collect::<Vec<_>>().join(" ");
+            if one.chars().count() > OLD_ERROR_CHARS {
+                format!("{}…", one.chars().take(OLD_ERROR_CHARS).collect::<String>())
+            } else {
+                one
+            }
+        })
+        .collect();
+    if !older.is_empty() {
+        block.push_str("\nEarlier failures (shortened, oldest first):");
+        for e in older {
+            block.push_str("\n- ");
+            block.push_str(&e);
+        }
+    }
+    format!("[Verify]\n{block}")
+}
+
+/// Both task-engine sections of the trailing note, task first.
+pub fn task_note(
+    spec: Option<&TaskSpec>,
+    state: &TaskState,
+    verify: Option<&VerifyState>,
+    older_errors: &[String],
+) -> String {
+    [
+        task_section(spec, state, verify),
+        verify_section(verify, older_errors),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
+/// The task as the compaction summary must keep it: the goal, the result
+/// schema `submit` takes, and the checks. Empty for a plain chat turn.
+pub fn compaction_brief(spec: Option<&TaskSpec>, goal: &str) -> String {
+    let Some(spec) = spec.filter(|s| s.is_typed()) else {
+        return String::new();
+    };
+    let goal = if spec.goal.trim().is_empty() {
+        goal
+    } else {
+        &spec.goal
+    };
+    let mut out = format!("Task goal: {}", goal.trim());
+    if let Some(schema) = &spec.schema {
+        out.push_str(&format!(
+            "\nResult schema (the arguments of `submit`): {}",
+            serde_json::to_string(schema).unwrap_or_default()
+        ));
+    }
+    let checks = spec.labels();
+    if !checks.is_empty() {
+        out.push_str(&format!("\nChecks run on submit: {}", checks.join(", ")));
+    }
+    out
 }
 
 /// The model stopped without `submit` while a schema is active.
@@ -857,6 +980,48 @@ mod tests {
         let chat = task_note(None, &state, Some(&v), &[]);
         assert!(chat.starts_with("[Task]\nFix the build before continuing."));
         assert!(!chat.contains("submit"));
+    }
+
+    #[test]
+    fn task_and_verify_are_separate_sections_in_order() {
+        let spec = TaskSpec::typed("g", json!({"type": "object"}));
+        let state = TaskState::new("g", BudgetLimits::default(), false);
+        let mut v = VerifyState::default();
+        assert_eq!(verify_section(Some(&v), &[]), "", "nothing run yet");
+        v.record_build(&outcome(true, "ok"));
+        let task = task_section(Some(&spec), &state, Some(&v));
+        let verify = verify_section(Some(&v), &[]);
+        assert!(
+            task.starts_with("[Task]\n") && !task.contains("LATEST COMPILE"),
+            "{task}"
+        );
+        assert!(
+            verify.starts_with("[Verify]\nLATEST COMPILE/TEST STATE"),
+            "{verify}"
+        );
+        let both = task_note(Some(&spec), &state, Some(&v), &[]);
+        assert_eq!(both, format!("{task}\n\n{verify}"));
+        assert_eq!(both.matches("[Task]").count(), 1);
+        // A green chat turn has the verify section only.
+        assert_eq!(task_note(None, &state, Some(&v), &[]), verify);
+    }
+
+    #[test]
+    fn the_compaction_brief_keeps_goal_schema_and_checks() {
+        let mut spec = TaskSpec::typed(
+            "list the files",
+            json!({"type": "object", "required": ["files"]}),
+        );
+        spec.validators = vec![ValidatorSpec::Exists("/files".into())];
+        let brief = compaction_brief(Some(&spec), "ignored");
+        assert!(brief.contains("Task goal: list the files"), "{brief}");
+        assert!(brief.contains(r#""required":["files"]"#), "{brief}");
+        assert!(
+            brief.contains("Checks run on submit: exists:/files"),
+            "{brief}"
+        );
+        assert_eq!(compaction_brief(Some(&TaskSpec::chat()), "g"), "");
+        assert_eq!(compaction_brief(None, "g"), "");
     }
 
     #[test]

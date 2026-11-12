@@ -926,10 +926,15 @@ impl Hooks {
         instructions
     }
 
+    /// Whether any TaskValidate hook is configured (and trusted): the task
+    /// engine then runs them as one more check on `submit`.
+    pub fn has_task_validate(&self) -> bool {
+        !self.matching(Event::TaskValidate, None).is_empty()
+    }
+
     /// TaskValidate, with the submitted result as `value` on stdin: `Ok`
     /// passes it; `Err` is the feedback the model sees, from the first
     /// hook's `{"decision":"block","reason":…}` or non-zero exit.
-    #[allow(dead_code)] // Wired to task submission by the task-engine workstream.
     pub async fn task_validate(
         &self,
         value: &Value,
@@ -1113,10 +1118,8 @@ pub async fn pre_step(
 }
 
 /// TaskValidate hooks for a submitted `value`: `Ok` passes it, `Err` is
-/// the feedback to give the model. The task engine calls this when a task
-/// submits its result (`verify.required` sessions may wire it into
-/// `submit`).
-#[allow(dead_code)] // Exposed for the task engine (submit validation).
+/// the feedback to give the model. The task engine runs this on `submit`,
+/// after the built-in validators pass (`crate::agent::task`).
 pub async fn run_task_validate_hooks(
     hooks: &Hooks,
     value: &Value,

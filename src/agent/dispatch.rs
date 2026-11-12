@@ -51,7 +51,16 @@ struct Footprint {
     writes: Vec<PathBuf>,
 }
 
+/// One call of a wave after it ran: its output, the paths it touched (for
+/// nested instructions) and, when it ran, its final footprint.
+type Ran = (ToolOutput, Vec<PathBuf>, Option<Footprint>);
+
 impl Footprint {
+    /// The class and normalized write paths the task engine observes.
+    fn ran(&self) -> (&crate::tools::Concurrency, &[PathBuf]) {
+        (&self.class, &self.writes)
+    }
+
     /// A call that touches nothing: answered without running.
     fn vacant() -> Self {
         Self {
@@ -198,11 +207,10 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
         return ToolOutput::err("Background commands are unavailable during child orchestration: run a bounded foreground command so its writer lease covers its lifetime.");
     }
     let writer = crate::orchestration::writer(&ready.ctx.cwd);
-    let coordination = crate::orchestration::COORDINATION_TOOLS.contains(&ready.name.as_str());
     let _lease = match &ready.footprint.class {
         // W11: coordination tools (subagent, team, scripts) wait on children
         // that need the lease themselves, so they never hold it.
-        _ if coordination => None,
+        _ if tool.kind() == crate::tools::ToolKind::Coordination => None,
         // Reads and pure calls hold no lock. Declared writers share the
         // gate through per-path mutexes; undeclared writers exclude all.
         crate::tools::Concurrency::Pure | crate::tools::Concurrency::ReadFs => None,
@@ -235,6 +243,13 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
     // changed nothing drops all of them (a multi-file patch has several).
     if out.is_error && !out.changed {
         undo = Default::default();
+    }
+    // A kept snapshot means this call wrote its files: say so before the
+    // undo log is handed on (settle takes it), so scripts and the task
+    // engine see the change. A tool's own undo records (a subagent's) are
+    // the tool's to report through `changed`.
+    if !undo.is_empty() {
+        out.changed = true;
     }
     undo.append(std::mem::take(&mut out.undo));
     out.undo = undo;
@@ -342,7 +357,7 @@ impl Agent {
             if crate::scripting::kind_of(&calls[i].1).is_some() {
                 let (id, name, arguments) = &calls[i];
                 let out = self.run_script_call(id, name, arguments, ui, cancel).await;
-                self.task_observe(name, arguments, &out);
+                self.task_observe(name, arguments, &out, None);
                 images.extend(self.record_result(id, name, out));
                 i += 1;
                 continue;
@@ -372,7 +387,7 @@ impl Agent {
             }
             // A hook may have rewritten arguments into another class, so
             // re-partition by each prepared call's final footprint.
-            let mut outs: Vec<(ToolOutput, Vec<PathBuf>)> = Vec::with_capacity(prepared.len());
+            let mut outs: Vec<Ran> = Vec::with_capacity(prepared.len());
             let mut start = 0;
             let mut busy = Busy::default();
             for (j, p) in prepared.iter().enumerate() {
@@ -386,9 +401,16 @@ impl Agent {
             }
             outs.extend(self.exec_wave(&prepared[start..], ui, cancel).await);
 
-            for ((id, name, arguments), (mut out, touched)) in calls[i..end].iter().zip(outs) {
+            for ((id, name, arguments), (mut out, touched, footprint)) in
+                calls[i..end].iter().zip(outs)
+            {
                 // W9: touched files, the background verifier, the cycle detector.
-                self.task_observe(name, arguments, &out);
+                self.task_observe(
+                    name,
+                    arguments,
+                    &out,
+                    footprint.as_ref().map(Footprint::ran),
+                );
                 if out.is_error {
                     let n = failures
                         .entry((name.clone(), arguments.clone()))
@@ -708,7 +730,15 @@ impl Agent {
                 for (id, name, arguments) in &calls[i..end] {
                     prepared.push(self.prepare(id, name, arguments, ui, cancel).await);
                 }
-                for (out, _) in self.exec_wave(&prepared, ui, cancel).await {
+                let ran = self.exec_wave(&prepared, ui, cancel).await;
+                for ((_, name, arguments), (out, _, footprint)) in calls[i..end].iter().zip(ran) {
+                    // W9: a script's writes count like the model's own.
+                    self.task_observe(
+                        name,
+                        arguments,
+                        &out,
+                        footprint.as_ref().map(Footprint::ran),
+                    );
                     outs.push(out);
                 }
                 i = end;
@@ -722,7 +752,7 @@ impl Agent {
         prepared: &[Prepared],
         ui: &mut dyn Ui,
         cancel: &CancellationToken,
-    ) -> Vec<(ToolOutput, Vec<PathBuf>)> {
+    ) -> Vec<Ran> {
         use futures::StreamExt;
         // W5: each call is marked started (transcript synced first) before
         // any of the wave can have side effects.
@@ -743,7 +773,7 @@ impl Agent {
                 .collect();
             for p in prepared {
                 outs.push(match p {
-                    Prepared::Done(out) => (out.clone(), Vec::new()),
+                    Prepared::Done(out) => (out.clone(), Vec::new(), None),
                     Prepared::Run(ready) => {
                         ui.tool_start(&ready.name, &ready.summary);
                         let out = running
@@ -751,12 +781,12 @@ impl Agent {
                             .await
                             .unwrap_or_else(|| ToolOutput::err("The call did not run."));
                         ui.tool_end(&ready.name, &out);
-                        (out, ready.touched())
+                        (out, ready.touched(), Some(ready.footprint.clone()))
                     }
                 });
             }
         }
-        for (p, (out, _)) in prepared.iter().zip(outs.iter_mut()) {
+        for (p, (out, _, _)) in prepared.iter().zip(outs.iter_mut()) {
             if let Prepared::Run(ready) = p {
                 self.settle(ready, out, cancel).await;
             }

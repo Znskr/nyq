@@ -269,36 +269,12 @@ pub(crate) fn builtin_tool(name: &str) -> Option<&'static dyn crate::tools::Tool
     R.get_or_init(crate::tools::Registry::all_builtin).get(name)
 }
 
-/// The raw `path`/`paths` arguments, unresolved.
-fn named_paths(args: &Value) -> Vec<PathBuf> {
-    args.get("path")
-        .and_then(Value::as_str)
-        .into_iter()
-        .chain(
-            args.get("paths")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str),
-        )
-        .map(PathBuf::from)
-        .collect()
-}
-
-/// Whether `tool` writes exactly the files named by its `path`/`paths`
-/// arguments (write_file, edit_file): probed with a placeholder path, so a
-/// missing or empty path still classifies correctly. Grants for such calls
-/// scope to the file's directory.
+/// Whether `tool` writes exactly the files its arguments name (write_file,
+/// edit_file, and apply_patch with the files of its patch), by its static
+/// kind ([`crate::tools::ToolKind::FileWrite`]). Path rules (`edit:…`) and
+/// grants for such calls scope to those files.
 pub(crate) fn is_file_tool(tool: &str) -> bool {
-    let Some(t) = builtin_tool(tool) else {
-        return false;
-    };
-    let args = serde_json::json!({"path": "x", "paths": ["y"]});
-    let crate::tools::Writes::Known(writes) = t.effects(&args).writes else {
-        return false;
-    };
-    let named = named_paths(&args);
-    !writes.is_empty() && writes.iter().all(|w| named.contains(w))
+    builtin_tool(tool).is_some_and(|t| t.kind() == crate::tools::ToolKind::FileWrite)
 }
 
 /// A subagent call's mode: `general` or (by default) `explore`.

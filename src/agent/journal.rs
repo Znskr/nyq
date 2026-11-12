@@ -7,32 +7,19 @@ use super::Agent;
 use crate::session::Session;
 use crate::types::StreamEvent;
 
-/// Tools that only read: a call cut off by a crash is safe to repeat, so they
-/// are not journalled.
-const PURE_READS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "glob",
-    "grep",
-    "view_image",
-    "web_fetch",
-    "web_search",
-    crate::tools::artifacts::TOOL,
-    crate::tools::session_search::TOOL,
-    "skill",
-];
+/// Tools that are not in the static built-in registry but only read. The
+/// `skill` tool is registered per session from the skills found, so its
+/// declared effects (reads only) can't be looked up by name here.
+const SESSION_READS: &[&str] = &["skill"];
 
-/// Whether `name` is a pure read (no side effects; safe to repeat).
+/// Whether `name` is a pure read (no side effects; safe to repeat), by its
+/// static kind ([`crate::tools::ToolKind::is_pure_read`]): a read, a network
+/// read, or session-local state. A call cut off by a crash is then safe to
+/// repeat, so it is not journalled. A tool whose effects depend on its
+/// arguments (`memory`: `list` only reads) counts as side-effecting.
 pub(crate) fn is_pure_read(name: &str) -> bool {
-    PURE_READS.contains(&name)
-        || super::builtin_tool(name).is_some_and(|t| {
-            let none = serde_json::json!({});
-            t.is_read_only(&none)
-                && matches!(
-                    t.concurrency(&none),
-                    crate::tools::Concurrency::Pure | crate::tools::Concurrency::ReadFs
-                )
-        })
+    SESSION_READS.contains(&name)
+        || super::builtin_tool(name).is_some_and(|t| t.kind().is_pure_read())
 }
 
 fn report(what: &str, result: anyhow::Result<()>) {
@@ -280,5 +267,62 @@ mod tests {
                 json!(["compaction_end", "done"])
             ]
         );
+    }
+    /// A patch is journalled before it runs, so recovery never calls a
+    /// half-applied one "safe to repeat"; a read is not.
+    #[test]
+    fn apply_patch_is_journalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = scripted(Vec::new());
+        agent.cwd = dir.path().to_path_buf();
+        agent.session = Some(
+            crate::session::Session::create(&dir.path().join("sessions"), &agent.cwd, "fake")
+                .unwrap(),
+        );
+        let patch = json!({"patch": "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n"});
+        agent.journal_requested(&[
+            ("p1".into(), "apply_patch".into(), patch.to_string()),
+            (
+                "r1".into(),
+                "read_file".into(),
+                json!({"path": "a.txt"}).to_string(),
+            ),
+        ]);
+        let path = agent.session.as_ref().unwrap().path.with_extension("calls");
+        let journal: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(journal["calls"]["p1"]["state"], "pending");
+        assert!(journal["calls"].get("r1").is_none());
+    }
+
+    #[test]
+    fn pure_reads_come_from_declared_effects() {
+        for name in [
+            "read_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "view_image",
+            "web_fetch",
+            "web_search",
+            crate::tools::artifacts::TOOL,
+            crate::tools::session_search::TOOL,
+            "skill",
+            "team_task_list",
+        ] {
+            assert!(is_pure_read(name), "{name}");
+        }
+        for name in [
+            "write_file",
+            "edit_file",
+            "multi_edit",
+            "apply_patch",
+            "bash",
+            "memory",
+            "subagent",
+            "team_task_claim",
+            "mcp__x__y",
+        ] {
+            assert!(!is_pure_read(name), "{name}");
+        }
     }
 }
