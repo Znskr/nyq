@@ -676,7 +676,10 @@ impl Agent {
     /// Hook points for the session's compaction records (see
     /// [`CompactionPhase`]).
     fn compaction_phase(&mut self, phase: CompactionPhase) {
-        // W5: `compaction_start` / `compaction_end` session records go here.
+        match phase {
+            CompactionPhase::Start { .. } => self.compaction_started(),
+            CompactionPhase::End => self.compaction_ended(),
+        }
         crate::trace::log("compaction", || match phase {
             CompactionPhase::Start { summarized, kept } => {
                 format!("start: {summarized} items summarized, {kept} kept")

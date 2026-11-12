@@ -452,6 +452,7 @@ async fn load_session(
     {
         let inner = live.inner.lock().await;
         replay(cx, &live.id, &inner.agent);
+        recovery_notice(cx, &live.id, &inner.agent);
     }
     let (modes, options) = describe(state, &live, cx);
     Ok(acp::LoadSessionResponse::new()
@@ -473,7 +474,11 @@ async fn resume_session(
     let held = lock(&state.sessions).get(&*req.session_id.0).cloned();
     let live = match held {
         Some(live) if live.cwd == req.cwd => live,
-        _ => reopen(state, cx, &req.session_id, req.cwd, &req.mcp_servers).await?,
+        _ => {
+            let live = reopen(state, cx, &req.session_id, req.cwd, &req.mcp_servers).await?;
+            recovery_notice(cx, &live.id, &live.inner.lock().await.agent);
+            live
+        }
     };
     let (modes, options) = describe(state, &live, cx);
     Ok(acp::ResumeSessionResponse::new()
@@ -1164,6 +1169,30 @@ fn file_path(uri: &str, cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Tell the editor what reopening the session had to repair (calls whose
+/// outcome is unknown, skipped lines), as the terminal does.
+fn recovery_notice(cx: &ConnectionTo<Client>, session: &acp::SessionId, agent: &Agent) {
+    let Some(recovery) = agent
+        .session
+        .as_ref()
+        .map(|s| &s.recovery)
+        .filter(|r| !r.is_empty())
+    else {
+        return;
+    };
+    let text = recovery
+        .notes()
+        .iter()
+        .map(|n| format!("- Recovered: {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chunk = acp::ContentChunk::new(format!("[nyq] Recovered this session:\n{text}\n").into());
+    let _ = cx.send_notification(acp::SessionNotification::new(
+        session.clone(),
+        acp::SessionUpdate::AgentMessageChunk(chunk),
+    ));
+}
+
 /// Stream a loaded transcript to the editor (`session/load`).
 fn replay(cx: &ConnectionTo<Client>, session: &acp::SessionId, agent: &Agent) {
     let send = |update| {
@@ -1764,6 +1793,55 @@ mod tests {
             name: "write_file".into(),
             arguments: json!({"path": "out.txt", "content": "done\n"}).to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn loading_a_crashed_session_reports_the_recovery() {
+        let h = harness(Vec::new());
+        let work = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_path_buf();
+        // A session that stopped while `bash` was running.
+        let mut saved =
+            crate::session::Session::create(&h.state.sessions_dir(), &cwd, "fake").unwrap();
+        saved.append(&Item::user("deploy")).unwrap();
+        saved
+            .append(&Item::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "make deploy"}).to_string(),
+            })
+            .unwrap();
+        saved
+            .calls_requested(&[("c1".into(), "bash".into())])
+            .unwrap();
+        saved.call_started("c1", "make deploy").unwrap();
+        let id = acp::SessionId::new(saved.id.clone());
+        drop(saved);
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        as_client(
+            h.client,
+            seen.clone(),
+            async move |cx: ConnectionTo<sdk::Agent>| {
+                cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                cx.send_request(acp::LoadSessionRequest::new(id, cwd))
+                    .block_task()
+                    .await?;
+                Ok(())
+            },
+        )
+        .await;
+        let seen = lock(&seen);
+        let text: String = seen
+            .updates
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .map(|u| u["content"]["text"].as_str().unwrap())
+            .collect();
+        assert!(text.contains("Recovered:"), "{text}");
+        assert!(text.contains("may have run"), "{text}");
+        assert!(text.contains("bash make deploy"), "{text}");
     }
 
     #[tokio::test]

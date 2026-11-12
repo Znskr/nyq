@@ -9,8 +9,21 @@
 //!
 //! Listings read each file once and cache the result in `<id>.summary`,
 //! reused while the transcript's size and modification time are unchanged.
+//!
+//! Two sidecars keep crash-safety records out of the transcript, so older
+//! nyq versions (which treat unknown lines as corruption) can still open it:
+//!
+//! - `<id>.calls`, the call journal: side-effecting tool calls that were
+//!   requested but have no saved result yet, `pending` (not handed to the
+//!   tool) or `started` (its side effects may have happened). Loading after a
+//!   crash uses it to tell a call that never ran from one whose outcome is
+//!   unknown (see [`repairs_with`]). Replaced atomically on every change.
+//! - `<id>.meta`, an append-only JSON-lines log that is never shown to the
+//!   model: `attempt` records for failed or retried model requests, and
+//!   `compaction_start`/`compaction_end` markers. A start without an end on
+//!   load means nyq stopped mid-compaction; it is reported and ignored.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +34,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Item;
 
-const INTERRUPTED: &str = "Interrupted before this tool ran.";
+/// Result for a journalled call that was still `pending`: it never ran.
+pub(crate) const NOT_STARTED: &str = "[nyq] This call did not run: nyq stopped while it was waiting to start \
+(for example at an approval prompt). Nothing was executed; make the call again if it is still needed.";
+/// Result for a journalled call that had `started`.
+pub(crate) const OUTCOME_UNKNOWN: &str = "[nyq] OUTCOME UNKNOWN: nyq stopped while this call was running, before \
+its result was saved. It may have completed, partly completed or failed. Do not repeat it blindly: check the \
+current state first (files, git status, running processes) and run it again only if it is still needed and \
+safe to repeat.";
+/// Result for a side-effecting call the journal has no record of (an older
+/// session, or a subagent, which has no journal).
+pub(crate) const UNRECORDED: &str = "[nyq] OUTCOME UNKNOWN: nyq stopped before this call's result was saved, \
+and there is no record of whether it started. Assume it may have run: check the current state before \
+repeating it.";
+/// Result for a pure read that did not finish.
+pub(crate) const READ_INTERRUPTED: &str =
+    "[nyq] This read-only call did not finish before nyq stopped. It has \
+no side effects, so it is safe to repeat if you still need the result.";
+/// Longest error text kept in an `attempt` record.
+const ATTEMPT_ERROR_MAX: usize = 500;
 const TITLE_MAX: usize = 60;
 const PREVIEW_MAX: usize = 240;
 /// Longest `/rename` title, in bytes. Listings may still shorten it.
@@ -168,6 +199,10 @@ pub fn recover(dir: &Path, which: &str, cwd: &Path) -> Result<(String, usize, us
         bail!("No readable items found; source unchanged");
     }
     write_private(&recovered.path, payload.as_bytes())?;
+    // The copy keeps what the journal knows about unanswered calls.
+    if let Ok(journal) = fs::read(calls_path(&path)) {
+        let _ = write_private(&calls_path(&recovered.path), &journal);
+    }
     Ok((recovered.id.clone(), kept, skipped))
 }
 
@@ -252,6 +287,207 @@ pub struct Session {
     workset: Option<serde_json::Value>,
     /// Every `intent` metadata record in the file, oldest first.
     intents: Vec<serde_json::Value>,
+    /// Side-effecting calls without a saved result (mirrors `<id>.calls`).
+    calls: BTreeMap<String, CallEntry>,
+    /// A `compaction_start` marker was written and not closed yet.
+    compacting: bool,
+    /// What loading had to repair; empty for a new or clean session.
+    pub recovery: Recovery,
+}
+
+/// Where a requested tool call stands before its result is saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallState {
+    /// The model asked for it; it has not been handed to the tool yet
+    /// (still being approved, or queued behind another call).
+    Pending,
+    /// Handed to the tool: its side effects may have happened.
+    Started,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CallEntry {
+    pub name: String,
+    pub state: CallState,
+    /// One line naming what the call does (redacted), for the recovery notice.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<DateTime<Utc>>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Journal {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    calls: BTreeMap<String, CallEntry>,
+}
+
+/// `<id>.jsonl` → `<id>.calls`.
+fn calls_path(path: &Path) -> PathBuf {
+    path.with_extension("calls")
+}
+
+/// `<id>.jsonl` → `<id>.meta`. Not `<id>.meta.jsonl`: listings (in this and
+/// older versions) take every `*.jsonl` file for a transcript.
+fn meta_path(path: &Path) -> PathBuf {
+    path.with_extension("meta")
+}
+
+/// The call journal of a transcript; empty when missing or unreadable.
+fn read_journal(path: &Path) -> BTreeMap<String, CallEntry> {
+    fs::read(calls_path(path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Journal>(&b).ok())
+        .map(|j| j.calls)
+        .unwrap_or_default()
+}
+
+/// Every readable record of a transcript's `<id>.meta` log, oldest first.
+/// Damaged lines are skipped: the log is for audit only.
+pub(crate) fn meta_records(path: &Path) -> Vec<serde_json::Value> {
+    let Ok(data) = fs::read(meta_path(path)) else {
+        return Vec::new();
+    };
+    data.split(|b| *b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter(|v| v.get("type").is_some_and(serde_json::Value::is_string))
+        .collect()
+}
+
+/// Append one record to `<id>.meta` (created 0600).
+fn append_meta(path: &Path, record: &serde_json::Value) -> Result<()> {
+    let path = meta_path(path);
+    let mut opts = OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut line = serde_json::to_string(record)?;
+    line.push('\n');
+    opts.open(&path)
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .with_context(|| format!("saving {}", path.display()))
+}
+
+/// The start time of a compaction that began and never ended, if the last
+/// `compaction_start` in the log has no `compaction_end` after it.
+fn open_compaction(records: &[serde_json::Value]) -> Option<String> {
+    let last = records.iter().rposition(|r| {
+        matches!(
+            r["type"].as_str(),
+            Some("compaction_start" | "compaction_end")
+        )
+    })?;
+    (records[last]["type"] == "compaction_start")
+        .then(|| records[last]["ts"].as_str().unwrap_or("").to_string())
+}
+
+/// What loading a session repaired, reported to the user by every frontend.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Recovery {
+    /// A half-written final line was cut off.
+    pub torn_tail: bool,
+    /// 1-based line numbers that could not be read and were skipped (the
+    /// file keeps them; `nyq session recover` makes a clean copy).
+    pub skipped_lines: Vec<usize>,
+    /// Calls that may have run before nyq stopped: `name summary`.
+    pub unknown: Vec<String>,
+    /// Calls that were requested but never started.
+    pub not_started: usize,
+    /// Read-only calls that did not finish.
+    pub reads: usize,
+    /// Results without a matching call, or repeated results, left out.
+    pub dropped_results: usize,
+    /// A compaction that started and never finished: when it started.
+    pub interrupted_compaction: Option<String>,
+}
+
+impl Recovery {
+    pub fn is_empty(&self) -> bool {
+        *self == Recovery::default()
+    }
+
+    /// One line per finding, for the `Recovered: …` notices.
+    pub fn notes(&self) -> Vec<String> {
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let mut out = Vec::new();
+        if !self.unknown.is_empty() {
+            out.push(format!(
+                "{} call{} may have run before nyq stopped (outcome unknown; the model was told to check before repeating): {}",
+                self.unknown.len(),
+                plural(self.unknown.len()),
+                self.unknown.join("; ")
+            ));
+        }
+        if self.not_started > 0 {
+            out.push(format!(
+                "{} requested call{} never started and did not run.",
+                self.not_started,
+                plural(self.not_started)
+            ));
+        }
+        if self.reads > 0 {
+            out.push(format!(
+                "{} read-only call{} did not finish (no side effects).",
+                self.reads,
+                plural(self.reads)
+            ));
+        }
+        if self.torn_tail {
+            out.push("Cut off a half-written last line of the session file.".into());
+        }
+        if !self.skipped_lines.is_empty() {
+            let lines: Vec<String> = self
+                .skipped_lines
+                .iter()
+                .take(5)
+                .map(usize::to_string)
+                .collect();
+            out.push(format!(
+                "Skipped {} unreadable line{} in the session file (line {}{}); the file keeps them, and `nyq session recover ID` makes a clean copy.",
+                self.skipped_lines.len(),
+                plural(self.skipped_lines.len()),
+                lines.join(", "),
+                if self.skipped_lines.len() > 5 { ", …" } else { "" }
+            ));
+        }
+        if self.dropped_results > 0 {
+            out.push(format!(
+                "Left out {} tool result{} without a matching call.",
+                self.dropped_results,
+                plural(self.dropped_results)
+            ));
+        }
+        if let Some(ts) = &self.interrupted_compaction {
+            let when = if ts.is_empty() {
+                String::new()
+            } else {
+                format!(" (started {ts})")
+            };
+            out.push(format!(
+                "A compaction was interrupted{when} and was ignored; the conversation is unchanged."
+            ));
+        }
+        out
+    }
+
+    fn merge(&mut self, other: Recovery) {
+        self.torn_tail |= other.torn_tail;
+        self.skipped_lines.extend(other.skipped_lines);
+        self.unknown.extend(other.unknown);
+        self.not_started += other.not_started;
+        self.reads += other.reads;
+        self.dropped_results += other.dropped_results;
+        self.interrupted_compaction = self
+            .interrupted_compaction
+            .take()
+            .or(other.interrupted_compaction);
+    }
 }
 
 impl Session {
@@ -278,6 +514,9 @@ impl Session {
             permissions: None,
             workset: None,
             intents: Vec::new(),
+            calls: BTreeMap::new(),
+            compacting: false,
+            recovery: Recovery::default(),
         })
     }
 
@@ -298,7 +537,148 @@ impl Session {
         let line = serde_json::to_string(item)
             .with_context(|| format!("encoding a session item for {}", self.id))?;
         self.queued.push(line);
-        self.flush_queue()
+        self.flush_queue()?;
+        // A saved summary finishes an open compaction; any other item means it
+        // ended without one (cancelled or failed).
+        if self.compacting {
+            let done = matches!(item, Item::Compaction { .. });
+            self.close_compaction(if done { "done" } else { "abandoned" });
+        }
+        // The result is saved: the call is settled.
+        if let Item::ToolResult { id, .. } = item {
+            if self.calls.remove(id).is_some() {
+                self.write_journal()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Journal side-effecting calls the model just requested, as `(id, name)`,
+    /// before any of them is approved or run. Their `ToolCall` items must be
+    /// saved already.
+    pub fn calls_requested(&mut self, calls: &[(String, String)]) -> Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        for (id, name) in calls {
+            self.calls.insert(
+                id.clone(),
+                CallEntry {
+                    name: name.clone(),
+                    state: CallState::Pending,
+                    summary: String::new(),
+                    started: None,
+                },
+            );
+        }
+        self.write_journal()
+    }
+
+    /// Mark a journalled call as handed to its tool. The transcript is synced
+    /// first, so the call itself is on disk before any side effect, then the
+    /// journal is replaced atomically. Calls that were never journalled (pure
+    /// reads) are ignored.
+    pub fn call_started(&mut self, id: &str, summary: &str) -> Result<()> {
+        let Some(entry) = self.calls.get_mut(id) else {
+            return Ok(());
+        };
+        entry.state = CallState::Started;
+        entry.summary = crate::ui::one_line(&crate::tools::redact::scrub(summary), 120);
+        entry.started = Some(Utc::now());
+        self.flush_queue()?;
+        if let Some(file) = &self.file {
+            file.sync_data()
+                .with_context(|| format!("syncing session {}", self.id))?;
+        }
+        self.write_journal()
+    }
+
+    /// Replace `<id>.calls` with the open calls (temp file, fsync, rename),
+    /// or remove it when every call is settled.
+    fn write_journal(&mut self) -> Result<()> {
+        let path = calls_path(&self.path);
+        if self.calls.is_empty() {
+            return match fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(e).with_context(|| format!("clearing {}", path.display()))
+                }
+                _ => Ok(()),
+            };
+        }
+        let journal = Journal {
+            version: 1,
+            calls: self.calls.clone(),
+        };
+        let bytes = serde_json::to_vec(&journal)?;
+        write_private(&path, &bytes).with_context(|| format!("saving {}", path.display()))
+    }
+
+    /// The calls journalled and not yet settled, by id.
+    #[cfg(test)]
+    pub fn open_calls(&self) -> &BTreeMap<String, CallEntry> {
+        &self.calls
+    }
+
+    /// Record a failed or retried model request in `<id>.meta`, for audit.
+    /// Never shown to the model. Skipped while the session is not saved.
+    pub fn record_attempt(&mut self, error: &str, partial_text_len: usize) -> Result<()> {
+        let error = crate::tools::redact::scrub(error);
+        let error: String = error.chars().take(ATTEMPT_ERROR_MAX).collect();
+        self.write_meta(serde_json::json!({
+            "type": "attempt",
+            "error": error,
+            "partial_text_len": partial_text_len,
+            "ts": Utc::now().to_rfc3339(),
+        }))
+    }
+
+    /// Mark the start of a compaction in `<id>.meta`. If nyq stops before
+    /// [`Session::compaction_end`], the next load reports it and ignores it.
+    pub fn compaction_start(&mut self) -> Result<()> {
+        let len = self
+            .file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len());
+        self.write_meta(serde_json::json!({
+            "type": "compaction_start",
+            "ts": Utc::now().to_rfc3339(),
+            "transcript_len": len,
+        }))?;
+        self.compacting = self.pending_header.is_none();
+        Ok(())
+    }
+
+    /// Mark a compaction as finished. Saving its `Compaction` item already
+    /// does this; the call covers compactions that save no summary item.
+    pub fn compaction_end(&mut self) -> Result<()> {
+        if !self.compacting {
+            return Ok(());
+        }
+        self.compacting = false;
+        self.write_meta(serde_json::json!({
+            "type": "compaction_end",
+            "ts": Utc::now().to_rfc3339(),
+            "outcome": "done",
+        }))
+    }
+
+    /// Close an open compaction that ended without a summary. Best effort:
+    /// at worst the next load reports it as interrupted.
+    fn close_compaction(&mut self, outcome: &str) {
+        self.compacting = false;
+        let _ = self.write_meta(serde_json::json!({
+            "type": "compaction_end",
+            "ts": Utc::now().to_rfc3339(),
+            "outcome": outcome,
+        }));
+    }
+
+    fn write_meta(&mut self, record: serde_json::Value) -> Result<()> {
+        if self.pending_header.is_some() {
+            return Ok(());
+        }
+        append_meta(&self.path, &record)
     }
 
     /// Write anything still queued from an earlier failed append.
@@ -454,6 +834,8 @@ impl Session {
         self.permissions = None;
         self.workset = None;
         self.intents.clear();
+        self.calls.clear();
+        self.write_journal()?;
         let header = self.header_line()?;
         if self.file.is_none() && !self.path.exists() {
             self.pending_header = Some(header);
@@ -553,6 +935,9 @@ fn lock_path(path: &Path) -> PathBuf {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.compacting {
+            self.close_compaction("abandoned");
+        }
         if let Some(lock) = self.lock.as_ref() {
             let _ = lock.unlock();
         }
@@ -930,6 +1315,8 @@ pub fn delete(dir: &Path, which: &str, cwd: &Path) -> Result<Meta> {
     let meta = find(dir, which, cwd)?;
     fs::remove_file(&meta.path).with_context(|| format!("deleting {}", meta.path.display()))?;
     let _ = fs::remove_file(lock_path(&meta.path));
+    let _ = fs::remove_file(calls_path(&meta.path));
+    let _ = fs::remove_file(meta_path(&meta.path));
     let _ = fs::remove_file(summary_path(&meta.path));
     // Its named subagents go with it.
     let _ = fs::remove_dir_all(crate::subagents::store_dir(&meta.path));
@@ -1035,6 +1422,13 @@ fn preview_line(text: &str) -> String {
     first_line(text, 120)
 }
 
+/// Every readable item of a transcript, before and after compactions, read
+/// leniently (damaged lines skipped). For `session_search`.
+pub(crate) fn transcript_items(path: &Path) -> Result<Vec<Item>> {
+    let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(parse_items(&data).items)
+}
+
 fn read_stored_items(path: &Path) -> Result<Vec<Item>> {
     let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(read_items(&data, path)?.0)
@@ -1042,6 +1436,12 @@ fn read_stored_items(path: &Path) -> Result<Vec<Item>> {
 
 /// Load a session by id, unique id prefix, or `last` (newest in the
 /// given cwd). Returns the session reopened for appending plus its items.
+///
+/// Loading is forgiving: a torn final record is cut off, an unreadable line
+/// elsewhere is skipped (and left in the file), results without a call are
+/// left out, and every call without a result gets one that says whether it
+/// never ran, may have run, or is safe to repeat (see [`repairs_with`]).
+/// `Session::recovery` lists what was repaired.
 pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<Item>)> {
     let meta = find(dir, which, cwd)?;
 
@@ -1054,7 +1454,15 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
     let mut data = Vec::new();
     file.read_to_end(&mut data)
         .with_context(|| format!("reading {}", meta.path.display()))?;
-    let (mut items, good) = read_items(&data, &meta.path)?;
+    let parsed = parse_items(&data);
+    let good = parsed.good;
+    let mut recovery = Recovery {
+        torn_tail: !data[good..]
+            .iter()
+            .all(|b| b.is_ascii_whitespace() || *b == 0),
+        skipped_lines: parsed.skipped,
+        ..Recovery::default()
+    };
     let permissions = latest_permissions(&data[..good]);
     let workset = latest_workset(&data[..good]);
     let intents = intent_records(&data[..good]);
@@ -1069,6 +1477,7 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
             file.flush()?;
         }
     }
+    let journal = read_journal(&meta.path);
     let mut session = Session {
         id: meta.id.clone(),
         path: meta.path.clone(),
@@ -1081,11 +1490,11 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         permissions,
         workset,
         intents,
+        calls: BTreeMap::new(),
+        compacting: false,
+        recovery: Recovery::default(),
     };
-    for item in repairs(&items) {
-        session.append(&item)?;
-        items.push(item);
-    }
+    let mut items = parsed.items;
     // Everything before the latest compaction is summarized by it.
     if let Some(i) = items
         .iter()
@@ -1093,14 +1502,64 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
     {
         items.drain(..i);
     }
+    let (mut items, report) = normalize(items, &journal);
+    recovery.merge(report);
+    // Calls at the end of the transcript get their results appended, so the
+    // file reads the same way next time and new items follow them.
+    let (tail, report) = repairs_with(&items, &journal);
+    recovery.merge(report);
+    for item in tail {
+        session.append(&item)?;
+        items.push(item);
+    }
+    // Every call is settled now; anything left in the journal is stale.
+    if !journal.is_empty() {
+        session.write_journal()?;
+    }
+    // A compaction writes its summary only when it is done, so one that never
+    // ended changed nothing. Close it so it is reported once.
+    if let Some(ts) = open_compaction(&meta_records(&meta.path)) {
+        recovery.interrupted_compaction = Some(ts);
+        session.close_compaction("interrupted");
+    }
+    session.recovery = recovery;
     Ok((session, meta, items))
+}
+
+/// The items of a session file, read leniently.
+struct Parsed {
+    items: Vec<Item>,
+    /// Byte length of the prefix that ends with the last readable record.
+    good: usize,
+    /// 1-based numbers of unreadable lines that were skipped.
+    skipped: Vec<usize>,
 }
 
 /// Items after the header plus the byte length of the well-formed prefix.
 /// An unparsable final record (crash mid-write, including torn UTF-8) is
-/// ignored; an unparsable record elsewhere is an error.
+/// ignored; an unparsable record elsewhere is an error. `nyq doctor` and
+/// `nyq session show` use this strict reader; [`load`] uses [`parse_items`].
 fn read_items(data: &[u8], path: &Path) -> Result<(Vec<Item>, usize)> {
+    let parsed = parse_items(data);
+    if let Some(&line) = parsed.skipped.first() {
+        let raw = data
+            .split(|b| *b == b'\n')
+            .nth(line - 1)
+            .unwrap_or_default();
+        let e = serde_json::from_slice::<Item>(raw)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        bail!("{}: line {line} is corrupt: {e}", path.display());
+    }
+    Ok((parsed.items, parsed.good))
+}
+
+/// Like [`read_items`], but an unreadable record that is not the last one is
+/// skipped and reported instead of failing the whole file.
+fn parse_items(data: &[u8]) -> Parsed {
     let mut items = Vec::new();
+    let mut skipped = Vec::new();
     let mut good = 0;
     let mut offset = 0;
     let mut n = 0usize;
@@ -1113,19 +1572,117 @@ fn read_items(data: &[u8], path: &Path) -> Result<(Vec<Item>, usize)> {
         let raw = &data[offset..end];
         let mut line = raw.strip_suffix(b"\n").unwrap_or(raw);
         line = line.strip_suffix(b"\r").unwrap_or(line);
-        let blank = line.iter().all(u8::is_ascii_whitespace);
+        let blank = line.iter().all(|b| b.is_ascii_whitespace() || *b == 0);
         if n > 0 && !blank && !is_meta_line(line) {
             match serde_json::from_slice::<Item>(line) {
                 Ok(item) => items.push(item),
                 Err(_) if end == data.len() => break,
-                Err(e) => bail!("{}: line {} is corrupt: {e}", path.display(), n + 1),
+                Err(_) => skipped.push(n + 1),
             }
         }
         good = end;
         offset = end;
         n += 1;
     }
-    Ok((items, good))
+    Parsed {
+        items,
+        good,
+        skipped,
+    }
+}
+
+/// The synthetic result for a call that has no saved result, by what the
+/// journal knows about it.
+fn unanswered(name: &str, entry: Option<&CallEntry>, recovery: &mut Recovery) -> &'static str {
+    match entry.map(|e| e.state) {
+        Some(CallState::Started) => {
+            let summary = entry.map(|e| e.summary.as_str()).unwrap_or("");
+            let label = if summary.is_empty() || summary.starts_with(name) {
+                summary.to_string()
+            } else {
+                format!("{name} {summary}")
+            };
+            recovery.unknown.push(if label.trim().is_empty() {
+                name.to_string()
+            } else {
+                label.trim().to_string()
+            });
+            OUTCOME_UNKNOWN
+        }
+        Some(CallState::Pending) => {
+            recovery.not_started += 1;
+            NOT_STARTED
+        }
+        None if crate::agent::is_pure_read(name) => {
+            recovery.reads += 1;
+            READ_INTERRUPTED
+        }
+        None => {
+            recovery.unknown.push(name.to_string());
+            UNRECORDED
+        }
+    }
+}
+
+/// Make a transcript well-formed in memory: drop results with no earlier
+/// call and repeated results, and answer calls that are followed by other
+/// conversation but never got a result (possible after a skipped line), with
+/// a result placed right after their run of calls. Calls at the very end are
+/// left to [`repairs_with`]. The file is not changed.
+fn normalize(items: Vec<Item>, journal: &BTreeMap<String, CallEntry>) -> (Vec<Item>, Recovery) {
+    let mut recovery = Recovery::default();
+    let tail_start = tail_start(&items);
+    let answered: HashSet<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut called: HashSet<String> = HashSet::new();
+    let mut seen_results: HashSet<String> = HashSet::new();
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    // Calls of the current call/result run still waiting for a result.
+    let mut open: Vec<(String, String)> = Vec::new();
+    let close = |open: &mut Vec<(String, String)>, out: &mut Vec<Item>, recovery: &mut Recovery| {
+        for (id, name) in open.drain(..) {
+            let text = unanswered(&name, journal.get(&id), recovery);
+            out.push(Item::ToolResult {
+                id,
+                output: text.into(),
+                is_error: true,
+                labels: Vec::new(),
+            });
+        }
+    };
+    for (i, item) in items.into_iter().enumerate() {
+        match &item {
+            Item::ToolCall { id, name, .. } => {
+                called.insert(id.clone());
+                if !answered.contains(id) && i < tail_start {
+                    open.push((id.clone(), name.clone()));
+                }
+            }
+            Item::ToolResult { id, .. } => {
+                if !called.contains(id) || !seen_results.insert(id.clone()) {
+                    recovery.dropped_results += 1;
+                    continue;
+                }
+            }
+            _ => close(&mut open, &mut out, &mut recovery),
+        }
+        out.push(item);
+    }
+    close(&mut open, &mut out, &mut recovery);
+    (out, recovery)
+}
+
+/// Where the trailing run of tool calls and results starts.
+fn tail_start(items: &[Item]) -> usize {
+    items
+        .iter()
+        .rposition(|i| !matches!(i, Item::ToolCall { .. } | Item::ToolResult { .. }))
+        .map_or(0, |p| p + 1)
 }
 
 /// `nyq doctor`: how many sessions are saved, and each one that can't be
@@ -1176,13 +1733,20 @@ pub fn health(dir: &Path) -> (usize, Vec<String>) {
 }
 
 /// Synthetic results for trailing tool calls that never got one, so the next
-/// request to the model is well-formed.
+/// request to the model is well-formed. Without a journal (a subagent, or an
+/// older session) a call that is not a pure read may have run.
 pub(crate) fn repairs(items: &[Item]) -> Vec<Item> {
-    let tail_start = items
-        .iter()
-        .rposition(|i| !matches!(i, Item::ToolCall { .. } | Item::ToolResult { .. }))
-        .map_or(0, |p| p + 1);
-    let tail = &items[tail_start..];
+    repairs_with(items, &BTreeMap::new()).0
+}
+
+/// [`repairs`], using what the call journal knows: a call still `pending`
+/// never ran, a `started` one has an unknown outcome, and a pure read with
+/// no entry is safe to repeat.
+pub(crate) fn repairs_with(
+    items: &[Item],
+    journal: &BTreeMap<String, CallEntry>,
+) -> (Vec<Item>, Recovery) {
+    let tail = &items[tail_start(items)..];
     let answered: HashSet<&str> = tail
         .iter()
         .filter_map(|i| match i {
@@ -1190,19 +1754,22 @@ pub(crate) fn repairs(items: &[Item]) -> Vec<Item> {
             _ => None,
         })
         .collect();
-    tail.iter()
+    let mut recovery = Recovery::default();
+    let repairs = tail
+        .iter()
         .filter_map(|i| match i {
-            Item::ToolCall { id, .. } if !answered.contains(id.as_str()) => {
+            Item::ToolCall { id, name, .. } if !answered.contains(id.as_str()) => {
                 Some(Item::ToolResult {
                     id: id.clone(),
-                    output: INTERRUPTED.into(),
+                    output: unanswered(name, journal.get(id), &mut recovery).into(),
                     is_error: true,
                     labels: Vec::new(),
                 })
             }
             _ => None,
         })
-        .collect()
+        .collect();
+    (repairs, recovery)
 }
 
 #[cfg(test)]
@@ -1333,7 +1900,8 @@ mod tests {
             items[4],
             Item::ToolResult {
                 id: "c2".into(),
-                output: INTERRUPTED.into(),
+                // No journal says whether `bash` started: it may have run.
+                output: UNRECORDED.into(),
                 is_error: true,
                 labels: Vec::new(),
             }
@@ -1349,6 +1917,463 @@ mod tests {
         assert_eq!(again.len(), 6);
         assert_eq!(again[4], items[4]);
         assert!(repairs(&again).is_empty());
+    }
+
+    fn named_call(id: &str, name: &str) -> Item {
+        Item::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    fn result(id: &str) -> Item {
+        Item::ToolResult {
+            id: id.into(),
+            output: "ok".into(),
+            is_error: false,
+            labels: Vec::new(),
+        }
+    }
+
+    /// The result each call got, in transcript order.
+    fn outputs(items: &[Item]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolResult { id, output, .. } => Some((id.clone(), output.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn header_line(id: &str) -> String {
+        format!(
+            r#"{{"type":"session","version":1,"id":"{id}","created":"2026-01-01T00:00:00Z","cwd":"/w","model":"m"}}"#
+        )
+    }
+
+    fn line(item: &Item) -> String {
+        serde_json::to_string(item).unwrap()
+    }
+
+    /// What an older nyq requires of a transcript: every line after the
+    /// header is an item or a title/prefs/permissions line, and listing the
+    /// directory finds no unreadable session files.
+    fn old_reader_accepts(dir: &Path, path: &Path) {
+        let data = fs::read(path).unwrap();
+        for (i, raw) in data.split(|b| *b == b'\n').enumerate().skip(1) {
+            if raw.is_empty() {
+                continue;
+            }
+            assert!(
+                serde_json::from_slice::<Item>(raw).is_ok() || is_meta_line(raw),
+                "line {} is not readable by older versions: {}",
+                i + 1,
+                String::from_utf8_lossy(raw)
+            );
+        }
+        read_items(&data, path).unwrap();
+        let (_, unreadable) = list_report(dir).unwrap();
+        assert!(unreadable.is_empty(), "{unreadable:?}");
+    }
+
+    #[test]
+    fn crash_with_pending_and_started_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("ship it")).unwrap();
+        for item in [
+            named_call("c1", "bash"),
+            named_call("c2", "edit_file"),
+            named_call("c3", "read_file"),
+        ] {
+            s.append(&item).unwrap();
+        }
+        // The loop journals the side-effecting calls only.
+        s.calls_requested(&[
+            ("c1".into(), "bash".into()),
+            ("c2".into(), "edit_file".into()),
+        ])
+        .unwrap();
+        s.call_started(
+            "c1",
+            "make deploy TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        )
+        .unwrap();
+        let journal = calls_path(&s.path);
+        let saved: Journal = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        assert_eq!(saved.calls["c1"].state, CallState::Started);
+        assert!(saved.calls["c1"].started.is_some());
+        assert!(
+            !saved.calls["c1"].summary.contains("ghp_abc"),
+            "summary is redacted"
+        );
+        assert_eq!(saved.calls["c2"].state, CallState::Pending);
+        assert!(!saved.calls.contains_key("c3"));
+        let id = s.id.clone();
+        // Crash: no results are saved.
+        drop(s);
+
+        let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert_eq!(
+            outputs(&items),
+            vec![
+                ("c1".to_string(), OUTCOME_UNKNOWN.to_string()),
+                ("c2".to_string(), NOT_STARTED.to_string()),
+                ("c3".to_string(), READ_INTERRUPTED.to_string()),
+            ]
+        );
+        assert_eq!(s.recovery.unknown.len(), 1);
+        assert!(s.recovery.unknown[0].starts_with("bash make deploy"));
+        assert_eq!(s.recovery.not_started, 1);
+        assert_eq!(s.recovery.reads, 1);
+        let notes = s.recovery.notes();
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(notes[0].contains("may have run"));
+        assert!(notes[1].contains("never started"));
+        assert!(notes[2].contains("read-only"));
+        // The repairs are saved and the journal is cleared.
+        assert!(!journal.exists());
+        assert!(s.open_calls().is_empty());
+        old_reader_accepts(dir, &s.path);
+        drop(s);
+        let (s, _, again) = load(dir, &id, Path::new("/w")).unwrap();
+        assert_eq!(again, items);
+        assert!(s.recovery.is_empty(), "{:?}", s.recovery);
+    }
+
+    #[test]
+    fn a_saved_result_settles_the_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("go")).unwrap();
+        s.append(&call("c1")).unwrap();
+        s.append(&call("c2")).unwrap();
+        s.calls_requested(&[("c1".into(), "bash".into()), ("c2".into(), "bash".into())])
+            .unwrap();
+        s.call_started("c1", "ls").unwrap();
+        // A call that was never journalled (a pure read) is ignored.
+        s.call_started("nope", "x").unwrap();
+        assert_eq!(s.open_calls().len(), 2);
+        s.append(&result("c1")).unwrap();
+        let journal = calls_path(&s.path);
+        let saved: Journal = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        assert_eq!(saved.calls.keys().collect::<Vec<_>>(), ["c2"]);
+        s.append(&result("c2")).unwrap();
+        assert!(!journal.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            s.calls_requested(&[("c3".into(), "bash".into())]).unwrap();
+            let mode = fs::metadata(&journal).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        s.record_attempt("boom", 0).unwrap();
+        let id = s.id.clone();
+        drop(s);
+        assert!(meta_path(&dir.join(format!("{id}.jsonl"))).exists());
+        delete(dir, &id, Path::new("/w")).unwrap();
+        assert!(!journal.exists());
+        assert!(!meta_path(&dir.join(format!("{id}.jsonl"))).exists());
+    }
+
+    #[test]
+    fn crash_mid_write_cuts_the_torn_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("go")).unwrap();
+        s.append(&call("c1")).unwrap();
+        s.calls_requested(&[("c1".into(), "bash".into())]).unwrap();
+        s.call_started("c1", "cargo test").unwrap();
+        let path = s.path.clone();
+        drop(s);
+        // nyq died while writing the result.
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(br#"{"type":"tool_result","id":"c1","out"#)
+            .unwrap();
+        drop(f);
+
+        let (s, _, items) = load(dir, "last", Path::new("/w")).unwrap();
+        assert!(s.recovery.torn_tail);
+        assert!(s.recovery.skipped_lines.is_empty());
+        assert_eq!(
+            outputs(&items),
+            vec![("c1".to_string(), OUTCOME_UNKNOWN.to_string())]
+        );
+        assert!(s
+            .recovery
+            .notes()
+            .iter()
+            .any(|n| n.contains("half-written")));
+        old_reader_accepts(dir, &path);
+        drop(s);
+        let (s, _, again) = load(dir, "last", Path::new("/w")).unwrap();
+        assert_eq!(again, items);
+        assert!(s.recovery.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_middle_line_is_skipped_and_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let path = dir.join("abc.jsonl");
+        let lines = [
+            header_line("abc"),
+            line(&user("first")),
+            line(&call("c1")),
+            "{\"type\":\"tool_result\",\"id\":\"c1\",\"output\":\"o\u{fffd}".into(),
+            line(&Item::Assistant {
+                text: "next".into(),
+            }),
+            line(&result("ghost")),
+            line(&user("second")),
+            line(&named_call("c2", "grep")),
+            line(&result("c2")),
+            line(&result("c2")),
+            line(&Item::Assistant {
+                text: "done".into(),
+            }),
+        ];
+        let bytes = format!("{}\n", lines.join("\n"));
+        fs::write(&path, &bytes).unwrap();
+
+        let (s, _, items) = load(dir, "abc", Path::new("/w")).unwrap();
+        assert_eq!(s.recovery.skipped_lines, vec![4]);
+        assert_eq!(s.recovery.dropped_results, 2);
+        assert_eq!(s.recovery.unknown, vec!["bash".to_string()]);
+        assert_eq!(
+            items,
+            vec![
+                user("first"),
+                call("c1"),
+                Item::ToolResult {
+                    id: "c1".into(),
+                    output: UNRECORDED.into(),
+                    is_error: true,
+                    labels: Vec::new(),
+                },
+                Item::Assistant {
+                    text: "next".into()
+                },
+                user("second"),
+                named_call("c2", "grep"),
+                result("c2"),
+                Item::Assistant {
+                    text: "done".into()
+                },
+            ]
+        );
+        let notes = s.recovery.notes();
+        assert!(notes.iter().any(|n| n.contains("line 4")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("2 tool results")),
+            "{notes:?}"
+        );
+        drop(s);
+        // The file is not rewritten, so `recover` still has every byte, and
+        // the strict reader (`nyq doctor`) still names the damage.
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        assert!(read_items(bytes.as_bytes(), &path).is_err());
+        let (_, problems) = health(dir);
+        assert!(
+            problems.iter().any(|p| p.contains("corrupt lines")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_compaction_is_reported_once_and_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("long work")).unwrap();
+        s.append(&Item::Assistant { text: "ok".into() }).unwrap();
+        s.compaction_start().unwrap();
+        // Crash: the summary and the end marker never land (and no clean
+        // shutdown closes the marker).
+        s.compacting = false;
+        let id = s.id.clone();
+        drop(s);
+
+        let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert!(s.recovery.interrupted_compaction.is_some());
+        assert!(s
+            .recovery
+            .notes()
+            .iter()
+            .any(|n| n.contains("compaction was interrupted")));
+        assert_eq!(
+            items,
+            vec![user("long work"), Item::Assistant { text: "ok".into() }]
+        );
+        let records = meta_records(&s.path);
+        assert_eq!(records.last().unwrap()["outcome"], "interrupted");
+        old_reader_accepts(dir, &s.path);
+        drop(s);
+        let (s, _, _) = load(dir, &id, Path::new("/w")).unwrap();
+        assert!(s.recovery.is_empty(), "{:?}", s.recovery);
+    }
+
+    #[test]
+    fn compaction_markers_close_on_success_cancel_and_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        // Nothing is written for a session that is not saved yet.
+        s.compaction_start().unwrap();
+        s.compaction_end().unwrap();
+        s.append(&user("a")).unwrap();
+        assert!(meta_records(&s.path).is_empty());
+        // Done: the summary is saved, then the end marker.
+        s.compaction_start().unwrap();
+        s.append(&Item::Compaction {
+            summary: "sum".into(),
+        })
+        .unwrap();
+        s.compaction_end().unwrap();
+        // Cancelled: the next item closes it.
+        s.compaction_start().unwrap();
+        s.append(&user("b")).unwrap();
+        // Failed, then the session closed.
+        s.compaction_start().unwrap();
+        let id = s.id.clone();
+        drop(s);
+        let records = meta_records(&dir.join(format!("{id}.jsonl")));
+        let kinds: Vec<String> = records
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    r["type"].as_str().unwrap(),
+                    r["outcome"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "compaction_start ",
+                "compaction_end done",
+                "compaction_start ",
+                "compaction_end abandoned",
+                "compaction_start ",
+                "compaction_end abandoned"
+            ]
+        );
+        assert!(records[0]["transcript_len"].as_u64().unwrap() > 0);
+        let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert!(s.recovery.is_empty(), "{:?}", s.recovery);
+        assert_eq!(
+            items[0],
+            Item::Compaction {
+                summary: "sum".into()
+            }
+        );
+    }
+
+    #[test]
+    fn attempts_are_kept_out_of_the_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("hi")).unwrap();
+        s.record_attempt(
+            &format!(
+                "HTTP 500 (key sk-ant-abcdefghijklmnopqrstuvwxyz) {}",
+                "x".repeat(900)
+            ),
+            42,
+        )
+        .unwrap();
+        s.append(&Item::Assistant {
+            text: "hello".into(),
+        })
+        .unwrap();
+        let records = meta_records(&s.path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["type"], "attempt");
+        assert_eq!(records[0]["partial_text_len"], 42);
+        assert!(records[0]["ts"].is_string());
+        let error = records[0]["error"].as_str().unwrap();
+        assert!(error.starts_with("HTTP 500"));
+        assert!(!error.contains("abcdefghijklmnop"), "{error}");
+        assert!(error.chars().count() <= ATTEMPT_ERROR_MAX);
+        old_reader_accepts(dir, &s.path);
+        let id = s.id.clone();
+        drop(s);
+        let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                user("hi"),
+                Item::Assistant {
+                    text: "hello".into()
+                }
+            ]
+        );
+        assert!(s.recovery.is_empty());
+    }
+
+    #[test]
+    fn older_sessions_without_a_journal_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // As written by an older nyq: no version, no sidecars, a crash after
+        // two calls.
+        let path = dir.join("old.jsonl");
+        let lines = [
+            r#"{"type":"session","id":"old","created":"2026-01-01T00:00:00Z","cwd":"/w","model":"m"}"#
+                .to_string(),
+            r#"{"type":"title","title":"Old one"}"#.into(),
+            line(&user("go")),
+            line(&named_call("c1", "bash")),
+            line(&named_call("c2", "glob")),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let (s, meta, items) = load(dir, "old", Path::new("/w")).unwrap();
+        assert_eq!(meta.title, "Old one");
+        assert_eq!(
+            outputs(&items),
+            vec![
+                ("c1".to_string(), UNRECORDED.to_string()),
+                ("c2".to_string(), READ_INTERRUPTED.to_string()),
+            ]
+        );
+        assert_eq!(s.recovery.unknown, vec!["bash".to_string()]);
+        assert_eq!(s.recovery.reads, 1);
+        assert!(!calls_path(&path).exists());
+        old_reader_accepts(dir, &path);
+        // A stray or damaged journal is harmless.
+        drop(s);
+        fs::write(calls_path(&path), b"{not json").unwrap();
+        let (s, _, again) = load(dir, "old", Path::new("/w")).unwrap();
+        assert_eq!(again, items);
+        assert!(s.recovery.is_empty());
+    }
+
+    #[test]
+    fn recover_copies_the_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("go")).unwrap();
+        s.append(&call("c1")).unwrap();
+        s.calls_requested(&[("c1".into(), "bash".into())]).unwrap();
+        s.call_started("c1", "rm -rf build").unwrap();
+        let id = s.id.clone();
+        drop(s);
+        let (copy, kept, _) = recover(dir, &id, Path::new("/w")).unwrap();
+        assert_eq!(kept, 2);
+        let (s, _, items) = load(dir, &copy, Path::new("/w")).unwrap();
+        assert_eq!(
+            outputs(&items),
+            vec![("c1".to_string(), OUTCOME_UNKNOWN.to_string())]
+        );
+        assert!(s.recovery.unknown[0].contains("rm -rf build"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub(crate) mod patch;
 pub(crate) mod redact;
 pub(crate) mod safeio;
 mod search;
+pub(crate) mod session_search;
 pub mod subagent;
 pub mod web;
 pub(crate) mod workset;
@@ -632,6 +633,7 @@ impl Registry {
         background::register(&mut r);
         memory::register(&mut r);
         artifacts::register(&mut r);
+        session_search::register(&mut r);
         image::register(&mut r);
         web::register(&mut r);
         subagent::register(&mut r);

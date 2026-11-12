@@ -626,6 +626,13 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Vec<(ToolOutput, Vec<PathBuf>)> {
         use futures::StreamExt;
+        // W5: each call is marked started (transcript synced first) before
+        // any of the wave can have side effects.
+        for p in prepared {
+            if let Prepared::Run(ready) = p {
+                self.journal_started(&ready.id, &ready.summary);
+            }
+        }
         let mut outs = Vec::new();
         {
             let tools = &self.tools;

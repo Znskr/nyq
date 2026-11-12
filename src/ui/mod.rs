@@ -341,6 +341,13 @@ pub fn info(msg: &str) {
     }
 }
 
+/// What resuming had to repair (see `session::Recovery`), one notice per finding.
+pub fn recovery(recovery: &crate::session::Recovery) {
+    for note in recovery.notes() {
+        info(&format!("Recovered: {note}"));
+    }
+}
+
 pub fn error(msg: &str) {
     let msg = sanitize_text(msg);
     let style = theme::fg(theme::RED);
