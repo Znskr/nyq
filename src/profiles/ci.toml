@@ -1,0 +1,7 @@
+# Headless CI runs: no approvals, confined sandbox, verification required.
+headless = true
+permission_mode = "yolo"
+sandbox = "workspace-write"
+
+[verify]
+required = true

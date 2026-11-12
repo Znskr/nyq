@@ -396,6 +396,9 @@ impl Extensions {
     }
 
     fn rediscover(&self) -> Vec<String> {
+        if !crate::profiles::feature("extensions") {
+            return Vec::new();
+        }
         let (found, warnings) = discover(&self.0.home, &self.0.cwd);
         *lock(&self.0.exts) = found
             .into_iter()

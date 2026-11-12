@@ -92,6 +92,7 @@ impl Tool for Bash {
         let timeout = Duration::from_secs(
             args.get("timeout_secs")
                 .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+                .or_else(crate::profiles::command_timeout)
                 .unwrap_or(DEFAULT_TIMEOUT)
                 .clamp(1, MAX_TIMEOUT),
         );

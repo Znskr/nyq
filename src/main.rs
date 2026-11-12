@@ -2,6 +2,7 @@ mod account;
 mod acp;
 mod agent;
 mod auto_upgrade;
+mod bench;
 mod catalog;
 mod classifier;
 mod cli;
@@ -10,6 +11,7 @@ mod commands;
 mod config;
 mod diagnostics;
 mod doctor;
+mod export;
 mod extensions;
 mod github;
 mod grants;
@@ -29,6 +31,7 @@ mod notify;
 mod orchestration;
 mod permissions;
 mod pricing;
+mod profiles;
 mod prompt;
 mod provider;
 mod record_tape;
@@ -195,6 +198,24 @@ fn ask_json(
     steps: u64,
     error: Option<String>,
 ) -> serde_json::Value {
+    ask_json_usage(
+        record, exit_code, model, session_id, steps, None, None, error,
+    )
+}
+
+/// `ask_json` plus the run's token usage and cost (the bench runner reads
+/// these; absent for early failures).
+#[allow(clippy::too_many_arguments)]
+fn ask_json_usage(
+    record: Option<&ui::RunRecord>,
+    exit_code: i32,
+    model: Option<&str>,
+    session_id: Option<&str>,
+    steps: u64,
+    usage: Option<Usage>,
+    cost_usd: Option<f64>,
+    error: Option<String>,
+) -> serde_json::Value {
     let mut v = serde_json::json!({
         "output": record.map_or("", |r| r.output.as_str()),
         "final_output": record.map_or("", |r| r.final_output.trim()),
@@ -204,6 +225,13 @@ fn ask_json(
         "steps": steps,
         "tool_calls": record.map_or(&[][..], |r| r.tool_calls.as_slice()),
         "notices": record.map_or(&[][..], |r| r.notices.as_slice()),
+        "usage": usage.map(|u| serde_json::json!({
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "cached_tokens": u.cached_tokens,
+            "reasoning_tokens": u.reasoning_tokens,
+        })),
+        "cost_usd": cost_usd,
     });
     if let Some(e) = error {
         v["error"] = e.into();
@@ -233,11 +261,19 @@ async fn run() -> Result<()> {
     let home = config::home();
     let sessions_dir = home.join("sessions");
     let cwd = std::env::current_dir().context("reading current directory")?;
-    let (user_settings, settings_warnings) = settings::load_layered(&home, &cwd);
+    let profile = profiles::resolve(&home, cli.profile.as_deref())?;
+    let (mut user_settings, settings_warnings) =
+        settings::load_layered_with(&home, &cwd, profile.as_ref());
+    let set_applied = settings::apply_set(&mut user_settings, &cli.set)?;
+    settings::note_cli_overrides(set_applied);
     let color_warnings = ui::theme::set_colors(&user_settings.theme_colors);
     settings::install(user_settings);
     for w in settings_warnings.into_iter().chain(color_warnings) {
         ui::error(&w);
+    }
+    if cli.dump_config {
+        println!("{}", serde_json::to_string_pretty(&settings::dump_config())?);
+        return Ok(());
     }
     limits::configure(&settings::current(), &cli.context_limit)?;
     let env_mode = env_permission_mode();
@@ -252,8 +288,19 @@ async fn run() -> Result<()> {
         ui::error(w);
     }
 
-    let explicit_mode = cli.permission_mode.is_some() || cli.yolo || env_mode.is_some();
-    let print = cli.print || matches!(cli.command, Some(Command::Ask { .. })) || ask.print_only();
+    // A profile's permission_mode counts as requested for this run (like an
+    // env override): it is not the "saved" mode noninteractive mode ignores.
+    let explicit_mode = cli.permission_mode.is_some()
+        || cli.yolo
+        || env_mode.is_some()
+        || matches!(
+            settings::source(settings::Id::Permission),
+            Some(settings::Layer::Profile)
+        );
+    let print = cli.print
+        || matches!(cli.command, Some(Command::Ask { .. }))
+        || ask.print_only()
+        || profiles::headless();
     let prompt = match &cli.command {
         Some(Command::Ask { prompt, .. }) => prompt.clone(),
         _ => cli.prompt.clone(),
@@ -358,9 +405,15 @@ async fn run() -> Result<()> {
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());
-    let mut skills = skills::discover(&home, &cwd);
+    let mut skills = if profiles::feature("skills") {
+        skills::discover(&home, &cwd)
+    } else {
+        Vec::new()
+    };
     commands::sync_prompt(&mut agent, &skills);
-    skills::register(&mut agent.tools, skills.clone(), &home, &cwd);
+    if profiles::feature("skills") {
+        skills::register(&mut agent.tools, skills.clone(), &home, &cwd);
+    }
 
     // `-r` without an id opens the session picker once the TUI is up.
     let pick = resume.as_deref() == Some("");
@@ -375,7 +428,11 @@ async fn run() -> Result<()> {
     }
 
     let mut mcp = McpManager::new(home.clone());
-    let (mut servers, warnings) = mcp::load_configs(&home, &cwd);
+    let (mut servers, warnings) = if profiles::feature("mcp") {
+        mcp::load_configs(&home, &cwd)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     for w in &warnings {
         ui::error(w);
     }
@@ -506,7 +563,9 @@ async fn run() -> Result<()> {
         s.footer.extensions = watched.statuses();
         s.redraw();
     });
-    ext.start();
+    if profiles::feature("extensions") {
+        ext.start();
+    }
     if let Err(e) = mcp_slash::connect_profile_servers(&mut mcp, &mut agent, &servers, false).await
     {
         drop(tui);
@@ -1126,7 +1185,9 @@ async fn print_mode(
             ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
             ui::set_session_title(&meta.title);
         }
-        ext.start();
+        if profiles::feature("extensions") {
+            ext.start();
+        }
         mcp_slash::connect_profile_servers(mcp, agent, servers, true).await?;
         mcp_features::sync(agent, mcp);
         // A single answer: wait for the extensions' tools and handlers first.
@@ -1175,12 +1236,19 @@ async fn print_mode(
         let _ = s.flush();
     }
     if ask.json {
-        let value = ask_json(
+        let price = pricing::lookup(
+            &crate::config::home(),
+            agent.provider.name(),
+            agent.provider.model(),
+        );
+        let value = ask_json_usage(
             plain.record.as_ref(),
             code,
             Some(agent.provider.model()),
             agent.session.as_ref().map(|s| s.id.as_str()),
             agent.stats.requests - requests_before,
+            Some(agent.usage),
+            price.map(|p| p.cost(agent.usage)),
             result.as_ref().err().map(|e| format!("{e:#}")),
         );
         println!("{value}");

@@ -104,6 +104,16 @@ impl Agent {
                 ));
             }
         }
+        let session = self.session.as_ref().map(|s| s.id.clone());
+        for extra in self
+            .hooks
+            .pre_compact(&self.cwd, session.as_deref(), cancel)
+            .await
+        {
+            prompt.push_str(&format!(
+                "\n\nAdditional instructions for this summary:\n{extra}"
+            ));
+        }
         items.push(Item::user(prompt));
         let req = Request {
             system: &self.system,

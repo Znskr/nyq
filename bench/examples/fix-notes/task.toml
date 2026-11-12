@@ -1,0 +1,4 @@
+prompt = "In notes.md, replace the line containing TODO with a line that says exactly DONE"
+setup = "setup.sh"
+check = "check.sh"
+timeout_secs = 300

@@ -28,6 +28,16 @@
 //!   session.
 //! - `AttentionRequired` (when nyq waits for an approval or an answer) runs
 //!   in the background, e.g. to send a notification.
+//! - `PreStep` (before each model request in a turn): like
+//!   `UserPromptSubmit`, `{"decision":"block"}` ends the turn and
+//!   `{"context":"…"}` is added to the conversation first.
+//! - `PreCompact` (before a compaction summarizes the conversation):
+//!   `{"context":"…"}` (or plain stdout) is appended to the summarizer's
+//!   instructions.
+//! - `TaskValidate` (when a task submits a result for validation): exit 0
+//!   passes; a non-zero exit or `{"decision":"block","reason":…}` fails it
+//!   and the reason goes back to the model.
+//! - `SubagentStop` (when a subagent finishes) observes its outcome.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -60,6 +70,10 @@ pub enum Event {
     Stop,
     SessionStart,
     AttentionRequired,
+    PreStep,
+    PreCompact,
+    TaskValidate,
+    SubagentStop,
 }
 
 impl Event {
@@ -71,6 +85,10 @@ impl Event {
             "Stop" => Event::Stop,
             "SessionStart" => Event::SessionStart,
             "AttentionRequired" => Event::AttentionRequired,
+            "PreStep" => Event::PreStep,
+            "PreCompact" => Event::PreCompact,
+            "TaskValidate" => Event::TaskValidate,
+            "SubagentStop" => Event::SubagentStop,
             _ => return None,
         })
     }
@@ -83,6 +101,10 @@ impl Event {
             Event::Stop => "Stop",
             Event::SessionStart => "SessionStart",
             Event::AttentionRequired => "AttentionRequired",
+            Event::PreStep => "PreStep",
+            Event::PreCompact => "PreCompact",
+            Event::TaskValidate => "TaskValidate",
+            Event::SubagentStop => "SubagentStop",
         }
     }
 
@@ -842,6 +864,133 @@ impl Hooks {
         .await;
     }
 
+    /// PreStep, before each model request in a turn: a hook may end the
+    /// turn (`{"decision":"block"}`) or add context that is placed in the
+    /// conversation before the request. `step` counts the requests made.
+    pub async fn pre_step(
+        &self,
+        step: usize,
+        cwd: &Path,
+        session_id: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> PromptOutcome {
+        let payload = json!({
+            "event": Event::PreStep.as_str(),
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+            "step": step,
+        });
+        let mut context = Vec::new();
+        let mut blocked = None;
+        self.dispatch(Event::PreStep, None, &payload, cwd, cancel, |label, r| {
+            match prompt_decision(r) {
+                PromptDecision::Block(reason) => {
+                    blocked = Some(format!("turn ended by hook {label}: {reason}"))
+                }
+                PromptDecision::Context(text) => {
+                    context.push(format!("[hook {label} added this context]\n{text}"))
+                }
+                PromptDecision::None => {}
+            }
+            blocked.is_some()
+        })
+        .await;
+        match blocked {
+            Some(msg) => PromptOutcome::Blocked(msg),
+            None => PromptOutcome::Run(context),
+        }
+    }
+
+    /// PreCompact, before a compaction summarizes the conversation: each
+    /// hook's `{"context":"…"}` (or plain stdout) is an extra instruction
+    /// for the summarizer, in hook order.
+    pub async fn pre_compact(
+        &self,
+        cwd: &Path,
+        session_id: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Vec<String> {
+        let payload = json!({
+            "event": Event::PreCompact.as_str(),
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+        });
+        let mut instructions = Vec::new();
+        self.dispatch(Event::PreCompact, None, &payload, cwd, cancel, |_, r| {
+            if let PromptDecision::Context(text) = prompt_decision(r) {
+                instructions.push(text);
+            }
+            false
+        })
+        .await;
+        instructions
+    }
+
+    /// TaskValidate, with the submitted result as `value` on stdin: `Ok`
+    /// passes it; `Err` is the feedback the model sees, from the first
+    /// hook's `{"decision":"block","reason":…}` or non-zero exit.
+    #[allow(dead_code)] // Wired to task submission by the task-engine workstream.
+    pub async fn task_validate(
+        &self,
+        value: &Value,
+        cwd: &Path,
+        session_id: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        let payload = json!({
+            "event": Event::TaskValidate.as_str(),
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+            "value": value,
+        });
+        let mut failed = None;
+        self.dispatch(
+            Event::TaskValidate,
+            None,
+            &payload,
+            cwd,
+            cancel,
+            |label, r| {
+                failed = block_reason(r).map(|why| format!("validation failed (hook {label}): {why}"));
+                failed.is_some()
+            },
+        )
+        .await;
+        match failed {
+            Some(msg) => Err(msg),
+            None => Ok(()),
+        }
+    }
+
+    /// SubagentStop, when a subagent finishes: `name` is the task it ran,
+    /// `ok` whether its turn completed normally. Observe only.
+    pub async fn subagent_stop(
+        &self,
+        name: &str,
+        ok: bool,
+        last_text: &str,
+        cwd: &Path,
+        session_id: Option<&str>,
+    ) {
+        let payload = json!({
+            "event": Event::SubagentStop.as_str(),
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+            "subagent": cap(name, 200),
+            "ok": ok,
+            "last_assistant_text": cap(last_text, MAX_TEXT),
+        });
+        self.dispatch(
+            Event::SubagentStop,
+            None,
+            &payload,
+            cwd,
+            &CancellationToken::new(),
+            |_, _| false,
+        )
+        .await;
+    }
+
     /// Rows for `/hooks`.
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!(
@@ -934,6 +1083,47 @@ pub async fn prompt_submit(
             None
         }
     }
+}
+
+/// PreStep hooks for an agent's next request; any context they add is
+/// placed in the conversation first. Returns the block message when the
+/// turn must end (`ui` gets the notice at the call site).
+pub async fn pre_step(
+    agent: &mut crate::agent::Agent,
+    step: usize,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    let hooks = agent.hooks.clone();
+    let session = agent.session.as_ref().map(|s| s.id.clone());
+    match hooks
+        .pre_step(step, &agent.cwd, session.as_deref(), cancel)
+        .await
+    {
+        PromptOutcome::Blocked(msg) => Some(msg),
+        PromptOutcome::Run(_) if cancel.is_cancelled() => Some("cancelled".into()),
+        PromptOutcome::Run(items) => {
+            for text in items {
+                crate::ui::info(text.lines().next().unwrap_or(""));
+                agent.push_counted(crate::types::Item::user(text));
+            }
+            None
+        }
+    }
+}
+
+/// TaskValidate hooks for a submitted `value`: `Ok` passes it, `Err` is
+/// the feedback to give the model. The task engine calls this when a task
+/// submits its result (`verify.required` sessions may wire it into
+/// `submit`).
+#[allow(dead_code)] // Exposed for the task engine (submit validation).
+pub async fn run_task_validate_hooks(
+    hooks: &Hooks,
+    value: &Value,
+    cwd: &Path,
+    session_id: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    hooks.task_validate(value, cwd, session_id, cancel).await
 }
 
 /// `/hooks` re-reads the hook files and lists them with their trust
@@ -1250,11 +1440,31 @@ mod tests {
             ("Stop", Event::Stop),
             ("SessionStart", Event::SessionStart),
             ("AttentionRequired", Event::AttentionRequired),
+            ("PreStep", Event::PreStep),
+            ("PreCompact", Event::PreCompact),
+            ("TaskValidate", Event::TaskValidate),
+            ("SubagentStop", Event::SubagentStop),
         ] {
             assert_eq!(Event::parse(name), Some(event));
             assert_eq!(event.as_str(), name);
         }
         assert_eq!(Event::parse("pretooluse"), None);
+        // Turn-level events stay the parent's; only tool events and
+        // AttentionRequired follow a subagent.
+        let h = hooks_with(
+            vec![
+                hook(Event::PreStep, None, "a.sh"),
+                hook(Event::PreCompact, None, "b.sh"),
+                hook(Event::TaskValidate, None, "c.sh"),
+                hook(Event::SubagentStop, None, "d.sh"),
+                hook(Event::PreToolUse, None, "e.sh"),
+            ],
+            Vec::new(),
+            false,
+        );
+        let sub = h.for_subagent();
+        assert_eq!(sub.user.len(), 1);
+        assert_eq!(sub.user[0].event, Event::PreToolUse);
     }
 
     fn outcome(exit: Option<i32>, stdout: &str, stderr: &str) -> RunOutcome {
@@ -1922,5 +2132,136 @@ mod tests {
         assert_eq!(line["tool"], "bash");
         assert_eq!(line["is_error"], true);
         assert_eq!(line["output"], "boom");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_step_pre_compact_task_validate_and_subagent_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+
+        // PreStep: context is collected, a block ends the turn.
+        let h = hooks_with(
+            vec![
+                hook(Event::PreStep, None, r#"echo '{"context":"watch out"}'"#),
+                hook(Event::PreStep, None, "echo plain-context"),
+            ],
+            Vec::new(),
+            false,
+        );
+        match h.pre_step(3, &cwd, Some("s1"), &live()).await {
+            PromptOutcome::Run(items) => {
+                assert_eq!(items.len(), 2, "{items:?}");
+                assert!(items[0].contains("watch out") && items[1].contains("plain-context"));
+            }
+            PromptOutcome::Blocked(m) => panic!("unexpected block: {m}"),
+        }
+        let h = hooks_with(
+            vec![hook(
+                Event::PreStep,
+                None,
+                r#"echo '{"decision":"block","reason":"budget spent"}'"#,
+            )],
+            Vec::new(),
+            false,
+        );
+        match h.pre_step(3, &cwd, None, &live()).await {
+            PromptOutcome::Blocked(m) => assert!(m.contains("budget spent"), "{m}"),
+            PromptOutcome::Run(_) => panic!("expected a block"),
+        }
+        // The step number reaches the hook payload.
+        let dumped = dir.path().join("prestep.json");
+        let h = hooks_with(
+            vec![hook(Event::PreStep, None, &format!("cat > {}", dumped.display()))],
+            Vec::new(),
+            false,
+        );
+        h.pre_step(7, &cwd, None, &live()).await;
+        let line: Value = serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
+        assert_eq!(line["event"], "PreStep");
+        assert_eq!(line["step"], 7);
+
+        // PreCompact: context/plain stdout are extra summarizer instructions.
+        let h = hooks_with(
+            vec![
+                hook(Event::PreCompact, None, r#"echo '{"context":"note the failures"}'"#),
+                hook(Event::PreCompact, None, "echo also plain"),
+                hook(Event::PreCompact, None, "exit 1"),
+            ],
+            Vec::new(),
+            false,
+        );
+        let got = h.pre_compact(&cwd, Some("s1"), &live()).await;
+        assert_eq!(got, ["note the failures", "also plain"]);
+
+        // TaskValidate: exit 0 passes; a block decision or a non-zero exit
+        // fails with feedback for the model.
+        let h = hooks_with(
+            vec![hook(Event::TaskValidate, None, "cat > /dev/null; exit 0")],
+            Vec::new(),
+            false,
+        );
+        assert!(h.task_validate(&json!({"a": 1}), &cwd, None, &live()).await.is_ok());
+        let h = hooks_with(
+            vec![hook(
+                Event::TaskValidate,
+                None,
+                r#"echo '{"decision":"block","reason":"missing tests"}'"#,
+            )],
+            Vec::new(),
+            false,
+        );
+        let msg = h
+            .task_validate(&json!({"a": 1}), &cwd, None, &live())
+            .await
+            .unwrap_err();
+        assert!(msg.contains("missing tests"), "{msg}");
+        let h = hooks_with(
+            vec![hook(Event::TaskValidate, None, "echo schema mismatch >&2; exit 2")],
+            Vec::new(),
+            false,
+        );
+        let msg = h
+            .task_validate(&json!({"a": 1}), &cwd, None, &live())
+            .await
+            .unwrap_err();
+        assert!(msg.contains("schema mismatch"), "{msg}");
+
+        // The submitted JSON reaches the hook on stdin.
+        let dumped = dir.path().join("validate.json");
+        let h = hooks_with(
+            vec![hook(
+                Event::TaskValidate,
+                None,
+                &format!("cat > {}", dumped.display()),
+            )],
+            Vec::new(),
+            false,
+        );
+        run_task_validate_hooks(&h, &json!({"answer": 42}), &cwd, Some("s9"), &live())
+            .await
+            .unwrap();
+        let line: Value = serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
+        assert_eq!(line["event"], "TaskValidate");
+        assert_eq!(line["value"]["answer"], 42);
+        assert_eq!(line["session_id"], "s9");
+
+        // SubagentStop observes the outcome.
+        let dumped = dir.path().join("subagent.json");
+        let h = hooks_with(
+            vec![hook(
+                Event::SubagentStop,
+                None,
+                &format!("cat > {}", dumped.display()),
+            )],
+            Vec::new(),
+            false,
+        );
+        h.subagent_stop("explorer", true, "done here", &cwd, Some("s1")).await;
+        let line: Value = serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
+        assert_eq!(line["event"], "SubagentStop");
+        assert_eq!(line["subagent"], "explorer");
+        assert_eq!(line["ok"], true);
+        assert_eq!(line["last_assistant_text"], "done here");
     }
 }

@@ -352,6 +352,21 @@ async fn drive_child(
             .await
         }
     };
+    if !ctx.cancel.is_cancelled() {
+        let last = agent.items.iter().rev().find_map(|i| match i {
+            Item::Assistant { text } => Some(text.as_str()),
+            _ => None,
+        });
+        ctx.hooks
+            .subagent_stop(
+                &ui.origin,
+                matches!(result, Ok(TurnEnd::Done)),
+                last.unwrap_or(""),
+                &ctx.cwd,
+                ctx.session_id.as_deref(),
+            )
+            .await;
+    }
     ctx.granted
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -593,13 +593,17 @@ async fn open(
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());
-    let skills = skills::discover(&state.home, &cwd);
+    let skills = if crate::profiles::feature("skills") {
+        skills::discover(&state.home, &cwd)
+    } else {
+        Vec::new()
+    };
     if !skills.is_empty() {
         agent
             .system
             .push_str(&format!("\n\n{}", skills::prompt_section(&skills)));
+        skills::register(&mut agent.tools, skills, &state.home, &cwd);
     }
-    skills::register(&mut agent.tools, skills, &state.home, &cwd);
     if !items.is_empty() {
         agent.items = items;
         agent.adopt_transcript();
@@ -627,7 +631,11 @@ async fn open(
             caps,
         }));
     }
-    let (servers, warnings) = mcp::load_configs(&state.home, &cwd);
+    let (servers, warnings) = if crate::profiles::feature("mcp") {
+        mcp::load_configs(&state.home, &cwd)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     for w in warnings {
         warn(w);
     }
@@ -635,14 +643,16 @@ async fn open(
         .into_iter()
         .filter(|s| s.scope == Scope::Profile && s.options.enabled)
         .collect();
-    for server in client_servers {
-        match server_config(server, &cwd) {
-            Ok(cfg) => {
-                // The editor's server replaces a profile server of the same name.
-                wanted.retain(|s| s.name != cfg.name);
-                wanted.push(cfg);
+    if crate::profiles::feature("mcp") {
+        for server in client_servers {
+            match server_config(server, &cwd) {
+                Ok(cfg) => {
+                    // The editor's server replaces a profile server of the same name.
+                    wanted.retain(|s| s.name != cfg.name);
+                    wanted.push(cfg);
+                }
+                Err(e) => warn(e.to_string()),
             }
-            Err(e) => warn(e.to_string()),
         }
     }
     // All at once; the session starts with every server that came up.

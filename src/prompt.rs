@@ -150,8 +150,10 @@ Relative paths still resolve from the working directory. Project instructions co
         "project_instructions_total_bytes",
         &project,
     ));
-    let facts = crate::tools::memory::load(&crate::config::home()).unwrap_or_default();
-    s.push_str(&crate::tools::memory::prompt_section(&facts));
+    if crate::profiles::feature("memory") {
+        let facts = crate::tools::memory::load(&crate::config::home()).unwrap_or_default();
+        s.push_str(&crate::tools::memory::prompt_section(&facts));
+    }
     s
 }
 

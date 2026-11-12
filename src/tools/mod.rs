@@ -377,6 +377,9 @@ pub struct Registry {
     /// Names from the `disabled_tools` setting: never listed or callable,
     /// including tools (MCP, extensions) added later.
     disabled: HashSet<String>,
+    /// The `enabled_tools` allow-list: when non-empty, names outside it are
+    /// hidden the same way (profiles use it; empty means everything goes).
+    enabled: HashSet<String>,
     /// Installed skills, which `mcp_search_tools` also finds.
     skills: Vec<crate::skills::Skill>,
 }
@@ -390,6 +393,8 @@ const OTHER_TOOLS: &[&str] = &[
     "mcp_read_resource",
     "mcp_list_prompts",
     "mcp_get_prompt",
+    // The task engine's completion tool (W9); profiles may name it already.
+    "submit",
 ];
 
 /// The `disabled_tools` entries that name no nyq tool. MCP (`mcp__…`) and
@@ -416,10 +421,16 @@ impl Registry {
     /// The built-in workspace tools: read_file, write_file, edit_file, bash,
     /// glob, grep, list_dir, view_image, web_fetch, web_search, subagent,
     /// memory, bash_output, kill_shell, read_tool_result. Tools named in the
-    /// `disabled_tools` setting are hidden.
+    /// `disabled_tools` setting are hidden; a non-empty `enabled_tools`
+    /// hides everything outside it.
     pub fn builtin() -> Self {
         let mut r = Self::all_builtin();
-        r.disable(&crate::settings::current().disabled_tools);
+        let s = crate::settings::current();
+        r.disable(&s.disabled_tools);
+        r.enable(&s.enabled_tools);
+        if !crate::profiles::feature("memory") {
+            r.disable(&["memory".to_string()]);
+        }
         r
     }
 
@@ -447,6 +458,18 @@ impl Registry {
         self.disabled = names.iter().cloned().collect();
     }
 
+    /// Make `names` the tool allow-list (after `enabled_tools` changed);
+    /// an empty list allows everything.
+    pub fn enable(&mut self, names: &[String]) {
+        self.enabled = names.iter().cloned().collect();
+    }
+
+    /// Not offered or callable: disabled, or outside a set allow-list.
+    fn hidden(&self, name: &str) -> bool {
+        self.disabled.contains(name)
+            || (!self.enabled.is_empty() && !self.enabled.contains(name))
+    }
+
     /// Every registered tool, disabled ones included, for `/tools`: its spec,
     /// whether it is disabled, and whether a call asks by default (probed
     /// with no arguments, inside `cwd`).
@@ -456,7 +479,7 @@ impl Registry {
             .iter()
             .map(|t| {
                 let spec = t.spec();
-                let disabled = self.disabled.contains(&spec.name);
+                let disabled = self.hidden(&spec.name);
                 // Reads inside the workspace never ask (see `Agent::prepare`).
                 let asks = t.needs_approval_for(&none, cwd)
                     && !crate::permissions::is_read_tool(&spec.name);
@@ -525,7 +548,7 @@ impl Registry {
             .iter()
             .filter(|t| {
                 let name = t.spec().name;
-                !self.disabled.contains(&name)
+                !self.hidden(&name)
                     && (mcp_search::is_mcp(&name)
                         || name.starts_with(crate::extensions::TOOL_PREFIX)
                         || SHARED.contains(&name.as_str()))
@@ -547,7 +570,7 @@ impl Registry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        if self.disabled.contains(name) {
+        if self.hidden(name) {
             return None;
         }
         self.tools
@@ -560,7 +583,7 @@ impl Registry {
         self.tools
             .iter()
             .map(|t| t.spec())
-            .filter(|s| !self.disabled.contains(&s.name))
+            .filter(|s| !self.hidden(&s.name))
             .collect()
     }
 
@@ -654,6 +677,57 @@ impl SecretRoots {
             roots,
             open: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use serde_json::Map;
+
+    struct Stub(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for Stub {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.0.to_string(),
+                description: String::new(),
+                parameters: Value::Object(Map::new()),
+            }
+        }
+        fn summary(&self, _args: &Value) -> String {
+            String::new()
+        }
+        async fn run(&self, _args: Value, _ctx: &ToolCtx) -> ToolOutput {
+            ToolOutput::default()
+        }
+    }
+
+    /// A registry with a couple of fake names, no filesystem needed.
+    fn reg() -> Registry {
+        let mut r = Registry::default();
+        r.add(Box::new(Stub("bash")));
+        r.add(Box::new(Stub("view_image")));
+        r
+    }
+
+    #[test]
+    fn the_allow_list_hides_everything_else_and_disabled_still_wins() {
+        let mut r = reg();
+        assert!(r.get("bash").is_some() && r.get("view_image").is_some());
+        r.enable(&["bash".to_string()]);
+        assert!(r.get("bash").is_some());
+        assert!(r.get("view_image").is_none());
+        assert_eq!(r.specs().len(), 1);
+        // disabled_tools still wins over the allow-list.
+        r.disable(&["bash".to_string()]);
+        assert!(r.get("bash").is_none());
+        assert!(r.specs().is_empty());
+        // An empty allow-list allows everything again.
+        r.enable(&[]);
+        assert!(r.get("view_image").is_some());
+        assert!(r.get("bash").is_none());
     }
 }
 

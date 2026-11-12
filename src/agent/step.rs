@@ -171,7 +171,7 @@ impl Agent {
         let mut stop_continued = false;
         // Failing calls by (tool, arguments), to stop the model looping on one.
         let mut failures: HashMap<(String, String), usize> = HashMap::new();
-        for _ in 0..max_steps {
+        for step in 0..max_steps {
             if cancel.is_cancelled() {
                 return Ok(TurnEnd::Cancelled);
             }
@@ -182,6 +182,10 @@ impl Agent {
             }
             // MCP servers that connected or changed their tools since the last step.
             self.tools.refresh();
+            if let Some(reason) = crate::hooks::pre_step(self, step, &cancel).await {
+                ui.notice(&reason);
+                return Ok(TurnEnd::Done);
+            }
             let specs = self.advertised();
             // The system prompt stays stable between requests (so providers
             // can cache it); per-request state goes in a trailing note.

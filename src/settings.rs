@@ -8,7 +8,7 @@ pub mod file;
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -224,6 +224,15 @@ pub struct Settings {
     /// or `ext__…`. A project's list adds to the user's.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled_tools: Vec<String>,
+    /// When non-empty, only these tools are offered to the model (an
+    /// allow-list, used by profiles such as `minimal`). `disabled_tools`
+    /// still applies on top. A project may not set it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub enabled_tools: Vec<String>,
+    /// Default timeout for `bash` commands when a call sets none (seconds;
+    /// a call may still ask for more). Profiles use it; a project may not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_timeout_secs: Option<u64>,
     /// Skills (by id, as `/skills` shows them) never offered to the model or
     /// in `$`/`/` completion; `/skills` still lists them. A project's list
     /// adds to the user's.
@@ -263,6 +272,8 @@ impl Default for Settings {
             collapse_tool_calls: false,
             startup_scrollback: false,
             disabled_tools: Vec::new(),
+            enabled_tools: Vec::new(),
+            command_timeout_secs: None,
             disabled_skills: Vec::new(),
             extra: Map::new(),
         }
@@ -401,11 +412,12 @@ fn listed(
         let value = (!mine.is_empty()).then(|| Value::from(mine.clone()));
         write_changes(home, &[(vec![key.to_string()], value)])?;
     }
-    // The same layering as `load_layered`: the project adds, the workspace replaces.
+    // The same layering as `load_layered`: a profile replaces the user's
+    // list, the project adds to it, the workspace replaces.
     let effective = match names(&layers.workspace, key) {
         Some(ws) => ws,
         None => {
-            let mut all = mine;
+            let mut all = names(&layers.profile, key).unwrap_or(mine);
             for n in names(&layers.project, key).unwrap_or_default() {
                 if !all.contains(&n) {
                     all.push(n);
@@ -425,10 +437,14 @@ fn listed(
 // ------------------------------------------------------------------ layers
 
 /// A settings layer above the user's `settings.toml`. Later layers win:
-/// the user file, then the project's `.nyq/settings.toml`, then the user's
-/// override for this workspace (`workspaces.<path>` in the user file).
+/// the user file, then a `--profile` overlay, then the project's
+/// `.nyq/settings.toml`, then the user's override for this workspace
+/// (`workspaces.<path>` in the user file).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
+    /// A `--set key=value` command-line override.
+    Cli,
+    Profile,
     Project,
     Workspace,
 }
@@ -436,6 +452,8 @@ pub enum Layer {
 impl Layer {
     pub fn label(self) -> &'static str {
         match self {
+            Layer::Cli => "cli",
+            Layer::Profile => "profile",
             Layer::Project => "project",
             Layer::Workspace => "workspace",
         }
@@ -443,6 +461,8 @@ impl Layer {
 
     fn describe(self) -> &'static str {
         match self {
+            Layer::Cli => "a --set override",
+            Layer::Profile => "the selected profile",
             Layer::Project => ".nyq/settings.toml",
             Layer::Workspace => "workspaces in settings.toml",
         }
@@ -469,20 +489,56 @@ const PROJECT_KEYS: &[&str] = &[
 
 #[derive(Clone, Debug, Default)]
 struct Overrides {
+    /// The user's own file; it cannot shadow itself, but `--dump-config`
+    /// reports it as a source.
+    user: Map<String, Value>,
+    profile: Map<String, Value>,
+    profile_name: Option<String>,
+    profile_source: Option<String>,
     project: Map<String, Value>,
     workspace: Map<String, Value>,
+    /// The `--set` pairs, the highest layer of all.
+    cli: Map<String, Value>,
 }
 
 impl Overrides {
-    /// The highest layer that sets `path`.
+    fn has(m: &Map<String, Value>, path: &[String]) -> bool {
+        get_path(&Value::Object(m.clone()), path).is_some()
+    }
+
+    /// The highest layer above the user file that sets `path`.
     fn layer(&self, path: &[String]) -> Option<Layer> {
-        let has = |m: &Map<String, Value>| get_path(&Value::Object(m.clone()), path).is_some();
-        if has(&self.workspace) {
+        if Self::has(&self.cli, path) {
+            Some(Layer::Cli)
+        } else if Self::has(&self.workspace, path) {
             Some(Layer::Workspace)
-        } else if has(&self.project) {
+        } else if Self::has(&self.project, path) {
             Some(Layer::Project)
+        } else if Self::has(&self.profile, path) {
+            Some(Layer::Profile)
         } else {
             None
+        }
+    }
+
+    /// Every layer, for `--dump-config`: the highest one that sets `path`,
+    /// or "default".
+    fn source_of(&self, path: &[String]) -> String {
+        if Self::has(&self.cli, path) {
+            "cli".to_string()
+        } else if Self::has(&self.workspace, path) {
+            "workspace".to_string()
+        } else if Self::has(&self.project, path) {
+            "project".to_string()
+        } else if Self::has(&self.profile, path) {
+            match &self.profile_name {
+                Some(n) => format!("profile:{n}"),
+                None => "profile".to_string(),
+            }
+        } else if Self::has(&self.user, path) {
+            "user".to_string()
+        } else {
+            "default".to_string()
         }
     }
 }
@@ -586,12 +642,39 @@ fn workspace_overrides(user: &Map<String, Value>, cwd: &Path) -> Map<String, Val
 /// Load the user file with the project and workspace layers for `cwd` on
 /// top, and remember the layers for [`source`] and [`update`].
 /// Problems come back as warnings; a broken layer is skipped.
+#[allow(dead_code)] // The layered entry point without a profile: tests and callers that never take one.
 pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
+    load_layered_with(home, cwd, None)
+}
+
+/// [`load_layered`] with a `--profile` overlay (see [`crate::profiles`])
+/// merged between the user file and the project layer: the project keeps
+/// tightening what the profile set, never loosens it.
+pub fn load_layered_with(
+    home: &Path,
+    cwd: &Path,
+    profile: Option<&crate::profiles::Profile>,
+) -> (Settings, Vec<String>) {
+    let (settings, warnings, layers) = load_layered_parts(home, cwd, profile);
+    *OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()) = Some(layers);
+    (settings, warnings)
+}
+
+/// `load_layered_with` plus the resolved layers, for tests and
+/// `--dump-config` that want the layers without the process-global store.
+fn load_layered_parts(
+    home: &Path,
+    cwd: &Path,
+    profile: Option<&crate::profiles::Profile>,
+) -> (Settings, Vec<String>, Overrides) {
     let mut warnings = Vec::new();
     let user = file::read_user(home).unwrap_or_else(|e| {
         warnings.push(format!("{e} (ignored)"));
         Map::new()
     });
+    let mut profile_map = profile.map(|p| p.settings.clone()).unwrap_or_default();
+    let profile_name = profile.map(|p| p.name.clone());
+    let profile_source = profile.map(|p| p.source.clone());
     let project_path = file::project_path(cwd);
     // Started in the home directory, the "project" file is the user's own.
     let mut project = if file::project_path(cwd) == file::user_path(home)
@@ -618,30 +701,33 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
             ignored.join(", ")
         ));
     }
-    // A project may disable more tools and skills, never re-enable the user's.
-    // The layer itself keeps only its own names, for `set_listed`.
+    // A project may disable more tools and skills, never re-enable what the
+    // user file and the profile allow. The layer itself keeps only its own
+    // names, for `set_listed`.
+    let mut merged = user.clone();
+    merge(&mut merged, &profile_map);
     let mut layered = project.clone();
     for key in [List::Tools, List::Skills].map(List::key) {
         if let (Some(Value::Array(mine)), Some(Value::Array(theirs))) =
-            (user.get(key), layered.get_mut(key))
+            (merged.get(key), layered.get_mut(key))
         {
             let extra: Vec<Value> = theirs.drain(..).filter(|n| !mine.contains(n)).collect();
             *theirs = mine.iter().cloned().chain(extra).collect();
         }
     }
-    let mut merged = user.clone();
     merge(&mut merged, &layered);
     merge(&mut merged, &workspace);
     let settings: Settings = serde_json::from_value(Value::Object(merged))
         .or_else(|e| {
             warnings.push(format!(
-                "project or workspace settings: {e} (using your settings.toml)"
+                "profile, project or workspace settings: {e} (using your settings.toml)"
             ));
             // The layers are unusable: none of them may be reported as the
             // source of a value or shadow a later change.
+            profile_map.clear();
             project.clear();
             workspace.clear();
-            serde_json::from_value(Value::Object(user))
+            serde_json::from_value(Value::Object(user.clone()))
         })
         .unwrap_or_else(|e| {
             warnings.push(format!("{}: {e} (using default settings)", file::FILE));
@@ -654,8 +740,109 @@ pub fn load_layered(home: &Path, cwd: &Path) -> (Settings, Vec<String>) {
             unknown.join(", ")
         ));
     }
-    *OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()) = Some(Overrides { project, workspace });
-    (settings, warnings)
+    let unknown = crate::tools::unknown_tool_names(&settings.enabled_tools);
+    if !unknown.is_empty() {
+        warnings.push(format!(
+            "enabled_tools: unknown tool {} (no such tool to allow)",
+            unknown.join(", ")
+        ));
+    }
+    let layers = Overrides {
+        user,
+        profile: profile_map,
+        profile_name,
+        profile_source,
+        project,
+        workspace,
+        cli: Map::new(),
+    };
+    (settings, warnings, layers)
+}
+
+/// Apply `--set key=value` pairs on top of the resolved settings; a dotted
+/// key addresses a nested field and the value parses as JSON (a bare word
+/// becomes a string). Bad pairs fail loudly: they came from the command line.
+/// Returns the applied paths, for [`note_cli_overrides`].
+pub fn apply_set(s: &mut Settings, pairs: &[String]) -> Result<Map<String, Value>> {
+    let mut applied = Value::Object(Map::new());
+    if pairs.is_empty() {
+        return Ok(Map::new());
+    }
+    let mut value = serde_json::to_value(&*s)?;
+    for pair in pairs {
+        let Some((key, raw)) = pair.split_once('=') else {
+            bail!("--set expects key=value, got `{pair}`");
+        };
+        let path: Vec<String> = key.split('.').map(str::to_string).collect();
+        if path.iter().any(|k| k.is_empty()) {
+            bail!("--set: bad key `{key}`");
+        }
+        let v = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+        set_path(&mut value, &path, Some(v.clone()));
+        set_path(&mut applied, &path, Some(v));
+    }
+    *s = serde_json::from_value(value)?;
+    Ok(applied.as_object().cloned().unwrap_or_default())
+}
+
+/// Record the `--set` paths [`apply_set`] returned so `source` and
+/// `--dump-config` report them as the `cli` layer.
+pub fn note_cli_overrides(applied: Map<String, Value>) {
+    if applied.is_empty() {
+        return;
+    }
+    if let Some(layers) = OVERRIDES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        merge(&mut layers.cli, &applied);
+    }
+}
+
+/// `--dump-config`: every resolved key with the layer that set it
+/// (`default`, `user`, `profile:<name>`, `project`, `workspace` or `cli`
+/// for `--set`; for a merged list such as `disabled_tools` it is the
+/// highest contributing layer).
+pub fn dump_config() -> Value {
+    dump_config_with(&current(), &overrides())
+}
+
+/// `dump_config` for a specific resolved pair (tests pass their own layers
+/// instead of the process-global ones).
+fn dump_config_with(s: &Settings, layers: &Overrides) -> Value {
+    let merged = serde_json::to_value(s).unwrap_or_default();
+    let mut flat = Vec::new();
+    flatten(&merged, &mut Vec::new(), &mut flat);
+    let settings: Map<String, Value> = flat
+        .into_iter()
+        .map(|(path, v)| {
+            (
+                path.join("."),
+                serde_json::json!({"value": v, "source": layers.source_of(&path)}),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "profile": layers.profile_name,
+        "profile_source": layers.profile_source,
+        "settings": Value::Object(settings),
+    })
+}
+
+/// The leaf `path -> value` pairs of `v` (objects are walked; everything
+/// else is a leaf).
+fn flatten(v: &Value, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, Value)>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                path.push(k.clone());
+                flatten(x, path, out);
+                path.pop();
+            }
+        }
+        _ => out.push((path.clone(), v.clone())),
+    }
 }
 
 /// The layer that sets a setting's value, when it isn't the user file.
@@ -1236,7 +1423,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"disabled_skills": ["review", "pdf"], "disabled_tools": ["web_fetch"]})).unwrap();
         let layers = Overrides {
             project,
-            workspace: Map::new(),
+            ..Default::default()
         };
         let s = Settings {
             disabled_skills: vec!["pdf".into(), "review".into()],
@@ -1272,8 +1459,8 @@ mod tests {
         let ws: Map<String, Value> =
             serde_json::from_value(serde_json::json!({"disabled_skills": ["x"]})).unwrap();
         let layers = Overrides {
-            project: Map::new(),
             workspace: ws,
+            ..Default::default()
         };
         let (s, notice) = listed(
             home.path(),
@@ -1469,5 +1656,130 @@ mod tests {
         );
         // Without a flag, the saved setting decides (tests read the defaults).
         assert_eq!(sandbox_mode_or(None), sandbox_mode(&current()));
+    }
+
+    /// A `Profile` value for tests, parsed like the real resolver does.
+    fn test_profile(name: &str, toml: &str) -> crate::profiles::Profile {
+        crate::profiles::Profile {
+            name: name.to_string(),
+            settings: file::parse_str(toml).unwrap(),
+            source: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn profile_sits_between_user_and_project() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("settings.toml"),
+            "sound = \"on\"\nauto_compact = 70\ndisabled_tools = [\"bash\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(cwd.path().join(".nyq")).unwrap();
+        std::fs::write(
+            cwd.path().join(".nyq/settings.toml"),
+            // Projects still tighten the profile's list, never loosen:
+            // `permission_mode` is filtered out of the project file.
+            "disabled_tools = [\"web_fetch\"]\npermission_mode = \"ask\"\n",
+        )
+        .unwrap();
+        let profile = test_profile(
+            "testp",
+            "sound = \"max\"\nenabled_tools = [\"bash\", \"view_image\"]\ndisabled_tools = []\npermission_mode = \"yolo\"\n",
+        );
+        let (s, warnings, layers) =
+            load_layered_parts(home.path(), cwd.path(), Some(&profile));
+        // The profile beats the user file for the keys it sets…
+        assert_eq!(s.sound, "max");
+        assert_eq!(s.enabled_tools, ["bash", "view_image"]);
+        assert_eq!(s.permission_mode, "yolo");
+        assert_eq!(s.auto_compact, 70);
+        // …the project's list is added to the profile's (empty) list, and
+        // its filtered keys never apply.
+        assert_eq!(s.disabled_tools, ["web_fetch"]);
+        assert!(warnings.iter().any(|w| w.contains("permission_mode")));
+        assert_eq!(layers.layer(&["sound".into()]), Some(Layer::Profile));
+        assert_eq!(
+            layers.layer(&["permission_mode".into()]),
+            Some(Layer::Profile)
+        );
+    }
+
+    #[test]
+    fn profile_project_still_cannot_loosen() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join(".nyq")).unwrap();
+        std::fs::write(
+            cwd.path().join(".nyq/settings.toml"),
+            "enabled_tools = [\"bash\"]\nauto_compact = 50\n",
+        )
+        .unwrap();
+        let profile = test_profile("minimal", "enabled_tools = []\nauto_compact = 80\n");
+        let (s, warnings, _) =
+            load_layered_parts(home.path(), cwd.path(), Some(&profile));
+        // `enabled_tools` is not a project key: tightening it would let a
+        // repo decide what the model may do, so it stays filtered out.
+        assert!(s.enabled_tools.is_empty(), "{:?}", s.enabled_tools);
+        assert_eq!(s.auto_compact, 50);
+        assert!(warnings.iter().any(|w| w.contains("enabled_tools")));
+    }
+
+    #[test]
+    fn dump_config_reports_each_keys_source() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("settings.toml"),
+            "theme = \"dark\"\ndisabled_tools = [\"bash\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(cwd.path().join(".nyq")).unwrap();
+        std::fs::write(
+            cwd.path().join(".nyq/settings.toml"),
+            "disabled_tools = [\"web_fetch\"]\n",
+        )
+        .unwrap();
+        let profile = test_profile("ci", "permission_mode = \"yolo\"\ncommand_timeout_secs = 300\n");
+        let (s, _, layers) = load_layered_parts(home.path(), cwd.path(), Some(&profile));
+        let dump = dump_config_with(&s, &layers);
+        assert_eq!(dump["profile"], "ci");
+        let src = |key: &str| dump["settings"][key]["source"].as_str().unwrap().to_string();
+        assert_eq!(src("theme"), "user");
+        assert_eq!(src("permission_mode"), "profile:ci");
+        assert_eq!(src("command_timeout_secs"), "profile:ci");
+        assert_eq!(dump["settings"]["command_timeout_secs"]["value"], 300);
+        assert_eq!(src("disabled_tools"), "project");
+        assert_eq!(src("sound"), "default");
+    }
+
+    #[test]
+    fn set_pairs_override_and_fail_loud() {
+        let mut s = Settings::default();
+        let applied = apply_set(
+            &mut s,
+            &[
+                "auto_compact=60".to_string(),
+                "features.mcp=false".to_string(),
+                "theme=dracula".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.auto_compact, 60);
+        assert_eq!(s.theme, "dracula");
+        assert_eq!(s.extra["features"]["mcp"], false);
+        // The applied paths are the `cli` layer for source reporting.
+        assert!(applied.contains_key("auto_compact"));
+        assert!(applied.contains_key("theme"));
+        assert!(get_path(&applied["features"], &["mcp".into()]).is_some());
+        let layers = Overrides {
+            cli: applied,
+            ..Default::default()
+        };
+        assert_eq!(layers.layer(&["theme".into()]), Some(Layer::Cli));
+        assert_eq!(layers.source_of(&["theme".into()]), "cli");
+        assert!(apply_set(&mut s, &["badpair".to_string()]).is_err());
+        assert!(apply_set(&mut s, &["a..b=1".to_string()]).is_err());
     }
 }

@@ -344,6 +344,8 @@ pub(crate) const VALUE_LONG: &[&str] = &[
     "--context-limit",
     "--system",
     "--image",
+    "--profile",
+    "--set",
 ];
 pub(crate) const VALUE_SHORT: &[char] = &['m'];
 /// Flags that must not carry over: they pick or start a conversation, or (a

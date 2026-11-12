@@ -143,6 +143,9 @@ pub fn refresh_section(system: &mut String, home: &Path) {
             .map_or(system.len(), |i| body + i);
         system.replace_range(start..end, "");
     }
+    if !crate::profiles::feature("memory") {
+        return;
+    }
     let facts = load(home).unwrap_or_default();
     system.push_str(&prompt_section(&facts));
 }
