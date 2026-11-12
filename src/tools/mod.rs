@@ -15,6 +15,7 @@ pub(crate) mod safeio;
 mod search;
 pub mod subagent;
 pub mod web;
+pub(crate) mod workset;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -268,6 +269,9 @@ pub struct ToolCtx {
     pub subagent_dir: Option<PathBuf>,
     /// Session tools a subagent inherits: MCP tools and skills.
     pub shared_tools: Vec<std::sync::Arc<dyn Tool>>,
+    /// The session working set (`open`/`focus`/`close`/`note_intent`). An
+    /// empty set is harmless where no session owns it (tests, subagent ctxs).
+    pub workset: std::sync::Arc<std::sync::Mutex<workset::Workset>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -624,6 +628,7 @@ impl Registry {
         image::register(&mut r);
         web::register(&mut r);
         subagent::register(&mut r);
+        workset::register(&mut r);
         r
     }
 

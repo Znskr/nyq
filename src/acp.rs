@@ -591,6 +591,7 @@ async fn open(
         sandbox,
         undo: Default::default(),
         taint: Default::default(),
+        workset: Default::default(),
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());

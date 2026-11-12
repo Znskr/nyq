@@ -295,6 +295,7 @@ fn child(
         sandbox: ctx.sandbox.clone(),
         undo: Default::default(),
         taint: Default::default(),
+        workset: Default::default(),
     })
 }
 

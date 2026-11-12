@@ -266,6 +266,46 @@ fn push_numbered(out: &mut String, n: u64, line: &str, exceeds: bool) {
     }
 }
 
+/// The whole file as UTF-8 text, with the same checks `read_file` applies
+/// (regular file, no NUL, UTF-8).
+pub(crate) fn file_text(path: &Path) -> Result<String, ToolOutput> {
+    let file = open_regular(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut out = String::new();
+    loop {
+        let scanned = next_line(&mut reader, path)?;
+        let (bytes, exceeds) = match scanned {
+            ScanLine::Eof => break,
+            ScanLine::Line(b) => (b, false),
+            ScanLine::TooLong(b) => (b, true),
+        };
+        let text = line_text(&bytes, path, exceeds)?;
+        out.push_str(&text);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// The whole file numbered like `read_file` (`     N\tline`).
+pub(crate) fn file_numbered(path: &Path) -> Result<String, ToolOutput> {
+    let file = open_regular(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut out = String::new();
+    let mut line_no: u64 = 0;
+    loop {
+        let scanned = next_line(&mut reader, path)?;
+        let (bytes, exceeds) = match scanned {
+            ScanLine::Eof => break,
+            ScanLine::Line(b) => (b, false),
+            ScanLine::TooLong(b) => (b, true),
+        };
+        let text = line_text(&bytes, path, exceeds)?;
+        line_no += 1;
+        push_numbered(&mut out, line_no, &text, exceeds);
+    }
+    Ok(out)
+}
+
 // --------------------------------------------------------------------------- read_file
 
 struct ReadFile;
