@@ -149,7 +149,8 @@ pub fn recover(dir: &Path, which: &str, cwd: &Path) -> Result<(String, usize, us
             let value: serde_json::Value = serde_json::from_slice(line)?;
             let valid = match value["type"].as_str() {
                 Some("title") => value["title"].is_string(),
-                Some("permissions") => true,
+                Some("permissions" | "intent") => true,
+                Some("workset") => value["state"].is_object(),
                 _ => serde_json::from_value::<Prefs>(value.clone()).is_ok(),
             };
             if !valid {
@@ -247,6 +248,10 @@ pub struct Session {
     lock: Option<File>,
     /// The latest permissions line: read on load, then what was last written.
     permissions: Option<serde_json::Value>,
+    /// The latest working-set line: read on load, then what was last written.
+    workset: Option<serde_json::Value>,
+    /// Every `intent` metadata record in the file, oldest first.
+    intents: Vec<serde_json::Value>,
 }
 
 impl Session {
@@ -271,6 +276,8 @@ impl Session {
             file: None,
             lock: None,
             permissions: None,
+            workset: None,
+            intents: Vec::new(),
         })
     }
 
@@ -404,12 +411,49 @@ impl Session {
         self.permissions.as_ref()
     }
 
+    /// Record the session's working set (skipped when unchanged).
+    pub fn save_workset(&mut self, state: serde_json::Value) -> Result<()> {
+        if self.workset.as_ref() == Some(&state) {
+            return Ok(());
+        }
+        let line = serde_json::to_string(&serde_json::json!({ "type": "workset", "state": state }))
+            .with_context(|| format!("encoding the working set for {}", self.id))?;
+        self.queued.push(line);
+        self.flush_queue()?;
+        self.workset = Some(state);
+        Ok(())
+    }
+
+    /// The working-set state saved with this session, if any.
+    pub fn saved_workset(&self) -> Option<&serde_json::Value> {
+        self.workset.as_ref()
+    }
+
+    /// Append one intent record (`note_intent` or a mutating tool's intent).
+    pub fn append_intent(&mut self, record: &serde_json::Value) -> Result<()> {
+        let mut value = record.clone();
+        value["type"] = "intent".into();
+        let line = serde_json::to_string(&value)
+            .with_context(|| format!("encoding an intent for {}", self.id))?;
+        self.queued.push(line);
+        self.flush_queue()?;
+        self.intents.push(record.clone());
+        Ok(())
+    }
+
+    /// Every intent record saved with this session, oldest first.
+    pub fn saved_intents(&self) -> &[serde_json::Value] {
+        &self.intents
+    }
+
     /// Replace the file with its header, keeping the session id and settings.
     /// The new header is written by rename, then the file is reopened for append,
     /// so a crash cannot leave a zero-length session.
     pub fn clear_transcript(&mut self) -> Result<()> {
         self.queued.clear();
         self.permissions = None;
+        self.workset = None;
+        self.intents.clear();
         let header = self.header_line()?;
         if self.file.is_none() && !self.path.exists() {
             self.pending_header = Some(header);
@@ -735,14 +779,15 @@ pub fn generated_title(raw: &str) -> Result<String> {
     validate_title(&title).map_err(|_| anyhow::anyhow!("the model did not return a usable title"))
 }
 
-/// A `title`, `prefs` or `permissions` metadata line (not a transcript item).
+/// A `title`, `prefs`, `permissions`, `workset` or `intent` metadata line
+/// (not a transcript item).
 fn is_meta_line(line: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(line)
         .ok()
         .is_some_and(|value| {
             matches!(
                 value["type"].as_str(),
-                Some("title" | "prefs" | "permissions")
+                Some("title" | "prefs" | "permissions" | "workset" | "intent")
             )
         })
 }
@@ -753,6 +798,26 @@ fn latest_permissions(data: &[u8]) -> Option<serde_json::Value> {
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
         .find(|v| v["type"] == "permissions")
         .map(|mut v| v["state"].take())
+}
+
+/// The state of the last `workset` line.
+fn latest_workset(data: &[u8]) -> Option<serde_json::Value> {
+    data.rsplit(|b| *b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .find(|v| v["type"] == "workset")
+        .map(|mut v| v["state"].take())
+}
+
+/// Every `intent` line's record (`type` stripped), oldest first.
+fn intent_records(data: &[u8]) -> Vec<serde_json::Value> {
+    data.split(|b| *b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter(|v| v["type"] == "intent")
+        .map(|mut v| {
+            v.as_object_mut().map(|o| o.remove("type"));
+            v
+        })
+        .collect()
 }
 
 /// The first non-empty line, at most `max` characters.
@@ -991,6 +1056,8 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         .with_context(|| format!("reading {}", meta.path.display()))?;
     let (mut items, good) = read_items(&data, &meta.path)?;
     let permissions = latest_permissions(&data[..good]);
+    let workset = latest_workset(&data[..good]);
+    let intents = intent_records(&data[..good]);
     if good < data.len() || !data[..good].ends_with(b"\n") {
         // Drop a half-written final record (including a torn UTF-8 byte) and
         // make sure appends start on a fresh line. The lock is already held.
@@ -1012,6 +1079,8 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         file: Some(file),
         lock: Some(lock),
         permissions,
+        workset,
+        intents,
     };
     for item in repairs(&items) {
         session.append(&item)?;
@@ -1679,6 +1748,64 @@ mod tests {
             find(tmp.path(), &id, Path::new("/w")).unwrap().prefs,
             Some(prefs("a", None, true))
         );
+    }
+
+    #[test]
+    fn workset_and_intents_roundtrip_as_meta_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("hi")).unwrap();
+        s.save_workset(serde_json::json!({
+            "files": [{"path": "a.rs", "mode": "focused"}]
+        }))
+        .unwrap();
+        // Unchanged state is not written again.
+        s.save_workset(serde_json::json!({
+            "files": [{"path": "a.rs", "mode": "focused"}]
+        }))
+        .unwrap();
+        s.append_intent(&serde_json::json!({"did": "d1", "why": "w1", "next": "n1"}))
+            .unwrap();
+        s.append_intent(&serde_json::json!({"did": "d2", "why": "w2"}))
+            .unwrap();
+        let id = s.id.clone();
+        drop(s);
+
+        let (_s, _meta, items) = load(dir, &id, Path::new("/w")).unwrap();
+        // Meta lines never become transcript items.
+        assert_eq!(items, vec![user("hi")]);
+        drop(_s);
+        let (s2, _m, _i) = load(dir, &id, Path::new("/w")).unwrap();
+        assert_eq!(
+            s2.saved_workset(),
+            Some(&serde_json::json!({"files": [{"path": "a.rs", "mode": "focused"}]}))
+        );
+        assert_eq!(
+            s2.saved_intents(),
+            &[
+                serde_json::json!({"did": "d1", "why": "w1", "next": "n1"}),
+                serde_json::json!({"did": "d2", "why": "w2"}),
+            ]
+        );
+        let lines = std::fs::read_to_string(&s2.path).unwrap();
+        assert_eq!(lines.matches("\"type\":\"workset\"").count(), 1);
+        assert_eq!(lines.matches("\"type\":\"intent\"").count(), 2);
+    }
+
+    #[test]
+    fn recovery_keeps_workset_and_intents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Session::create(tmp.path(), Path::new("/w"), "m").unwrap();
+        s.append(&user("hi")).unwrap();
+        s.save_workset(serde_json::json!({"files": []})).unwrap();
+        s.append_intent(&serde_json::json!({"did": "d", "why": "w"}))
+            .unwrap();
+        let (id, kept, skipped) = recover(tmp.path(), &s.id, Path::new("/w")).unwrap();
+        assert_eq!((kept, skipped), (1, 0));
+        let (s2, _m, _i) = load(tmp.path(), &id, Path::new("/w")).unwrap();
+        assert!(s2.saved_workset().is_some());
+        assert_eq!(s2.saved_intents().len(), 1);
     }
 
     #[test]

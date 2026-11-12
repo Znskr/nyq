@@ -14,6 +14,9 @@ tls-rustls = ["dep:rustls", "reqwest/rustls-no-provider"]
 # Platform TLS (Security.framework on macOS, OpenSSL on Linux): smaller binary,
 # but adds an OpenSSL build/runtime dependency on Linux.
 tls-native = ["reqwest/native-tls"]
+# Deliberately absent: a `outline-tree-sitter` feature for grammar-based file
+# outlines. src/outline.rs is a hand-rolled scanner because tree-sitter grammars
+# cost megabytes against the binary-size budget (size-budget.json).
 
 [profile.release]
 opt-level = "z"

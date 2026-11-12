@@ -27,6 +27,7 @@ mod mcp_sse;
 mod models;
 mod notify;
 mod orchestration;
+mod outline;
 mod permissions;
 mod pricing;
 mod prompt;
@@ -354,6 +355,7 @@ async fn run() -> Result<()> {
         hooks: std::sync::Arc::new(hooks),
         sandbox,
         undo: Default::default(),
+        workset: Default::default(),
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());

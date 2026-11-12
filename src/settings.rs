@@ -169,6 +169,42 @@ impl StatusLine {
     }
 }
 
+/// The `workset` table: the session working set and its trailing note.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Workset {
+    /// The `open`/`focus`/`close`/`workset` tools and the note's rendering.
+    pub enabled: bool,
+    /// Files shown in full at once; extras render as outlines.
+    pub max_focused: usize,
+    /// Working-set budget as a percent of the context window (0 hides it).
+    pub max_tokens_pct: u8,
+}
+
+impl Default for Workset {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_focused: 4,
+            max_tokens_pct: 25,
+        }
+    }
+}
+
+/// The `intents` table: the intent log (`note_intent` and tool intents).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Intents {
+    /// How many recent intents the trailing note shows (0 hides it).
+    pub show: usize,
+}
+
+impl Default for Intents {
+    fn default() -> Self {
+        Self { show: 8 }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -229,6 +265,10 @@ pub struct Settings {
     /// adds to the user's.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled_skills: Vec<String>,
+    /// The session working set (`open`/`focus`/`close` and its trailing note).
+    pub workset: Workset,
+    /// The intent log shown in the trailing note.
+    pub intents: Intents,
     /// Keys nyq doesn't manage here (`provider`, `models`, …), kept on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -264,6 +304,8 @@ impl Default for Settings {
             startup_scrollback: false,
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
+            workset: Workset::default(),
+            intents: Intents::default(),
             extra: Map::new(),
         }
     }

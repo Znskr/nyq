@@ -34,6 +34,9 @@ const PARALLEL_TOOLS: &[&str] = &[
     "web_search",
     crate::tools::artifacts::TOOL,
     "skill",
+    "open",
+    "focus",
+    "workset",
 ];
 
 /// Whether this call may run alongside its read-only neighbours: read tools,
@@ -531,6 +534,7 @@ impl Agent {
                 .as_ref()
                 .map(|s| crate::subagents::store_dir(&s.path)),
             shared_tools: self.tools.shared(),
+            workset: std::sync::Arc::clone(&self.workset),
         };
         let summary_of = |args: &Value| {
             if meta {

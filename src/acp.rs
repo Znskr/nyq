@@ -589,6 +589,7 @@ async fn open(
         hooks: Arc::new(hooks),
         sandbox,
         undo: Default::default(),
+        workset: Default::default(),
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());

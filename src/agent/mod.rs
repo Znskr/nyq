@@ -91,6 +91,10 @@ pub struct Agent {
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
     /// File contents before each write/edit, for `/undo`.
     pub undo: crate::undo::UndoLog,
+    /// The session working set (`open`/`focus`/`close`, plus the intent log).
+    /// Contents are rendered from disk into the trailing note; membership is
+    /// saved with the session (`Session::save_workset`).
+    pub workset: crate::tools::workset::Shared,
 }
 
 impl Agent {
@@ -109,6 +113,28 @@ impl Agent {
         }
     }
 
+    /// Flush working-set/intent changes the tools made since the last item.
+    /// Saved only when a session exists (and only what changed).
+    fn sync_workset(&mut self) {
+        let (state, intents) = {
+            let mut ws = crate::tools::workset::lock(&self.workset);
+            (ws.take_files_dirty(), ws.take_pending_intents())
+        };
+        let Some(s) = &mut self.session else { return };
+        if let Some(state) = state {
+            if let Err(e) = s.save_workset(state) {
+                crate::ui::error(&format!("could not save the working set: {e:#}"));
+            }
+        }
+        for intent in intents {
+            if let Err(e) = s.append_intent(&serde_json::json!({
+                "did": intent.did, "why": intent.why, "next": intent.next,
+            })) {
+                crate::ui::error(&format!("could not save an intent: {e:#}"));
+            }
+        }
+    }
+
     pub fn push(&mut self, item: Item) {
         self.stats.item(&item);
         self.sync_prefs();
@@ -117,6 +143,7 @@ impl Agent {
                 crate::ui::error(&format!("could not save session: {e:#}"));
             }
         }
+        self.sync_workset();
         self.items.push(item);
         if let Err(e) = crate::subagents::checkpoint(&self.items) {
             crate::ui::error(&format!("Child checkpoint failed: {e:#}"));
@@ -218,6 +245,7 @@ impl Agent {
         self.suppress_auto_compact = false;
         self.submitted = 0;
         self.undo = Default::default();
+        crate::tools::workset::lock(&self.workset).clear();
     }
 
     /// Drop the transcript in place: same session id, model, sandbox and rules.
@@ -246,6 +274,7 @@ impl Agent {
         self.submitted = 0;
         self.undo = Default::default();
         self.allowed.clear();
+        crate::tools::workset::lock(&self.workset).clear();
         Ok(())
     }
 
@@ -296,6 +325,22 @@ impl Agent {
         self.context_estimated = true;
         self.context_tokens = estimate_context(&self.system, &self.items);
         self.submitted = self.items.len();
+        self.restore_workset();
+    }
+
+    /// Restore the working set and intent log saved with the session.
+    fn restore_workset(&mut self) {
+        let Some(s) = &self.session else { return };
+        let mut ws = crate::tools::workset::lock(&self.workset);
+        if let Some(state) = s.saved_workset() {
+            ws.restore_files(state, &self.cwd);
+        }
+        let intents = s
+            .saved_intents()
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+        ws.restore_intents(intents);
     }
 
     pub(crate) fn push_counted(&mut self, mut item: Item) {

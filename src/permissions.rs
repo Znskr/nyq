@@ -21,7 +21,16 @@ use crate::agent::{bash_matches, is_file_tool, program_base, subagent_mode};
 
 /// Read tools ask only for paths outside the workspace; a persistent allow
 /// never covers those.
-const READ_TOOLS: &[&str] = &["read_file", "list_dir", "glob", "grep", "view_image"];
+const READ_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "view_image",
+    "open",
+    "focus",
+    "workset",
+];
 
 pub(crate) fn is_read_tool(tool: &str) -> bool {
     READ_TOOLS.contains(&tool)
