@@ -71,10 +71,9 @@ impl Agent {
         // never stored in the transcript, so the cached prefix stays stable.
         let mut workset_note = String::new();
         if crate::settings::current().workset.enabled {
-            let rendered = crate::tools::workset::lock(&self.workset)
-                .render(&crate::tools::workset::Budgets::from_settings(
-                    self.context_window,
-                ));
+            let rendered = crate::tools::workset::lock(&self.workset).render(
+                &crate::tools::workset::Budgets::from_settings(self.context_window),
+            );
             if rendered.contains("[Working set]") {
                 notes.push(
                     "- File contents in the working set are read from disk at request time and \

@@ -349,9 +349,8 @@ pub fn grant_rule_in(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) ->
         // plain in-workspace write.
         let text = args.get("patch").and_then(Value::as_str).unwrap_or("");
         let paths = crate::tools::patch::paths(text);
-        return (!paths.is_empty()
-            && paths.iter().all(|p| file_grant_ok_in(p, cwd, extra)))
-        .then(|| tool.to_string());
+        return (!paths.is_empty() && paths.iter().all(|p| file_grant_ok_in(p, cwd, extra)))
+            .then(|| tool.to_string());
     }
     if read || is_file_tool(tool) {
         let path = args

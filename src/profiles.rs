@@ -163,26 +163,29 @@ mod tests {
         assert_eq!(p.name, "minimal");
         assert_eq!(p.source, "built-in");
         assert_eq!(
-            p.settings.get("command_timeout_secs").and_then(Value::as_u64),
+            p.settings
+                .get("command_timeout_secs")
+                .and_then(Value::as_u64),
             Some(300)
         );
 
         std::fs::create_dir_all(home.join("profiles")).unwrap();
-        std::fs::write(
-            user_path(home, "minimal"),
-            "command_timeout_secs = 60\n",
-        )
-        .unwrap();
+        std::fs::write(user_path(home, "minimal"), "command_timeout_secs = 60\n").unwrap();
         let p = resolve(home, Some("minimal")).unwrap().unwrap();
         assert_eq!(
-            p.settings.get("command_timeout_secs").and_then(Value::as_u64),
+            p.settings
+                .get("command_timeout_secs")
+                .and_then(Value::as_u64),
             Some(60)
         );
         assert!(p.source.ends_with("minimal.toml"));
 
         std::fs::write(user_path(home, "mine"), "theme = \"dark\"\n").unwrap();
         let p = resolve(home, Some("mine")).unwrap().unwrap();
-        assert_eq!(p.settings.get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(
+            p.settings.get("theme").and_then(Value::as_str),
+            Some("dark")
+        );
     }
 
     #[test]

@@ -13,10 +13,14 @@ pub(crate) mod mcp_search;
 pub(crate) mod memory;
 pub(crate) mod patch;
 pub(crate) mod redact;
+#[cfg(feature = "scripting")]
+mod run_code;
 pub(crate) mod safeio;
 mod search;
 pub(crate) mod session_search;
 pub mod subagent;
+pub(crate) mod team;
+pub(crate) mod typed;
 pub mod web;
 pub(crate) mod workset;
 
@@ -357,7 +361,8 @@ pub struct Effects {
     /// Starts a child process.
     pub exec: bool,
     /// Talks to the network.
-    #[allow(dead_code)] // Declared for consumers of the effects model (permissions, scheduling).
+    #[allow(dead_code)]
+    // Declared for consumers of the effects model (permissions, scheduling).
     pub net: bool,
 }
 
@@ -649,6 +654,9 @@ impl Registry {
         web::register(&mut r);
         subagent::register(&mut r);
         workset::register(&mut r);
+        team::register(&mut r);
+        #[cfg(feature = "scripting")]
+        run_code::register(&mut r);
         r
     }
 
@@ -670,8 +678,7 @@ impl Registry {
 
     /// Not offered or callable: disabled, or outside a set allow-list.
     fn hidden(&self, name: &str) -> bool {
-        self.disabled.contains(name)
-            || (!self.enabled.is_empty() && !self.enabled.contains(name))
+        self.disabled.contains(name) || (!self.enabled.is_empty() && !self.enabled.contains(name))
     }
 
     /// Every registered tool, disabled ones included, for `/tools`: its spec,
@@ -748,7 +755,10 @@ impl Registry {
     pub fn try_insert_shared(&mut self, tool: std::sync::Arc<dyn Tool>) -> Result<(), String> {
         let spec = tool.spec();
         if self.tools.iter().any(|e| e.spec.name == spec.name) {
-            return Err(format!("tool `{}` collides with an existing tool", spec.name));
+            return Err(format!(
+                "tool `{}` collides with an existing tool",
+                spec.name
+            ));
         }
         self.tools.push(Entry { tool, spec });
         Ok(())

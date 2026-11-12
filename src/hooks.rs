@@ -951,7 +951,8 @@ impl Hooks {
             cwd,
             cancel,
             |label, r| {
-                failed = block_reason(r).map(|why| format!("validation failed (hook {label}): {why}"));
+                failed =
+                    block_reason(r).map(|why| format!("validation failed (hook {label}): {why}"));
                 failed.is_some()
             },
         )
@@ -2172,7 +2173,11 @@ mod tests {
         // The step number reaches the hook payload.
         let dumped = dir.path().join("prestep.json");
         let h = hooks_with(
-            vec![hook(Event::PreStep, None, &format!("cat > {}", dumped.display()))],
+            vec![hook(
+                Event::PreStep,
+                None,
+                &format!("cat > {}", dumped.display()),
+            )],
             Vec::new(),
             false,
         );
@@ -2184,7 +2189,11 @@ mod tests {
         // PreCompact: context/plain stdout are extra summarizer instructions.
         let h = hooks_with(
             vec![
-                hook(Event::PreCompact, None, r#"echo '{"context":"note the failures"}'"#),
+                hook(
+                    Event::PreCompact,
+                    None,
+                    r#"echo '{"context":"note the failures"}'"#,
+                ),
                 hook(Event::PreCompact, None, "echo also plain"),
                 hook(Event::PreCompact, None, "exit 1"),
             ],
@@ -2201,7 +2210,10 @@ mod tests {
             Vec::new(),
             false,
         );
-        assert!(h.task_validate(&json!({"a": 1}), &cwd, None, &live()).await.is_ok());
+        assert!(h
+            .task_validate(&json!({"a": 1}), &cwd, None, &live())
+            .await
+            .is_ok());
         let h = hooks_with(
             vec![hook(
                 Event::TaskValidate,
@@ -2217,7 +2229,11 @@ mod tests {
             .unwrap_err();
         assert!(msg.contains("missing tests"), "{msg}");
         let h = hooks_with(
-            vec![hook(Event::TaskValidate, None, "echo schema mismatch >&2; exit 2")],
+            vec![hook(
+                Event::TaskValidate,
+                None,
+                "echo schema mismatch >&2; exit 2",
+            )],
             Vec::new(),
             false,
         );
@@ -2257,7 +2273,8 @@ mod tests {
             Vec::new(),
             false,
         );
-        h.subagent_stop("explorer", true, "done here", &cwd, Some("s1")).await;
+        h.subagent_stop("explorer", true, "done here", &cwd, Some("s1"))
+            .await;
         let line: Value = serde_json::from_str(&std::fs::read_to_string(&dumped).unwrap()).unwrap();
         assert_eq!(line["event"], "SubagentStop");
         assert_eq!(line["subagent"], "explorer");

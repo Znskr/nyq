@@ -13,6 +13,7 @@ mod diagnostics;
 mod doctor;
 mod export;
 mod extensions;
+mod external_agent;
 mod github;
 mod grants;
 mod hooks;
@@ -37,6 +38,7 @@ mod prompt;
 mod provider;
 mod record_tape;
 mod sandbox;
+mod scripting;
 mod session;
 mod settings;
 mod skill_install;
@@ -44,8 +46,9 @@ mod skill_invoke;
 mod skills;
 mod slash;
 mod subagents;
-mod task;
 mod taint;
+mod task;
+mod team;
 mod templates;
 mod tool_list;
 mod tools;
@@ -56,6 +59,7 @@ mod undo;
 mod upgrade;
 mod usage;
 mod workspace;
+mod worktree;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -274,7 +278,10 @@ async fn run() -> Result<()> {
         ui::error(&w);
     }
     if cli.dump_config {
-        println!("{}", serde_json::to_string_pretty(&settings::dump_config())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&settings::dump_config())?
+        );
         return Ok(());
     }
     limits::configure(&settings::current(), &cli.context_limit)?;

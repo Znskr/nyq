@@ -72,9 +72,7 @@ pub struct Caps {
 }
 
 fn is_flash(model: &str) -> bool {
-    model
-        .to_ascii_lowercase()
-        .starts_with("deepseek-flash")
+    model.to_ascii_lowercase().starts_with("deepseek-flash")
 }
 
 fn is_pro(model: &str) -> bool {
@@ -505,7 +503,11 @@ impl DeepSeekProvider {
             avail.insert(name.to_owned());
         }
         (
-            state.tools.iter().map(|t| tool_decl(&t.spec, t.deferred)).collect(),
+            state
+                .tools
+                .iter()
+                .map(|t| tool_decl(&t.spec, t.deferred))
+                .collect(),
             state.updates.iter().map(Update::block).collect(),
         )
     }
@@ -523,7 +525,8 @@ impl DeepSeekProvider {
             for m in &mut messages {
                 for block in m["content"].as_array_mut().into_iter().flatten() {
                     if block["type"] == "image" {
-                        *block = json!({"type":"text","text":"[image omitted: the model is text-only]"});
+                        *block =
+                            json!({"type":"text","text":"[image omitted: the model is text-only]"});
                     }
                 }
             }
@@ -751,13 +754,41 @@ mod tests {
         let items = [Item::user("hi")];
         for (effort, thinking, output_config) in [
             (None, json!({"type":"enabled"}), json!({"effort":"high"})),
-            (Some("auto"), json!({"type":"enabled"}), json!({"effort":"high"})),
-            (Some("low"), json!({"type":"enabled"}), json!({"effort":"low"})),
-            (Some("minimal"), json!({"type":"enabled"}), json!({"effort":"low"})),
-            (Some("high"), json!({"type":"enabled"}), json!({"effort":"high"})),
-            (Some("medium"), json!({"type":"enabled"}), json!({"effort":"high"})),
-            (Some("max"), json!({"type":"enabled"}), json!({"effort":"max"})),
-            (Some("xhigh"), json!({"type":"enabled"}), json!({"effort":"max"})),
+            (
+                Some("auto"),
+                json!({"type":"enabled"}),
+                json!({"effort":"high"}),
+            ),
+            (
+                Some("low"),
+                json!({"type":"enabled"}),
+                json!({"effort":"low"}),
+            ),
+            (
+                Some("minimal"),
+                json!({"type":"enabled"}),
+                json!({"effort":"low"}),
+            ),
+            (
+                Some("high"),
+                json!({"type":"enabled"}),
+                json!({"effort":"high"}),
+            ),
+            (
+                Some("medium"),
+                json!({"type":"enabled"}),
+                json!({"effort":"high"}),
+            ),
+            (
+                Some("max"),
+                json!({"type":"enabled"}),
+                json!({"effort":"max"}),
+            ),
+            (
+                Some("xhigh"),
+                json!({"type":"enabled"}),
+                json!({"effort":"max"}),
+            ),
             (Some("off"), json!({"type":"disabled"}), Value::Null),
             (Some("none"), json!({"type":"disabled"}), Value::Null),
         ] {
@@ -768,7 +799,10 @@ mod tests {
             assert_eq!(body["output_config"], output_config, "{effort:?}");
             assert!(!body.to_string().contains("budget_tokens"));
         }
-        assert_eq!(provider("deepseek-v4-pro").efforts(), ["off", "low", "high", "max"]);
+        assert_eq!(
+            provider("deepseek-v4-pro").efforts(),
+            ["off", "low", "high", "max"]
+        );
     }
 
     #[test]
@@ -848,10 +882,7 @@ mod tests {
         assert!(changes);
         assert_eq!(
             body["tools"],
-            json!([
-                tool_decl(&tool("a"), false),
-                tool_decl(&tool("b"), true),
-            ])
+            json!([tool_decl(&tool("a"), false), tool_decl(&tool("b"), true),])
         );
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(
@@ -876,7 +907,11 @@ mod tests {
         p.caps.tool_update = Some(ToolUpdate::InHistory);
         let history = [Item::user("hi"), Item::user("more")];
         let (body, _) = p.body(request("s", &history, &[tool("a"), tool("b")]));
-        assert!(!body["messages"].as_array().unwrap().iter().any(|m| m["role"] == "system"));
+        assert!(!body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "system"));
         // A removal keeps the declaration and adds a removal notice.
         let (body, changes) = p.body(request("s", &history, &[tool("b")]));
         assert!(changes);
@@ -941,7 +976,8 @@ mod tests {
         assert!(messages.system_in_history);
         assert_eq!(messages.tool_update, Some(ToolUpdate::AdditionOnly));
         // A declared update mode governs wholesale: absent = leading-only.
-        let bare = parse_listed(&json!({"id":"m","api_capabilities":{"anthropic_messages":{}}})).unwrap();
+        let bare =
+            parse_listed(&json!({"id":"m","api_capabilities":{"anthropic_messages":{}}})).unwrap();
         let caps = capabilities("deepseek-flash", Some(&bare), None);
         assert_eq!(caps.tool_update, None);
         assert!(!caps.system_in_history);
@@ -953,7 +989,10 @@ mod tests {
         let caps = capabilities("deepseek-v4-pro", None, None);
         assert!(!caps.system_in_history && !caps.vision && caps.tool_update.is_none());
         // Context: listing > catalog > known 1,048,576 > 1M.
-        assert_eq!(context_window("deepseek-flash", Some(&listed), None), 1_048_576);
+        assert_eq!(
+            context_window("deepseek-flash", Some(&listed), None),
+            1_048_576
+        );
         assert_eq!(context_window("deepseek-v4-pro", None, None), 1_048_576);
         assert_eq!(context_window("unknown", None, None), 1_000_000);
         assert_eq!(max_tokens(Some(&listed), None), 256_000);
@@ -1014,11 +1053,7 @@ mod tests {
         let usage = r.usage.unwrap();
         // Cache-hit tokens land in cached_tokens and the total input.
         assert_eq!(
-            (
-                usage.input_tokens,
-                usage.cached_tokens,
-                usage.output_tokens
-            ),
+            (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
             (2100, 2000, 9)
         );
         let request = requests.recv().await.unwrap();
@@ -1050,12 +1085,9 @@ mod tests {
         p.stream(request("s", &history, &[tool("a")]), &mut |_| {})
             .await
             .unwrap();
-        p.stream(
-            request("s", &history, &[tool("a"), tool("b")]),
-            &mut |_| {},
-        )
-        .await
-        .unwrap();
+        p.stream(request("s", &history, &[tool("a"), tool("b")]), &mut |_| {})
+            .await
+            .unwrap();
         let first = requests.recv().await.unwrap().to_lowercase();
         assert!(!first.contains("anthropic-beta"), "{first}");
         let second = requests.recv().await.unwrap().to_lowercase();
@@ -1078,18 +1110,18 @@ mod tests {
         p.base_url = url;
         let items = [Item::user("hi")];
         let mut events = Vec::new();
-        let r = crate::provider::stream_with_retry(
-            &p,
-            request("s", &items, &[]),
-            &mut |e| events.push(e),
-        )
+        let r = crate::provider::stream_with_retry(&p, request("s", &items, &[]), &mut |e| {
+            events.push(e)
+        })
         .await
         .unwrap();
         assert_eq!(r.items, vec![Item::Assistant { text: "ok".into() }]);
         assert!(requests.recv().await.is_some());
         assert!(requests.recv().await.is_some());
         assert!(
-            events.iter().any(|e| matches!(e, crate::types::StreamEvent::Retrying(_))),
+            events
+                .iter()
+                .any(|e| matches!(e, crate::types::StreamEvent::Retrying(_))),
             "{events:?}"
         );
         task.await.unwrap();
@@ -1099,24 +1131,38 @@ mod tests {
     async fn error_classification() {
         // Auth errors are final; context-window and mid-stream server
         // errors are reported plainly.
-        let cases: Vec<(u16, String)> = vec![
-            (401, r#"{"type":"error","error":{"type":"authentication_error","message":"bad key"}}"#.into()),
-        ];
+        let cases: Vec<(u16, String)> = vec![(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"bad key"}}"#
+                .into(),
+        )];
         let (url, _requests, task) = server(cases).await;
         let mut p = provider("deepseek-v4-pro");
         p.base_url = url;
         let items = [Item::user("hi")];
-        let err = p.stream(request("s", &items, &[]), &mut |_| {}).await.unwrap_err();
-        assert!(format!("{err:#}").contains("401") && format!("{err:#}").contains("denied"), "{err:#}");
+        let err = p
+            .stream(request("s", &items, &[]), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("401") && format!("{err:#}").contains("denied"),
+            "{err:#}"
+        );
         task.await.unwrap();
 
-        let stream_error = events(&[json!({"type":"error","error":{"type":"invalid_request_error","message":"model_context_window_exceeded"}})]);
+        let stream_error = events(&[
+            json!({"type":"error","error":{"type":"invalid_request_error","message":"model_context_window_exceeded"}}),
+        ]);
         let (url, _r, task) = server(vec![(200, stream_error)]).await;
         let mut p = provider("deepseek-v4-pro");
         p.base_url = url;
-        let err = p.stream(request("s", &items, &[]), &mut |_| {}).await.unwrap_err();
+        let err = p
+            .stream(request("s", &items, &[]), &mut |_| {})
+            .await
+            .unwrap_err();
         assert!(
-            format!("{err:#}").contains("context_window") || format!("{err:#}").contains("invalid_request"),
+            format!("{err:#}").contains("context_window")
+                || format!("{err:#}").contains("invalid_request"),
             "{err:#}"
         );
         task.await.unwrap();

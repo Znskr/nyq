@@ -216,7 +216,11 @@ mod tests {
         fs::create_dir(dir.path().join("existing")).unwrap();
         let path = dir.path().join("existing/new/nested/file");
         let mut log = UndoLog::default();
-        log.snapshot(dir.path(), Mode::WorkspaceWrite, std::slice::from_ref(&path));
+        log.snapshot(
+            dir.path(),
+            Mode::WorkspaceWrite,
+            std::slice::from_ref(&path),
+        );
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "new").unwrap();
         assert_eq!(
@@ -235,7 +239,11 @@ mod tests {
         let victim = outside.path().join("file");
         fs::write(&victim, "keep").unwrap();
         let mut log = UndoLog::default();
-        log.snapshot(dir.path(), Mode::WorkspaceWrite, &[PathBuf::from("sub/file")]);
+        log.snapshot(
+            dir.path(),
+            Mode::WorkspaceWrite,
+            &[PathBuf::from("sub/file")],
+        );
         fs::create_dir_all(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/file"), "new").unwrap();
         fs::remove_dir_all(dir.path().join("sub")).unwrap();

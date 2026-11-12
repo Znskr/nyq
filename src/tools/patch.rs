@@ -140,14 +140,19 @@ fn parse_unified(text: &str) -> Result<Vec<FilePatch>, String> {
         let old_path = strip_path(old_raw);
         i += 1;
         let Some(new_raw) = lines.get(i).and_then(|l| l.strip_prefix("+++ ")) else {
-            return Err(format!("unified diff: `--- {old_path}` is not followed by a `+++` line"));
+            return Err(format!(
+                "unified diff: `--- {old_path}` is not followed by a `+++` line"
+            ));
         };
         let new_path = strip_path(new_raw);
         i += 1;
         let mut hunks = Vec::new();
         while i < lines.len() && lines[i].starts_with("@@") {
             let Some((os, oc, _ns, nc)) = hunk_counts(lines[i]) else {
-                return Err(format!("unified diff: malformed hunk header `{}`", lines[i]));
+                return Err(format!(
+                    "unified diff: malformed hunk header `{}`",
+                    lines[i]
+                ));
             };
             // `-a,0` means insert after line a; `-a,n` starts at line a.
             let hint = if oc == 0 { os } else { os.saturating_sub(1) };
@@ -432,8 +437,7 @@ fn find(
     };
     // A trailing `\ No newline` marker pins the match to a newline-less EOF.
     let eof_ok = |pos: usize| {
-        want.last().map(|l| l.no_nl) != Some(true)
-            || (pos + n == lines.len() && !has_nl)
+        want.last().map(|l| l.no_nl) != Some(true) || (pos + n == lines.len() && !has_nl)
     };
     for rtrim in [false, true] {
         let mut best: Option<usize> = None;
@@ -533,10 +537,7 @@ fn apply_update(path: &str, norm: &str, hunks: &[Hunk]) -> Result<String, String
             has_nl,
         )?;
         let at_eof = pos + want.len() == lines.len();
-        lines.splice(
-            pos..pos + want.len(),
-            repl.iter().map(|l| l.text.clone()),
-        );
+        lines.splice(pos..pos + want.len(), repl.iter().map(|l| l.text.clone()));
         if at_eof {
             has_nl = repl.last().map(|l| !l.no_nl).unwrap_or(has_nl);
         }
@@ -767,7 +768,10 @@ index 111..222 100644
         let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-nope\n+y\n";
         let files = parse(patch).unwrap();
         let err = apply_str("something\nelse\n", &files[0].change).unwrap_err();
-        assert!(err.contains("hunk 1") && err.contains("context not found"), "{err}");
+        assert!(
+            err.contains("hunk 1") && err.contains("context not found"),
+            "{err}"
+        );
     }
 
     #[test]

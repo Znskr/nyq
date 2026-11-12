@@ -109,9 +109,7 @@ impl Service {
             Service::Anthropic => {
                 env("ANTHROPIC_MODEL").unwrap_or_else(|| "claude-opus-5-5".into())
             }
-            Service::DeepSeek => {
-                env("DEEPSEEK_MODEL").unwrap_or_else(|| "deepseek-v4-pro".into())
-            }
+            Service::DeepSeek => env("DEEPSEEK_MODEL").unwrap_or_else(|| "deepseek-v4-pro".into()),
         }
     }
 
@@ -306,8 +304,7 @@ pub enum KeyCheck {
 /// `x-api-key` and `anthropic-version`; DeepSeek: `x-api-key` on the
 /// listing at the origin).
 pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck {
-    let deepseek_route =
-        service == Service::DeepSeek || host_is(base_url, "deepseek.com");
+    let deepseek_route = service == Service::DeepSeek || host_is(base_url, "deepseek.com");
     let url = if deepseek_route {
         deepseek::models_url(base_url)
     } else {
@@ -717,7 +714,8 @@ impl HostedProvider {
         provider.headers = self.headers();
         provider.caps = deepseek::capabilities(&self.model, listed.as_ref(), self.meta());
         provider.max_tokens = deepseek::max_tokens(listed.as_ref(), self.meta());
-        provider.context_window = deepseek::context_window(&self.model, listed.as_ref(), self.meta());
+        provider.context_window =
+            deepseek::context_window(&self.model, listed.as_ref(), self.meta());
         provider.session = Some(self.session.clone());
         provider.state = Arc::clone(&self.deepseek);
         provider.stream(req, on_event).await
@@ -1324,11 +1322,14 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
             json!({"type":"message_stop"}),
         ]);
-        let listing =
-            json!({"data":[{"id":"deepseek-flash","context_window":1048576,"api_capabilities":{"anthropic_messages":{"system_prompt_update":"in-history","tool_update":"addition-only"}}}]});
+        let listing = json!({"data":[{"id":"deepseek-flash","context_window":1048576,"api_capabilities":{"anthropic_messages":{"system_prompt_update":"in-history","tool_update":"addition-only"}}}]});
         let (url, mut requests, task) =
             server(vec![(200, listing.to_string()), (200, reply)]).await;
-        let mut p = provider(Service::DeepSeek, &format!("{url}/anthropic/v1"), "deepseek-flash");
+        let mut p = provider(
+            Service::DeepSeek,
+            &format!("{url}/anthropic/v1"),
+            "deepseek-flash",
+        );
         p.set_conversation("conv-ds");
         p.set_effort(Some("low".into()));
         let tools = [crate::types::ToolSpec {
@@ -1353,7 +1354,10 @@ mod tests {
         assert!(lookup.starts_with("get /models "), "{lookup}");
         assert!(lookup.contains("x-api-key: sk-test") && !lookup.contains("authorization"));
         let request = requests.recv().await.unwrap().to_lowercase();
-        assert!(request.starts_with("post /anthropic/v1/messages "), "{request}");
+        assert!(
+            request.starts_with("post /anthropic/v1/messages "),
+            "{request}"
+        );
         assert!(request.contains("x-deepseek-harness-session-id: conv-ds"));
         let body = body_of(&request);
         // The DeepSeek wire: effort in output_config, string system, big caps.
@@ -1395,7 +1399,14 @@ mod tests {
         let models = p.list_models().await.unwrap();
         assert_eq!(
             models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
-            ["claude", "deepseek-flash", "deepseek-v4-pro", "gemini", "glm", "grok"]
+            [
+                "claude",
+                "deepseek-flash",
+                "deepseek-v4-pro",
+                "gemini",
+                "glm",
+                "grok"
+            ]
         );
         task.await.unwrap();
     }

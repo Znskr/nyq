@@ -121,10 +121,7 @@ impl FileLedger {
 
     /// Forget every record: a fresh conversation has read nothing.
     pub(crate) fn clear(&self) {
-        self.seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// `Err` explains to the model why `path` may not be written.
@@ -141,9 +138,7 @@ impl FileLedger {
                 "{tool}: {} has not been read in this session; read it first.",
                 display_path(path)
             )),
-            Some(&(len, modified))
-                if len != meta.len() || modified != meta.modified().ok() =>
-            {
+            Some(&(len, modified)) if len != meta.len() || modified != meta.modified().ok() => {
                 Err(format!(
                     "{tool}: {} changed on disk since you last read it; re-read it.",
                     display_path(path)
@@ -874,12 +869,8 @@ fn load_text(
             display_path(path)
         )));
     }
-    String::from_utf8(bytes).map_err(|_| {
-        ToolOutput::err(format!(
-            "{tool}: {} is not UTF-8 text.",
-            display_path(path)
-        ))
-    })
+    String::from_utf8(bytes)
+        .map_err(|_| ToolOutput::err(format!("{tool}: {} is not UTF-8 text.", display_path(path))))
 }
 
 /// Replace `old_string` with `new_string` inside `content`: exact match,
@@ -910,10 +901,7 @@ fn replace_in(
 
     let count = content.matches(&old).count();
     if count == 0 {
-        return Err(format!(
-            "old_string not found in {}.",
-            display_path(path)
-        ));
+        return Err(format!("old_string not found in {}.", display_path(path)));
     }
     if count > 1 && !replace_all {
         return Err(format!(
@@ -976,12 +964,18 @@ fn apply_multi(
     let content = load_text(ctx, user_path, path, "multi_edit")?;
     let mut current = content.clone();
     for (i, edit) in edits.iter().enumerate() {
-        let old_string = edit.get("old_string").and_then(Value::as_str).ok_or_else(|| {
-            ToolOutput::err(format!("multi_edit: edit {i}: missing `old_string`."))
-        })?;
-        let new_string = edit.get("new_string").and_then(Value::as_str).ok_or_else(|| {
-            ToolOutput::err(format!("multi_edit: edit {i}: missing `new_string`."))
-        })?;
+        let old_string = edit
+            .get("old_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ToolOutput::err(format!("multi_edit: edit {i}: missing `old_string`."))
+            })?;
+        let new_string = edit
+            .get("new_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ToolOutput::err(format!("multi_edit: edit {i}: missing `new_string`."))
+            })?;
         let replace_all = edit
             .get("replace_all")
             .and_then(Value::as_bool)
@@ -1001,12 +995,11 @@ impl Tool for MultiEdit {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "multi_edit".into(),
-            description:
-                "Apply a list of `edit_file`-style replacements to one file, in order, \
+            description: "Apply a list of `edit_file`-style replacements to one file, in order, \
                 atomically: if any edit fails nothing is written and the error names the \
                 failing edit's index. Each edit is `{old_string, new_string, replace_all?}` \
                 with the same matching and CRLF rules as edit_file."
-                    .into(),
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1111,12 +1104,7 @@ fn apply_range(
         .filter(|(i, _)| start_re.is_match(line(*i)))
         .map(|(i, _)| i)
         .min_by_key(|i| (i + 1).abs_diff(start_near))
-        .ok_or_else(|| {
-            format!(
-                "start_regex matches no line of {}.",
-                display_path(path)
-            )
-        })?;
+        .ok_or_else(|| format!("start_regex matches no line of {}.", display_path(path)))?;
     let anchor = end_near.unwrap_or(start + 1);
     let end = bounds
         .iter()
@@ -1160,13 +1148,12 @@ impl Tool for EditRange {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_range".into(),
-            description:
-                "Replace a range of lines in a text file. `start_regex` picks the line \
+            description: "Replace a range of lines in a text file. `start_regex` picks the line \
                 closest to `start_near_line`, then `end_regex` picks the match closest to \
                 `end_near_line` at or after the start; the inclusive range is replaced by \
                 `new_text`. Regexes match against single lines, so this stays correct when \
                 line numbers drift. The approval prompt shows the resulting diff."
-                    .into(),
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1232,9 +1219,8 @@ fn apply_range_args(
     path: &Path,
     args: &Value,
 ) -> Result<(String, String), ToolOutput> {
-    let missing = |name: &str| {
-        ToolOutput::err(format!("edit_range: missing required argument `{name}`."))
-    };
+    let missing =
+        |name: &str| ToolOutput::err(format!("edit_range: missing required argument `{name}`."));
     let Some(start_src) = args.get("start_regex").and_then(Value::as_str) else {
         return Err(missing("start_regex"));
     };
@@ -1249,12 +1235,10 @@ fn apply_range_args(
             "edit_range: regexes must match single lines.",
         ));
     }
-    let start_re = regex::Regex::new(start_src).map_err(|e| {
-        ToolOutput::err(format!("edit_range: invalid start_regex: {e}"))
-    })?;
-    let end_re = regex::Regex::new(end_src).map_err(|e| {
-        ToolOutput::err(format!("edit_range: invalid end_regex: {e}"))
-    })?;
+    let start_re = regex::Regex::new(start_src)
+        .map_err(|e| ToolOutput::err(format!("edit_range: invalid start_regex: {e}")))?;
+    let end_re = regex::Regex::new(end_src)
+        .map_err(|e| ToolOutput::err(format!("edit_range: invalid end_regex: {e}")))?;
     let near = |name: &str| -> Result<Option<usize>, ToolOutput> {
         match int_arg(args, name) {
             None => Ok(None),
@@ -1293,18 +1277,14 @@ struct PlannedFile {
 
 /// Parse `args` and compute every file's outcome without writing. Also the
 /// preview's source of truth, so what the approver sees is what runs.
-fn plan_patch(
-    ctx: &ToolCtx,
-    args: &Value,
-) -> Result<Vec<PlannedFile>, ToolOutput> {
+fn plan_patch(ctx: &ToolCtx, args: &Value) -> Result<Vec<PlannedFile>, ToolOutput> {
     let Some(text) = args.get("patch").and_then(Value::as_str) else {
         return Err(ToolOutput::err(
             "apply_patch: missing required argument `patch`.",
         ));
     };
-    let files = super::patch::parse(text).map_err(|e| {
-        ToolOutput::err(format!("apply_patch: {e}"))
-    })?;
+    let files =
+        super::patch::parse(text).map_err(|e| ToolOutput::err(format!("apply_patch: {e}")))?;
     let mut planned = Vec::with_capacity(files.len());
     for file in &files {
         let path = resolve(&ctx.cwd, &file.path);
@@ -1417,14 +1397,13 @@ impl Tool for ApplyPatch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "apply_patch".into(),
-            description:
-                "Apply a patch to one or more files. Accepts a standard unified diff \
+            description: "Apply a patch to one or more files. Accepts a standard unified diff \
                 (multi-file, tolerant of small line-offset and trailing-whitespace fuzz) \
                 and the Codex format (`*** Begin Patch` with `*** Update File:` / \
                 `*** Add File:` / `*** Delete File:` sections, ending `*** End Patch`). \
                 Every hunk of every file is validated before anything is written; on a \
                 mid-write failure earlier files are restored."
-                    .into(),
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1846,10 +1825,7 @@ mod tests {
         assert!(out.is_error, "{}", out.content);
         assert!(out.content.contains("edit 1"), "{}", out.content);
         assert!(out.content.contains("not found"), "{}", out.content);
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "one\ntwo\nthree\n"
-        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\nthree\n");
 
         let out = run_ctx(
             &MultiEdit,
@@ -1883,7 +1859,11 @@ mod tests {
             json!({"path": "m.txt", "edits": [{"new_string": "x"}]}),
             &c,
         );
-        assert!(out.is_error && out.content.contains("edit 0"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("edit 0"),
+            "{}",
+            out.content
+        );
         assert!(MultiEdit.needs_approval(&json!({"path": "m.txt"})));
     }
 
@@ -1927,7 +1907,10 @@ mod tests {
             "new_text": "fn b() {\n  REWRITTEN\n}"
         });
         let preview = EditRange.preview(&args, &c).unwrap();
-        assert!(preview.contains("-  2") && preview.contains("+  REWRITTEN"), "{preview}");
+        assert!(
+            preview.contains("-  2") && preview.contains("+  REWRITTEN"),
+            "{preview}"
+        );
         let out = run_ctx(&EditRange, args, &c);
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(
@@ -1959,13 +1942,21 @@ mod tests {
             json!({"path": "r.rs", "start_regex": "nope", "end_regex": "x", "new_text": "y"}),
             &c,
         );
-        assert!(out.is_error && out.content.contains("no line"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("no line"),
+            "{}",
+            out.content
+        );
         let out = run_ctx(
             &EditRange,
             json!({"path": "r.rs", "start_regex": "^fn c", "end_regex": "^zzz", "new_text": "y"}),
             &c,
         );
-        assert!(out.is_error && out.content.contains("end_regex"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("end_regex"),
+            "{}",
+            out.content
+        );
         let out = run_ctx(
             &EditRange,
             json!({"path": "r.rs", "start_regex": "[", "end_regex": "x", "new_text": "y"}),
@@ -2004,7 +1995,10 @@ diff --git a/a.txt b/a.txt
 ";
         let args = json!({"patch": patch});
         let preview = ApplyPatch.preview(&args, &c).unwrap();
-        assert!(preview.contains("-two") && preview.contains("+TWO"), "{preview}");
+        assert!(
+            preview.contains("-two") && preview.contains("+TWO"),
+            "{preview}"
+        );
         assert!(preview.contains("new file:") && preview.contains("new.txt"));
         let out = run_ctx(&ApplyPatch, args.clone(), &c);
         assert!(!out.is_error, "{}", out.content);
@@ -2030,7 +2024,11 @@ diff --git a/a.txt b/a.txt
         )
         .unwrap_or_else(|_| {
             std::fs::create_dir_all(dir.path().join("src")).unwrap();
-            std::fs::write(dir.path().join("src/lib.rs"), "fn main() {\n    old();\n}\n").unwrap();
+            std::fs::write(
+                dir.path().join("src/lib.rs"),
+                "fn main() {\n    old();\n}\n",
+            )
+            .unwrap();
         });
         prime(&c, "src/lib.rs");
         let patch = "\
@@ -2080,7 +2078,11 @@ diff --git a/a.txt b/a.txt
 ";
         let out = run_ctx(&ApplyPatch, json!({"patch": patch}), &c);
         assert!(out.is_error, "{}", out.content);
-        assert!(out.content.contains("hunk") && out.content.contains("context"), "{}", out.content);
+        assert!(
+            out.content.contains("hunk") && out.content.contains("context"),
+            "{}",
+            out.content
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "keep me\n"
@@ -2109,7 +2111,11 @@ diff --git a/a.txt b/a.txt
             json!({"path": "g.txt", "old_string": "original", "new_string": "x"}),
             &c,
         );
-        assert!(out.is_error && out.content.contains("read it first"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("read it first"),
+            "{}",
+            out.content
+        );
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "original content\n"
@@ -2132,7 +2138,9 @@ diff --git a/a.txt b/a.txt
             &c,
         );
         assert!(
-            out.is_error && out.content.contains("changed on disk") && out.content.contains("re-read"),
+            out.is_error
+                && out.content.contains("changed on disk")
+                && out.content.contains("re-read"),
             "{}",
             out.content
         );
@@ -2151,19 +2159,31 @@ diff --git a/a.txt b/a.txt
             json!({"path": "u.txt", "edits": [{"old_string": "u", "new_string": "x"}]}),
             &c,
         );
-        assert!(out.is_error && out.content.contains("read it first"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("read it first"),
+            "{}",
+            out.content
+        );
         let out = run_ctx(
             &ApplyPatch,
             json!({"patch": "--- a/u.txt\n+++ b/u.txt\n@@ -1 +1 @@\n-unread\n+x\n"}),
             &c,
         );
-        assert!(out.is_error && out.content.contains("read it first"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("read it first"),
+            "{}",
+            out.content
+        );
         let out = run_ctx(
             &WriteFile,
             json!({"path": "u.txt", "content": "over\n"}),
             &c,
         );
-        assert!(out.is_error && out.content.contains("read it first"), "{}", out.content);
+        assert!(
+            out.is_error && out.content.contains("read it first"),
+            "{}",
+            out.content
+        );
         let out = run_ctx(
             &WriteFile,
             json!({"path": "brand-new.txt", "content": "made\n"}),
@@ -2379,7 +2399,11 @@ diff --git a/a.txt b/a.txt
         let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
         perms.set_mode(0o555);
         std::fs::set_permissions(dir.path(), perms).unwrap();
-        let out = run_ctx(&WriteFile, json!({"path": "keep.txt", "content": "new"}), &c);
+        let out = run_ctx(
+            &WriteFile,
+            json!({"path": "keep.txt", "content": "new"}),
+            &c,
+        );
         let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(dir.path(), perms).unwrap();

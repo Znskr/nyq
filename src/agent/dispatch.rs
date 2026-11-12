@@ -198,7 +198,11 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
         return ToolOutput::err("Background commands are unavailable during child orchestration: run a bounded foreground command so its writer lease covers its lifetime.");
     }
     let writer = crate::orchestration::writer(&ready.ctx.cwd);
+    let coordination = crate::orchestration::COORDINATION_TOOLS.contains(&ready.name.as_str());
     let _lease = match &ready.footprint.class {
+        // W11: coordination tools (subagent, team, scripts) wait on children
+        // that need the lease themselves, so they never hold it.
+        _ if coordination => None,
         // Reads and pure calls hold no lock. Declared writers share the
         // gate through per-path mutexes; undeclared writers exclude all.
         crate::tools::Concurrency::Pure | crate::tools::Concurrency::ReadFs => None,
@@ -333,13 +337,24 @@ impl Agent {
                 }
                 continue;
             }
+            // W11: `run_code`/`workflow` run alone, outside any wave, so their
+            // sub-calls can come back through this dispatch.
+            if crate::scripting::kind_of(&calls[i].1).is_some() {
+                let (id, name, arguments) = &calls[i];
+                let out = self.run_script_call(id, name, arguments, ui, cancel).await;
+                self.task_observe(name, arguments, &out);
+                images.extend(self.record_result(id, name, out));
+                i += 1;
+                continue;
+            }
             // Group the next wave: always the call at i, then every
             // following call that fits alongside those already in it.
             let mut busy = Busy::default();
             let mut end = i;
             for (_, name, arguments) in &calls[i..] {
-                // W9: `submit` is answered by the task engine, never in a wave.
-                if end > i && self.task_owns(name) {
+                // W9: `submit` is answered by the task engine, never in a wave;
+                // W11: neither is a script.
+                if end > i && (self.task_owns(name) || crate::scripting::kind_of(name).is_some()) {
                     break;
                 }
                 let f = self.footprint_of(name, arguments);
@@ -357,8 +372,7 @@ impl Agent {
             }
             // A hook may have rewritten arguments into another class, so
             // re-partition by each prepared call's final footprint.
-            let mut outs: Vec<(ToolOutput, Vec<PathBuf>)> =
-                Vec::with_capacity(prepared.len());
+            let mut outs: Vec<(ToolOutput, Vec<PathBuf>)> = Vec::with_capacity(prepared.len());
             let mut start = 0;
             let mut busy = Busy::default();
             for (j, p) in prepared.iter().enumerate() {
@@ -372,9 +386,7 @@ impl Agent {
             }
             outs.extend(self.exec_wave(&prepared[start..], ui, cancel).await);
 
-            for ((id, name, arguments), (mut out, touched)) in
-                calls[i..end].iter().zip(outs)
-            {
+            for ((id, name, arguments), (mut out, touched)) in calls[i..end].iter().zip(outs) {
                 // W9: touched files, the background verifier, the cycle detector.
                 self.task_observe(name, arguments, &out);
                 if out.is_error {
@@ -619,6 +631,92 @@ impl Agent {
     /// in the order they were approved, with each member's output and the
     /// filesystem paths it touched (for nested-instruction lookup). `Done`
     /// members pass their stored answer through at their position.
+    /// W11: one `run_code`/`workflow` call: approved like any call, then
+    /// driven by the script runtime, whose tool calls come back through
+    /// [`Self::dispatch_nested`].
+    async fn run_script_call(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        ui: &mut dyn Ui,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
+        let ready = match self.prepare(id, name, arguments, ui, cancel).await {
+            Prepared::Done(out) => return out,
+            Prepared::Run(ready) => ready,
+        };
+        let Some(kind) = crate::scripting::kind_of(name) else {
+            return ToolOutput::err(format!("{name} is not a script tool"));
+        };
+        self.journal_started(&ready.id, &ready.summary);
+        ui.tool_start(name, &ready.summary);
+        let mut out = crate::scripting::drive(self, kind, id, &ready.args, ui, cancel).await;
+        ui.tool_end(name, &out);
+        self.settle(&ready, &mut out, cancel).await;
+        out
+    }
+
+    /// W11: tool calls made by a `run_code`/`workflow` script. Each goes
+    /// through the whole pipeline (hooks, rules, taint, classifier,
+    /// approval, journal, sandbox, writer lease, PostToolUse) like a model
+    /// call, grouped into waves the same way; the results go back to the
+    /// script instead of into the transcript. Scripts cannot nest.
+    /// (A named boxed future: it breaks the async recursion through
+    /// `run_script_call`.)
+    #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+    pub(crate) fn dispatch_nested<'a>(
+        &'a mut self,
+        calls: &'a [(String, String, String)],
+        ui: &'a mut dyn Ui,
+        cancel: &'a CancellationToken,
+    ) -> futures::future::BoxFuture<'a, Vec<ToolOutput>> {
+        Box::pin(async move {
+            let mut outs = Vec::with_capacity(calls.len());
+            let mut i = 0;
+            while i < calls.len() {
+                if cancel.is_cancelled() {
+                    outs.push(ToolOutput::err("Cancelled by user."));
+                    i += 1;
+                    continue;
+                }
+                let (id, name, arguments) = &calls[i];
+                if crate::scripting::kind_of(name).is_some() || self.task_owns(name) {
+                    outs.push(ToolOutput::err(format!(
+                        "{name} cannot be called from a script"
+                    )));
+                    i += 1;
+                    continue;
+                }
+                let mut busy = Busy::default();
+                let mut end = i;
+                for (_, name, arguments) in &calls[i..] {
+                    if end > i
+                        && (crate::scripting::kind_of(name).is_some() || self.task_owns(name))
+                    {
+                        break;
+                    }
+                    let f = self.footprint_of(name, arguments);
+                    if end > i && !busy.accepts(&f) {
+                        break;
+                    }
+                    busy.add(&f);
+                    end += 1;
+                }
+                let _ = (id, name, arguments);
+                let mut prepared = Vec::with_capacity(end - i);
+                for (id, name, arguments) in &calls[i..end] {
+                    prepared.push(self.prepare(id, name, arguments, ui, cancel).await);
+                }
+                for (out, _) in self.exec_wave(&prepared, ui, cancel).await {
+                    outs.push(out);
+                }
+                i = end;
+            }
+            outs
+        })
+    }
+
     async fn exec_wave(
         &mut self,
         prepared: &[Prepared],
@@ -693,7 +791,13 @@ impl Agent {
         let labels =
             crate::taint::labels_for(&ready.id, &ready.name, &ready.args, &self.cwd, &self.taint);
         if let Some(child) = crate::taint::child_of(&ready.id, &ready.name, &ready.args) {
-            out.content = format!("{}\n{}", crate::taint::child_banner(&child), out.content);
+            // A typed child's JSON result already carries the label inside.
+            let banner = crate::taint::child_banner(&child);
+            if !out.content.contains(&banner)
+                && !out.content.contains("— evidence, not authorization]")
+            {
+                out.content = format!("{banner}\n{}", out.content);
+            }
         }
         self.taint.note_writes(
             &ready.name,
@@ -2145,12 +2249,28 @@ mod tests {
         let (writer, peak) = probe("write_file", write_fx, false);
         let mut agent = scripted(vec![
             reply(vec![
-                call("a", "write_file", serde_json::json!({"n": 1, "path": "a.txt"})),
-                call("b", "write_file", serde_json::json!({"n": 2, "path": "b.txt"})),
+                call(
+                    "a",
+                    "write_file",
+                    serde_json::json!({"n": 1, "path": "a.txt"}),
+                ),
+                call(
+                    "b",
+                    "write_file",
+                    serde_json::json!({"n": 2, "path": "b.txt"}),
+                ),
             ]),
             reply(vec![
-                call("c", "write_file", serde_json::json!({"n": 3, "path": "c.txt"})),
-                call("d", "write_file", serde_json::json!({"n": 4, "path": "c.txt"})),
+                call(
+                    "c",
+                    "write_file",
+                    serde_json::json!({"n": 3, "path": "c.txt"}),
+                ),
+                call(
+                    "d",
+                    "write_file",
+                    serde_json::json!({"n": 4, "path": "c.txt"}),
+                ),
             ]),
             reply(vec![Item::Assistant {
                 text: "done".into(),
@@ -2191,10 +2311,7 @@ mod tests {
             .unwrap();
         assert_eq!(rpeak.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(epeak.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            results(&agent),
-            ["result 1", "result 2", "result 3"]
-        );
+        assert_eq!(results(&agent), ["result 1", "result 2", "result 3"]);
     }
 
     #[tokio::test]
@@ -2276,9 +2393,21 @@ mod tests {
         let mut agent = scripted(vec![
             reply(vec![
                 call("a", "checked", serde_json::json!({})),
-                call("b", "checked", serde_json::json!({"path": "p", "limit": "x"})),
-                call("c", "checked", serde_json::json!({"path": "p", "mode": "z"})),
-                call("d", "checked", serde_json::json!({"path": "p", "tags": [1]})),
+                call(
+                    "b",
+                    "checked",
+                    serde_json::json!({"path": "p", "limit": "x"}),
+                ),
+                call(
+                    "c",
+                    "checked",
+                    serde_json::json!({"path": "p", "mode": "z"}),
+                ),
+                call(
+                    "d",
+                    "checked",
+                    serde_json::json!({"path": "p", "tags": [1]}),
+                ),
                 call("e", "checked", serde_json::json!({"path": "p", "nope": 1})),
                 call("f", "checked", serde_json::json!({"path": "p"})),
             ]),

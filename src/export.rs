@@ -60,8 +60,7 @@ fn export_all(
     if metas.is_empty() {
         bail!("no saved sessions in {}", sessions_dir.display());
     }
-    std::fs::create_dir_all(out_dir)
-        .with_context(|| format!("creating {}", out_dir.display()))?;
+    std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     for meta in &metas {
         let text = render(meta, cwd, redact, format)?;
         write_out(Some(out_dir), meta.id.as_str(), format, &text)?;
@@ -169,7 +168,8 @@ fn redact_value(v: &mut Value, workspace: &str, home: &str) {
         }
         Value::Array(a) => a.iter_mut().for_each(|x| redact_value(x, workspace, home)),
         Value::Object(m) => {
-            m.values_mut().for_each(|x| redact_value(x, workspace, home));
+            m.values_mut()
+                .for_each(|x| redact_value(x, workspace, home));
             m.remove("images");
         }
         _ => {}
@@ -260,10 +260,7 @@ fn sharegpt_turn(item: &Value) -> Option<Value> {
             "observation",
             item["output"].as_str().unwrap_or("").to_string(),
         ),
-        Some("compaction") => (
-            "system",
-            item["summary"].as_str().unwrap_or("").to_string(),
-        ),
+        Some("compaction") => ("system", item["summary"].as_str().unwrap_or("").to_string()),
         _ => return None,
     };
     Some(json!({"from": from, "value": value}))
@@ -364,9 +361,10 @@ mod tests {
             prefs: None,
             path,
         };
-        let out: Value =
-            serde_json::from_str(&render(&meta, Path::new("/tmp/ws"), true, Format::Sharegpt).unwrap())
-                .unwrap();
+        let out: Value = serde_json::from_str(
+            &render(&meta, Path::new("/tmp/ws"), true, Format::Sharegpt).unwrap(),
+        )
+        .unwrap();
         let conv = out["conversations"].as_array().unwrap();
         assert_eq!(conv[0]["from"], "human");
         assert_eq!(conv[1]["from"], "gpt");

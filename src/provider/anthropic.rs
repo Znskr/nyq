@@ -195,9 +195,7 @@ pub fn wire_messages(items: &[Item], reasoning: Reasoning) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
     // Consecutive blocks of the same role share one message.
     let mut push = |role: &str, block: Value| match messages.last_mut() {
-        Some(last) if last["role"] == role => {
-            last["content"].as_array_mut().unwrap().push(block)
-        }
+        Some(last) if last["role"] == role => last["content"].as_array_mut().unwrap().push(block),
         _ => messages.push(json!({"role": role, "content": [block]})),
     };
     for item in items {

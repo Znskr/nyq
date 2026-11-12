@@ -308,10 +308,7 @@ fn mask(lang: Lang, text: &str) -> Vec<Masked> {
                     {
                         st = St::Block(1);
                         (lex.block_open.len(), false)
-                    } else if lex.rust_raw
-                        && rest[0] == b'r'
-                        && rust_raw_at(rest).is_some()
-                    {
+                    } else if lex.rust_raw && rest[0] == b'r' && rust_raw_at(rest).is_some() {
                         let (len, hashes) = rust_raw_at(rest).unwrap();
                         st = St::Str {
                             delim: b'"',
@@ -377,11 +374,7 @@ fn mask(lang: Lang, text: &str) -> Vec<Masked> {
                     if let Some(hashes) = raw_hashes {
                         // Rust raw string: ends at '"' + the same # count.
                         if rest[0] == b'"'
-                            && rest[1..]
-                                .iter()
-                                .take_while(|c| **c == b'#')
-                                .count()
-                                == hashes
+                            && rest[1..].iter().take_while(|c| **c == b'#').count() == hashes
                         {
                             st = St::Normal;
                             (1 + hashes, false)
@@ -630,8 +623,7 @@ fn outline_brace(lines: &[Masked], eol_leaf: bool) -> Vec<(u64, String)> {
         }
         if let Some(pos) = opened {
             let head = format!("{pending_code}{}", &code[..pos]);
-            let container =
-                !any_word(&head, FN_WORDS) && any_word(&head, CONTAINER_WORDS);
+            let container = !any_word(&head, FN_WORDS) && any_word(&head, CONTAINER_WORDS);
             if container {
                 emit_all(&mut out, &pending);
             } else {
@@ -786,8 +778,18 @@ fn outline_python(lines: &[Masked]) -> Vec<(u64, String)> {
         } else if tc.ends_with(':')
             || matches!(
                 tc.split_whitespace().next(),
-                Some("if" | "elif" | "else" | "for" | "while" | "try" | "except" | "finally"
-                    | "with" | "match" | "case")
+                Some(
+                    "if" | "elif"
+                        | "else"
+                        | "for"
+                        | "while"
+                        | "try"
+                        | "except"
+                        | "finally"
+                        | "with"
+                        | "match"
+                        | "case"
+                )
             ) && paren_delta(code) > 0
         {
             Some(PyKind::Other)
@@ -858,7 +860,13 @@ fn outline_ruby(lines: &[Masked]) -> Vec<(u64, String)> {
 /// header still opens.
 fn opens_ruby_block(code: &str) -> bool {
     let t = code.trim();
-    if t == "do" || t.starts_with("do ") || t.starts_with("do|") || t.ends_with(" do") || t.contains(" do |") || t.contains(" do|") {
+    if t == "do"
+        || t.starts_with("do ")
+        || t.starts_with("do|")
+        || t.ends_with(" do")
+        || t.contains(" do |")
+        || t.contains(" do|")
+    {
         return true;
     }
     brace_delta(code) > 0
@@ -872,8 +880,7 @@ fn ruby_delta(code: &str) -> i64 {
     let mut d = brace_delta(code);
     if matches!(
         first,
-        "def" | "class" | "module" | "if" | "unless" | "case" | "while" | "until" | "for"
-            | "begin"
+        "def" | "class" | "module" | "if" | "unless" | "case" | "while" | "until" | "for" | "begin"
     ) {
         d += 1;
     }
@@ -884,9 +891,7 @@ fn ruby_delta(code: &str) -> i64 {
     // never as `x.end` or inside `sender`.
     let mut rest = t;
     while let Some(pos) = rest.find("end") {
-        let before_ok = pos == 0
-            || rest[..pos].ends_with(';')
-            || rest[..pos].ends_with("; ");
+        let before_ok = pos == 0 || rest[..pos].ends_with(';') || rest[..pos].ends_with("; ");
         let after_ok = rest[pos + 3..]
             .chars()
             .next()
@@ -1092,7 +1097,10 @@ func (s *Server) Start() error {
         assert!(joined.contains("type Server struct {"), "{joined}");
         assert!(joined.contains("addr string"), "{joined}");
         assert!(joined.contains("type Handler interface {"), "{joined}");
-        assert!(joined.contains("Serve(ctx context.Context) error"), "{joined}");
+        assert!(
+            joined.contains("Serve(ctx context.Context) error"),
+            "{joined}"
+        );
         assert!(
             joined.contains("func (s *Server) Start() error { … }"),
             "{joined}"
@@ -1166,9 +1174,15 @@ type Alias = { a: number };
         let joined = ol("f.ts", ts);
         assert!(joined.contains("export interface User {"), "{joined}");
         assert!(joined.contains("name(): string;"), "{joined}");
-        assert!(joined.contains("export class C implements User {"), "{joined}");
+        assert!(
+            joined.contains("export class C implements User {"),
+            "{joined}"
+        );
         assert!(joined.contains("name(): string { … }"), "{joined}");
-        assert!(joined.contains("export const f = (x: number) => { … }"), "{joined}");
+        assert!(
+            joined.contains("export const f = (x: number) => { … }"),
+            "{joined}"
+        );
         assert!(joined.contains("type Alias = { a: number };"), "{joined}");
 
         let java = r#"package x.y;
@@ -1184,7 +1198,10 @@ public class Foo extends Bar {
 }
 "#;
         let joined = ol("f.java", java);
-        assert!(joined.contains("public class Foo extends Bar {"), "{joined}");
+        assert!(
+            joined.contains("public class Foo extends Bar {"),
+            "{joined}"
+        );
         assert!(joined.contains("private int count;"), "{joined}");
         assert!(joined.contains("@Override"), "{joined}");
         assert!(joined.contains("public String name() { … }"), "{joined}");
@@ -1274,7 +1291,10 @@ main = do
     print 1
 "#;
         let joined = ol("f.hs", src);
-        assert!(joined.contains("module Foo (bar, Baz(..)) where"), "{joined}");
+        assert!(
+            joined.contains("module Foo (bar, Baz(..)) where"),
+            "{joined}"
+        );
         assert!(joined.contains("data Baz = MkBaz Int | Other"), "{joined}");
         assert!(joined.contains("deriving (Show)"), "{joined}");
         assert!(joined.contains("c :: a -> Int"), "{joined}");

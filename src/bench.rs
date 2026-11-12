@@ -51,8 +51,8 @@ fn string(m: &Map<String, Value>, key: &str) -> Option<String> {
 /// Parse `<dir>/task.toml`; `prompt` is required, everything else optional.
 pub fn parse_task(dir: &Path) -> Result<TaskDef> {
     let file = dir.join("task.toml");
-    let text = std::fs::read_to_string(&file)
-        .with_context(|| format!("reading {}", file.display()))?;
+    let text =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let map = crate::settings::file::parse_str(&text)
         .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
     let prompt = string(&map, "prompt")
@@ -129,8 +129,7 @@ impl WorkDir {
                 .map(|d| d.as_millis())
                 .unwrap_or_default()
         ));
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(WorkDir(dir))
     }
 
@@ -187,8 +186,7 @@ pub async fn run(
     let profile = profile.unwrap_or_else(|| "minimal".to_string());
     let mut out: Box<dyn Write> = match output {
         Some(path) => Box::new(
-            std::fs::File::create(path)
-                .with_context(|| format!("writing {}", path.display()))?,
+            std::fs::File::create(path).with_context(|| format!("writing {}", path.display()))?,
         ),
         None => Box::new(std::io::stdout().lock()),
     };
@@ -203,7 +201,11 @@ pub async fn run(
         eprintln!(
             "bench {:<24} {} ({}ms)",
             task.name,
-            if record["pass"] == true { "pass" } else { "FAIL" },
+            if record["pass"] == true {
+                "pass"
+            } else {
+                "FAIL"
+            },
             record["wall_ms"]
         );
     }
@@ -286,9 +288,7 @@ async fn run_one(
         Ok(r) => (Some(r.context("waiting for the task agent")?), false),
         Err(_) => (None, true),
     };
-    let stdout = result
-        .as_ref()
-        .and_then(|o| run_output(&o.stdout));
+    let stdout = result.as_ref().and_then(|o| run_output(&o.stdout));
     let agent_exit = stdout
         .as_ref()
         .and_then(|v| v["exit_code"].as_i64())
@@ -355,7 +355,10 @@ pub fn report(a: &Path, b: &Path) -> Result<()> {
         println!("no results to compare");
         return Ok(());
     }
-    println!("{:<28} {:^9} {:^9} {:>10} {:>10} {:>10} {:>10}", "task", "A", "B", "steps A→B", "tokens A→B", "cost A→B", "ms A→B");
+    println!(
+        "{:<28} {:^9} {:^9} {:>10} {:>10} {:>10} {:>10}",
+        "task", "A", "B", "steps A→B", "tokens A→B", "cost A→B", "ms A→B"
+    );
     let mut pass_a = 0usize;
     let mut pass_b = 0usize;
     let mut tok_a = 0u64;
@@ -378,7 +381,11 @@ pub fn report(a: &Path, b: &Path) -> Result<()> {
             name,
             verdict(pa, ra.is_some()),
             verdict(pb, rb.is_some()),
-            delta(ra.and_then(|r| r["steps"].as_i64()), rb.and_then(|r| r["steps"].as_i64()), ""),
+            delta(
+                ra.and_then(|r| r["steps"].as_i64()),
+                rb.and_then(|r| r["steps"].as_i64()),
+                ""
+            ),
             format!("{}→{}", tokens(ra), tokens(rb)),
             format!("{:.4}→{:.4}", cost(ra), cost(rb)),
             delta(
@@ -430,8 +437,8 @@ fn cost(r: Option<&Value>) -> f64 {
 
 /// A results file as `task -> record`; blank/broken lines are skipped.
 fn read_results(path: &Path) -> Result<BTreeMap<String, Value>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut out = BTreeMap::new();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {

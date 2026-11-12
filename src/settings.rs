@@ -822,7 +822,8 @@ pub fn apply_set(s: &mut Settings, pairs: &[String]) -> Result<Map<String, Value
         if path.iter().any(|k| k.is_empty()) {
             bail!("--set: bad key `{key}`");
         }
-        let v = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+        let v =
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
         set_path(&mut value, &path, Some(v.clone()));
         set_path(&mut applied, &path, Some(v));
     }
@@ -836,11 +837,7 @@ pub fn note_cli_overrides(applied: Map<String, Value>) {
     if applied.is_empty() {
         return;
     }
-    if let Some(layers) = OVERRIDES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()
-    {
+    if let Some(layers) = OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         merge(&mut layers.cli, &applied);
     }
 }
@@ -1744,8 +1741,7 @@ mod tests {
             "testp",
             "sound = \"max\"\nenabled_tools = [\"bash\", \"view_image\"]\ndisabled_tools = []\npermission_mode = \"yolo\"\n",
         );
-        let (s, warnings, layers) =
-            load_layered_parts(home.path(), cwd.path(), Some(&profile));
+        let (s, warnings, layers) = load_layered_parts(home.path(), cwd.path(), Some(&profile));
         // The profile beats the user file for the keys it sets…
         assert_eq!(s.sound, "max");
         assert_eq!(s.enabled_tools, ["bash", "view_image"]);
@@ -1773,8 +1769,7 @@ mod tests {
         )
         .unwrap();
         let profile = test_profile("minimal", "enabled_tools = []\nauto_compact = 80\n");
-        let (s, warnings, _) =
-            load_layered_parts(home.path(), cwd.path(), Some(&profile));
+        let (s, warnings, _) = load_layered_parts(home.path(), cwd.path(), Some(&profile));
         // `enabled_tools` is not a project key: tightening it would let a
         // repo decide what the model may do, so it stays filtered out.
         assert!(s.enabled_tools.is_empty(), "{:?}", s.enabled_tools);
@@ -1797,11 +1792,19 @@ mod tests {
             "disabled_tools = [\"web_fetch\"]\n",
         )
         .unwrap();
-        let profile = test_profile("ci", "permission_mode = \"yolo\"\ncommand_timeout_secs = 300\n");
+        let profile = test_profile(
+            "ci",
+            "permission_mode = \"yolo\"\ncommand_timeout_secs = 300\n",
+        );
         let (s, _, layers) = load_layered_parts(home.path(), cwd.path(), Some(&profile));
         let dump = dump_config_with(&s, &layers);
         assert_eq!(dump["profile"], "ci");
-        let src = |key: &str| dump["settings"][key]["source"].as_str().unwrap().to_string();
+        let src = |key: &str| {
+            dump["settings"][key]["source"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
         assert_eq!(src("theme"), "user");
         assert_eq!(src("permission_mode"), "profile:ci");
         assert_eq!(src("command_timeout_secs"), "profile:ci");

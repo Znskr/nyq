@@ -301,7 +301,9 @@ impl Workset {
                         Err(e) => format!("(unreadable: {})", first_line(&e.content)),
                     },
                     Mode::Outline => match fs::file_text(&e.path) {
-                        Ok(text) => crate::outline::render(&e.path, &text).trim_end().to_string(),
+                        Ok(text) => crate::outline::render(&e.path, &text)
+                            .trim_end()
+                            .to_string(),
                         Err(e) => format!("(unreadable: {})", first_line(&e.content)),
                     },
                 }
@@ -523,7 +525,10 @@ impl Tool for Focus {
             Err(e) => return e,
         };
         let msg = lock(&ctx.workset).open(&ctx.cwd, path, Mode::Focused);
-        ToolOutput::ok(msg.replacen("opened", "focused", 1).replacen("updated", "focused", 1))
+        ToolOutput::ok(
+            msg.replacen("opened", "focused", 1)
+                .replacen("updated", "focused", 1),
+        )
     }
 }
 
@@ -775,9 +780,22 @@ mod tests {
         assert_eq!(out.content, "opened a.rs (outline)");
         let out = run(&Open, json!({"path": "spec.md"}), dir.path(), &ws);
         assert_eq!(out.content, "opened spec.md (pinned)");
-        let out = run(&Open, json!({"path": "a.rs", "mode": "focused"}), dir.path(), &ws);
+        let out = run(
+            &Open,
+            json!({"path": "a.rs", "mode": "focused"}),
+            dir.path(),
+            &ws,
+        );
         assert_eq!(out.content, "updated a.rs (focused)");
-        assert!(run(&Open, json!({"path": "a.rs", "mode": "bogus"}), dir.path(), &ws).is_error);
+        assert!(
+            run(
+                &Open,
+                json!({"path": "a.rs", "mode": "bogus"}),
+                dir.path(),
+                &ws
+            )
+            .is_error
+        );
         assert!(run(&Open, json!({"path": "missing.rs"}), dir.path(), &ws).is_error);
         assert!(run(&Open, json!({"path": "."}), dir.path(), &ws).is_error);
         let lines = {
