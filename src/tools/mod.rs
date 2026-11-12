@@ -1047,9 +1047,10 @@ mod registry_tests {
                 .unwrap_or_else(|| panic!("add `{}` to this table with its kind", spec.name));
             assert_eq!(r.get(&spec.name).unwrap().kind(), want, "{}", spec.name);
         }
-        // A patch's kind does not depend on whether a probe has a patch.
+        // A patch's kind does not depend on whether a probe has a patch; a
+        // call naming no file is never treated as a read.
         let patch = r.get("apply_patch").unwrap();
-        assert!(patch.effects(&serde_json::json!({})).is_read_only());
+        assert!(!patch.effects(&serde_json::json!({})).is_read_only());
         assert_eq!(patch.kind(), FileWrite);
     }
 
