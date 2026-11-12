@@ -82,8 +82,8 @@ impl Tool for Script {
     }
 
     /// Each sub-call goes through dispatch and takes the lease itself.
-    fn coordinates(&self) -> bool {
-        true
+    fn kind(&self) -> super::ToolKind {
+        super::ToolKind::Coordination
     }
 
     async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {

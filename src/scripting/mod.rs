@@ -147,6 +147,8 @@ pub(crate) async fn drive(
     let mut logs = String::new();
     let mut phases: Vec<String> = Vec::new();
     let mut undo = crate::undo::UndoLog::default();
+    // Whether any sub-call changed the workspace.
+    let mut changed = false;
     let mut images = Vec::new();
     let result = loop {
         let event = tokio::select! {
@@ -198,6 +200,9 @@ pub(crate) async fn drive(
                     for ((n, name, args), out) in chunk.into_iter().zip(by_index) {
                         let mut out =
                             out.unwrap_or_else(|| ToolOutput::err("The call did not run."));
+                        // Dispatch already moved each sub-call's undo records
+                        // into the session's log; its `changed` flag survives.
+                        changed |= out.changed || !out.undo.is_empty();
                         undo.append(std::mem::take(&mut out.undo));
                         images.append(&mut out.images);
                         record.push(SubCall {
@@ -219,7 +224,7 @@ pub(crate) async fn drive(
     let mut out = render(kind, result, &record, &logs, &phases);
     out.undo = undo;
     out.images = images;
-    out.changed = !out.undo.is_empty();
+    out.changed = changed || !out.undo.is_empty();
     out
 }
 
@@ -395,6 +400,27 @@ mod tests {
     }
 
     const ASK: &str = "const a = await tools.mcp__wiki__ask({q: 1}); return {got: a};";
+
+    /// The script's result says it changed the workspace when a sub-call
+    /// did, though dispatch already moved the sub-call's undo records into
+    /// the session's log (once).
+    #[tokio::test]
+    async fn a_script_reports_the_changes_its_sub_calls_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = builtin();
+        agent.cwd = dir.path().to_path_buf();
+        let mut ui = Answer(Approval::Yes, 0);
+        let cancel = CancellationToken::new();
+        let write =
+            json!({"code": "await tools.write_file({path: \"c.txt\", content: \"x\"}); return 1;"});
+        let out = drive(&mut agent, Kind::Code, "s1", &write, &mut ui, &cancel).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.changed, "{}", out.content);
+        assert_eq!(agent.undo.len(), 1);
+        let read = json!({"code": "return (await tools.read_file({path: \"c.txt\"})).length > 0;"});
+        let out = drive(&mut agent, Kind::Code, "s2", &read, &mut ui, &cancel).await;
+        assert!(!out.is_error && !out.changed, "{}", out.content);
+    }
 
     #[tokio::test]
     async fn sub_calls_go_through_approval_and_a_denial_is_a_denial() {

@@ -13,20 +13,13 @@ use crate::types::StreamEvent;
 const SESSION_READS: &[&str] = &["skill"];
 
 /// Whether `name` is a pure read (no side effects; safe to repeat), by its
-/// declared effects: it writes nothing, starts no process, and schedules as
-/// a read. A call cut off by a crash is then safe to repeat, so it is not
-/// journalled. Judged without arguments, so a tool whose effects depend on
-/// them (`memory`: `list` only reads) counts as side-effecting.
+/// static kind ([`crate::tools::ToolKind::is_pure_read`]): a read, a network
+/// read, or session-local state. A call cut off by a crash is then safe to
+/// repeat, so it is not journalled. A tool whose effects depend on its
+/// arguments (`memory`: `list` only reads) counts as side-effecting.
 pub(crate) fn is_pure_read(name: &str) -> bool {
     SESSION_READS.contains(&name)
-        || super::builtin_tool(name).is_some_and(|t| {
-            let none = serde_json::json!({});
-            t.is_read_only(&none)
-                && matches!(
-                    t.concurrency(&none),
-                    crate::tools::Concurrency::Pure | crate::tools::Concurrency::ReadFs
-                )
-        })
+        || super::builtin_tool(name).is_some_and(|t| t.kind().is_pure_read())
 }
 
 fn report(what: &str, result: anyhow::Result<()>) {
@@ -275,6 +268,32 @@ mod tests {
             ]
         );
     }
+    /// A patch is journalled before it runs, so recovery never calls a
+    /// half-applied one "safe to repeat"; a read is not.
+    #[test]
+    fn apply_patch_is_journalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = scripted(Vec::new());
+        agent.cwd = dir.path().to_path_buf();
+        agent.session = Some(
+            crate::session::Session::create(&dir.path().join("sessions"), &agent.cwd, "fake")
+                .unwrap(),
+        );
+        let patch = json!({"patch": "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n"});
+        agent.journal_requested(&[
+            ("p1".into(), "apply_patch".into(), patch.to_string()),
+            (
+                "r1".into(),
+                "read_file".into(),
+                json!({"path": "a.txt"}).to_string(),
+            ),
+        ]);
+        let path = agent.session.as_ref().unwrap().path.with_extension("calls");
+        let journal: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(journal["calls"]["p1"]["state"], "pending");
+        assert!(journal["calls"].get("r1").is_none());
+    }
+
     #[test]
     fn pure_reads_come_from_declared_effects() {
         for name in [

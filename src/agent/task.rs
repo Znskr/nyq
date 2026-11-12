@@ -733,8 +733,8 @@ impl Agent {
             && !self.tools.spec_of(name).is_some_and(intent::declares_field)
     }
 
-    /// The workspace files a call writes, by its declared effects, relative
-    /// to the workspace (paths outside it are left out).
+    /// The files a call writes, by its declared effects, as the task tracks
+    /// them (see [`Agent::tracked`]).
     fn written_files(&self, name: &str, args: &Value) -> Vec<PathBuf> {
         let Some(tool) = self.tools.get(name) else {
             return Vec::new();
@@ -743,8 +743,24 @@ impl Agent {
             .writes
             .paths()
             .iter()
-            .filter_map(|p| self.workspace_relative(&p.to_string_lossy()))
+            .filter_map(|p| self.tracked(p))
             .collect()
+    }
+
+    /// A written path as the task tracks it: relative to the workspace, or
+    /// absolute under another writable root (`--add-dir`); None elsewhere
+    /// (nyq's own stores, such as the memory file).
+    fn tracked(&self, path: &Path) -> Option<PathBuf> {
+        let text = path.to_string_lossy();
+        if let Some(rel) = self.workspace_relative(&text) {
+            return Some(rel);
+        }
+        let full = super::lexical(&self.cwd, &text)?;
+        self.sandbox
+            .writable
+            .iter()
+            .any(|root| full.starts_with(root))
+            .then_some(full)
     }
 
     /// Before a call is approved and run: take the `intent` field off a
@@ -796,10 +812,19 @@ impl Agent {
         None
     }
 
-    /// After a call ran: feed the cycle detector (the intents stated since
-    /// the last call, then the call itself), and on a write track the files
-    /// and schedule the verifier.
-    pub(super) fn task_observe(&mut self, name: &str, arguments: &str, out: &ToolOutput) {
+    /// After a call ran (a model call, or a script's sub-call): feed the
+    /// cycle detector (the intents stated since the last call, then the call
+    /// itself), and on a write track the files and schedule the verifier.
+    /// `ran` is the call's final footprint from dispatch (its schedule class
+    /// and normalized write paths, from its declared effects after hooks);
+    /// None when it did not run through a wave.
+    pub(super) fn task_observe(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        out: &ToolOutput,
+        ran: Option<(&Concurrency, &[PathBuf])>,
+    ) {
         if self.task.state.is_none() {
             return;
         }
@@ -807,21 +832,26 @@ impl Agent {
         if self.intent_field_of(name) {
             intent::take(&mut args);
         }
-        // Whether the call changed the workspace, by its declared effects:
-        // a process (not a read-only command), or a declared write inside the
-        // workspace. A tool that reports a change, or returns undo records
-        // (a general subagent), changed it too.
-        let tool = self.tools.get(name);
-        let files = self.written_files(name, &args);
-        let wrote = out.changed
-            || !out.undo.is_empty()
-            || (!out.is_error
-                && match tool.map(|t| t.concurrency_in(&args, &self.cwd, &self.sandbox.writable)) {
-                    Some(Concurrency::Exec) => true,
-                    Some(Concurrency::WriteFs(_)) => !files.is_empty(),
-                    Some(Concurrency::Barrier) => !tool.is_some_and(|t| t.coordinates()),
-                    Some(Concurrency::Pure | Concurrency::ReadFs) | None => false,
-                });
+        let files: Vec<PathBuf> = ran
+            .map(|(_, writes)| writes.iter().filter_map(|p| self.tracked(p)).collect())
+            .unwrap_or_default();
+        let coordination = self
+            .tools
+            .get(name)
+            .is_some_and(|t| t.kind() == crate::tools::ToolKind::Coordination);
+        // Whether the call changed the workspace: a declared write to a
+        // tracked file, a process (not a read-only command), an undeclared
+        // tool, or a tool that reports a change itself (a shared subagent, a
+        // worktree merge). A script's sub-calls are observed one by one, so
+        // the script call itself is only a step for the cycle detector.
+        let done = |ok: bool| ok && (out.changed || !out.is_error);
+        let wrote = crate::scripting::kind_of(name).is_none()
+            && match ran.map(|(class, _)| class) {
+                Some(Concurrency::WriteFs(_)) => done(!files.is_empty()),
+                Some(Concurrency::Exec) => done(true),
+                Some(Concurrency::Barrier) => out.changed || (!out.is_error && !coordination),
+                Some(Concurrency::Pure | Concurrency::ReadFs) | None => out.changed,
+            };
         let intents: Vec<String> = {
             let ws = crate::tools::workset::lock(&self.workset);
             let seen = self.task.state.as_ref().map_or(0, |s| s.intents_seen);
@@ -847,10 +877,9 @@ impl Agent {
             return;
         }
         st.writes += 1;
-        if !out.is_error {
-            for rel in files {
-                st.touch(rel);
-            }
+        // A failed call that still changed its files touched them too.
+        for rel in files {
+            st.touch(rel);
         }
         if let Some(v) = &self.task.verifier {
             v.schedule();
@@ -1831,6 +1860,169 @@ mod tests {
             f.agent.take_task_outcome(),
             Some(TaskOutcome::Submitted(json!({"answer": 42})))
         );
+    }
+
+    /// The real built-in tools and a fake build the verifier runs: the
+    /// runner counts the builds.
+    fn with_builtins_and_verifier(f: &mut Fixture) -> Arc<FakeRunner> {
+        f.agent.tools = crate::tools::Registry::builtin();
+        let fake = FakeRunner::new().on("fake-build", vec![CommandOutput::ok("")]);
+        f.agent.task.runner = Some(fake.clone());
+        f.agent.task.build_system = Some(Some(Arc::new(FakeBuild(f.dir.path().into()))));
+        f.agent.task.options = Some(TaskOptions {
+            verify_auto: Some(true),
+            verify_debounce: std::time::Duration::ZERO,
+            verify_wait: std::time::Duration::from_secs(10),
+            ..TaskOptions::default()
+        });
+        fake
+    }
+
+    fn builds(fake: &FakeRunner) -> usize {
+        fake.calls()
+            .iter()
+            .filter(|c| c.contains("fake-build"))
+            .count()
+    }
+
+    fn touched_task(file: &str) -> TaskSpec {
+        let mut spec = TaskSpec::typed("make the file", answer_schema());
+        spec.validators = vec![ValidatorSpec::FilesTouched(vec![PathBuf::from(file)])];
+        spec
+    }
+
+    /// An `apply_patch` edit is a write like any other: its files (from
+    /// the patch) are touched, so `touched:` accepts it, and the verifier
+    /// runs after it.
+    #[tokio::test]
+    async fn an_apply_patch_edit_is_touched_and_verified() {
+        let patch = "*** Begin Patch\n*** Add File: a.rs\n+pub fn a() {}\n*** End Patch\n";
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call("1", "apply_patch", json!({"patch": patch}))]),
+                submit("2", json!({"answer": 1})),
+            ],
+            Some(touched_task("a.rs")),
+        );
+        let fake = with_builtins_and_verifier(&mut f);
+        f.run("go").await;
+        assert!(
+            results(&f.agent)[0].contains("a.rs"),
+            "{:?}",
+            results(&f.agent)
+        );
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"answer": 1}))),
+            "{:?}",
+            results(&f.agent)
+        );
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.touched, [PathBuf::from("a.rs")]);
+        assert_eq!(
+            builds(&fake),
+            2,
+            "the baseline and one build after the patch"
+        );
+    }
+
+    /// Writes a `run_code` script makes through its tools count: the file
+    /// is touched and the verifier runs, though the script call itself is
+    /// not a write.
+    #[cfg(feature = "scripting")]
+    #[tokio::test]
+    async fn a_scripts_writes_are_observed_one_by_one() {
+        let code = r#"await tools.write_file({path: "b.txt", content: "x\n"}); return "ok";"#;
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call(
+                    "1",
+                    crate::scripting::RUN_CODE,
+                    json!({"code": code}),
+                )]),
+                submit("2", json!({"answer": 1})),
+            ],
+            Some(touched_task("b.txt")),
+        );
+        let fake = with_builtins_and_verifier(&mut f);
+        f.run("go").await;
+        assert_eq!(
+            std::fs::read_to_string(f.dir.path().join("b.txt")).unwrap(),
+            "x\n"
+        );
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(json!({"answer": 1}))),
+            "{:?}",
+            results(&f.agent)
+        );
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.touched, [PathBuf::from("b.txt")]);
+        assert_eq!(st.writes, 1, "the sub-call, not the script as well");
+        assert_eq!(
+            builds(&fake),
+            2,
+            "the baseline and one build after the write"
+        );
+    }
+
+    /// What counts as a write, from the dispatch footprint and the result.
+    #[tokio::test]
+    async fn observed_writes_follow_the_footprint_and_reported_changes() {
+        let mut f = Fixture::new(Vec::new(), Some(TaskSpec::typed("g", answer_schema())));
+        f.agent.tools = crate::tools::Registry::builtin();
+        f.agent.items.push(Item::user("go"));
+        f.agent.task_begin();
+        let changed = ToolOutput {
+            changed: true,
+            ..ToolOutput::ok("done")
+        };
+        let ok = ToolOutput::ok("done");
+        let writes = |st: &TaskState| st.writes;
+        // A shared general subagent reports its change (it schedules Pure).
+        f.agent
+            .task_observe("subagent", "{}", &changed, Some((&Concurrency::Pure, &[])));
+        assert_eq!(writes(f.agent.task_state().unwrap()), 1);
+        // An explore child, or a spawn/list action, changed nothing.
+        f.agent
+            .task_observe("subagent", "{}", &ok, Some((&Concurrency::Pure, &[])));
+        f.agent
+            .task_observe("subagent", "{}", &ok, Some((&Concurrency::Barrier, &[])));
+        assert_eq!(writes(f.agent.task_state().unwrap()), 1);
+        // A worktree merge that applied did.
+        f.agent.task_observe(
+            "subagent",
+            "{}",
+            &changed,
+            Some((&Concurrency::Barrier, &[])),
+        );
+        assert_eq!(writes(f.agent.task_state().unwrap()), 2);
+        // A script call is not a write itself: its sub-calls are observed.
+        #[cfg(feature = "scripting")]
+        {
+            f.agent
+                .task_observe(crate::scripting::RUN_CODE, "{}", &changed, None);
+            assert_eq!(writes(f.agent.task_state().unwrap()), 2);
+        }
+        // A declared write inside the workspace is tracked; one into nyq's
+        // own stores (the memory file) is not a workspace change.
+        let inside = f.dir.path().join("src/x.rs");
+        f.agent.task_observe(
+            "write_file",
+            "{}",
+            &changed,
+            Some((&Concurrency::WriteFs(vec![inside.clone()]), &[inside])),
+        );
+        let outside = PathBuf::from("/nonexistent/.nyq/memory.json");
+        f.agent.task_observe(
+            "memory",
+            "{}",
+            &changed,
+            Some((&Concurrency::WriteFs(vec![outside.clone()]), &[outside])),
+        );
+        let st = f.agent.task_state().unwrap();
+        assert_eq!(st.writes, 3);
+        assert_eq!(st.touched, [PathBuf::from("src/x.rs")]);
     }
 
     /// Every section once, in order: task, verify, working set, intents,

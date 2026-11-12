@@ -236,8 +236,11 @@ fn declared_effects(tool: &str, args: &Value) -> Vec<Effect> {
     let Some(t) = crate::agent::builtin_tool(tool) else {
         return Vec::new();
     };
-    if t.coordinates() {
-        return Vec::new();
+    match t.kind() {
+        crate::tools::ToolKind::Coordination => return Vec::new(),
+        // Whatever the arguments say (a patch's files, a missing path).
+        crate::tools::ToolKind::FileWrite => return vec![Effect::Write],
+        _ => {}
     }
     let fx = t.effects(args);
     if fx.exec {

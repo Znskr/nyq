@@ -33,13 +33,11 @@ use serde_json::Value;
 use crate::agent::{bash_matches, is_file_tool, program_base, subagent_mode};
 
 /// Read tools ask only for paths outside the workspace; a persistent allow
-/// never covers those. A tool counts as a read tool when it declares
-/// read-only filesystem effects.
+/// never covers those. A tool counts as a read tool by its static kind
+/// ([`crate::tools::ToolKind::Read`]), never by a probe of its effects with
+/// made-up arguments (which once called `apply_patch` a read).
 pub(crate) fn is_read_tool(tool: &str) -> bool {
-    crate::agent::builtin_tool(tool).is_some_and(|t| {
-        let e = t.effects(&Value::Object(Default::default()));
-        e.is_read_only() && e.reads
-    })
+    crate::agent::builtin_tool(tool).is_some_and(|t| t.kind() == crate::tools::ToolKind::Read)
 }
 
 /// Built-in rules of the strict taint mode, after the files' own rules.
@@ -1317,6 +1315,80 @@ fn resolve_removal(args: &[&str], entries: &[TrustEntry]) -> Result<TrustEntry, 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `apply_patch` is a file write whatever a probe of its effects says:
+    /// edit rules cover the files its patch names, and read rules or read
+    /// grants never approve it.
+    #[test]
+    fn apply_patch_is_judged_as_the_file_write_it_is() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path();
+        let patch = |path: &str| json!({"patch": format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-a\n+b\n")});
+        let none = HashSet::new();
+        let decide = |p: &Permissions, session: &HashSet<String>, args: &Value, mode| {
+            p.decide(session, "apply_patch", args, cwd, true, mode)
+        };
+        assert!(!is_read_tool("apply_patch") && is_file_tool("apply_patch"));
+        // deny edit:.env stops a patch to .env, in every mode.
+        let p = perms(&[], &[], &["edit:.env"]);
+        for mode in [Mode::Ask, Mode::Yolo] {
+            assert!(
+                matches!(decide(&p, &none, &patch(".env"), mode), Decision::Deny(_)),
+                "{mode:?}"
+            );
+        }
+        let codex = json!({"patch": "*** Begin Patch\n*** Add File: .env\n+A=1\n*** End Patch\n"});
+        assert!(matches!(
+            decide(&p, &none, &codex, Mode::Yolo),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            decide(&p, &none, &patch("src/a.rs"), Mode::Yolo),
+            Decision::Run
+        );
+        let p = perms(&[], &[], &["edit_file:.env"]);
+        assert!(matches!(
+            decide(&p, &none, &patch(".env"), Mode::Ask),
+            Decision::Deny(_)
+        ));
+        // A read rule never approves a patch, least of all into .git/hooks.
+        let hook = patch(".git/hooks/pre-commit");
+        let p = perms(&["read:**"], &[], &[]);
+        assert_eq!(
+            decide(&p, &none, &hook, Mode::Ask),
+            Decision::Ask { forced: None }
+        );
+        assert_eq!(
+            decide(&p, &none, &patch("src/a.rs"), Mode::Ask),
+            Decision::Ask { forced: None }
+        );
+        // Nor does a directory read grant from this session.
+        let grant: HashSet<String> = [format!("read_file:{}/**", cwd.display())].into();
+        assert_eq!(
+            decide(&perms(&[], &[], &[]), &grant, &hook, Mode::Ask),
+            Decision::Ask { forced: None }
+        );
+        // An edit rule covers the patch's files, but never under .git.
+        let p = perms(&["edit:**"], &[], &[]);
+        assert_eq!(
+            decide(&p, &none, &patch("src/a.rs"), Mode::Ask),
+            Decision::Run
+        );
+        assert_eq!(
+            decide(&p, &none, &hook, Mode::Ask),
+            Decision::Ask { forced: None }
+        );
+        // A plain allow of the tool covers in-workspace files only.
+        let p = perms(&["apply_patch"], &[], &[]);
+        assert_eq!(
+            decide(&p, &none, &patch("src/a.rs"), Mode::Ask),
+            Decision::Run
+        );
+        assert_eq!(
+            decide(&p, &none, &hook, Mode::Ask),
+            Decision::Ask { forced: None }
+        );
+    }
 
     fn perms(allow: &[&str], ask: &[&str], deny: &[&str]) -> Permissions {
         let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect();

@@ -860,7 +860,8 @@ Path-scoped rules limit file tools to paths: `edit_file:src/**`,
 `write_file:docs/*.md`, `read_file:secrets/*`, `read:~/notes/**`,
 `edit:/tmp/scratch/**`. The part before `:` picks a category — `read_file`,
 `list_dir`, `glob`, `grep`, `view_image` and `read` cover every read tool;
-`write_file`, `edit_file` and `edit` cover both writing tools — so a
+`write_file`, `edit_file` and `edit` cover every file-writing tool (`multi_edit`,
+`edit_range`, and `apply_patch` for each file its patch names) — so a
 `deny: ["read_file:secrets/*"]` also stops `grep` there. Relative patterns are
 relative to the workspace; `*` matches within a path segment and `**` across
 segments. Ask and deny rules match the path as written or with symlinks

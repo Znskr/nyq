@@ -429,6 +429,69 @@ impl Effects {
     }
 }
 
+/// What a tool is, whatever one call's arguments are: the static
+/// classification that name-level policy uses (path rules and grants, which
+/// tools count as reads, the crash journal, the `intent` field), where a
+/// probe of [`Tool::effects`] with made-up arguments can be wrong. The wave
+/// scheduler and the writer lease still use each call's own effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    /// Reads files or directories (its `path`/`paths`) and changes nothing.
+    Read,
+    /// Writes the files its arguments name: `path`/`paths`, or the files a
+    /// patch names.
+    FileWrite,
+    /// Runs a process.
+    Exec,
+    /// Talks to the network and changes nothing locally.
+    Net,
+    /// Delegates or coordinates other work (subagents, the team graph,
+    /// scripts): its children's and sub-calls' own calls are checked, take
+    /// the writer lease and carry intents; the coordinating call never holds
+    /// the lease (waiting on a child that needs it would deadlock).
+    Coordination,
+    /// No filesystem, process or network effects (session-local state such
+    /// as the working set, or reading a process's output).
+    Pure,
+    /// Anything else, or undeclared: it may write anywhere.
+    Other,
+}
+
+impl ToolKind {
+    /// The kind [`Effects`] imply for a call whose `path`/`paths` are
+    /// `named`: what [`Tool::kind`]'s default reads off a probe.
+    pub fn of_effects(e: &Effects, named: &[PathBuf]) -> Self {
+        if e.exec {
+            return Self::Exec;
+        }
+        match &e.writes {
+            Writes::Unknown => Self::Other,
+            Writes::Known(w) if !w.is_empty() => {
+                if w.iter().all(|p| named.contains(p)) {
+                    Self::FileWrite
+                } else {
+                    Self::Other
+                }
+            }
+            _ if e.reads => Self::Read,
+            _ if e.net => Self::Net,
+            _ => Self::Pure,
+        }
+    }
+
+    /// Whether a call changes nothing outside the session, so one cut off by
+    /// a crash is safe to repeat (it is not journalled).
+    pub fn is_pure_read(self) -> bool {
+        matches!(self, Self::Read | Self::Net | Self::Pure)
+    }
+
+    /// Whether the tool itself changes the workspace (it gets the `intent`
+    /// field; coordination tools' children and sub-calls carry their own).
+    pub fn mutates(self) -> bool {
+        matches!(self, Self::FileWrite | Self::Exec | Self::Other)
+    }
+}
+
 /// How a call may run alongside its neighbours in the same tool round
 /// (design §3). `Exec` and `Barrier` always run alone; `Pure`, `ReadFs`
 /// and non-conflicting `WriteFs` calls may share a wave.
@@ -527,13 +590,17 @@ pub trait Tool: Send + Sync {
     fn handles_cancel(&self) -> bool {
         false
     }
-    /// Whether the tool only coordinates other work: delegation, the team
-    /// graph, scripts whose sub-calls are dispatched (and take the lease)
-    /// one by one. Such a call never holds the workspace writer lease,
-    /// since waiting on a child that needs it would deadlock, and it is not
-    /// itself a workspace change (no `intent` field, no verify run).
-    fn coordinates(&self) -> bool {
-        false
+    /// The tool's static kind (see [`ToolKind`]). The default reads it off
+    /// [`Tool::effects`] probed with a placeholder `path`/`paths`, which is
+    /// right for tools whose effects come from those arguments or from none.
+    /// A tool whose effects depend on other arguments must declare its kind
+    /// (as `apply_patch`, whose paths come from the patch, does).
+    fn kind(&self) -> ToolKind {
+        let probe = serde_json::json!({"path": "x", "paths": ["y"]});
+        ToolKind::of_effects(
+            &self.effects(&probe),
+            &[PathBuf::from("x"), PathBuf::from("y")],
+        )
     }
 }
 
@@ -926,6 +993,65 @@ impl SecretRoots {
 mod registry_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Every built-in tool's static kind, decided here on purpose: a new
+    /// tool fails this test until someone says what it is. (The default
+    /// probe of `effects` once called `apply_patch` a read.)
+    #[test]
+    fn every_built_in_tool_has_the_intended_kind() {
+        use ToolKind::*;
+        let expected: &[(&str, ToolKind)] = &[
+            ("read_file", Read),
+            ("list_dir", Read),
+            ("glob", Read),
+            ("grep", Read),
+            ("view_image", Read),
+            ("vision", Read),
+            (artifacts::TOOL, Read),
+            (session_search::TOOL, Read),
+            ("open", Read),
+            ("focus", Read),
+            ("workset", Read),
+            ("write_file", FileWrite),
+            ("edit_file", FileWrite),
+            ("multi_edit", FileWrite),
+            ("edit_range", FileWrite),
+            ("apply_patch", FileWrite),
+            ("bash", Exec),
+            ("process_write", Exec),
+            ("kill_shell", Exec),
+            ("web_fetch", Net),
+            ("web_search", Net),
+            ("process_wait", Net),
+            ("bash_output", Pure),
+            ("unfocus", Pure),
+            ("close", Pure),
+            ("note_intent", Pure),
+            ("team_task_list", Pure),
+            ("memory", Other),
+            ("subagent", Coordination),
+            ("team_task_create", Coordination),
+            ("team_task_claim", Coordination),
+            ("team_task_update", Coordination),
+            ("send_message", Coordination),
+            ("wait_agent", Coordination),
+            ("run_code", Coordination),
+            ("workflow", Coordination),
+        ];
+        let r = Registry::all_builtin();
+        for spec in r.specs() {
+            let want = expected
+                .iter()
+                .find(|(n, _)| *n == spec.name)
+                .map(|(_, k)| *k)
+                .unwrap_or_else(|| panic!("add `{}` to this table with its kind", spec.name));
+            assert_eq!(r.get(&spec.name).unwrap().kind(), want, "{}", spec.name);
+        }
+        // A patch's kind does not depend on whether a probe has a patch.
+        let patch = r.get("apply_patch").unwrap();
+        assert!(patch.effects(&serde_json::json!({})).is_read_only());
+        assert_eq!(patch.kind(), FileWrite);
+    }
 
     /// Counts how often its spec is built.
     struct Counted {

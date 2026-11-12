@@ -17,15 +17,13 @@ use crate::types::ToolSpec;
 
 pub const FIELD: &str = "intent";
 
-/// Whether calls to `tool` can change the workspace, by its declared
-/// effects. Probed with no arguments, which every built-in write tool
-/// answers conservatively (a missing `path` is the workspace root; a patch
-/// with no files writes unknown paths), so the answer does not depend on a
-/// particular call and the schema the model saw matches what is stripped.
-/// Coordination tools (delegation, scripts) change nothing themselves: their
-/// children's and sub-calls' own calls carry intents.
+/// Whether calls to `tool` change the workspace, by its static kind
+/// ([`crate::tools::ToolKind::mutates`]), so the schema the model saw matches
+/// what is stripped whatever the call's arguments. Coordination tools
+/// (delegation, scripts) change nothing themselves: their children's and
+/// sub-calls' own calls carry intents.
 pub fn is_mutating(tool: &dyn Tool) -> bool {
-    !tool.coordinates() && !tool.effects(&Value::Object(Map::new())).is_read_only()
+    tool.kind().mutates()
 }
 
 /// Whether the tool's own schema already has an `intent` property: then it

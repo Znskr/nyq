@@ -264,8 +264,13 @@ impl Tool for Team {
         }
     }
 
-    fn coordinates(&self) -> bool {
-        true
+    /// Listing changes nothing; the other actions coordinate children
+    /// (and `wait_agent` waits on them), so they never hold the lease.
+    fn kind(&self) -> crate::tools::ToolKind {
+        match self.0 {
+            Kind::List => crate::tools::ToolKind::Pure,
+            _ => crate::tools::ToolKind::Coordination,
+        }
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {

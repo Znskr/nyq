@@ -220,8 +220,8 @@ impl Tool for Subagent {
 
     /// The child's own calls take the writer lease; the delegating call
     /// never does.
-    fn coordinates(&self) -> bool {
-        true
+    fn kind(&self) -> super::ToolKind {
+        super::ToolKind::Coordination
     }
 
     /// A run or resume hosts a nested agent whose own calls take the
@@ -611,9 +611,13 @@ fn report(
 ) -> ToolOutput {
     let display = Some(display(&outcome.calls));
     let undo = outcome.undo;
+    // The child's undo records are its writes: the workspace changed (an
+    // isolated child's caller clears this; its writes are in its worktree).
+    let changed = !undo.is_empty();
     let fail = |msg: String| ToolOutput {
         display: display.clone(),
         undo: undo.clone(),
+        changed,
         ..ToolOutput::err(msg)
     };
     match outcome.result {
@@ -642,6 +646,7 @@ fn report(
         return ToolOutput {
             display,
             undo,
+            changed,
             is_error: checked.failure.is_some(),
             ..ToolOutput::ok(truncate(&content, MAX_REPORT * 2))
         };
@@ -662,6 +667,7 @@ fn report(
     ToolOutput {
         display,
         undo,
+        changed,
         ..ToolOutput::ok(content)
     }
 }
@@ -897,6 +903,11 @@ pub(crate) async fn run_named(
         _ => format!("; `{name}` can finish this with action \"resume\""),
     };
     let mut out = report(outcome, &agent, footer, &name, changes);
+    // An isolated child changed its worktree, not this workspace: only a
+    // merge does that.
+    if record.isolation.is_some() {
+        out.changed = false;
+    }
     if let Err(e) = saved {
         out.is_error = true;
         out.content
@@ -1041,9 +1052,13 @@ async fn external(args: &Value, ext: &str, ctx: &ToolCtx) -> ToolOutput {
         Ok(o) => Some(display(&o.tool_calls)),
         Err(_) => None,
     };
+    // An external agent edits with its own tools, which nyq cannot see: a
+    // finished run in this workspace may have changed it.
+    let shared = !wants_worktree(args);
     let finish = |content: String, is_error: bool| ToolOutput {
         content,
         is_error,
+        changed: shared && !is_error,
         display: display.clone(),
         ..Default::default()
     };
@@ -1678,6 +1693,8 @@ mod tests {
             std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
             "x"
         );
+        // A shared child's writes are this workspace's changes.
+        assert!(out.changed);
         let mut parent_undo = crate::undo::UndoLog::default();
         parent_undo.append(out.undo);
         assert_eq!(parent_undo.len(), 1);
@@ -2176,6 +2193,7 @@ mod tests {
             )
             .await;
         assert!(!out.is_error, "{}", out.content);
+        assert!(!out.changed, "an explore child changes nothing");
         let v: Value = serde_json::from_str(&out.content).unwrap();
         assert_eq!(v["status"], "passed");
         assert_eq!(v["attempts"], 1);
@@ -2311,6 +2329,8 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("+child"), "{}", out.content);
         assert!(out.content.contains("action \"merge\""));
+        // Its writes are in its worktree: only the merge changes this one.
+        assert!(!out.changed);
         // The child wrote its worktree, not the parent's files.
         assert_eq!(read("a.txt"), "one\ntwo\nthree\n");
         let record = subagents::load(store.path(), "w1").unwrap().unwrap();
