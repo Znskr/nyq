@@ -941,7 +941,10 @@ async fn merge(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
         _ = ctx.cancel.cancelled() => return ToolOutput::err("Cancelled waiting for workspace writer"),
     };
     let mut undo = crate::undo::UndoLog::default();
-    let merged = match wt.merge(&mut undo).await {
+    // The patch may only touch what the parent itself may write.
+    let mut roots = vec![ctx.cwd.clone()];
+    roots.extend(ctx.sandbox.writable.iter().cloned());
+    let merged = match wt.merge(&mut undo, &roots).await {
         Ok(m) => m,
         Err(e) => return ToolOutput::err(format!("Merge of `{name}` failed: {e:#}")),
     };
@@ -2400,5 +2403,59 @@ mod tests {
             .unwrap()
             .worktree
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn merge_waits_for_the_writer_lease_and_stays_inside_the_parents_cwd() {
+        let repo = crate::worktree::tests::repo();
+        std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            read_call("r1", "a.txt"),
+            write_call("1", "a.txt", "one\nchild\nthree\n"),
+            answer("edited a.txt"),
+        ];
+        // The parent works from a subdirectory of the repository.
+        let sub = repo.path().join("sub");
+        let mut c = named_ctx(&fake, &sub, store.path());
+        c.yolo = true;
+        let out = Subagent
+            .run(
+                json!({"task": "edit a", "name": "outside", "isolation": "worktree"}),
+                &c,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let wt = subagents::load(store.path(), "outside")
+            .unwrap()
+            .unwrap()
+            .worktree
+            .unwrap();
+
+        // Another writer holds the workspace: the merge must queue behind it.
+        let writer = crate::orchestration::writer(&sub);
+        let lease = writer.lock_unknown().await;
+        let args = json!({"action": "merge", "name": "outside"});
+        let mut pending = Box::pin(Subagent.run(args.clone(), &c));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut pending)
+                .await
+                .is_err(),
+            "merge ran without the writer lease"
+        );
+        drop(lease);
+        // a.txt is in the repository root, outside the parent's cwd (`sub`).
+        let refused = pending.await;
+        assert!(
+            refused.is_error && refused.content.contains("outside your writable roots"),
+            "{}",
+            refused.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+        assert!(wt.path.is_dir());
     }
 }

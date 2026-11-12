@@ -168,16 +168,23 @@ pub struct Outcome {
 pub async fn run(cfg: &Config, run: Run<'_>) -> anyhow::Result<Outcome> {
     use tokio::io::AsyncBufReadExt;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-    let mut child = tokio::process::Command::new(&cfg.command)
+    let mut command = tokio::process::Command::new(&cfg.command);
+    command
         .args(&cfg.args)
         .envs(&cfg.env)
         .current_dir(run.cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // Its own process group: a launcher like `npx foo-acp` forks the real
+    // agent, so cancel/timeout/drop must signal the whole group.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|e| anyhow::anyhow!("could not start `{}`: {e}", cfg.command))?;
+    let mut group = Group::new(child.id());
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr_tail = Arc::new(Mutex::new(String::new()));
@@ -202,9 +209,8 @@ pub async fn run(cfg: &Config, run: Run<'_>) -> anyhow::Result<Outcome> {
     }
     let transport = sdk::ByteStreams::new(stdin.compat_write(), stdout.compat());
     let result = run_with_transport(transport, run).await;
-    // Dropping the handle kills an agent that is still running.
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    // Stop whatever is still running, launcher and descendants alike.
+    group.terminate(&mut child).await;
     result.map_err(|e| {
         let tail = lock(&stderr_tail).trim().to_string();
         if tail.is_empty() {
@@ -214,6 +220,67 @@ pub async fn run(cfg: &Config, run: Run<'_>) -> anyhow::Result<Outcome> {
         }
     })
 }
+
+/// How long a process group gets to exit after SIGTERM before SIGKILL.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// The external agent's process group. Unix: SIGTERM the group, then SIGKILL
+/// after a grace period (also if the run future is dropped). Elsewhere only
+/// the direct child is killed.
+struct Group {
+    pgid: Option<u32>,
+}
+
+impl Group {
+    fn new(pid: Option<u32>) -> Self {
+        Group {
+            pgid: if cfg!(unix) { pid } else { None },
+        }
+    }
+
+    /// SIGTERM the group, wait for the child up to the grace period, then
+    /// SIGKILL whatever is left (grandchildren may outlive the child).
+    async fn terminate(&mut self, child: &mut tokio::process::Child) {
+        let Some(pgid) = self.pgid.take() else {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            return;
+        };
+        signal_group(pgid, false);
+        let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+        signal_group(pgid, true);
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
+impl Drop for Group {
+    /// Reached only when the run future was dropped before `terminate`:
+    /// SIGTERM now, SIGKILL after the grace period from a detached thread.
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            signal_group(pgid, false);
+            let _ = std::thread::Builder::new().spawn(move || {
+                std::thread::sleep(KILL_GRACE);
+                signal_group(pgid, true);
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_group(pgid: u32, kill: bool) {
+    if let Ok(pgid) = i32::try_from(pgid) {
+        if pgid > 0 {
+            let sig = if kill { libc::SIGKILL } else { libc::SIGTERM };
+            // SAFETY: plain syscall; a negative pid addresses the process group.
+            unsafe { libc::kill(-pgid, sig) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pgid: u32, _kill: bool) {}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -784,6 +851,102 @@ mod tests {
         run.timeout = Duration::from_millis(200);
         let err = run_with_transport(fake_agent(true), run).await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// A launcher that forks a long-lived grandchild and never speaks ACP.
+    /// Returns the config and the file the grandchild's pid is written to.
+    #[cfg(unix)]
+    fn launcher(dir: &Path) -> (Config, std::path::PathBuf) {
+        let pidfile = dir.join("grandchild.pid");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+        let cfg = Config {
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            ..Default::default()
+        };
+        (cfg, pidfile)
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn grandchild_pid(pidfile: &Path) -> i32 {
+        for _ in 0..100 {
+            if let Ok(t) = std::fs::read_to_string(pidfile) {
+                if let Ok(pid) = t.trim().parse() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("grandchild never started");
+    }
+
+    /// A reaped-or-zombie grandchild counts as gone: it is reparented to init
+    /// and may linger briefly as a zombie, so poll /proc state when present.
+    #[cfg(unix)]
+    async fn gone(pid: i32) -> bool {
+        for _ in 0..100 {
+            let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| s.rsplit(") ").next().unwrap_or("").starts_with('Z'))
+                .unwrap_or(false);
+            if !alive(pid) || zombie {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_the_launchers_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, pidfile) = launcher(dir.path());
+        let mut r = base(dir.path());
+        r.timeout = Duration::from_secs(60);
+        let cancel = r.cancel.clone();
+        let (result, pid) = tokio::join!(super::run(&cfg, r), async {
+            let pid = grandchild_pid(&pidfile).await;
+            assert!(alive(pid));
+            cancel.cancel();
+            pid
+        });
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(gone(pid).await, "grandchild {pid} survived cancel");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_launchers_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, pidfile) = launcher(dir.path());
+        let mut r = base(dir.path());
+        r.timeout = Duration::from_millis(500);
+        let err = super::run(&cfg, r).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        let pid = grandchild_pid(&pidfile).await;
+        assert!(gone(pid).await, "grandchild {pid} survived timeout");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_run_kills_the_launchers_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, pidfile) = launcher(dir.path());
+        let mut r = base(dir.path());
+        r.timeout = Duration::from_secs(60);
+        // The run future is dropped as soon as the grandchild exists.
+        let pid = tokio::select! {
+            _ = super::run(&cfg, r) => panic!("agent run ended on its own"),
+            pid = grandchild_pid(&pidfile) => pid,
+        };
+        assert!(gone(pid).await, "grandchild {pid} survived drop");
     }
 
     #[tokio::test]
