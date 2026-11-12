@@ -105,6 +105,7 @@ fn sandbox_policy(opts: &Options) -> anyhow::Result<sandbox::Policy> {
         mode: settings::sandbox_mode_or(opts.sandbox),
         network: opts.allow_network,
         writable: Vec::new(),
+        ..Default::default()
     };
     if let Err(e) = sandbox::check(&policy) {
         if opts.sandbox.is_some() {
