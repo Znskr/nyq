@@ -113,74 +113,7 @@ impl AnthropicProvider {
     }
 
     fn body(&self, req: Request<'_>) -> Value {
-        let mut messages: Vec<Value> = Vec::new();
-        // Consecutive blocks of the same role share one message.
-        let mut push = |role: &str, block: Value| match messages.last_mut() {
-            Some(last) if last["role"] == role => {
-                last["content"].as_array_mut().unwrap().push(block)
-            }
-            _ => messages.push(json!({"role": role, "content": [block]})),
-        };
-        for item in req.items {
-            match item {
-                Item::User { text, images } => {
-                    for image in images {
-                        push(
-                            "user",
-                            json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data}}),
-                        );
-                    }
-                    if !text.is_empty() || images.is_empty() {
-                        push("user", json!({"type":"text","text":text}));
-                    }
-                }
-                Item::Compaction { summary } => push(
-                    "user",
-                    json!({"type":"text","text":crate::types::compaction_text(summary)}),
-                ),
-                Item::ToolResult {
-                    id,
-                    output,
-                    is_error,
-                } => push(
-                    "user",
-                    json!({"type":"tool_result","tool_use_id":id,"content":if output.is_empty() { "(no output)" } else { output },"is_error":is_error}),
-                ),
-                Item::Assistant { text } if text.is_empty() => {}
-                Item::Assistant { text } => push("assistant", json!({"type":"text","text":text})),
-                Item::Reasoning {
-                    id,
-                    summary,
-                    encrypted: Some(signature),
-                } if id.as_deref() == Some(THINKING) => push(
-                    "assistant",
-                    json!({"type":"thinking","thinking":summary,"signature":signature}),
-                ),
-                Item::Reasoning {
-                    id,
-                    encrypted: Some(data),
-                    ..
-                } if id.as_deref() == Some(REDACTED) => {
-                    push("assistant", json!({"type":"redacted_thinking","data":data}))
-                }
-                // Reasoning from other protocols cannot be replayed here.
-                Item::Reasoning { .. } => {}
-                Item::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    let input: Value = serde_json::from_str(arguments)
-                        .ok()
-                        .filter(Value::is_object)
-                        .unwrap_or_else(|| json!({}));
-                    push(
-                        "assistant",
-                        json!({"type":"tool_use","id":id,"name":name,"input":input}),
-                    );
-                }
-            }
-        }
+        let mut messages = wire_messages(req.items, Reasoning::Signed);
         // Cache the conversation prefix up to the newest message, and up to
         // the previous user message (where the last request's breakpoint
         // was), so long tool rounds still find it. With the system prompt
@@ -246,6 +179,106 @@ impl AnthropicProvider {
     }
 }
 
+/// How [`Item::Reasoning`] serializes into thinking blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reasoning {
+    /// Anthropic replay: only signed thinking blocks and redacted blobs.
+    Signed,
+    /// DeepSeek replay: reasoning text always replays; a signature rides
+    /// along only on a native `thinking` item whose blob is non-empty.
+    Lenient,
+}
+
+/// The `messages` array shared by the Anthropic and DeepSeek Messages
+/// requests: consecutive same-role items merge into one turn.
+pub fn wire_messages(items: &[Item], reasoning: Reasoning) -> Vec<Value> {
+    let mut messages: Vec<Value> = Vec::new();
+    // Consecutive blocks of the same role share one message.
+    let mut push = |role: &str, block: Value| match messages.last_mut() {
+        Some(last) if last["role"] == role => {
+            last["content"].as_array_mut().unwrap().push(block)
+        }
+        _ => messages.push(json!({"role": role, "content": [block]})),
+    };
+    for item in items {
+        match item {
+            Item::User { text, images } => {
+                for image in images {
+                    push(
+                        "user",
+                        json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data}}),
+                    );
+                }
+                if !text.is_empty() || images.is_empty() {
+                    push("user", json!({"type":"text","text":text}));
+                }
+            }
+            Item::Compaction { summary } => push(
+                "user",
+                json!({"type":"text","text":crate::types::compaction_text(summary)}),
+            ),
+            Item::ToolResult {
+                id,
+                output,
+                is_error,
+            } => push(
+                "user",
+                json!({"type":"tool_result","tool_use_id":id,"content":if output.is_empty() { "(no output)" } else { output },"is_error":is_error}),
+            ),
+            Item::Assistant { text } if text.is_empty() => {}
+            Item::Assistant { text } => push("assistant", json!({"type":"text","text":text})),
+            Item::Reasoning {
+                id,
+                summary,
+                encrypted,
+            } if reasoning == Reasoning::Lenient => {
+                if id.as_deref() == Some(REDACTED) {
+                    continue;
+                }
+                let mut block = json!({"type":"thinking","thinking":summary});
+                if id.as_deref() == Some(THINKING) {
+                    if let Some(signature) = encrypted.as_deref().filter(|s| !s.is_empty()) {
+                        block["signature"] = json!(signature);
+                    }
+                }
+                push("assistant", block);
+            }
+            Item::Reasoning {
+                id,
+                summary,
+                encrypted: Some(signature),
+            } if id.as_deref() == Some(THINKING) => push(
+                "assistant",
+                json!({"type":"thinking","thinking":summary,"signature":signature}),
+            ),
+            Item::Reasoning {
+                id,
+                encrypted: Some(data),
+                ..
+            } if id.as_deref() == Some(REDACTED) => {
+                push("assistant", json!({"type":"redacted_thinking","data":data}))
+            }
+            // Reasoning from other protocols cannot be replayed here.
+            Item::Reasoning { .. } => {}
+            Item::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                let input: Value = serde_json::from_str(arguments)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
+                push(
+                    "assistant",
+                    json!({"type":"tool_use","id":id,"name":name,"input":input}),
+                );
+            }
+        }
+    }
+    messages
+}
+
 /// A content block being streamed.
 enum Block {
     Text(String),
@@ -279,11 +312,38 @@ fn usage_from(usage: &Value, into: &mut Usage) {
     }
 }
 
+/// Knobs a Messages-compatible endpoint can differ in (DeepSeek).
+pub struct StreamOpts {
+    /// Fold one `usage` object into the running totals.
+    pub usage: fn(&Value, &mut Usage),
+    /// A `message_stop` with no content blocks is a retryable failure.
+    pub empty_fails: bool,
+}
+
 pub async fn read_stream(
     http: reqwest::Response,
     label: &str,
     on_event: EventSink<'_>,
 ) -> Result<Response> {
+    read_stream_opts(
+        http,
+        label,
+        StreamOpts {
+            usage: usage_from,
+            empty_fails: false,
+        },
+        on_event,
+    )
+    .await
+}
+
+pub async fn read_stream_opts(
+    http: reqwest::Response,
+    label: &str,
+    opts: StreamOpts,
+    on_event: EventSink<'_>,
+) -> Result<Response> {
+    let usage_from = opts.usage;
     let mut events = sse::checked(http).await?.bytes_stream().eventsource();
     let mut blocks: BTreeMap<u64, Block> = BTreeMap::new();
     let mut usage = Usage::default();
@@ -393,6 +453,12 @@ pub async fn read_stream(
         }
     }
     anyhow::ensure!(completed, "{label} stream ended before message_stop");
+    if opts.empty_fails && blocks.is_empty() {
+        return Err(sse::EmptyStream {
+            message: format!("{label} returned an empty response"),
+        }
+        .into());
+    }
     let items = blocks
         .into_values()
         .filter_map(|block| match block {

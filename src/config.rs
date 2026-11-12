@@ -340,7 +340,7 @@ pub fn provider(
             Ok(Box::new(HostedProvider::configured(home, service, model, effort)?))
         }
         None => bail!(
-            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • Grok subscription: run `nyq login grok`\n  • Anthropic API (or a compatible endpoint): run `nyq login anthropic` or set ANTHROPIC_API_KEY [ANTHROPIC_BASE_URL=…]\n  • OpenCode Go/Zen or xAI: run `nyq login opencode-go|opencode|xai` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
+            "no model configured.\n  • ChatGPT subscription: run `nyq login`\n  • Grok subscription: run `nyq login grok`\n  • Anthropic API (or a compatible endpoint): run `nyq login anthropic` or set ANTHROPIC_API_KEY [ANTHROPIC_BASE_URL=…]\n  • DeepSeek API: run `nyq login deepseek` or set DEEPSEEK_API_KEY\n  • OpenCode Go/Zen or xAI: run `nyq login opencode-go|opencode|xai` or set its API key variable\n  • Any OpenAI-compatible API: export NYQ_BASE_URL=… NYQ_MODEL=… [NYQ_API_KEY=…]"
         ),
     }
 }

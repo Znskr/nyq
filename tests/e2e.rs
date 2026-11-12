@@ -482,8 +482,18 @@ fn usage_status_and_doctor_commands_work_without_model_requests() {
             .env_remove("NYQ_PROVIDER")
             .env_remove("NYQ_MODEL")
             .env_remove("NYQ_BASE_URL")
-            .env_remove("NYQ_API_KEY")
-            .env("NYQ_CODEX_AUTH", home.path().join("missing.json"));
+            .env_remove("NYQ_API_KEY");
+        // Ambient service keys must not make doctor see a configured provider.
+        for var in [
+            "OPENCODE_API_KEY",
+            "XAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "DEEPSEEK_API_KEY",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.env("NYQ_CODEX_AUTH", home.path().join("missing.json"));
         cmd
     };
     let report = command()

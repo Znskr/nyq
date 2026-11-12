@@ -16,10 +16,11 @@ use crate::provider::hosted::{self, Service};
 use crate::ui::{self, tui::Tui};
 
 /// Built-in providers, in menu order; saved compatible providers follow these.
-pub const PROVIDERS: [&str; 8] = [
+pub const PROVIDERS: [&str; 9] = [
     "codex",
     "grok",
     "anthropic",
+    "deepseek",
     "opencode-go",
     "opencode",
     "xai",
@@ -27,10 +28,11 @@ pub const PROVIDERS: [&str; 8] = [
     "ollama",
 ];
 /// Providers `/login` can sign in to (the rest are configured by endpoint).
-const LOGIN: [&str; 6] = [
+const LOGIN: [&str; 7] = [
     "codex",
     "grok",
     "anthropic",
+    "deepseek",
     "opencode-go",
     "opencode",
     "xai",
@@ -300,6 +302,10 @@ fn source_lines(home: &Path) -> Vec<String> {
     lines.push(format!(
         "Anthropic: ANTHROPIC_API_KEY, then ANTHROPIC_AUTH_TOKEN (sent as a bearer token), then nyq's auth.json · endpoint {} (ANTHROPIC_BASE_URL)",
         hosted::Service::Anthropic.base_url()
+    ));
+    lines.push(format!(
+        "DeepSeek: DEEPSEEK_API_KEY, then nyq's auth.json · endpoint {} (DEEPSEEK_BASE_URL)",
+        hosted::Service::DeepSeek.base_url()
     ));
     lines
 }

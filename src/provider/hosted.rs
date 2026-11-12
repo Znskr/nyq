@@ -1,9 +1,11 @@
-//! API-key model services: OpenCode Go, OpenCode Zen, xAI and the Anthropic
-//! API. OpenCode speaks OpenAI-compatible chat completions and serves some
-//! models over the Responses or Anthropic Messages protocol (per model, from
-//! models.dev); xAI is used through the Responses API; Anthropic (or any
-//! Anthropic-compatible endpoint, via `ANTHROPIC_BASE_URL`) through the
-//! Messages API.
+//! API-key model services: OpenCode Go, OpenCode Zen, xAI, the Anthropic
+//! API and DeepSeek. OpenCode speaks OpenAI-compatible chat completions and
+//! serves some models over the Responses or Anthropic Messages protocol
+//! (per model, from models.dev); xAI is used through the Responses API;
+//! Anthropic (or any Anthropic-compatible endpoint, via
+//! `ANTHROPIC_BASE_URL`) through the Messages API; DeepSeek through its own
+//! Messages adapter — also picked when an Anthropic-compatible endpoint
+//! lives on a `deepseek.com` host.
 //!
 //! API keys: the service's environment variable (for Anthropic also
 //! `ANTHROPIC_AUTH_TOKEN`, sent as a bearer token), else (OpenCode only) the
@@ -12,7 +14,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
@@ -20,6 +22,7 @@ use serde_json::{json, Value};
 
 use super::{
     anthropic::{self, AnthropicProvider},
+    deepseek::{self, DeepSeekProvider},
     openai::OpenAiProvider,
     responses::ResponsesProvider,
     EventSink, Provider,
@@ -36,6 +39,7 @@ pub enum Service {
     Opencode,
     Xai,
     Anthropic,
+    DeepSeek,
 }
 
 /// The Anthropic API, unless `ANTHROPIC_BASE_URL` points elsewhere.
@@ -45,11 +49,12 @@ pub const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1";
 pub const ANTHROPIC_AUTH_TOKEN: &str = "ANTHROPIC_AUTH_TOKEN";
 
 impl Service {
-    pub const ALL: [Service; 4] = [
+    pub const ALL: [Service; 5] = [
         Service::OpencodeGo,
         Service::Opencode,
         Service::Xai,
         Service::Anthropic,
+        Service::DeepSeek,
     ];
 
     /// Provider id, as used by `--provider`, the switcher tab and models.dev.
@@ -59,6 +64,7 @@ impl Service {
             Service::Opencode => "opencode",
             Service::Xai => "xai",
             Service::Anthropic => "anthropic",
+            Service::DeepSeek => "deepseek",
         }
     }
 
@@ -68,6 +74,7 @@ impl Service {
             "opencode" | "zen" | "opencode-zen" => Some(Service::Opencode),
             "xai" => Some(Service::Xai),
             "anthropic" | "claude" => Some(Service::Anthropic),
+            "deepseek" => Some(Service::DeepSeek),
             _ => None,
         }
     }
@@ -78,6 +85,7 @@ impl Service {
             Service::Opencode => "OpenCode Zen",
             Service::Xai => "xAI",
             Service::Anthropic => "Anthropic API",
+            Service::DeepSeek => "DeepSeek API",
         }
     }
 
@@ -87,6 +95,7 @@ impl Service {
             Service::OpencodeGo | Service::Opencode => "OPENCODE_API_KEY",
             Service::Xai => "XAI_API_KEY",
             Service::Anthropic => "ANTHROPIC_API_KEY",
+            Service::DeepSeek => "DEEPSEEK_API_KEY",
         }
     }
 
@@ -100,11 +109,15 @@ impl Service {
             Service::Anthropic => {
                 env("ANTHROPIC_MODEL").unwrap_or_else(|| "claude-opus-5-5".into())
             }
+            Service::DeepSeek => {
+                env("DEEPSEEK_MODEL").unwrap_or_else(|| "deepseek-v4-pro".into())
+            }
         }
     }
 
     /// API base URL; `NYQ_<SERVICE>_BASE_URL` overrides it (for Anthropic
-    /// also `ANTHROPIC_BASE_URL`, given with or without the `/v1`).
+    /// also `ANTHROPIC_BASE_URL`, for DeepSeek also `DEEPSEEK_BASE_URL`,
+    /// each given with or without the `/v1`).
     pub fn base_url(self) -> String {
         let (var, default) = match self {
             Service::OpencodeGo => ("NYQ_OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1"),
@@ -114,6 +127,12 @@ impl Service {
                 return match env("NYQ_ANTHROPIC_BASE_URL").or_else(|| env("ANTHROPIC_BASE_URL")) {
                     Some(url) => anthropic_base(&url),
                     None => ANTHROPIC_URL.into(),
+                };
+            }
+            Service::DeepSeek => {
+                return match env("NYQ_DEEPSEEK_BASE_URL").or_else(|| env("DEEPSEEK_BASE_URL")) {
+                    Some(url) => anthropic_base(&url),
+                    None => anthropic_base("https://api.deepseek.com/anthropic"),
                 };
             }
         };
@@ -128,11 +147,7 @@ impl Service {
             return self.id();
         }
         let base = self.base_url();
-        let host = reqwest::Url::parse(&base)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-            .unwrap_or_default();
-        let is = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+        let is = |domain: &str| host_is(&base, domain);
         if is("deepseek.com") {
             "deepseek"
         } else if is("moonshot.ai") || is("moonshot.cn") {
@@ -158,6 +173,15 @@ fn env(var: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
+}
+
+/// Whether `base_url`'s host is `domain` or a subdomain of it.
+pub fn host_is(base_url: &str, domain: &str) -> bool {
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    host == domain || host.ends_with(&format!(".{domain}"))
 }
 
 /// A Messages API base ending in `/v1`: SDK-style bases
@@ -279,16 +303,25 @@ pub enum KeyCheck {
 }
 
 /// Probe `base_url` with `key` through the models list (Anthropic: with
-/// `x-api-key` and `anthropic-version`).
+/// `x-api-key` and `anthropic-version`; DeepSeek: `x-api-key` on the
+/// listing at the origin).
 pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck {
+    let deepseek_route =
+        service == Service::DeepSeek || host_is(base_url, "deepseek.com");
+    let url = if deepseek_route {
+        deepseek::models_url(base_url)
+    } else {
+        format!("{}/models", base_url.trim_end_matches('/'))
+    };
     let request = crate::http::client()
-        .get(format!("{}/models", base_url.trim_end_matches('/')))
+        .get(url)
         .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
         .timeout(std::time::Duration::from_secs(10));
     let request = match service {
-        Service::Anthropic => request
+        Service::Anthropic if !deepseek_route => request
             .header("x-api-key", key.trim())
             .header("anthropic-version", anthropic::VERSION),
+        _ if deepseek_route => request.header("x-api-key", key.trim()),
         _ => request.bearer_auth(key.trim()),
     };
     let response = match request.send().await {
@@ -328,6 +361,8 @@ pub struct HostedProvider {
     models: Arc<Models>,
     /// models.dev provider id for metadata and prices.
     catalog: String,
+    /// Wire state DeepSeek remembers between requests of a conversation.
+    deepseek: Arc<Mutex<deepseek::State>>,
 }
 
 impl HostedProvider {
@@ -349,6 +384,7 @@ impl HostedProvider {
             session: uuid::Uuid::new_v4().to_string(),
             models,
             catalog: service.id().into(),
+            deepseek: Arc::new(Mutex::new(deepseek::State::default())),
         }
     }
 
@@ -391,10 +427,24 @@ impl HostedProvider {
             .flatten()
     }
 
+    /// What the model listing said (DeepSeek only).
+    fn deepseek_info(&self) -> Option<deepseek::ListedModel> {
+        self.is_deepseek()
+            .then(|| deepseek::known(&self.base_url, &self.model).flatten())
+            .flatten()
+    }
+
+    /// Streams through the DeepSeek adapter: the DeepSeek service, or an
+    /// Anthropic service pointed at a `deepseek.com` endpoint.
+    fn is_deepseek(&self) -> bool {
+        self.service == Service::DeepSeek
+            || (self.service == Service::Anthropic && host_is(&self.base_url, "deepseek.com"))
+    }
+
     pub fn protocol(&self) -> Protocol {
         match self.service {
             Service::Xai => Protocol::Responses,
-            Service::Anthropic => Protocol::Anthropic,
+            Service::Anthropic | Service::DeepSeek => Protocol::Anthropic,
             // A missing catalog used to force chat completions for every model.
             Service::OpencodeGo | Service::Opencode => self
                 .meta()
@@ -413,7 +463,8 @@ impl HostedProvider {
             }
             // Routes a conversation to the same cache.
             Service::Xai => headers.push(("x-grok-conv-id".into(), self.session.clone())),
-            Service::Anthropic => {}
+            // DeepSeek sends its conversation id on the request itself.
+            Service::Anthropic | Service::DeepSeek => {}
         }
         headers
     }
@@ -436,6 +487,9 @@ impl HostedProvider {
     /// Image, video and embedding models, and models served over protocols
     /// nyq does not speak, are left out.
     pub async fn list_models(&self) -> Result<Vec<ModelChoice>> {
+        if self.is_deepseek() {
+            return self.list_deepseek().await;
+        }
         if self.service == Service::Anthropic {
             return self.list_anthropic().await;
         }
@@ -534,6 +588,69 @@ impl HostedProvider {
             .collect())
     }
 
+    /// DeepSeek's `GET {origin}/models`; when the endpoint has none, the
+    /// catalog's text models plus the two stock ones and the current model.
+    async fn list_deepseek(&self) -> Result<Vec<ModelChoice>> {
+        let choice = |id: String, listed: Option<&deepseek::ListedModel>| {
+            let meta = self.models.get(&id);
+            ModelChoice {
+                provider: self.service.id().into(),
+                context_window: Some(deepseek::context_window(&id, listed, meta)),
+                efforts: meta
+                    .map(|m| m.efforts.clone())
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or_else(|| deepseek::EFFORTS.map(String::from).to_vec()),
+                price: meta.and_then(ModelMeta::price),
+                model: id,
+            }
+        };
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            deepseek::list_models(&self.base_url, Some(&self.api_key)),
+        )
+        .await
+        .context("timed out listing models");
+        let error = match listed {
+            Ok(Ok(models)) if !models.is_empty() => {
+                super::remember_listing(
+                    self.service.id(),
+                    models.iter().map(|m| m.id.clone()).collect(),
+                    Vec::new(),
+                );
+                return Ok(models
+                    .into_iter()
+                    .map(|m| choice(m.id.clone(), Some(&m)))
+                    .collect());
+            }
+            Ok(Ok(_)) => anyhow::anyhow!("the endpoint lists no models"),
+            Ok(Err(e)) => e,
+            Err(e) => e,
+        };
+        // A refused key is not something the catalog can paper over.
+        if error.chain().any(|c| {
+            c.downcast_ref::<super::sse::HttpError>()
+                .is_some_and(|e| matches!(e.status, 401 | 403))
+        }) {
+            return Err(error);
+        }
+        let mut ids: Vec<String> = self
+            .models
+            .iter()
+            .filter(|(_, m)| m.text_output)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for known in ["deepseek-v4-pro", "deepseek-flash"] {
+            if !ids.iter().any(|id| id == known) {
+                ids.push(known.into());
+            }
+        }
+        ids.sort();
+        if !ids.contains(&self.model) {
+            ids.insert(0, self.model.clone());
+        }
+        Ok(ids.into_iter().map(|id| choice(id, None)).collect())
+    }
+
     /// Efforts for `id`: the Models API's, else the catalog's, else the
     /// defaults for how the model thinks.
     fn efforts_for(&self, id: &str, info: Option<&anthropic::ModelInfo>) -> Vec<String> {
@@ -587,6 +704,24 @@ impl HostedProvider {
         }
         provider.stream(req, on_event).await
     }
+
+    async fn stream_deepseek(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
+        let listed = deepseek::describe(&self.base_url, Some(&self.api_key), &self.model).await;
+        let mut provider = DeepSeekProvider::new(
+            self.service.id().into(),
+            self.base_url.clone(),
+            Some(self.api_key.clone()),
+            self.model.clone(),
+        );
+        provider.effort = self.effort.clone();
+        provider.headers = self.headers();
+        provider.caps = deepseek::capabilities(&self.model, listed.as_ref(), self.meta());
+        provider.max_tokens = deepseek::max_tokens(listed.as_ref(), self.meta());
+        provider.context_window = deepseek::context_window(&self.model, listed.as_ref(), self.meta());
+        provider.session = Some(self.session.clone());
+        provider.state = Arc::clone(&self.deepseek);
+        provider.stream(req, on_event).await
+    }
 }
 
 /// Backstop when models.dev has no row for this id.
@@ -625,12 +760,26 @@ impl Provider for HostedProvider {
         &self.catalog
     }
     fn efforts(&self) -> Vec<String> {
+        if self.is_deepseek() {
+            return self
+                .meta()
+                .map(|m| m.efforts.clone())
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| deepseek::EFFORTS.map(String::from).to_vec());
+        }
         if self.service == Service::Anthropic {
             return self.efforts_for(&self.model, self.info().as_ref());
         }
         self.meta().map(|m| m.efforts.clone()).unwrap_or_default()
     }
     fn context_window(&self) -> Option<u64> {
+        if self.is_deepseek() {
+            return Some(deepseek::context_window(
+                &self.model,
+                self.deepseek_info().as_ref(),
+                self.meta(),
+            ));
+        }
         self.info()
             .and_then(|i| i.context)
             .or_else(|| self.meta().and_then(|m| m.context))
@@ -653,6 +802,9 @@ impl Provider for HostedProvider {
         Box::new(fork)
     }
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
+        if self.is_deepseek() {
+            return self.stream_deepseek(req, on_event).await;
+        }
         if self.service == Service::Anthropic {
             return self.stream_anthropic(req, on_event).await;
         }
@@ -773,6 +925,7 @@ mod tests {
         assert_eq!(bare("grok-4"), Protocol::Responses);
         assert_eq!(bare("glm-5"), Protocol::Chat);
         assert_eq!(p(Service::Xai, "anything"), Protocol::Responses);
+        assert_eq!(p(Service::DeepSeek, "deepseek-v4-pro"), Protocol::Anthropic);
         assert!(Service::parse("vercel").is_none());
         assert!(Service::parse("grok").is_none());
         assert!(Service::parse("Grok").is_none());
@@ -1003,12 +1156,16 @@ mod tests {
         }
     }
 
-    const ANTHROPIC_VARS: [&str; 7] = [
+    const ANTHROPIC_VARS: [&str; 11] = [
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
         "NYQ_ANTHROPIC_BASE_URL",
         "ANTHROPIC_MODEL",
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_BASE_URL",
+        "NYQ_DEEPSEEK_BASE_URL",
+        "DEEPSEEK_MODEL",
         "HOME",
         "XDG_DATA_HOME",
     ];
@@ -1114,6 +1271,124 @@ mod tests {
         );
         assert_eq!(key_source(home, a).as_deref(), Some("ANTHROPIC_API_KEY"));
         assert!(!bearer(Service::Xai));
+    }
+
+    #[test]
+    fn deepseek_endpoint_and_credentials() {
+        let _env = AnthropicEnv::new();
+        let d = Service::DeepSeek;
+        assert_eq!(Service::parse("deepseek"), Some(d));
+        assert_eq!(
+            (
+                d.base_url().as_str(),
+                d.catalog_id(),
+                d.default_model().as_str()
+            ),
+            (
+                "https://api.deepseek.com/anthropic/v1",
+                "deepseek",
+                "deepseek-v4-pro"
+            )
+        );
+        std::env::set_var("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic");
+        assert_eq!(d.base_url(), "https://api.deepseek.com/anthropic/v1");
+        std::env::set_var("DEEPSEEK_MODEL", "deepseek-flash");
+        assert_eq!(d.default_model(), "deepseek-flash");
+        std::env::set_var("DEEPSEEK_BASE_URL", "http://127.0.0.1:4000/custom");
+        assert_eq!(d.base_url(), "http://127.0.0.1:4000/custom/v1");
+
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        assert_eq!((api_key(home, d), key_source(home, d)), (None, None));
+        save_key(home, d, "sk-ds-own").unwrap();
+        assert_eq!(api_key(home, d).as_deref(), Some("sk-ds-own"));
+        std::env::set_var("DEEPSEEK_API_KEY", "sk-ds-env");
+        assert_eq!(api_key(home, d).as_deref(), Some("sk-ds-env"));
+        assert_eq!(key_source(home, d).as_deref(), Some("DEEPSEEK_API_KEY"));
+        assert!(!bearer(d));
+    }
+
+    #[tokio::test]
+    async fn deepseek_stream_uses_deepseek_wire() {
+        let reply = events(&[
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hi"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let listing =
+            json!({"data":[{"id":"deepseek-flash","context_window":1048576,"api_capabilities":{"anthropic_messages":{"system_prompt_update":"in-history","tool_update":"addition-only"}}}]});
+        let (url, mut requests, task) =
+            server(vec![(200, listing.to_string()), (200, reply)]).await;
+        let mut p = provider(Service::DeepSeek, &format!("{url}/anthropic/v1"), "deepseek-flash");
+        p.set_conversation("conv-ds");
+        p.set_effort(Some("low".into()));
+        let tools = [crate::types::ToolSpec {
+            name: "read".into(),
+            description: "d".into(),
+            parameters: json!({"type":"object"}),
+        }];
+        let r = p
+            .stream(
+                Request {
+                    system: "sys",
+                    items: &[Item::user("hi")],
+                    tools: &tools,
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.items, vec![Item::Assistant { text: "hi".into() }]);
+        let lookup = requests.recv().await.unwrap().to_lowercase();
+        // The model listing lives at the origin, with x-api-key.
+        assert!(lookup.starts_with("get /models "), "{lookup}");
+        assert!(lookup.contains("x-api-key: sk-test") && !lookup.contains("authorization"));
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("post /anthropic/v1/messages "), "{request}");
+        assert!(request.contains("x-deepseek-harness-session-id: conv-ds"));
+        let body = body_of(&request);
+        // The DeepSeek wire: effort in output_config, string system, big caps.
+        assert_eq!(body["thinking"], json!({"type":"enabled"}));
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert_eq!(body["max_tokens"], 256_000);
+        assert_eq!(body["system"], "sys");
+        assert!(!body.to_string().contains("budget_tokens"));
+        task.await.unwrap();
+        assert_eq!(p.efforts(), ["off", "low", "high", "max"]);
+        assert_eq!(p.context_window(), Some(1_048_576));
+        assert_eq!(p.protocol(), Protocol::Anthropic);
+    }
+
+    #[tokio::test]
+    async fn deepseek_listing_and_fallback() {
+        let listing = json!({"data":[
+            {"id":"deepseek-flash","context_window":1048576,"max_output_tokens":256000,"input_modalities":["text","image"]},
+            {"id":"deepseek-v4-pro","context_window":1048576}
+        ]});
+        let (url, mut requests, task) = server(vec![(200, listing.to_string())]).await;
+        let p = provider(Service::DeepSeek, &format!("{url}/v1"), "deepseek-flash");
+        let models = p.list_models().await.unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
+            ["deepseek-flash", "deepseek-v4-pro"]
+        );
+        assert_eq!(models[0].context_window, Some(1_048_576));
+        assert_eq!(models[0].efforts, ["off", "low", "high", "max"]);
+        assert!(models.iter().all(|m| m.provider == "deepseek"));
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("get /models ") && request.contains("x-api-key: sk-test"));
+        task.await.unwrap();
+
+        // No listing endpoint: the catalog's text models, the stock pair,
+        // and the current model.
+        let (url, _r, task) = server(vec![(404, "nope".into())]).await;
+        let p = provider(Service::DeepSeek, &format!("{url}/v1"), "deepseek-v4-pro");
+        let models = p.list_models().await.unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
+            ["claude", "deepseek-flash", "deepseek-v4-pro", "gemini", "glm", "grok"]
+        );
+        task.await.unwrap();
     }
 
     fn anthropic(url: &str, model: &str, models: Models) -> HostedProvider {

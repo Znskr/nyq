@@ -20,6 +20,20 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// A terminal provider reply carrying no usable content; retried like a 5xx.
+#[derive(Debug)]
+pub struct EmptyStream {
+    pub message: String,
+}
+
+impl std::fmt::Display for EmptyStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EmptyStream {}
+
 pub async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
     let status = response.status();
     if !status.is_success() {
