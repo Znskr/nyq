@@ -53,7 +53,7 @@ pub struct Cli {
     /// Model id (overrides config).
     #[arg(short, long, global = true)]
     pub model: Option<String>,
-    /// Provider: codex, grok, anthropic, openai, ollama, opencode-go, opencode, xai or a custom id.
+    /// Provider: codex, grok, anthropic, deepseek, openai, ollama, opencode-go, opencode, xai or a custom id.
     #[arg(long, global = true)]
     pub provider: Option<String>,
     /// Run tools without asking for approval.
@@ -199,7 +199,7 @@ pub enum Command {
     /// Sign in: ChatGPT subscription (default, Codex models), a Grok
     /// subscription, a hosted API key, or add a compatible provider with `custom`.
     Login {
-        /// codex (default), grok, anthropic, opencode-go, opencode, xai, custom or a saved id.
+        /// codex (default), grok, anthropic, deepseek, opencode-go, opencode, xai, custom or a saved id.
         provider: Option<String>,
     },
     /// Remove nyq's stored login for a provider, or every stored login.
@@ -247,7 +247,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Choose the default provider (codex, grok, anthropic, opencode-go, opencode, xai, openai, ollama).
+    /// Choose the default provider (codex, grok, anthropic, deepseek, opencode-go, opencode, xai, openai, ollama).
     Provider { name: Option<String> },
     /// Show sign-in status per provider and the default; on a terminal, set them up.
     Setup,

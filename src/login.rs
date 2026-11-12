@@ -383,6 +383,7 @@ pub fn key_site(service: Service) -> &'static str {
         Service::OpencodeGo | Service::Opencode => "https://opencode.ai/auth",
         Service::Xai => "https://console.x.ai",
         Service::Anthropic => "https://console.anthropic.com/settings/keys",
+        Service::DeepSeek => "https://platform.deepseek.com/api_keys",
     }
 }
 
@@ -419,7 +420,7 @@ async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) 
                 "OPENCODE_API_KEY or the OpenCode CLI's login"
             }
             Service::Anthropic => "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN",
-            Service::Xai => service.key_env(),
+            Service::Xai | Service::DeepSeek => service.key_env(),
         };
         msg.push_str(&format!("\nNote: {other} is set and takes precedence."));
     }

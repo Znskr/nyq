@@ -20,7 +20,8 @@ pub fn register(r: &mut Registry) {
 pub(crate) const VISION: &str = "vision";
 
 /// Whether the catalog says `model` cannot read images (unknown models are
-/// assumed to). Looked up once per model.
+/// assumed to; on DeepSeek, only models nyq knows as vision-capable can).
+/// Looked up once per model.
 pub(crate) fn text_only(provider: &str, model: &str) -> bool {
     static SEEN: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<(String, String), bool>>,
@@ -29,8 +30,11 @@ pub(crate) fn text_only(provider: &str, model: &str) -> bool {
     if let Some(known) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return *known;
     }
-    let text_only = crate::catalog::lookup(&crate::config::home(), provider, model)
-        .is_some_and(|meta| meta.image_input == Some(false));
+    let meta = crate::catalog::lookup(&crate::config::home(), provider, model);
+    let text_only = match meta.and_then(|meta| meta.image_input) {
+        Some(image) => !image,
+        None => provider == "deepseek" && !crate::provider::deepseek::vision_capable(model),
+    };
     SEEN.lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, text_only);

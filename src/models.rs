@@ -62,8 +62,8 @@ pub struct ModelArgs {
     pub fast: Option<bool>,
 }
 
-const EFFORT_WORDS: [&str; 8] = [
-    "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+const EFFORT_WORDS: [&str; 9] = [
+    "auto", "none", "off", "minimal", "low", "medium", "high", "xhigh", "max",
 ];
 
 pub fn parse_args(args: &[&str]) -> ModelArgs {

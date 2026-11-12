@@ -191,11 +191,13 @@ pub fn vision_model(home: &Path, provider: &str, current: &str) -> Option<String
             .take_while(|(a, b)| a == b)
             .count()
     };
-    load(home, provider)
+    let cataloged = load(home, provider)
         .into_iter()
         .filter(|(_, m)| m.image_input == Some(true) && m.text_output)
         .map(|(id, _)| id)
-        .max_by(|a, b| shared(a).cmp(&shared(b)).then_with(|| b.cmp(a)))
+        .max_by(|a, b| shared(a).cmp(&shared(b)).then_with(|| b.cmp(a)));
+    // `deepseek-flash` is DeepSeek's vision model even without catalog data.
+    cataloged.or_else(|| (provider == "deepseek").then(|| "deepseek-flash".into()))
 }
 
 fn own(home: &Path) -> PathBuf {

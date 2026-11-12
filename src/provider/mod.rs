@@ -4,6 +4,7 @@
 pub mod anthropic;
 pub mod codex;
 pub mod custom;
+pub mod deepseek;
 pub mod grok;
 pub mod hosted;
 pub mod openai;
@@ -128,6 +129,9 @@ const BACKOFF: Duration = Duration::from_millis(if cfg!(test) { 10 } else { 1_00
 fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
     let backoff = (BACKOFF * 2u32.pow(attempt)).min(MAX_DELAY);
     error.chain().find_map(|cause| {
+        if cause.downcast_ref::<sse::EmptyStream>().is_some() {
+            return Some(Some(backoff));
+        }
         if let Some(e) = cause.downcast_ref::<sse::HttpError>() {
             if !matches!(e.status, 429 | 500 | 502 | 503 | 504 | 529) {
                 return Some(None);
