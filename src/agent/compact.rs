@@ -184,6 +184,7 @@ fn mark(item: &Item) -> u64 {
             id,
             output,
             is_error,
+            ..
         } => {
             text(id);
             text(output);
@@ -455,6 +456,7 @@ fn plan_prune(items: &[Item], cut: usize, e: &Estimator, store: &Store) -> Vec<(
                 id,
                 output,
                 is_error: true,
+                labels,
             } if Some(i) != newest_error && output.chars().count() > PRUNE_ERROR_CHARS => {
                 let keep = output
                     .char_indices()
@@ -464,11 +466,13 @@ fn plan_prune(items: &[Item], cut: usize, e: &Estimator, store: &Store) -> Vec<(
                     id: id.clone(),
                     output: format!("{}… [older error shortened]", &output[..keep]),
                     is_error: true,
+                    labels: labels.clone(),
                 })
             }
             Item::ToolResult {
                 id,
                 is_error: false,
+                labels,
                 ..
             } if superseded[i] => {
                 let path = call(id)
@@ -479,18 +483,21 @@ fn plan_prune(items: &[Item], cut: usize, e: &Estimator, store: &Store) -> Vec<(
                     id: id.clone(),
                     output: format!("[superseded by a later read of {path}]"),
                     is_error: false,
+                    labels: labels.clone(),
                 })
             }
             Item::ToolResult {
                 id,
                 output,
                 is_error: false,
+                labels,
             } if e.text(output) > PRUNE_RESULT_TOKENS => {
                 let tool = call(id).map_or("tool", |(n, _)| n);
                 Some(Item::ToolResult {
                     id: id.clone(),
                     output: shorten_result(id, tool, output, store),
                     is_error: false,
+                    labels: labels.clone(),
                 })
             }
             Item::User { text, images } if image_rank[i] + images.len() > PRUNE_KEEP_IMAGES => {
@@ -1323,6 +1330,7 @@ mod tests {
             id: id.into(),
             output: output.into(),
             is_error,
+            labels: Vec::new(),
         }
     }
 
