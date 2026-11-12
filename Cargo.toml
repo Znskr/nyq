@@ -8,7 +8,9 @@ repository = "https://github.com/Znskr/nyq"
 homepage = "https://nyq.zalthar.com"
 
 [features]
-default = ["tls-rustls"]
+default = ["tls-rustls", "scripting"]
+# `run_code` and `workflow`: an embedded QuickJS engine (about 0.8 MB).
+scripting = ["dep:rquickjs"]
 # Pure-Rust TLS on ring: no system TLS library, identical behaviour everywhere.
 tls-rustls = ["dep:rustls", "reqwest/rustls-no-provider"]
 # Platform TLS (Security.framework on macOS, OpenSSL on Linux): smaller binary,
@@ -44,6 +46,7 @@ ignore = "0.4"
 nu-ansi-term = "0.50"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }
 rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

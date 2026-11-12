@@ -34,6 +34,7 @@ mod prompt;
 mod provider;
 mod record_tape;
 mod sandbox;
+mod scripting;
 mod session;
 mod settings;
 mod skill_install;

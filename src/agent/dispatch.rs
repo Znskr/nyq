@@ -374,10 +374,40 @@ impl Agent {
             Prepared::Run(ready) => ready,
         };
         ui.tool_start(name, &ready.summary);
-        let mut out = run_ready(&self.tools, &ready, cancel).await;
+        // W11: `run_code`/`workflow` run here so their sub-calls can come
+        // back through this dispatch (`dispatch_nested`).
+        let mut out = match crate::scripting::kind_of(name) {
+            Some(kind) => crate::scripting::drive(self, kind, id, &ready.args, ui, cancel).await,
+            None => run_ready(&self.tools, &ready, cancel).await,
+        };
         ui.tool_end(name, &out);
         self.settle(&ready, &mut out, cancel).await;
         out
+    }
+
+    /// W11: tool calls made by a `run_code`/`workflow` script. Each goes
+    /// through the whole pipeline (hooks, rules, classifier, approval,
+    /// sandbox, writer lease, PostToolUse) like a model call; the results go
+    /// back to the script instead of into the transcript.
+    /// (A named boxed future: it breaks the async recursion through
+    /// `call_tool`.)
+    #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+    pub(crate) fn dispatch_nested<'a>(
+        &'a mut self,
+        calls: &'a [(String, String, String)],
+        ui: &'a mut dyn Ui,
+        cancel: &'a CancellationToken,
+    ) -> futures::future::BoxFuture<'a, Vec<ToolOutput>> {
+        Box::pin(async move {
+            if calls.len() > 1 && calls.iter().all(|(_, n, a)| runs_in_parallel(n, a)) {
+                return self.call_parallel(calls, ui, cancel).await;
+            }
+            let mut outs = Vec::new();
+            for (id, name, arguments) in calls {
+                outs.push(self.call_tool(id, name, arguments, ui, cancel).await);
+            }
+            outs
+        })
     }
 
     /// Run a batch of read-only calls (and subagents) concurrently. They are

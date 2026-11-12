@@ -11,6 +11,8 @@ pub mod image;
 pub(crate) mod mcp_search;
 pub(crate) mod memory;
 pub(crate) mod redact;
+#[cfg(feature = "scripting")]
+mod run_code;
 pub(crate) mod safeio;
 mod search;
 pub mod subagent;
@@ -437,6 +439,8 @@ impl Registry {
         web::register(&mut r);
         subagent::register(&mut r);
         team::register(&mut r);
+        #[cfg(feature = "scripting")]
+        run_code::register(&mut r);
         r
     }
 
