@@ -95,7 +95,10 @@ fn name_arg(args: &Value) -> Option<&str> {
 
 /// A fresh id for a child that wasn't given a name.
 fn fresh_id(prefix: &str) -> String {
-    format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
+    format!(
+        "{prefix}-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    )
 }
 
 fn action(args: &Value) -> &str {
@@ -253,7 +256,10 @@ impl Tool for Subagent {
         if let Err(e) = crate::tools::typed::Typed::from_args(&args) {
             return ToolOutput::err(format!("Invalid typed subagent arguments: {e}"));
         }
-        if !matches!(str_arg(&args, "isolation"), None | Some("shared" | "worktree")) {
+        if !matches!(
+            str_arg(&args, "isolation"),
+            None | Some("shared" | "worktree")
+        ) {
             return ToolOutput::err("isolation must be \"shared\" or \"worktree\".");
         }
         if let Some(ext) = external_name(&args) {
@@ -314,7 +320,9 @@ fn child(
     cwd: Option<&Path>,
 ) -> Result<Agent, ToolOutput> {
     // A worktree child works (and is sandboxed) in its own checkout.
-    let cwd = cwd.map(Path::to_path_buf).unwrap_or_else(|| ctx.cwd.clone());
+    let cwd = cwd
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| ctx.cwd.clone());
     let Some(provider) = &ctx.provider else {
         return Err(ToolOutput::err(
             "Subagents are unavailable: no model provider in this context.",
@@ -526,9 +534,10 @@ async fn drive_child(
         while matches!(result, Ok(TurnEnd::Done)) {
             attempts += 1;
             let c = t.check(last_answer(agent), &cancel).await;
-            let retry = c.failure.clone().filter(|_| {
-                attempts < crate::tools::typed::ATTEMPTS && !cancel.is_cancelled()
-            });
+            let retry = c
+                .failure
+                .clone()
+                .filter(|_| attempts < crate::tools::typed::ATTEMPTS && !cancel.is_cancelled());
             checked = Some((c, attempts));
             let Some(feedback) = retry else { break };
             result = drive_turn(
@@ -614,12 +623,11 @@ fn report(
         "" => "(the subagent produced no report)",
         text => text,
     };
-    let mut content = format!(
-        "{}\n{}",
-        crate::tools::typed::evidence(child),
-        truncate(report, MAX_REPORT)
-    );
-    content.push_str(&format!("\n\n({stats})"));
+    let mut content = truncate(report, MAX_REPORT);
+    content.push_str(&format!(
+        "\n\n({stats})\n{}",
+        crate::tools::typed::evidence(child)
+    ));
     if let Some(changes) = changes {
         content.push_str("\n\n");
         content.push_str(&changes);
@@ -704,7 +712,9 @@ async fn named_run(args: &Value, name: &str, dir: &Path, ctx: &ToolCtx) -> ToolO
                         r.isolation = Some("worktree".into());
                         r.worktree = Some(wt);
                     }
-                    Err(e) => return ToolOutput::err(format!("Could not create a worktree: {e:#}")),
+                    Err(e) => {
+                        return ToolOutput::err(format!("Could not create a worktree: {e:#}"))
+                    }
                 }
             }
             r
@@ -792,14 +802,7 @@ pub(crate) async fn run_named(
     let mut items = std::mem::take(&mut record.items);
     let repairs = crate::session::repairs(&items);
     items.extend(repairs);
-    let mut agent = match child(
-        ctx,
-        record.mode == "general",
-        true,
-        items,
-        args,
-        Some(&cwd),
-    ) {
+    let mut agent = match child(ctx, record.mode == "general", true, items, args, Some(&cwd)) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -1017,7 +1020,12 @@ async fn external(args: &Value, ext: &str, ctx: &ToolCtx) -> ToolOutput {
     };
     let mut changes = None;
     if let Some((mut r, dir)) = saved {
-        r.items = vec![Item::user(prompt.clone()), Item::Assistant { text: outcome.text.clone() }];
+        r.items = vec![
+            Item::user(prompt.clone()),
+            Item::Assistant {
+                text: outcome.text.clone(),
+            },
+        ];
         r.status = Status::Idle;
         r.turns = 1;
         r.tool_calls = outcome.tool_calls.len() as u64;
@@ -1043,9 +1051,9 @@ async fn external(args: &Value, ext: &str, ctx: &ToolCtx) -> ToolOutput {
         return finish(crate::tools::typed::render(&id, &checked, 1, extra), failed);
     }
     let mut content = format!(
-        "{}\n{}\n\n({stats})",
-        crate::tools::typed::evidence(&id),
-        truncate(outcome.text.trim(), MAX_REPORT)
+        "{}\n\n({stats})\n{}",
+        truncate(outcome.text.trim(), MAX_REPORT),
+        crate::tools::typed::evidence(&id)
     );
     if let Some(c) = changes {
         content.push_str("\n\n");
@@ -1303,7 +1311,7 @@ mod tests {
             }]),
         ];
         let ctx = ctx(&fake, dir.path());
-        let mut parent = child(&ctx, true, false, vec![], &Value::Null)
+        let mut parent = child(&ctx, true, false, vec![], &Value::Null, None)
             .unwrap_or_else(|e| panic!("{}", e.content));
         let session = crate::session::Session::create(dir.path(), dir.path(), "fake").unwrap();
         let store_dir = subagents::store_dir(&session.path);
@@ -1526,7 +1534,7 @@ mod tests {
         let mut parent = ctx(&Fake::default(), dir.path());
         parent.permission_mode = crate::permissions::Mode::Auto;
         let mode = |args: Value| {
-            child(&parent, false, false, Vec::new(), &args).map(|a| a.permission_mode)
+            child(&parent, false, false, Vec::new(), &args, None).map(|a| a.permission_mode)
         };
         assert_eq!(mode(json!({})).ok(), Some(crate::permissions::Mode::Auto));
         assert_eq!(
@@ -2070,5 +2078,210 @@ mod tests {
         assert_eq!(record.status, Status::Stopped);
         assert_eq!(users(&record.items), ["spin"]);
         assert!(!subagents::is_live(&key));
+    }
+
+    fn typed_args(validators: Value) -> Value {
+        json!({
+            "task": "list the relevant files",
+            "output_schema": {
+                "type": "object",
+                "required": ["files"],
+                "properties": {"files": {"type": "array", "items": {"type": "string"}}}
+            },
+            "validators": validators
+        })
+    }
+
+    fn last_user(items: &[Item]) -> String {
+        users(items).last().cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn typed_child_returns_checked_json_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![answer(r#"{"files": ["a.txt"]}"#)];
+        let out = Subagent
+            .run(
+                typed_args(json!(["exists:/files"])),
+                &ctx(&fake, dir.path()),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["status"], "passed");
+        assert_eq!(v["attempts"], 1);
+        assert_eq!(v["result"]["files"][0], "a.txt");
+        let child = v["child"].as_str().unwrap();
+        assert!(child.starts_with("run-"));
+        assert_eq!(v["evidence"], crate::tools::typed::evidence(child));
+        assert_eq!(v["checks"].as_array().unwrap().len(), 2);
+        // The child was told how to finish.
+        let first = fake.requests.lock().unwrap()[0].clone();
+        assert!(last_user(&first).contains("Required result"));
+        // Executing validators make the call ask; exists alone doesn't.
+        assert!(!Subagent.needs_approval(&typed_args(json!(["exists:/files"]))));
+        assert!(Subagent.needs_approval(&typed_args(json!(["cmd:make check"]))));
+        assert!(Subagent.needs_approval(&typed_args(json!(["tests"]))));
+        let bad = Subagent
+            .run(typed_args(json!(["frobnicate"])), &ctx(&fake, dir.path()))
+            .await;
+        assert!(bad.is_error && bad.content.contains("unknown validator"));
+    }
+
+    #[tokio::test]
+    async fn typed_child_gets_one_retry_with_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            answer("I looked around; a.txt is the one."),
+            answer(r#"{"files": ["a.txt"]}"#),
+        ];
+        let out = Subagent
+            .run(
+                typed_args(json!(["exists:/files"])),
+                &ctx(&fake, dir.path()),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["status"], "passed");
+        assert_eq!(v["attempts"], 2);
+        let requests = fake.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(last_user(&requests[1]).contains("not valid JSON"));
+    }
+
+    #[tokio::test]
+    async fn typed_child_fails_after_its_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            answer(r#"{"files": ["ghost.rs"]}"#),
+            answer(r#"{"files": ["still-ghost.rs"]}"#),
+        ];
+        let out = Subagent
+            .run(
+                typed_args(json!(["exists:/files"])),
+                &ctx(&fake, dir.path()),
+            )
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["attempts"], 2);
+        assert!(v["checks"][1]["feedback"]
+            .as_str()
+            .unwrap()
+            .contains("still-ghost.rs"));
+        let requests = fake.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "exactly one retry");
+        assert!(last_user(&requests[1]).contains("ghost.rs"));
+    }
+
+    fn write_call(id: &str, path: &str, content: &str) -> Response {
+        resp(vec![Item::ToolCall {
+            id: id.into(),
+            name: "write_file".into(),
+            arguments: json!({"path": path, "content": content}).to_string(),
+        }])
+    }
+
+    #[tokio::test]
+    async fn worktree_child_is_isolated_then_merged_or_conflicts() {
+        let repo = crate::worktree::tests::repo();
+        let store = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        *fake.script.lock().unwrap() = vec![
+            write_call("1", "a.txt", "one\nchild\nthree\n"),
+            answer("edited a.txt"),
+            answer("plain child done"),
+            write_call("2", "a.txt", "one\nsecond\nthree\n"),
+            answer("edited a.txt again"),
+        ];
+        let mut c = named_ctx(&fake, repo.path(), store.path());
+        c.yolo = true;
+        let read = |p: &str| std::fs::read_to_string(repo.path().join(p)).unwrap();
+
+        let out = Subagent
+            .run(
+                json!({"task": "edit a", "name": "w1", "isolation": "worktree"}),
+                &c,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("+child"), "{}", out.content);
+        assert!(out.content.contains("action \"merge\""));
+        // The child wrote its worktree, not the parent's files.
+        assert_eq!(read("a.txt"), "one\ntwo\nthree\n");
+        let record = subagents::load(store.path(), "w1").unwrap().unwrap();
+        assert_eq!(record.mode, "general");
+        let wt = record.worktree.clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
+            "one\nchild\nthree\n"
+        );
+        // Sharing is fixed at creation.
+        let again = Subagent
+            .run(json!({"task": "x", "name": "plain"}), &c)
+            .await;
+        assert!(!again.is_error, "{}", again.content);
+        let refused = Subagent
+            .run(
+                json!({"task": "x", "name": "plain", "isolation": "worktree"}),
+                &c,
+            )
+            .await;
+        assert!(refused.is_error && refused.content.contains("isolation is fixed"));
+
+        let merged = Subagent
+            .run(json!({"action": "merge", "id": "w1"}), &c)
+            .await;
+        assert!(!merged.is_error, "{}", merged.content);
+        assert!(merged.changed && !merged.undo.is_empty());
+        assert_eq!(read("a.txt"), "one\nchild\nthree\n");
+        assert!(!wt.path.exists());
+        let record = subagents::load(store.path(), "w1").unwrap().unwrap();
+        assert!(record.worktree.is_none() && record.status == Status::Stopped);
+        let gone = Subagent
+            .run(json!({"action": "merge", "name": "w1"}), &c)
+            .await;
+        assert!(gone.is_error);
+
+        // A second child started from HEAD edits the line the merge changed.
+        let out = Subagent
+            .run(
+                json!({"task": "edit a", "name": "w2", "isolation": "worktree"}),
+                &c,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let conflict = Subagent
+            .run(json!({"action": "merge", "name": "w2"}), &c)
+            .await;
+        assert!(conflict.is_error, "{}", conflict.content);
+        assert!(
+            conflict.content.contains("a.txt") && conflict.content.contains("nothing was written")
+        );
+        assert_eq!(read("a.txt"), "one\nchild\nthree\n");
+        let wt2 = subagents::load(store.path(), "w2")
+            .unwrap()
+            .unwrap()
+            .worktree
+            .unwrap();
+        assert!(wt2.path.is_dir());
+        // Stopping discards it.
+        let stopped = Subagent
+            .run(json!({"action": "stop", "name": "w2"}), &c)
+            .await;
+        assert!(!stopped.is_error, "{}", stopped.content);
+        assert!(!wt2.path.exists());
+        assert!(subagents::load(store.path(), "w2")
+            .unwrap()
+            .unwrap()
+            .worktree
+            .is_none());
     }
 }

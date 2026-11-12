@@ -117,7 +117,11 @@ pub async fn create(cwd: &Path, child: &str) -> Result<Worktree> {
     let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
     let branch = format!("nyq/{child}-{suffix}");
     let p = path.to_string_lossy().into_owned();
-    git(&repo, &["worktree", "add", "--quiet", "-b", &branch, &p, &base]).await?;
+    git(
+        &repo,
+        &["worktree", "add", "--quiet", "-b", &branch, &p, &base],
+    )
+    .await?;
     Ok(Worktree {
         repo,
         path,
@@ -376,7 +380,10 @@ pub(crate) mod tests {
     async fn create_diff_merge_and_cleanup() {
         let d = repo();
         let wt = create(d.path(), "fixer").await.unwrap();
-        assert_eq!(wt.path, d.path().canonicalize().unwrap().join(DIR).join("fixer"));
+        assert_eq!(
+            wt.path,
+            d.path().canonicalize().unwrap().join(DIR).join("fixer")
+        );
         assert!(wt.path.join("a.txt").is_file());
         // Excluded from the parent's status.
         let status = git(d.path(), &["status", "--porcelain"]).await.unwrap();
@@ -387,7 +394,10 @@ pub(crate) mod tests {
         std::fs::write(wt.path.join("a.txt"), "one\nTWO\nthree\n").unwrap();
         std::fs::write(wt.path.join("new.txt"), "fresh\n").unwrap();
         let summary = wt.summary("fixer").await;
-        assert!(summary.contains("new.txt") && summary.contains("+TWO"), "{summary}");
+        assert!(
+            summary.contains("new.txt") && summary.contains("+TWO"),
+            "{summary}"
+        );
         // The parent is untouched until the merge.
         assert_eq!(
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
@@ -445,7 +455,10 @@ pub(crate) mod tests {
         let d = repo();
         let wt = create(d.path(), "idle").await.unwrap();
         assert!(wt.summary("idle").await.contains("no changes"));
-        assert_eq!(wt.merge(&mut Default::default()).await.unwrap(), Merge::Empty);
+        assert_eq!(
+            wt.merge(&mut Default::default()).await.unwrap(),
+            Merge::Empty
+        );
         assert!(!wt.path.exists());
         let plain = tempfile::tempdir().unwrap();
         assert!(create(plain.path(), "x").await.is_err());

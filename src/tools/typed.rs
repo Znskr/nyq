@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::task::{
-    BuildValidator, CustomCommandValidator, Exec, ExistsValidator, LintValidator,
-    SchemaValidator, ShellRunner, TestScope, TestsValidator, ValidateCx, Validator, Verdict,
+    BuildValidator, CustomCommandValidator, Exec, ExistsValidator, LintValidator, SchemaValidator,
+    ShellRunner, TestScope, TestsValidator, ValidateCx, Validator, Verdict,
 };
 
 /// Attempts per typed child: the first answer and one retry.
@@ -206,11 +206,15 @@ impl Typed {
             }
             Err(_) => Value::String(text.trim().to_string()),
         };
-        let exec = Exec::new(Arc::new(ShellRunner::new(policy.clone()))).with_cancel(cancel.clone());
+        let exec =
+            Exec::new(Arc::new(ShellRunner::new(policy.clone()))).with_cancel(cancel.clone());
         let cx = ValidateCx::detect(root, exec);
         let mut validators: Vec<(String, Box<dyn Validator>)> = Vec::new();
         if let Some(schema) = &self.schema {
-            validators.push(("schema".into(), Box::new(SchemaValidator::new(schema.clone()))));
+            validators.push((
+                "schema".into(),
+                Box::new(SchemaValidator::new(schema.clone())),
+            ));
         }
         for c in &self.checks {
             validators.push((c.label(), c.validator()));
@@ -383,7 +387,9 @@ mod tests {
             .check(r#"{"files":["ghost.rs"]}"#, dir.path(), &policy, &cancel)
             .await;
         assert!(missing.failure.as_deref().unwrap().contains("ghost.rs"));
-        let shape = t.check(r#"{"files":"x"}"#, dir.path(), &policy, &cancel).await;
+        let shape = t
+            .check(r#"{"files":"x"}"#, dir.path(), &policy, &cancel)
+            .await;
         assert!(shape.failure.as_deref().unwrap().contains("schema"));
         assert_eq!(shape.checks.len(), 1);
         let prose = t.check("all done!", dir.path(), &policy, &cancel).await;

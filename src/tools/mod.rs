@@ -14,8 +14,8 @@ pub(crate) mod redact;
 pub(crate) mod safeio;
 mod search;
 pub mod subagent;
-pub(crate) mod typed;
 pub(crate) mod team;
+pub(crate) mod typed;
 pub mod web;
 
 use std::collections::{BTreeMap, HashSet};
