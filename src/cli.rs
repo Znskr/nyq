@@ -540,6 +540,7 @@ impl Ctx<'_> {
             mode: settings::sandbox_mode_or(self.cli.sandbox),
             network: self.cli.allow_network,
             writable: extra_dirs(self.home, self.cwd, self.cli),
+            ..Default::default()
         }
     }
 }

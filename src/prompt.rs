@@ -27,8 +27,6 @@ fn sandbox_guidance(policy: &crate::sandbox::Policy) -> String {
     let described = crate::sandbox::describe(policy);
     let net = if policy.network {
         ""
-    } else if cfg!(target_os = "linux") {
-        ". TCP is blocked; UDP and Unix-domain sockets stay unrestricted"
     } else {
         ", and cannot open network connections"
     };

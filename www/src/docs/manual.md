@@ -813,14 +813,17 @@ Shell commands the model runs are sandboxed by default (`--sandbox workspace-wri
 they can read everything but write only inside the workspace and temp dirs.
 `--allow-network` lifts the network block, `--sandbox read-only` also protects the
 workspace, and `--sandbox off` runs commands with your full permissions. Linux uses
-Landlock (kernel 5.13+, TCP rules need 6.7+). Landlock can block TCP bind and
-connect only: with the network off, UDP and Unix-domain sockets stay unrestricted,
-and the banner says so (a sandboxed command can still reach a host daemon such as
-the Docker socket). macOS uses `sandbox-exec`, which denies those sockets when the
-network is off. On both, `.git` stays writable so `git commit` works inside the
-sandbox — which also means a sandboxed command could change hooks or Git config
-that later run with your full permissions; use `--sandbox read-only` if that
-matters. `write_file`/`edit_file` always ask before touching anything under `.git`,
+Landlock (kernel 5.13+, TCP rules need 6.7+) plus a seccomp filter that fails
+`socket()` with EACCES for IPv4 and IPv6 of any type — UDP included — and for
+Unix-domain sockets. `NYQ_SANDBOX_UNIX=1` re-allows Unix-domain sockets only.
+macOS uses `sandbox-exec`, which denies those sockets when the network is off.
+On both, `.git/hooks`, `.git/config` and `.git/info` are made read-only inside
+the sandbox while the rest of `.git` stays writable, so `git commit` still works
+but a sandboxed command cannot plant hooks or Git config that would run later
+with your full permissions; `NYQ_SANDBOX_GIT_WRITABLE=1` opts out. Where a part
+of the policy cannot be enforced — an old kernel, missing seccomp or
+user-namespace support — the banner and `nyq status --json` say `partial` and
+why. `write_file`/`edit_file` always ask before touching anything under `.git`,
 even with an "always" grant. Other files that tools may run later
 (`.envrc`, `.vscode/tasks.json`, a project `.mcp.json`) are not special-cased: an
 "always" grant for `write_file`/`edit_file` covers them, though each still needs

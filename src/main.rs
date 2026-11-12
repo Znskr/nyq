@@ -1076,6 +1076,7 @@ fn sandbox_policy(cli: &Cli) -> Result<sandbox::Policy> {
         mode: settings::sandbox_mode_or(cli.sandbox),
         network: cli.allow_network,
         writable: Vec::new(),
+        ..Default::default()
     };
     if let Err(e) = sandbox::check(&policy) {
         if cli.sandbox.is_some() {

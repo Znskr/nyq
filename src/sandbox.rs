@@ -1,10 +1,22 @@
 //! Sandboxing for model-run shell commands.
 //!
-//! Linux uses Landlock: nyq re-executes itself as `nyq __sandbox …`, which
-//! restricts its own process (writes only to allowed roots, optionally no TCP)
-//! and then execs the shell, so the whole command tree inherits the policy.
-//! macOS wraps the shell in `sandbox-exec` with an equivalent profile. Other
-//! platforms have no sandbox; `check` reports that.
+//! Linux re-executes nyq as `nyq __sandbox …`, which restricts its own
+//! process and then execs the shell, so the whole command tree inherits the
+//! policy. The helper layers three mechanisms:
+//! - a user+mount namespace that re-binds `.git/hooks`, `.git/config` and
+//!   `.git/info` (for `attributes`) read-only over each writable root's `.git`,
+//!   so commits and branches keep working while planted hooks and config
+//!   redirects cannot run unsandboxed later;
+//! - Landlock: reads everywhere, writes only to allowed roots, and TCP
+//!   bind/connect denied on ABI v4+ when the network policy is off;
+//! - a seccomp filter, also only when the network policy is off, that fails
+//!   `socket()` with EACCES for AF_INET/AF_INET6 of any type (covering UDP)
+//!   and for AF_UNIX. `NYQ_SANDBOX_UNIX=1` re-allows AF_UNIX.
+//!
+//! macOS wraps the shell in `sandbox-exec` with an equivalent Seatbelt
+//! profile, including deny rules for the same `.git` paths. Other platforms
+//! have no sandbox; `check` reports that. `NYQ_SANDBOX_GIT_WRITABLE=1` opts
+//! out of git-metadata protection on both.
 #![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
@@ -20,13 +32,37 @@ pub enum Mode {
     WorkspaceWrite,
 }
 
-#[derive(Clone, Debug, Default)]
+/// An environment flag counts as set when it is non-empty and not "0".
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v.to_str() != Some("0"))
+}
+
+#[derive(Clone, Debug)]
 pub struct Policy {
     pub mode: Mode,
     /// Allow network access from sandboxed commands.
     pub network: bool,
+    /// Permit AF_UNIX sockets even when `network` is denied
+    /// (`NYQ_SANDBOX_UNIX=1` sets the default).
+    pub unix_sockets: bool,
+    /// Leave `.git/hooks`, `.git/config` and `.git/info` writable inside the
+    /// sandbox, opting out of git-metadata protection
+    /// (`NYQ_SANDBOX_GIT_WRITABLE=1` sets the default).
+    pub git_writable: bool,
     /// Extra writable roots besides the workspace (WorkspaceWrite only).
     pub writable: Vec<PathBuf>,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            mode: Mode::default(),
+            network: false,
+            unix_sockets: env_flag("NYQ_SANDBOX_UNIX"),
+            git_writable: env_flag("NYQ_SANDBOX_GIT_WRITABLE"),
+            writable: Vec::new(),
+        }
+    }
 }
 
 /// First argument of the hidden re-exec helper: `nyq __sandbox ...`.
@@ -109,6 +145,77 @@ fn writable_roots(policy: &Policy, cwd: &Path) -> Vec<PathBuf> {
     }
     v.retain(|p| p.exists());
     v
+}
+
+/// The real git directory behind a `.git` file (worktrees and submodules use
+/// `gitdir: <path>`), resolved against the file's location.
+fn resolve_gitfile(file: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let rel = text.trim().strip_prefix("gitdir:")?.trim();
+    std::fs::canonicalize(file.parent()?.join(rel)).ok()
+}
+
+/// The directory shared by a repo's worktrees (holds `hooks` and `config`):
+/// `gitdir/commondir` when the file exists, else `gitdir` itself.
+fn common_gitdir(gitdir: &Path) -> PathBuf {
+    std::fs::read_to_string(gitdir.join("commondir"))
+        .ok()
+        .and_then(|s| std::fs::canonicalize(gitdir.join(s.trim())).ok())
+        .unwrap_or_else(|| gitdir.to_path_buf())
+}
+
+/// `.git` paths a sandboxed command must not write: hooks and config under
+/// every reachable git dir, so a planted hook or `core.hooksPath` redirect
+/// cannot run later outside the sandbox. `cwd` and `writable` are the same
+/// roots the command may write. Paths are returned whether or not they exist;
+/// a caller that needs a real mount point may create a missing `hooks`
+/// directory or `config` file.
+fn protected_git_paths(cwd: &Path, writable: &[PathBuf]) -> Vec<PathBuf> {
+    let mut gitdirs: Vec<PathBuf> = Vec::new();
+    let mut pointers: Vec<PathBuf> = Vec::new();
+    let mut consider = |dir: &Path| {
+        if !writable.iter().any(|root| dir.starts_with(root)) {
+            return;
+        }
+        let git = dir.join(".git");
+        match std::fs::metadata(&git) {
+            Ok(m) if m.is_dir() => gitdirs.push(git),
+            Ok(_) => {
+                if let Some(gd) = resolve_gitfile(&git) {
+                    pointers.push(git);
+                    gitdirs.push(gd);
+                }
+            }
+            Err(_) => {}
+        }
+    };
+    for root in writable {
+        consider(root);
+    }
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        consider(d);
+        dir = d.parent();
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<PathBuf> = pointers;
+    for gitdir in gitdirs {
+        let gd = common_gitdir(&gitdir);
+        if !seen.insert(gd.clone()) {
+            continue;
+        }
+        out.extend([gd.join("hooks"), gd.join("config")]);
+        let info = gd.join("info");
+        if info.join("attributes").exists() || info.is_dir() {
+            out.push(if info.join("attributes").exists() {
+                info.join("attributes")
+            } else {
+                info
+            });
+        }
+    }
+    out
 }
 
 #[cfg(not(windows))]
@@ -227,17 +334,23 @@ fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<St
     Ok(linux::helper_args(
         &exe,
         &writable_roots(policy, cwd),
-        policy.network,
+        policy,
         argv,
     ))
 }
 
 #[cfg(target_os = "macos")]
 fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let writable = writable_roots(policy, cwd);
+    let git = if policy.git_writable {
+        Vec::new()
+    } else {
+        protected_git_paths(cwd, &writable)
+    };
     let mut v = vec![
         "/usr/bin/sandbox-exec".to_string(),
         "-p".into(),
-        seatbelt_profile(&writable_roots(policy, cwd), policy.network),
+        seatbelt_profile(&writable, policy.network, &git),
     ];
     v.extend(argv);
     Ok(v)
@@ -248,9 +361,11 @@ fn wrap(_policy: &Policy, _cwd: &Path, _argv: Vec<String>) -> anyhow::Result<Vec
     anyhow::bail!("sandboxing is not supported on this platform")
 }
 
-/// A macOS Seatbelt (SBPL) profile allowing writes only under `roots`.
+/// A macOS Seatbelt (SBPL) profile allowing writes only under `roots`. `git`
+/// lists the `.git` paths that stay read-only; deny rules come last because
+/// Seatbelt lets later rules win.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn seatbelt_profile(roots: &[PathBuf], network: bool) -> String {
+fn seatbelt_profile(roots: &[PathBuf], network: bool, git: &[PathBuf]) -> String {
     let quote = |p: &Path| {
         format!(
             "\"{}\"",
@@ -269,8 +384,17 @@ fn seatbelt_profile(roots: &[PathBuf], network: bool) -> String {
     s.push_str(")\n");
     if !network {
         // `(deny network*)` includes unix sockets. Re-allowing them was an
-        // escape through host daemons such as the Docker socket.
+        // escape through host daemons such as the Docker socket. The
+        // `unix_sockets` escape hatch is Linux-only (seccomp); a static
+        // profile cannot carve AF_UNIX back out safely.
         s.push_str("(deny network*)\n");
+    }
+    if !git.is_empty() {
+        s.push_str("(deny file-write*");
+        for p in git {
+            s.push_str(&format!(" (literal {}) (subpath {})", quote(p), quote(p)));
+        }
+        s.push_str(")\n");
     }
     s
 }
@@ -294,6 +418,94 @@ pub fn check(policy: &Policy) -> Result<(), String> {
     Err("sandboxing is not supported on this platform".into())
 }
 
+/// Which OS facility enforces the sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Landlock,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Seatbelt,
+    None,
+}
+
+/// How much of the requested policy the backend can actually enforce.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase", tag = "level", content = "reasons")]
+pub enum Enforcement {
+    /// Every part of the policy is kernel-enforced.
+    Full,
+    /// The sandbox runs but some aspects are open, with the reasons.
+    Partial(Vec<String>),
+    /// Nothing is enforced (`--sandbox off` or no usable backend).
+    None,
+}
+
+/// Machine-readable enforcement report for the banner, doctor and status.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SandboxStatus {
+    pub backend: Backend,
+    pub enforcement: Enforcement,
+}
+
+/// The enforcement level `policy` will get on this system, computed from the
+/// Landlock ABI, seccomp and user-namespace availability on Linux, the
+/// `sandbox-exec` binary on macOS, and nothing elsewhere.
+pub fn status(policy: &Policy) -> SandboxStatus {
+    if policy.mode == Mode::Off {
+        return SandboxStatus {
+            backend: Backend::None,
+            enforcement: Enforcement::None,
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(abi) = linux::abi() else {
+            return SandboxStatus {
+                backend: Backend::Landlock,
+                enforcement: Enforcement::None,
+            };
+        };
+        let mut reasons = Vec::new();
+        if !policy.network {
+            if abi < 4 {
+                reasons.push(format!("Landlock ABI v{abi} cannot deny TCP"));
+            }
+            if !(linux::seccomp::supported() && linux::seccomp::available()) {
+                reasons.push("no seccomp socket filter: UDP and unix sockets stay open".into());
+            }
+        }
+        if policy.mode == Mode::WorkspaceWrite
+            && !policy.git_writable
+            && !linux::git::userns_available()
+        {
+            reasons.push(".git hooks/config stay writable (user namespaces unavailable)".into());
+        }
+        return SandboxStatus {
+            backend: Backend::Landlock,
+            enforcement: if reasons.is_empty() {
+                Enforcement::Full
+            } else {
+                Enforcement::Partial(reasons)
+            },
+        };
+    }
+    #[cfg(target_os = "macos")]
+    return SandboxStatus {
+        backend: Backend::Seatbelt,
+        enforcement: if Path::new("/usr/bin/sandbox-exec").exists() {
+            Enforcement::Full
+        } else {
+            Enforcement::None
+        },
+    };
+    #[allow(unreachable_code)]
+    SandboxStatus {
+        backend: Backend::None,
+        enforcement: Enforcement::None,
+    }
+}
+
 /// One line for the banner.
 pub fn describe(policy: &Policy) -> String {
     let mode = match policy.mode {
@@ -306,35 +518,23 @@ pub fn describe(policy: &Policy) -> String {
     } else {
         "network off"
     };
-    #[cfg(target_os = "linux")]
-    if let Some(abi) = linux::abi() {
-        // Landlock ABI v4 can deny TCP bind/connect only. UDP and AF_UNIX
-        // stay open; there is no Landlock rule for them.
-        let net = if policy.network {
-            "network on; unix sockets not restricted"
-        } else if abi < 4 {
-            "network not restricted (kernel too old)"
-        } else {
-            "TCP blocked; UDP and unix sockets not restricted"
-        };
-        let git = if policy.mode == Mode::WorkspaceWrite {
-            "; .git remains writable"
-        } else {
-            ""
-        };
-        return format!("sandbox: {mode} · {net}{git} (landlock v{abi})");
-    }
-    let engine = if cfg!(target_os = "macos") {
-        "seatbelt"
-    } else {
-        "unavailable"
+    let st = status(policy);
+    let engine = match st.backend {
+        #[cfg(target_os = "linux")]
+        Backend::Landlock => linux::abi()
+            .map(|abi| format!("landlock v{abi}"))
+            .unwrap_or_else(|| "landlock unavailable".into()),
+        Backend::Seatbelt => "seatbelt".into(),
+        Backend::None => "unavailable".into(),
     };
-    let git = if policy.mode == Mode::WorkspaceWrite && cfg!(target_os = "macos") {
-        "; .git remains writable"
-    } else {
-        ""
+    let level = match st.enforcement {
+        Enforcement::Full => "enforcement: full".into(),
+        Enforcement::Partial(reasons) => {
+            format!("enforcement: partial ({})", reasons.join("; "))
+        }
+        Enforcement::None => "not enforced".into(),
     };
-    format!("sandbox: {mode} · {net}{git} ({engine})")
+    format!("sandbox: {mode} · {net} · {level} ({engine})")
 }
 
 /// Apply the policy encoded in `args` to this process, then exec the command.
@@ -373,16 +573,22 @@ mod linux {
         })
     }
 
-    /// `exe __sandbox [--net] [--write PATH]... -- argv...`
+    /// `exe __sandbox [--net] [--unix] [--git-writable] [--write PATH]... -- argv...`
     pub fn helper_args(
         exe: &Path,
         writable: &[PathBuf],
-        network: bool,
+        policy: &super::Policy,
         argv: Vec<String>,
     ) -> Vec<String> {
         let mut v = vec![exe.display().to_string(), super::HELPER_ARG.into()];
-        if network {
+        if policy.network {
             v.push("--net".into());
+        }
+        if policy.unix_sockets {
+            v.push("--unix".into());
+        }
+        if policy.git_writable {
+            v.push("--git-writable".into());
         }
         for w in writable {
             v.push("--write".into());
@@ -393,20 +599,41 @@ mod linux {
         v
     }
 
+    /// What `parse` decodes from the helper arguments.
+    pub struct Spec {
+        pub writable: Vec<PathBuf>,
+        pub network: bool,
+        /// Allow AF_UNIX sockets even with the network denied.
+        pub unix_sockets: bool,
+        /// Leave `.git` metadata (hooks/config) writable.
+        pub git_writable: bool,
+        pub argv: Vec<String>,
+    }
+
     /// Inverse of `helper_args` (without exe and HELPER_ARG).
-    pub fn parse(args: &[String]) -> Result<(Vec<PathBuf>, bool, Vec<String>), String> {
-        let (mut writable, mut network) = (Vec::new(), false);
+    pub fn parse(args: &[String]) -> Result<Spec, String> {
+        let mut spec = Spec {
+            writable: Vec::new(),
+            network: false,
+            unix_sockets: false,
+            git_writable: false,
+            argv: Vec::new(),
+        };
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--net" => network = true,
-                "--write" => writable.push(PathBuf::from(it.next().ok_or("--write needs a path")?)),
+                "--net" => spec.network = true,
+                "--unix" => spec.unix_sockets = true,
+                "--git-writable" => spec.git_writable = true,
+                "--write" => spec
+                    .writable
+                    .push(PathBuf::from(it.next().ok_or("--write needs a path")?)),
                 "--" => {
-                    let argv: Vec<String> = it.cloned().collect();
-                    if argv.is_empty() {
+                    spec.argv = it.cloned().collect();
+                    if spec.argv.is_empty() {
                         return Err("no command given".into());
                     }
-                    return Ok((writable, network, argv));
+                    return Ok(spec);
                 }
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -438,16 +665,330 @@ mod linux {
             eprintln!("nyq sandbox: {msg}");
             std::process::exit(126)
         };
-        let (writable, network, argv) = parse(&args).unwrap_or_else(|e| fail(e));
-        match restrict(&writable, network) {
+        let spec = parse(&args).unwrap_or_else(|e| fail(e));
+        if !spec.git_writable {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            let targets = super::protected_git_paths(&cwd, &spec.writable);
+            if let Err(e) = git::protect(&targets) {
+                eprintln!("nyq sandbox: .git metadata stays writable: {e}");
+            }
+        }
+        match restrict(&spec.writable, spec.network) {
             Ok(RulesetStatus::NotEnforced) => {
                 fail("Landlock is not enforced by this kernel; refusing to run unconfined".into())
             }
             Ok(_) => {}
             Err(e) => fail(e),
         }
-        let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
-        fail(format!("{}: {err}", argv[0]))
+        if !spec.network {
+            match seccomp::deny_sockets(spec.unix_sockets) {
+                // On an architecture the filter does not cover, run anyway
+                // (Landlock still applies); the status report says partial.
+                Err(e) if !seccomp::supported() => {
+                    eprintln!("nyq sandbox: {e}; UDP and unix sockets stay open")
+                }
+                Err(e) => fail(e),
+                Ok(()) => {}
+            }
+        }
+        let err = std::process::Command::new(&spec.argv[0])
+            .args(&spec.argv[1..])
+            .exec();
+        fail(format!("{}: {err}", spec.argv[0]))
+    }
+
+    /// seccomp-bpf that makes `socket()` fail with EACCES for AF_INET,
+    /// AF_INET6 (any type, so UDP too) and, unless the policy allows it,
+    /// AF_UNIX. Landlock can only gate TCP; this closes the UDP and
+    /// unix-socket gaps. The filter is installed via
+    /// `prctl(PR_SET_NO_NEW_PRIVS)` + `seccomp(SECCOMP_SET_MODE_FILTER)` with
+    /// a hand-written BPF program checked against the build architecture.
+    pub mod seccomp {
+        /// The socket filter has checked syscall numbers and audit arches for
+        /// x86_64 and aarch64 only.
+        pub fn supported() -> bool {
+            cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+        }
+
+        /// Kernel supports the `seccomp()` syscall (Linux 3.17+).
+        pub fn available() -> bool {
+            const SECCOMP_GET_ACTION_AVAIL: libc::c_uint = 2;
+            let action = libc::SECCOMP_RET_ALLOW;
+            unsafe {
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    SECCOMP_GET_ACTION_AVAIL,
+                    0,
+                    &action as *const _ as usize,
+                ) == 0
+            }
+        }
+
+        /// Install the socket filter. `allow_unix` leaves AF_UNIX open.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        pub fn deny_sockets(allow_unix: bool) -> Result<(), String> {
+            #[cfg(target_arch = "x86_64")]
+            const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+            #[cfg(target_arch = "aarch64")]
+            const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
+            const EACCES: u32 = 13;
+
+            // seccomp_data offsets: nr @0, arch @4, args[0] @16 (little-endian).
+            const OFF_NR: u32 = 0;
+            const OFF_ARCH: u32 = 4;
+            const OFF_ARG0_LO: u32 = 16;
+
+            const BPF_LD: u16 = 0x00;
+            const BPF_W: u16 = 0x00;
+            const BPF_ABS: u16 = 0x20;
+            const BPF_JMP: u16 = 0x05;
+            const BPF_JEQ: u16 = 0x10;
+            const BPF_K: u16 = 0x00;
+            const BPF_RET: u16 = 0x06;
+
+            let stmt = |code: u16, k: u32| libc::sock_filter {
+                code,
+                jt: 0,
+                jf: 0,
+                k,
+            };
+            let jeq = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt,
+                jf,
+                k,
+            };
+
+            // Syscall numbers to check. On x86_64 the x32 ABI reuses the same
+            // numbers with __X32_SYSCALL_BIT set; deny that variant too.
+            let mut socket_nrs = vec![libc::SYS_socket as u32];
+            #[cfg(target_arch = "x86_64")]
+            socket_nrs.push((libc::SYS_socket as u32) | 0x4000_0000);
+            let mut denied = vec![libc::AF_INET as u32, libc::AF_INET6 as u32];
+            if !allow_unix {
+                denied.push(libc::AF_UNIX as u32);
+            }
+            let (n, m) = (socket_nrs.len(), denied.len());
+            let allow_idx = 3 + n + 1 + m; // instruction index of `ret ALLOW`
+
+            let mut f = Vec::with_capacity(allow_idx + 3);
+            f.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH));
+            // Wrong architecture (e.g. i386 compat, where socket() rides
+            // socketcall): kill rather than risk a bypass.
+            f.push(jeq(AUDIT_ARCH, 0, (allow_idx + 2 - 2) as u8));
+            f.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR));
+            for (i, nr) in socket_nrs.iter().enumerate() {
+                // A match jumps to the domain checks; the last nr check must
+                // jump to ALLOW on mismatch, not fall through to them.
+                let jf = if i + 1 == n { (m + 1) as u8 } else { 0 };
+                f.push(jeq(*nr, (n - 1 - i) as u8, jf));
+            }
+            // args[0] is the socket domain; the kernel reads an int, so the
+            // low 32 bits decide. Matching only the low word also denies a
+            // domain smuggled in the high bits.
+            f.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0_LO));
+            for (j, dom) in denied.iter().enumerate() {
+                f.push(jeq(*dom, (m - j) as u8, 0));
+            }
+            f.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW));
+            f.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ERRNO | EACCES));
+            f.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
+
+            let prog = libc::sock_fprog {
+                len: f.len() as u16,
+                filter: f.as_ptr() as *mut libc::sock_filter,
+            };
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err("PR_SET_NO_NEW_PRIVS failed".into());
+                }
+                if libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &prog) != 0 {
+                    return Err(format!(
+                        "seccomp filter install failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        /// Other architectures have no checked syscall numbers; the command
+        /// still runs under Landlock and the status report says partial.
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        pub fn deny_sockets(_allow_unix: bool) -> Result<(), String> {
+            let _ = available();
+            Err("seccomp socket filter is not built for this architecture".into())
+        }
+    }
+
+    /// Read-only bind mounts over `.git` metadata inside a private user+mount
+    /// namespace. Landlock grants are union-based, so "writable `.git` minus
+    /// hooks/config" is not expressible there; a bind mount can.
+    pub mod git {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::{Path, PathBuf};
+
+        /// Unprivileged user namespaces look usable on this system (for the
+        /// startup report; the helper still does the real check per command).
+        pub fn userns_available() -> bool {
+            if let Ok(s) = std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
+                if s.trim().parse::<u64>().unwrap_or(0) == 0 {
+                    return false;
+                }
+            }
+            for (path, denied) in [
+                ("/proc/sys/kernel/unprivileged_userns_clone", "0"),
+                (
+                    "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+                    "1",
+                ),
+                ("/proc/sys/kernel/unprivileged_userns_apparmor_policy", "0"),
+            ] {
+                if std::fs::read_to_string(path).is_ok_and(|s| s.trim() == denied) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn write_proc(path: &str, value: &str) -> Result<(), String> {
+            std::fs::write(path, value).map_err(|e| format!("{path}: {e}"))
+        }
+
+        /// Enter a new user+mount namespace with the caller's uid/gid mapped
+        /// to themselves, so mounts we create stay private and file access
+        /// keeps working as the same user.
+        fn enter_namespaces() -> Result<(), String> {
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+                return Err(format!(
+                    "unshare user+mount namespace: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            write_proc("/proc/self/uid_map", &format!("{uid} {uid} 1"))?;
+            write_proc("/proc/self/setgroups", "deny")?;
+            write_proc("/proc/self/gid_map", &format!("{gid} {gid} 1"))?;
+            // Keep our mounts from propagating to (and leaking into) shared
+            // peer mounts outside the namespace.
+            if unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_PRIVATE | libc::MS_REC,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                return Err(format!(
+                    "make mounts private: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+
+        fn c_path(path: &Path) -> Result<CString, String> {
+            CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| format!("{}: path contains NUL", path.display()))
+        }
+
+        /// Re-bind `path` read-only over itself (open_tree + mount_setattr +
+        /// move_mount), inside the private mount namespace.
+        fn bind_read_only(path: &Path) -> Result<(), String> {
+            let c = c_path(path)?;
+            unsafe {
+                let tree = libc::syscall(
+                    libc::SYS_open_tree,
+                    libc::AT_FDCWD,
+                    c.as_ptr(),
+                    libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC,
+                );
+                if tree < 0 {
+                    return Err(format!(
+                        "open_tree {}: {}",
+                        path.display(),
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                let attr = libc::mount_attr {
+                    attr_set: libc::MOUNT_ATTR_RDONLY,
+                    attr_clr: 0,
+                    propagation: 0,
+                    userns_fd: 0,
+                };
+                if libc::syscall(
+                    libc::SYS_mount_setattr,
+                    tree,
+                    c"".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                    &attr,
+                    std::mem::size_of::<libc::mount_attr>(),
+                ) != 0
+                {
+                    let e = std::io::Error::last_os_error();
+                    libc::close(tree as i32);
+                    return Err(format!("mount_setattr {}: {e}", path.display()));
+                }
+                if libc::syscall(
+                    libc::SYS_move_mount,
+                    tree,
+                    c"".as_ptr(),
+                    libc::AT_FDCWD,
+                    c.as_ptr(),
+                    libc::MOVE_MOUNT_F_EMPTY_PATH,
+                ) != 0
+                {
+                    let e = std::io::Error::last_os_error();
+                    libc::close(tree as i32);
+                    return Err(format!("move_mount {}: {e}", path.display()));
+                }
+                libc::close(tree as i32);
+            }
+            Ok(())
+        }
+
+        /// Bind every `.git` metadata path read-only, then drop CAP_SYS_ADMIN
+        /// from the bounding set so the command cannot undo the mounts.
+        pub fn protect(targets: &[PathBuf]) -> Result<(), String> {
+            let mut mounts = Vec::new();
+            for target in targets {
+                if !target.exists() {
+                    // A missing hooks dir or config could be created inside
+                    // the sandbox; make it real first so it can be bound.
+                    let name = target.file_name().and_then(|n| n.to_str());
+                    let created = match name {
+                        Some("hooks") => std::fs::create_dir(target),
+                        Some("config") => std::fs::write(target, ""),
+                        _ => continue,
+                    };
+                    if created.is_err() {
+                        continue;
+                    }
+                }
+                mounts.push(target.clone());
+            }
+            if mounts.is_empty() {
+                return Ok(());
+            }
+            enter_namespaces()?;
+            for m in &mounts {
+                bind_read_only(m)?;
+            }
+            // Without CAP_SYS_ADMIN in the bounding set, nothing in the
+            // command tree can umount or rebind these paths — even inside a
+            // user namespace it creates itself.
+            const CAP_SYS_ADMIN: libc::c_int = 21;
+            if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, CAP_SYS_ADMIN, 0, 0, 0) } != 0 {
+                return Err(format!(
+                    "drop CAP_SYS_ADMIN: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -457,17 +998,23 @@ mod linux {
         #[test]
         fn args_round_trip() {
             let argv = vec!["bash".to_string(), "-c".into(), "echo --write hi".into()];
+            let policy = super::super::Policy {
+                network: true,
+                unix_sockets: true,
+                git_writable: true,
+                ..Default::default()
+            };
             let v = helper_args(
                 Path::new("/bin/nyq"),
                 &[PathBuf::from("/w s")],
-                false,
+                &policy,
                 argv.clone(),
             );
             assert_eq!(&v[..2], ["/bin/nyq", "__sandbox"]);
-            assert_eq!(
-                parse(&v[2..]).unwrap(),
-                (vec![PathBuf::from("/w s")], false, argv)
-            );
+            let spec = parse(&v[2..]).unwrap();
+            assert_eq!(spec.writable, vec![PathBuf::from("/w s")]);
+            assert!(spec.network && spec.unix_sockets && spec.git_writable);
+            assert_eq!(spec.argv, argv);
             assert!(parse(&["--net".into()]).is_err());
             assert!(parse(&["--bogus".into(), "--".into(), "x".into()]).is_err());
         }
@@ -517,16 +1064,50 @@ mod tests {
 
     #[test]
     fn seatbelt_profile_escapes_and_denies() {
-        let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false);
+        let git = vec![
+            PathBuf::from("/w/.git/hooks"),
+            PathBuf::from("/w/.git/config"),
+        ];
+        let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false, &git);
         assert!(p.contains("(deny file-write*)"));
-        assert!(
-            !p.contains(".git"),
-            "git must stay usable inside the sandbox"
-        );
         assert!(p.contains(r#""/tmp/a\"b""#));
         assert!(p.contains("(deny network*)"));
         assert!(!p.contains("unix-socket"));
-        assert!(!seatbelt_profile(&[], true).contains("deny network"));
+        // Git metadata is denied after the allows, so the rest of .git (and
+        // the workspace) stays writable while hooks and config are not.
+        assert!(p.contains(r#"(literal "/w/.git/config")"#));
+        assert!(p.contains(r#"(subpath "/w/.git/hooks")"#));
+        assert!(p.find(".git").unwrap() > p.find("allow file-write*").unwrap());
+        assert!(!seatbelt_profile(&[], true, &[]).contains("deny network"));
+        assert!(!seatbelt_profile(&[], false, &[]).contains(".git"));
+    }
+
+    #[test]
+    fn protected_git_paths_cover_dirs_and_worktrees() {
+        let root = tempfile::tempdir().unwrap();
+        let git = root.path().join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config"), "").unwrap();
+        std::fs::create_dir_all(git.join("info")).unwrap();
+        let roots = &[root.path().to_path_buf()];
+        let out = protected_git_paths(root.path(), roots);
+        assert!(out.contains(&git.join("hooks")), "{out:?}");
+        assert!(out.contains(&git.join("config")), "{out:?}");
+        assert!(out.contains(&git.join("info")), "{out:?}");
+
+        // A `.git` file (worktree pointer) is protected itself plus the real
+        // gitdir's shared metadata.
+        let main = tempfile::tempdir().unwrap();
+        let real_gd = main.path().join("m");
+        std::fs::create_dir_all(real_gd.join("hooks")).unwrap();
+        std::fs::write(real_gd.join("config"), "").unwrap();
+        let wt = root.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}", real_gd.display())).unwrap();
+        let out = protected_git_paths(&wt, roots);
+        assert!(out.contains(&wt.join(".git")), "{out:?}");
+        assert!(out.contains(&real_gd.join("hooks")), "{out:?}");
+        assert!(out.contains(&real_gd.join("config")), "{out:?}");
     }
 
     #[test]
@@ -588,34 +1169,50 @@ mod tests {
     }
 
     #[test]
-    fn describe_mentions_the_unix_socket_gap_on_linux() {
+    fn describe_reports_enforcement_level() {
+        let off = describe(&Policy {
+            mode: Mode::Off,
+            ..Default::default()
+        });
+        assert!(off.contains("off"), "{off}");
         let p = describe(&Policy {
             mode: Mode::ReadOnly,
             network: false,
             ..Default::default()
         });
         assert!(p.contains("read-only"), "{p}");
+        assert!(p.contains("enforcement:"), "{p}");
         #[cfg(target_os = "linux")]
-        if p.contains("landlock") {
-            if p.contains("kernel too old") {
-                assert!(p.contains("network not restricted"), "{p}");
-            } else {
-                assert!(
-                    p.contains("TCP blocked; UDP and unix sockets not restricted"),
-                    "{p}"
-                );
-                assert_eq!(p.matches("unix sockets").count(), 1, "{p}");
-            }
+        if p.contains("landlock v") {
+            // A modern kernel enforces everything: Landlock writes and TCP,
+            // seccomp UDP and unix sockets, mounts .git metadata.
+            assert!(p.contains("enforcement: full"), "{p}");
+            assert_eq!(p.matches("unix sockets").count(), 0, "{p}");
         }
+    }
+
+    #[test]
+    fn status_off_is_not_enforced() {
+        let st = status(&Policy {
+            mode: Mode::Off,
+            ..Default::default()
+        });
+        assert_eq!(st.backend, Backend::None);
+        assert_eq!(st.enforcement, Enforcement::None);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn describe_mentions_git_write_gap() {
-        let text = describe(&Policy::default());
-        if text.contains("landlock") {
-            assert!(text.contains(".git remains writable"), "{text}");
-        }
+    fn git_writable_setting_removes_the_userns_reason() {
+        let mut policy = Policy::default();
+        let without = status(&policy);
+        policy.git_writable = true;
+        let with = status(&policy);
+        let count = |s: &SandboxStatus| match &s.enforcement {
+            Enforcement::Partial(r) => r.iter().filter(|x| x.contains(".git")).count(),
+            _ => 0,
+        };
+        assert!(count(&without) >= count(&with), "{without:?} {with:?}");
     }
 
     #[test]

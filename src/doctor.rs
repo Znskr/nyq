@@ -64,6 +64,7 @@ pub fn status(
     json!({"version": env!("CARGO_PKG_VERSION"), "provider": provider.map(Provider::name), "model": provider.map(Provider::model),
         "effort": provider.and_then(Provider::effort).unwrap_or("auto"), "profile_dir": home,
         "auth_sources": auth_sources(home), "sandbox": sandbox::describe(policy),
+        "sandbox_status": sandbox::status(policy),
         "mcp": servers.iter().map(|s| json!({"name": s.name, "connected": connected.iter().any(|(name, _)| name == &s.name)})).collect::<Vec<_>>(),
         "skills_count": skills_count, "permissions_file": crate::permissions::user_path(home),
         "project_permissions_file": crate::permissions::project_path(cwd), "context_window": context,
