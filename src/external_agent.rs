@@ -19,7 +19,6 @@
 //! nobody can be asked. The client advertises no file-system or terminal
 //! capabilities, so the agent uses its own. Only the user's own settings.toml
 //! may name a command: a repository's `.nyq/settings.toml` cannot.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::Path;

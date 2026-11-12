@@ -175,6 +175,10 @@ pub fn delete(dir: &Path, name: &str) -> Result<()> {
     if is_live(&key(dir, name)) {
         bail!("`{name}` is working; stop it first.");
     }
+    // An unmerged worktree goes with its child.
+    if let Some(wt) = load(dir, name)?.and_then(|r| r.worktree) {
+        wt.remove()?;
+    }
     std::fs::remove_file(path(dir, name)).with_context(|| format!("deleting subagent {name}"))
 }
 
