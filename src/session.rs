@@ -21,7 +21,11 @@
 //! - `<id>.meta`, an append-only JSON-lines log that is never shown to the
 //!   model: `attempt` records for failed or retried model requests, and
 //!   `compaction_start`/`compaction_end` markers. A start without an end on
-//!   load means nyq stopped mid-compaction; it is reported and ignored.
+//!   load means nyq stopped mid-compaction; it is reported and ignored. The
+//!   end marker is written only after the summary *and* the kept tail are
+//!   saved, so an open marker followed by a `Compaction` item means the tail
+//!   may be incomplete: loading cuts the transcript back to just before that
+//!   item, restoring the pre-compaction items that are still in the file.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -289,10 +293,27 @@ pub struct Session {
     intents: Vec<serde_json::Value>,
     /// Side-effecting calls without a saved result (mirrors `<id>.calls`).
     calls: BTreeMap<String, CallEntry>,
-    /// A `compaction_start` marker was written and not closed yet.
-    compacting: bool,
+    /// Where an open compaction stands (see [`Compacting`]).
+    compacting: Compacting,
     /// What loading had to repair; empty for a new or clean session.
     pub recovery: Recovery,
+}
+
+/// The `compaction_start` marker's state while it is open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Compacting {
+    /// No marker is open.
+    #[default]
+    No,
+    /// Started; the summary is not saved. Any other item abandons it.
+    Started,
+    /// The summary is saved and the kept tail is being re-appended. Only
+    /// [`Session::compaction_end`] closes the marker: until then a crash
+    /// leaves it open and the next load drops the summary and partial tail.
+    Summarized,
+    /// `compaction_end` was called but the tail could not be written yet; the
+    /// next successful write closes the marker.
+    Ending,
 }
 
 /// Where a requested tool call stands before its result is saved.
@@ -357,8 +378,9 @@ pub(crate) fn meta_records(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Append one record to `<id>.meta` (created 0600).
-fn append_meta(path: &Path, record: &serde_json::Value) -> Result<()> {
+/// Append one record to `<id>.meta` (created 0600). `sync` makes it durable
+/// before returning (compaction markers order against transcript writes).
+fn append_meta(path: &Path, record: &serde_json::Value, sync: bool) -> Result<()> {
     let path = meta_path(path);
     let mut opts = OpenOptions::new();
     opts.append(true).create(true);
@@ -370,21 +392,38 @@ fn append_meta(path: &Path, record: &serde_json::Value) -> Result<()> {
     let mut line = serde_json::to_string(record)?;
     line.push('\n');
     opts.open(&path)
-        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .and_then(|mut f| {
+            f.write_all(line.as_bytes())?;
+            if sync {
+                f.sync_data()?;
+            }
+            Ok(())
+        })
         .with_context(|| format!("saving {}", path.display()))
 }
 
-/// The start time of a compaction that began and never ended, if the last
-/// `compaction_start` in the log has no `compaction_end` after it.
-fn open_compaction(records: &[serde_json::Value]) -> Option<String> {
+/// A compaction that began and never ended: the last `compaction_start` in
+/// the log has no `compaction_end` after it.
+struct OpenCompaction {
+    /// When it started (empty if unrecorded).
+    ts: String,
+    /// The transcript's length when it started: everything the compaction
+    /// wrote lies at or after this offset.
+    transcript_len: Option<u64>,
+}
+
+fn open_compaction(records: &[serde_json::Value]) -> Option<OpenCompaction> {
     let last = records.iter().rposition(|r| {
         matches!(
             r["type"].as_str(),
             Some("compaction_start" | "compaction_end")
         )
     })?;
-    (records[last]["type"] == "compaction_start")
-        .then(|| records[last]["ts"].as_str().unwrap_or("").to_string())
+    let r = &records[last];
+    (r["type"] == "compaction_start").then(|| OpenCompaction {
+        ts: r["ts"].as_str().unwrap_or("").to_string(),
+        transcript_len: r["transcript_len"].as_u64(),
+    })
 }
 
 /// What loading a session repaired, reported to the user by every frontend.
@@ -515,7 +554,7 @@ impl Session {
             workset: None,
             intents: Vec::new(),
             calls: BTreeMap::new(),
-            compacting: false,
+            compacting: Compacting::No,
             recovery: Recovery::default(),
         })
     }
@@ -537,13 +576,20 @@ impl Session {
         let line = serde_json::to_string(item)
             .with_context(|| format!("encoding a session item for {}", self.id))?;
         self.queued.push(line);
-        self.flush_queue()?;
-        // A saved summary finishes an open compaction; any other item means it
-        // ended without one (cancelled or failed).
-        if self.compacting {
-            let done = matches!(item, Item::Compaction { .. });
-            self.close_compaction(if done { "done" } else { "abandoned" });
+        let saved = self.flush_queue();
+        match self.compacting {
+            // The summary is in: the marker stays open until the kept tail
+            // after it is saved too (`compaction_end`).
+            Compacting::Started if matches!(item, Item::Compaction { .. }) => {
+                self.compacting = Compacting::Summarized;
+            }
+            // Any other item first means it ended without one (cancelled or
+            // failed).
+            Compacting::Started => self.close_compaction("abandoned"),
+            Compacting::Ending if saved.is_ok() => self.finish_compaction()?,
+            _ => {}
         }
+        saved?;
         // The result is saved: the call is settled.
         if let Item::ToolResult { id, .. } = item {
             if self.calls.remove(id).is_some() {
@@ -602,7 +648,13 @@ impl Session {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                     Err(e).with_context(|| format!("clearing {}", path.display()))
                 }
-                _ => Ok(()),
+                Err(_) => Ok(()),
+                // Best effort: a removal lost to a power cut only brings back
+                // entries that loading recognizes as settled.
+                Ok(()) => {
+                    let _ = sync_dir(path.parent().unwrap_or(Path::new(".")));
+                    Ok(())
+                }
             };
         }
         let journal = Journal {
@@ -640,33 +692,70 @@ impl Session {
             .as_ref()
             .and_then(|f| f.metadata().ok())
             .map(|m| m.len());
-        self.write_meta(serde_json::json!({
-            "type": "compaction_start",
-            "ts": Utc::now().to_rfc3339(),
-            "transcript_len": len,
-        }))?;
-        self.compacting = self.pending_header.is_none();
+        // Durable before the summary can reach the transcript, so a summary
+        // on disk always has its start marker.
+        self.write_meta_synced(
+            serde_json::json!({
+                "type": "compaction_start",
+                "ts": Utc::now().to_rfc3339(),
+                "transcript_len": len,
+            }),
+            true,
+        )?;
+        self.compacting = if self.pending_header.is_none() {
+            Compacting::Started
+        } else {
+            Compacting::No
+        };
         Ok(())
     }
 
-    /// Mark a compaction as finished. Saving its `Compaction` item already
-    /// does this; the call covers compactions that save no summary item.
+    /// Mark a compaction as finished: its summary and the kept tail after it
+    /// are saved. Until this is called, a crash leaves the marker open and
+    /// the next load discards the summary and whatever tail was re-appended.
+    /// It also covers compactions that save no summary item.
     pub fn compaction_end(&mut self) -> Result<()> {
-        if !self.compacting {
-            return Ok(());
+        match self.compacting {
+            Compacting::No => Ok(()),
+            Compacting::Started => {
+                self.compacting = Compacting::No;
+                self.write_meta(serde_json::json!({
+                    "type": "compaction_end",
+                    "ts": Utc::now().to_rfc3339(),
+                    "outcome": "done",
+                }))
+            }
+            Compacting::Summarized | Compacting::Ending => {
+                self.compacting = Compacting::Ending;
+                self.finish_compaction()
+            }
         }
-        self.compacting = false;
-        self.write_meta(serde_json::json!({
-            "type": "compaction_end",
-            "ts": Utc::now().to_rfc3339(),
-            "outcome": "done",
-        }))
+    }
+
+    /// Close a compaction whose summary is saved, once every queued item of
+    /// its tail is written and synced. If the tail cannot be written yet, the
+    /// marker stays open (`Ending`) and the next successful write closes it.
+    fn finish_compaction(&mut self) -> Result<()> {
+        self.flush_queue()?;
+        if let Some(file) = &self.file {
+            file.sync_data()
+                .with_context(|| format!("syncing session {}", self.id))?;
+        }
+        self.compacting = Compacting::No;
+        self.write_meta_synced(
+            serde_json::json!({
+                "type": "compaction_end",
+                "ts": Utc::now().to_rfc3339(),
+                "outcome": "done",
+            }),
+            true,
+        )
     }
 
     /// Close an open compaction that ended without a summary. Best effort:
     /// at worst the next load reports it as interrupted.
     fn close_compaction(&mut self, outcome: &str) {
-        self.compacting = false;
+        self.compacting = Compacting::No;
         let _ = self.write_meta(serde_json::json!({
             "type": "compaction_end",
             "ts": Utc::now().to_rfc3339(),
@@ -675,10 +764,14 @@ impl Session {
     }
 
     fn write_meta(&mut self, record: serde_json::Value) -> Result<()> {
+        self.write_meta_synced(record, false)
+    }
+
+    fn write_meta_synced(&mut self, record: serde_json::Value, sync: bool) -> Result<()> {
         if self.pending_header.is_some() {
             return Ok(());
         }
-        append_meta(&self.path, &record)
+        append_meta(&self.path, &record, sync)
     }
 
     /// Write anything still queued from an earlier failed append.
@@ -935,8 +1028,14 @@ fn lock_path(path: &Path) -> PathBuf {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if self.compacting {
-            self.close_compaction("abandoned");
+        match self.compacting {
+            Compacting::Started => self.close_compaction("abandoned"),
+            // Close it only if the whole tail can still be written; otherwise
+            // leave it open so the next load restores the pre-compaction items.
+            Compacting::Ending => {
+                let _ = self.finish_compaction();
+            }
+            Compacting::Summarized | Compacting::No => {}
         }
         if let Some(lock) = self.lock.as_ref() {
             let _ = lock.unlock();
@@ -978,6 +1077,18 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
+    sync_dir(dir)
+}
+
+/// Make a rename in `dir` durable: without it, a power loss can leave the
+/// directory pointing at the old file (or none) although the data was synced.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -1454,7 +1565,25 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
     let mut data = Vec::new();
     file.read_to_end(&mut data)
         .with_context(|| format!("reading {}", meta.path.display()))?;
-    let parsed = parse_items(&data);
+    let mut parsed = parse_items(&data);
+    // A compaction that never ended may have saved its summary and only part
+    // of the kept tail. Its writes all start at that `Compaction` line, after
+    // the pre-compaction items (still in the file): cut back to that line so
+    // the transcript reads as it did before the compaction, now and on every
+    // later load (new items are appended after the cut).
+    let open = open_compaction(&meta_records(&meta.path));
+    if let Some(cut) = open.as_ref().and_then(|o| {
+        let start = o.transcript_len?;
+        parsed
+            .last_compaction
+            .filter(|&at| at as u64 >= start && at <= data.len())
+    }) {
+        file.set_len(cut as u64)
+            .and_then(|_| file.sync_data())
+            .with_context(|| format!("restoring {}", meta.path.display()))?;
+        data.truncate(cut);
+        parsed = parse_items(&data);
+    }
     let good = parsed.good;
     let mut recovery = Recovery {
         torn_tail: !data[good..]
@@ -1491,7 +1620,7 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
         workset,
         intents,
         calls: BTreeMap::new(),
-        compacting: false,
+        compacting: Compacting::No,
         recovery: Recovery::default(),
     };
     let mut items = parsed.items;
@@ -1516,10 +1645,10 @@ pub fn load(dir: &Path, which: &str, cwd: &Path) -> Result<(Session, Meta, Vec<I
     if !journal.is_empty() {
         session.write_journal()?;
     }
-    // A compaction writes its summary only when it is done, so one that never
-    // ended changed nothing. Close it so it is reported once.
-    if let Some(ts) = open_compaction(&meta_records(&meta.path)) {
-        recovery.interrupted_compaction = Some(ts);
+    // A compaction that never ended changed nothing (its summary and partial
+    // tail were cut off above). Close it so it is reported once.
+    if let Some(open) = open {
+        recovery.interrupted_compaction = Some(open.ts);
         session.close_compaction("interrupted");
     }
     session.recovery = recovery;
@@ -1533,6 +1662,8 @@ struct Parsed {
     good: usize,
     /// 1-based numbers of unreadable lines that were skipped.
     skipped: Vec<usize>,
+    /// Byte offset of the line holding the last `Compaction` item.
+    last_compaction: Option<usize>,
 }
 
 /// Items after the header plus the byte length of the well-formed prefix.
@@ -1560,6 +1691,7 @@ fn read_items(data: &[u8], path: &Path) -> Result<(Vec<Item>, usize)> {
 fn parse_items(data: &[u8]) -> Parsed {
     let mut items = Vec::new();
     let mut skipped = Vec::new();
+    let mut last_compaction = None;
     let mut good = 0;
     let mut offset = 0;
     let mut n = 0usize;
@@ -1575,7 +1707,12 @@ fn parse_items(data: &[u8]) -> Parsed {
         let blank = line.iter().all(|b| b.is_ascii_whitespace() || *b == 0);
         if n > 0 && !blank && !is_meta_line(line) {
             match serde_json::from_slice::<Item>(line) {
-                Ok(item) => items.push(item),
+                Ok(item) => {
+                    if matches!(item, Item::Compaction { .. }) {
+                        last_compaction = Some(offset);
+                    }
+                    items.push(item);
+                }
                 Err(_) if end == data.len() => break,
                 Err(_) => skipped.push(n + 1),
             }
@@ -1588,6 +1725,7 @@ fn parse_items(data: &[u8]) -> Parsed {
         items,
         good,
         skipped,
+        last_compaction,
     }
 }
 
@@ -2195,7 +2333,7 @@ mod tests {
         s.compaction_start().unwrap();
         // Crash: the summary and the end marker never land (and no clean
         // shutdown closes the marker).
-        s.compacting = false;
+        s.compacting = Compacting::No;
         let id = s.id.clone();
         drop(s);
 
@@ -2273,6 +2411,156 @@ mod tests {
                 summary: "sum".into()
             }
         );
+    }
+
+    fn deploy_result() -> Item {
+        Item::ToolResult {
+            id: "c1".into(),
+            output: "deployed".into(),
+            is_error: false,
+            labels: Vec::new(),
+        }
+    }
+
+    /// The transcript a compaction starts from: an earlier summary, then a
+    /// finished `bash make deploy` and an answer.
+    fn compacted_before(dir: &Path) -> (Session, Vec<Item>) {
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        let before = vec![
+            Item::Compaction {
+                summary: "older".into(),
+            },
+            user("deploy it"),
+            Item::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"make deploy"}"#.into(),
+            },
+            deploy_result(),
+            Item::Assistant {
+                text: "deployed".into(),
+            },
+        ];
+        s.append(&user("first")).unwrap();
+        for item in &before {
+            s.append(item).unwrap();
+        }
+        (s, before)
+    }
+
+    #[test]
+    fn a_crash_while_the_kept_tail_is_rewritten_restores_the_pre_compaction_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (mut s, before) = compacted_before(dir);
+        s.compaction_start().unwrap();
+        s.append(&Item::Compaction {
+            summary: "new".into(),
+        })
+        .unwrap();
+        // The summary is saved, but the marker stays open until the tail is.
+        assert_eq!(
+            meta_records(&s.path).last().unwrap()["type"],
+            "compaction_start"
+        );
+        // Crash after re-appending only part of the kept tail: the call is
+        // back, its result is not.
+        s.append(&before[1]).unwrap();
+        s.append(&before[2]).unwrap();
+        let id = s.id.clone();
+        drop(s);
+        assert_eq!(
+            meta_records(&dir.join(format!("{id}.jsonl")))
+                .last()
+                .unwrap()["type"],
+            "compaction_start",
+            "a summarized compaction must not be closed on exit"
+        );
+
+        let (mut s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert_eq!(items, before, "{:?}", s.recovery);
+        assert!(s.recovery.interrupted_compaction.is_some());
+        assert!(s.recovery.unknown.is_empty(), "{:?}", s.recovery);
+        assert!(!fs::read_to_string(&s.path).unwrap().contains("\"new\""));
+        old_reader_accepts(dir, &s.path);
+        // Later turns follow the restored items, and the cut sticks.
+        s.append(&user("next")).unwrap();
+        drop(s);
+        let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert!(s.recovery.is_empty(), "{:?}", s.recovery);
+        let mut expected = before.clone();
+        expected.push(user("next"));
+        assert_eq!(items, expected);
+    }
+
+    #[test]
+    fn a_compaction_closes_only_after_its_tail_is_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (mut s, before) = compacted_before(dir);
+        s.compaction_start().unwrap();
+        let summary = Item::Compaction {
+            summary: "new".into(),
+        };
+        s.append(&summary).unwrap();
+        for item in &before[1..] {
+            s.append(item).unwrap();
+            // A tail item is not a cancelled compaction.
+            assert_eq!(
+                meta_records(&s.path).last().unwrap()["type"],
+                "compaction_start"
+            );
+        }
+        s.compaction_end().unwrap();
+        let last = meta_records(&s.path).last().cloned().unwrap();
+        assert_eq!(
+            (last["type"].as_str(), last["outcome"].as_str()),
+            (Some("compaction_end"), Some("done"))
+        );
+        let id = s.id.clone();
+        drop(s);
+        let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert!(s.recovery.is_empty(), "{:?}", s.recovery);
+        let mut expected = vec![summary];
+        expected.extend_from_slice(&before[1..]);
+        assert_eq!(items, expected);
+    }
+
+    #[test]
+    fn an_open_marker_without_its_summary_keeps_the_earlier_compaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (mut s, before) = compacted_before(dir);
+        s.compaction_start().unwrap();
+        // Crash before the summary lands.
+        s.compacting = Compacting::No;
+        let id = s.id.clone();
+        drop(s);
+        let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert!(s.recovery.interrupted_compaction.is_some());
+        assert_eq!(items, before);
+        assert!(fs::read_to_string(&s.path).unwrap().contains("\"older\""));
+    }
+
+    #[test]
+    fn journal_replacement_syncs_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let path = dir.join("x.calls");
+        write_private(&path, b"{}").unwrap();
+        write_private(&path, b"{\"version\":1}").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{\"version\":1}");
+        // The directory itself is opened and synced (a missing one fails).
+        sync_dir(&dir).unwrap();
+        #[cfg(unix)]
+        assert!(sync_dir(&dir.join("missing")).is_err());
+        // No temp file is left behind.
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("x.calls")]);
     }
 
     #[test]

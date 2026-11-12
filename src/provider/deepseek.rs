@@ -292,14 +292,32 @@ impl Update {
 /// Wire state the endpoint remembers for this conversation. Because
 /// update blocks are injected per request (the neutral items carry no
 /// tool history), the net notices replay at the tail every time.
+///
+/// It describes one wire history only: it is reset when the conversation
+/// changes (`set_conversation` with another id: `/new`, `/resume`) and when a
+/// request's history no longer starts with the remembered first message (a
+/// compaction rewrote it, or a new conversation without a session id).
 #[derive(Debug, Default)]
 pub struct State {
+    /// Fingerprint of the first wire message of the history this state
+    /// belongs to. Title and compaction requests replay the same history,
+    /// so they keep it.
+    root: Option<u64>,
     /// The top-level `system` first sent; in-history routes keep it.
     first_system: Option<String>,
     /// Tool declarations as sent, in declaration order.
     tools: Vec<DeclaredTool>,
     /// Notices replayed at the tail of every request, in order.
     updates: Vec<Update>,
+}
+
+/// Fingerprint of a wire message, to tell whether a request continues the
+/// remembered history.
+fn fingerprint(message: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    message.to_string().hash(&mut h);
+    h.finish()
 }
 
 /// The tool names the endpoint can call after replaying `updates`.
@@ -512,15 +530,16 @@ impl DeepSeekProvider {
         )
     }
 
+    /// Forget the wire history: the next request is a new series.
+    fn reset_wire(&self) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State::default();
+    }
+
     /// The request JSON, and whether it carries tool-change blocks (the
     /// `mid-conversation-tool-changes` beta header then applies).
     fn body(&self, req: Request<'_>) -> (Value, bool) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut messages = anthropic::wire_messages(req.items, anthropic::Reasoning::Lenient);
-        if messages.is_empty() {
-            // A fresh conversation starts a new wire series.
-            *state = State::default();
-        }
         if !self.caps.vision {
             for m in &mut messages {
                 for block in m["content"].as_array_mut().into_iter().flatten() {
@@ -531,6 +550,14 @@ impl DeepSeekProvider {
                 }
             }
         }
+        // A history that does not start where the remembered one did (a new
+        // conversation, or one a compaction rewrote) starts a new wire
+        // series: its leading system and tool baseline are the current ones.
+        let root = messages.first().map(fingerprint);
+        if root.is_none() || state.root.is_some_and(|r| Some(r) != root) {
+            *state = State::default();
+        }
+        state.root = root;
         let (tools, updates) = self.tool_wire(req.tools, &mut state);
         let (system, prompt_update) = self.system_wire(req.system, &mut state);
         if !updates.is_empty() {
@@ -589,6 +616,11 @@ impl Provider for DeepSeekProvider {
         Some(self.context_window)
     }
     fn set_conversation(&mut self, id: &str) {
+        if self.session.as_deref() != Some(id) {
+            // Another conversation (`/new`, `/resume`): the remembered
+            // system and tool baselines belong to the old one.
+            self.reset_wire();
+        }
         self.session = Some(id.to_owned());
     }
     fn fork(&self) -> Box<dyn Provider> {
@@ -862,6 +894,122 @@ mod tests {
         let (other, _) = pro.body(request("P2", &history, &[]));
         assert_eq!(other["system"], "P2");
         assert_eq!(other["messages"].as_array().unwrap().len(), 3);
+    }
+
+    /// The leading `system`, and the text of any system message that rides
+    /// the history.
+    fn systems(body: &Value) -> (Value, Vec<Value>) {
+        let trailing = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .map(|m| m["content"].clone())
+            .collect();
+        (body["system"].clone(), trailing)
+    }
+
+    fn prompt(text: &str) -> Value {
+        json!([{"type":"text","text":text}])
+    }
+
+    #[test]
+    fn a_new_conversation_starts_a_new_wire_series() {
+        let mut p = provider("deepseek-flash");
+        p.set_conversation("a");
+        let first = [Item::user("hi")];
+        let history = [
+            Item::user("hi"),
+            Item::Assistant { text: "hey".into() },
+            Item::user("more"),
+        ];
+        let _ = p.body(request("P1", &first, &[tool("a")]));
+        // The same conversation, bound again on every turn, keeps its series.
+        p.set_conversation("a");
+        let (body, changes) = p.body(request("P2", &history, &[tool("a"), tool("b")]));
+        assert!(changes);
+        let addition = json!([
+            {"type":"tool_addition","tool":{"type":"tool_reference","name":"b"}}
+        ]);
+        assert_eq!(systems(&body), (json!("P1"), vec![addition, prompt("P2")]));
+
+        // `/new`: another id, a history of its own. The current prompt leads,
+        // once, and every current tool is a plain declaration.
+        p.set_conversation("b");
+        let fresh = [Item::user("hello")];
+        let (body, changes) = p.body(request("P2", &fresh, &[tool("a"), tool("b")]));
+        assert!(!changes);
+        assert_eq!(systems(&body), (json!("P2"), vec![]));
+        assert_eq!(
+            body["tools"],
+            json!([tool_decl(&tool("a"), false), tool_decl(&tool("b"), false)])
+        );
+        let (body, _) = p.body(request("P2", &fresh, &[tool("a"), tool("b")]));
+        assert_eq!(systems(&body), (json!("P2"), vec![]));
+
+        // `/resume` back to the first conversation: its baselines are not
+        // remembered any more, so the current ones lead.
+        p.set_conversation("a");
+        let (body, changes) = p.body(request("P3", &history, &[tool("a"), tool("b")]));
+        assert!(!changes);
+        assert_eq!(systems(&body), (json!("P3"), vec![]));
+    }
+
+    #[test]
+    fn a_history_with_another_first_message_starts_a_new_wire_series() {
+        // No session id at all (`/new` with saving off): the history itself
+        // shows the conversation changed.
+        let p = provider("deepseek-flash");
+        let history = [
+            Item::user("hi"),
+            Item::Assistant { text: "hey".into() },
+            Item::user("more"),
+        ];
+        let _ = p.body(request("P1", &history, &[]));
+        let (body, _) = p.body(request("P2", &history, &[]));
+        assert_eq!(systems(&body), (json!("P1"), vec![prompt("P2")]));
+        // Title and summary requests replay the history and keep the series.
+        let mut titled = history.to_vec();
+        titled.push(Item::user("name this"));
+        let (body, _) = p.body(request("P2", &titled, &[]));
+        assert_eq!(systems(&body), (json!("P1"), vec![prompt("P2")]));
+        let new = [Item::user("unrelated")];
+        let (body, _) = p.body(request("P2", &new, &[]));
+        assert_eq!(systems(&body), (json!("P2"), vec![]));
+    }
+
+    #[test]
+    fn a_compacted_history_starts_a_new_wire_series() {
+        let p = provider("deepseek-flash");
+        let history = [
+            Item::user("hi"),
+            Item::Assistant { text: "hey".into() },
+            Item::user("more"),
+        ];
+        let _ = p.body(request("P1", &history, &[tool("a")]));
+        let (body, _) = p.body(request("P2", &history, &[tool("a"), tool("b")]));
+        assert_eq!(body["system"], "P1");
+        assert_eq!(body["tools"][1]["defer_loading"], true);
+        // The compaction rewrote the history: it now starts with the summary.
+        let compacted = [
+            Item::Compaction {
+                summary: "earlier: hi, hey".into(),
+            },
+            Item::user("more"),
+        ];
+        let (body, changes) = p.body(request("P2", &compacted, &[tool("a"), tool("b")]));
+        assert!(!changes);
+        assert_eq!(systems(&body), (json!("P2"), vec![]));
+        assert_eq!(
+            body["tools"],
+            json!([tool_decl(&tool("a"), false), tool_decl(&tool("b"), false)])
+        );
+        // And the new series continues from there.
+        let mut more = compacted.to_vec();
+        more.push(Item::Assistant { text: "ok".into() });
+        more.push(Item::user("go on"));
+        let (body, _) = p.body(request("P3", &more, &[tool("a"), tool("b")]));
+        assert_eq!(systems(&body), (json!("P2"), vec![prompt("P3")]));
     }
 
     #[test]
