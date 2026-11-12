@@ -90,6 +90,7 @@ impl Agent {
             hooks: self.hooks.clone(),
             subagent_dir: Some(dir.clone()),
             shared_tools: self.tools.shared(),
+            file_ledger: self.tools.file_ledger(),
             ..Default::default()
         };
         loop {

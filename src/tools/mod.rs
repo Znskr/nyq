@@ -6,10 +6,12 @@ pub(crate) mod background;
 mod bash;
 pub(crate) use bash::{live_tail, run_shell};
 mod fs;
+pub(crate) use fs::FileLedger;
 mod html;
 pub mod image;
 pub(crate) mod mcp_search;
 pub(crate) mod memory;
+pub(crate) mod patch;
 pub(crate) mod redact;
 pub(crate) mod safeio;
 mod search;
@@ -268,6 +270,9 @@ pub struct ToolCtx {
     pub subagent_dir: Option<PathBuf>,
     /// Session tools a subagent inherits: MCP tools and skills.
     pub shared_tools: Vec<std::sync::Arc<dyn Tool>>,
+    /// Files this session read or wrote, for the read-before-edit and mtime
+    /// guard the mutating file tools enforce.
+    pub file_ledger: std::sync::Arc<FileLedger>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -379,6 +384,8 @@ pub struct Registry {
     disabled: HashSet<String>,
     /// Installed skills, which `mcp_search_tools` also finds.
     skills: Vec<crate::skills::Skill>,
+    /// Read/write ledger for the file tools' read-before-edit guard.
+    file_ledger: std::sync::Arc<FileLedger>,
 }
 
 /// Tools registered outside [`Registry::builtin`] that `disabled_tools` may name.
@@ -492,6 +499,16 @@ impl Registry {
     /// The skills `mcp_search_tools` searches along with MCP tools.
     pub fn set_skills(&mut self, skills: Vec<crate::skills::Skill>) {
         self.skills = skills;
+    }
+
+    /// The session's file ledger (shared with subagents' registries).
+    pub fn file_ledger(&self) -> std::sync::Arc<FileLedger> {
+        self.file_ledger.clone()
+    }
+
+    /// Use `ledger` instead of a fresh one (a subagent shares its parent's).
+    pub(crate) fn share_file_ledger(&mut self, ledger: std::sync::Arc<FileLedger>) {
+        self.file_ledger = ledger;
     }
 
     /// Instructions of connected MCP servers, by server name.

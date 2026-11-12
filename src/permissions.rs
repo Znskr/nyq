@@ -384,7 +384,7 @@ impl Permissions {
                 .iter()
                 .chain(self.local.iter())
                 .any(|p| path_rule_matches(p, tool, args, cwd, true))
-                && !(is_file_tool(tool) && crate::agent::path_under_git(args, cwd))
+                && !(is_file_tool(tool) && crate::agent::paths_under_git(tool, args, cwd))
         };
         if exact.is_some()
             || path_allow()
@@ -596,6 +596,14 @@ impl Permissions {
 /// only ask outside the workspace). `extra` directories count as inside.
 fn allow_applies(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) -> bool {
     if is_file_tool(tool) {
+        if tool == "apply_patch" {
+            let text = args.get("patch").and_then(Value::as_str).unwrap_or("");
+            let paths = crate::tools::patch::paths(text);
+            return !paths.is_empty()
+                && paths
+                    .iter()
+                    .all(|p| crate::agent::file_grant_ok_in(p, cwd, extra));
+        }
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
         return crate::agent::file_grant_ok_in(path, cwd, extra);
     }
@@ -702,15 +710,20 @@ pub(crate) fn path_rule_matches(
     if wanted != Some(kind) || pattern.is_empty() {
         return false;
     }
-    let path = match args.get("path").and_then(Value::as_str) {
-        Some(p) if !p.is_empty() => p,
-        _ if kind == "read" => ".",
-        _ => return false,
+    // A patch writes several paths: an allow must cover every one; an
+    // ask/deny triggers on any.
+    let paths: Vec<String> = if tool == "apply_patch" {
+        crate::tools::patch::paths(args.get("patch").and_then(Value::as_str).unwrap_or(""))
+    } else {
+        match args.get("path").and_then(Value::as_str) {
+            Some(p) if !p.is_empty() => vec![p.to_string()],
+            _ if kind == "read" => vec![".".into()],
+            _ => return false,
+        }
     };
-    let Some(lexical) = crate::agent::lexical(cwd, path) else {
+    if paths.is_empty() {
         return false;
-    };
-    let resolved = crate::agent::resolved(cwd, path).unwrap_or_else(|| lexical.clone());
+    }
     let expanded = match pattern.strip_prefix("~/") {
         Some(rest) => dirs::home_dir().map(|h| slash(&h.join(rest))),
         None => Some(pattern.to_string()),
@@ -729,8 +742,18 @@ pub(crate) fn path_rule_matches(
     };
     let lexical_root = crate::agent::lexical(cwd, ".").unwrap_or_else(|| cwd.to_path_buf());
     let real_root = std::fs::canonicalize(cwd).unwrap_or_else(|_| lexical_root.clone());
-    let resolved_hit = hit(&resolved, &real_root);
-    resolved_hit || (!strict && hit(&lexical, &lexical_root))
+    let one = |path: &str| {
+        let Some(lexical) = crate::agent::lexical(cwd, path) else {
+            return false;
+        };
+        let resolved = crate::agent::resolved(cwd, path).unwrap_or_else(|| lexical.clone());
+        hit(&resolved, &real_root) || (!strict && hit(&lexical, &lexical_root))
+    };
+    if strict {
+        paths.iter().all(|p| one(p))
+    } else {
+        paths.iter().any(|p| one(p))
+    }
 }
 
 fn slash(p: &Path) -> String {

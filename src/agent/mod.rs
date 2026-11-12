@@ -23,7 +23,7 @@ pub use permission_rules::{
 #[allow(unused_imports)]
 pub(crate) use permission_rules::{
     file_grant_ok, file_grant_ok_in, inside, inside_any, is_file_tool, lexical, normalize_url,
-    path_under_git, program_base, resolved, subagent_mode,
+    path_under_git, paths_under_git, program_base, resolved, subagent_mode,
 };
 pub use step::step_limit;
 #[cfg(test)]
@@ -218,6 +218,7 @@ impl Agent {
         self.suppress_auto_compact = false;
         self.submitted = 0;
         self.undo = Default::default();
+        self.tools.file_ledger().clear();
     }
 
     /// Drop the transcript in place: same session id, model, sandbox and rules.
@@ -245,6 +246,7 @@ impl Agent {
         self.suppress_auto_compact = false;
         self.submitted = 0;
         self.undo = Default::default();
+        self.tools.file_ledger().clear();
         self.allowed.clear();
         Ok(())
     }

@@ -35,14 +35,30 @@ pub struct UndoLog {
 }
 
 impl UndoLog {
-    /// Capture before running a file tool; discard the entry if the tool fails.
-    pub fn snapshot(&mut self, cwd: &Path, mode: Mode, tool: &str, args: &Value) {
-        if !matches!(tool, "write_file" | "edit_file") {
-            return;
+    /// Capture before running a file tool; discard the entries if the tool
+    /// fails. A multi-file `apply_patch` snapshots every path it names.
+    pub fn snapshot(&mut self, cwd: &Path, mode: Mode, tool: &str, args: &Value) -> usize {
+        if !crate::agent::is_file_tool(tool) {
+            return 0;
         }
-        let Some(path) = args["path"].as_str().filter(|p| !p.is_empty()) else {
-            return;
+        let paths: Vec<String> = if tool == "apply_patch" {
+            crate::tools::patch::paths(args["patch"].as_str().unwrap_or(""))
+        } else {
+            args["path"]
+                .as_str()
+                .filter(|p| !p.is_empty())
+                .map(|p| vec![p.to_string()])
+                .unwrap_or_default()
         };
+        let mut taken = 0;
+        for path in paths {
+            self.snapshot_path(cwd, mode, &path);
+            taken += 1;
+        }
+        taken
+    }
+
+    fn snapshot_path(&mut self, cwd: &Path, mode: Mode, path: &str) {
         let cwd = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let path = cwd.join(path);
         let before = match File::open(&path) {

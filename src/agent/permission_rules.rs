@@ -262,7 +262,10 @@ pub fn bash_matches(prefix: &str, cmd: &str) -> bool {
 }
 
 pub(crate) fn is_file_tool(tool: &str) -> bool {
-    matches!(tool, "write_file" | "edit_file")
+    matches!(
+        tool,
+        "write_file" | "edit_file" | "multi_edit" | "edit_range" | "apply_patch"
+    )
 }
 
 /// A subagent call's mode: `general` or (by default) `explore`.
@@ -308,6 +311,15 @@ pub fn grant_rule_in(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) ->
         });
     }
     let read = crate::permissions::is_read_tool(tool);
+    if tool == "apply_patch" {
+        // No single `path`; grantable only when every file it names is a
+        // plain in-workspace write.
+        let text = args.get("patch").and_then(Value::as_str).unwrap_or("");
+        let paths = crate::tools::patch::paths(text);
+        return (!paths.is_empty()
+            && paths.iter().all(|p| file_grant_ok_in(p, cwd, extra)))
+        .then(|| tool.to_string());
+    }
     if read || is_file_tool(tool) {
         let path = args
             .get("path")
@@ -380,6 +392,22 @@ pub fn rule_label(rule: &str) -> String {
 /// directory.
 pub(crate) fn path_under_git(args: &Value, cwd: &Path) -> bool {
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+    str_under_git(path, cwd)
+}
+
+/// `path_under_git` over every path a call writes: a patch is under `.git`
+/// if any file it names is.
+pub(crate) fn paths_under_git(tool: &str, args: &Value, cwd: &Path) -> bool {
+    if tool == "apply_patch" {
+        let text = args.get("patch").and_then(Value::as_str).unwrap_or("");
+        return crate::tools::patch::paths(text)
+            .iter()
+            .any(|p| str_under_git(p, cwd));
+    }
+    path_under_git(args, cwd)
+}
+
+fn str_under_git(path: &str, cwd: &Path) -> bool {
     let is_git = |p: &Path| {
         p.components().any(|c| {
             c.as_os_str()
@@ -547,6 +575,13 @@ pub fn is_allowed_in(
             .any(|r| crate::permissions::path_rule_matches(r, tool, args, cwd, true))
     };
     if is_file_tool(tool) {
+        if tool == "apply_patch" {
+            let text = args.get("patch").and_then(Value::as_str).unwrap_or("");
+            let paths = crate::tools::patch::paths(text);
+            return !paths.is_empty()
+                && allowed.contains(tool)
+                && paths.iter().all(|p| file_grant_ok_in(p, cwd, extra));
+        }
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
         return (allowed.contains(tool) && file_grant_ok_in(path, cwd, extra))
             || (tree() && !path_under_git(args, cwd));

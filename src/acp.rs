@@ -1367,7 +1367,11 @@ impl Ui for AcpUi {
     fn end_message(&mut self) {}
 
     fn tool_start(&mut self, tool: &str, summary: &str) {
-        let file = matches!(tool, "write_file" | "edit_file").then(|| {
+        let file = matches!(
+            tool,
+            "write_file" | "edit_file" | "multi_edit" | "edit_range"
+        )
+        .then(|| {
             let path = resolve(&self.asker.cwd, summary);
             let before = read_small(&path);
             (path, before)
@@ -1483,7 +1487,9 @@ fn tool_kind(tool: &str) -> acp::ToolKind {
     match tool {
         "read_file" | "list_dir" | "view_image" => acp::ToolKind::Read,
         "grep" | "glob" => acp::ToolKind::Search,
-        "write_file" | "edit_file" => acp::ToolKind::Edit,
+        "write_file" | "edit_file" | "multi_edit" | "edit_range" | "apply_patch" => {
+            acp::ToolKind::Edit
+        }
         "bash" => acp::ToolKind::Execute,
         "web_fetch" | "web_search" => acp::ToolKind::Fetch,
         _ => acp::ToolKind::Other,
@@ -1512,7 +1518,8 @@ fn title(tool: &str, summary: &str) -> String {
         "glob" => format!("Find {s}"),
         "grep" => format!("Search {s}"),
         "write_file" => format!("Write {s}"),
-        "edit_file" => format!("Edit {s}"),
+        "edit_file" | "multi_edit" | "edit_range" => format!("Edit {s}"),
+        "apply_patch" => format!("Patch {s}"),
         "bash" => format!("`{}`", s.replace('`', "'")),
         "web_fetch" => format!("Fetch {s}"),
         "web_search" => format!("Search the web: {s}"),
@@ -1526,7 +1533,8 @@ fn title(tool: &str, summary: &str) -> String {
 
 fn locations(tool: &str, summary: &str, cwd: &Path) -> Vec<acp::ToolCallLocation> {
     match tool {
-        "read_file" | "list_dir" | "view_image" | "write_file" | "edit_file"
+        "read_file" | "list_dir" | "view_image" | "write_file" | "edit_file" | "multi_edit"
+        | "edit_range"
             if !summary.is_empty() =>
         {
             vec![acp::ToolCallLocation::new(resolve(cwd, summary))]

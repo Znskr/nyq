@@ -548,7 +548,7 @@ impl Stats {
 
     /// Count the lines a successful file write or edit changed.
     pub fn file_change(&mut self, tool: &str, args: &serde_json::Value, display: Option<&str>) {
-        if !matches!(tool, "write_file" | "edit_file") {
+        if !crate::agent::is_file_tool(tool) {
             return;
         }
         let Some(display) = display else { return };

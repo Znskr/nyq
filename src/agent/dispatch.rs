@@ -3,7 +3,7 @@
 //! (`settle`), and recording results.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -96,7 +96,7 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
         None
     };
     let mut undo = crate::undo::UndoLog::default();
-    undo.snapshot(
+    let snaps = undo.snapshot(
         &ready.ctx.cwd,
         ready.ctx.sandbox.mode,
         &ready.name,
@@ -110,8 +110,10 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
             _ = cancel.cancelled() => ToolOutput::err("Cancelled by user."),
         }
     };
-    if out.is_error && !out.changed && !undo.is_empty() {
-        undo.discard_last();
+    if out.is_error && !out.changed {
+        for _ in 0..snaps {
+            undo.discard_last();
+        }
     }
     undo.append(std::mem::take(&mut out.undo));
     out.undo = undo;
@@ -221,23 +223,56 @@ impl Agent {
     /// `CLAUDE.md`) from workspace subdirectories it touched, once per
     /// conversation (an earlier copy in the transcript counts).
     fn add_nested_instructions(&self, name: &str, arguments: &str, out: &mut ToolOutput) {
-        let file_tool = matches!(name, "read_file" | "edit_file" | "write_file");
-        if !file_tool && !matches!(name, "list_dir" | "glob" | "grep") {
+        let file_tool = matches!(
+            name,
+            "read_file" | "edit_file" | "write_file" | "multi_edit" | "edit_range"
+        );
+        if !file_tool && !matches!(name, "list_dir" | "glob" | "grep" | "apply_patch") {
             return;
         }
         let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let Some(full) = lexical(&self.cwd, path) else {
-            return;
-        };
-        if !inside(&self.cwd, path) {
-            return;
-        }
-        let dir = if file_tool || !full.is_dir() {
-            full.parent().map(Path::to_path_buf).unwrap_or_default()
+        // (directory to walk up from, the touched file itself)
+        let mut dirs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if name == "apply_patch" {
+            // A patch has no single `path`; each touched file's parent dir.
+            let text = args.get("patch").and_then(Value::as_str).unwrap_or("");
+            for p in crate::tools::patch::paths(text) {
+                if !inside(&self.cwd, &p) {
+                    continue;
+                }
+                if let Some(full) = lexical(&self.cwd, &p) {
+                    if let Some(dir) = full.parent() {
+                        dirs.push((dir.to_path_buf(), full));
+                    }
+                }
+            }
         } else {
-            full.clone()
-        };
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let Some(full) = lexical(&self.cwd, path) else {
+                return;
+            };
+            if !inside(&self.cwd, path) {
+                return;
+            }
+            dirs.push((
+                if file_tool || !full.is_dir() {
+                    full.parent().map(Path::to_path_buf).unwrap_or_default()
+                } else {
+                    full.clone()
+                },
+                full,
+            ));
+        }
+        dirs.dedup();
+        for (dir, full) in dirs {
+            self.add_instructions_under(&dir, &full, out);
+        }
+    }
+
+    /// Append `AGENTS.md`/`CLAUDE.md` files found on `dir`'s path up to the
+    /// workspace root (see [`Self::add_nested_instructions`]). `full` is the
+    /// touched path itself, which is never re-appended as instructions.
+    fn add_instructions_under(&self, dir: &Path, full: &Path, out: &mut ToolOutput) {
         let Ok(rel) = dir.strip_prefix(&self.cwd) else {
             return;
         };
@@ -432,7 +467,7 @@ impl Agent {
     /// PostToolUse hooks.
     async fn settle(&mut self, ready: &Ready, out: &mut ToolOutput, cancel: &CancellationToken) {
         self.undo.append(std::mem::take(&mut out.undo));
-        if matches!(ready.name.as_str(), "write_file" | "edit_file") && !out.is_error {
+        if is_file_tool(&ready.name) && !out.is_error {
             self.stats
                 .file_change(&ready.name, &ready.args, out.display.as_deref());
         }
@@ -531,6 +566,7 @@ impl Agent {
                 .as_ref()
                 .map(|s| crate::subagents::store_dir(&s.path)),
             shared_tools: self.tools.shared(),
+            file_ledger: self.tools.file_ledger(),
         };
         let summary_of = |args: &Value| {
             if meta {

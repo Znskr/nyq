@@ -186,6 +186,8 @@ pub struct Settings {
     pub classifier_model: Option<String>,
     /// Default sandbox when `--sandbox` isn't given: workspace-write, read-only or off.
     pub sandbox: String,
+    /// Refuse edits to files not read this session, or changed on disk since.
+    pub read_before_edit: bool,
     /// Compact automatically at this share of the context window (percent; 0 = never).
     pub auto_compact: u8,
     /// Sound (a system chime where one can play, else the terminal bell): `off`, `on` (long turns and prompts) or `max` (every turn).
@@ -242,6 +244,7 @@ impl Default for Settings {
             permission_mode: "ask".into(),
             classifier_model: None,
             sandbox: "workspace-write".into(),
+            read_before_edit: true,
             auto_compact: 80,
             // Elsewhere the bell is the only sound, so it stays opt-in.
             sound: if cfg!(target_os = "macos") {
@@ -667,6 +670,7 @@ pub fn source(id: Id) -> Option<Layer> {
         Id::Fast => vec!["fast_mode".into()],
         Id::Permission => vec!["permission_mode".into()],
         Id::Sandbox => vec!["sandbox".into()],
+        Id::ReadBeforeEdit => vec!["read_before_edit".into()],
         Id::AutoCompact => vec!["auto_compact".into()],
         Id::Sound => vec!["sound".into()],
         Id::Notifications => vec!["notifications".into()],
@@ -746,6 +750,7 @@ pub enum Id {
     Permission,
     ClassifierModel,
     Sandbox,
+    ReadBeforeEdit,
     AutoCompact,
     Sound,
     Notifications,
@@ -822,6 +827,12 @@ pub fn specs() -> Vec<Spec> {
             category: Category::Agent,
             label: "Default sandbox",
             description: "Sandbox for shell commands from the next start",
+        },
+        Spec {
+            id: Id::ReadBeforeEdit,
+            category: Category::Agent,
+            label: "Read-before-edit",
+            description: "Refuse edits to files not read this session or changed on disk since",
         },
         Spec {
             id: Id::AutoCompact,
@@ -923,6 +934,7 @@ pub fn value(id: Id, s: &Settings, live: &Live) -> String {
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| "auto".into()),
         Id::Sandbox => s.sandbox.clone(),
+        Id::ReadBeforeEdit => on_off(s.read_before_edit),
         Id::AutoCompact if s.auto_compact == 0 => "off".into(),
         Id::AutoCompact => format!("{}%", s.auto_compact),
         Id::Sound => s.sound.clone(),
@@ -960,6 +972,7 @@ pub fn options(id: Id, live: &Live) -> Vec<String> {
         Id::Theme => list(&["auto", "dark", "light"]),
         Id::UiStyle => list(&["classic", "fancy"]),
         Id::Fast
+        | Id::ReadBeforeEdit
         | Id::Notifications
         | Id::Segment(_)
         | Id::PromptHistory
@@ -992,6 +1005,7 @@ pub fn apply(id: Id, value: &str, s: &mut Settings) -> bool {
     match id {
         Id::ClassifierModel => s.classifier_model = Some(value.to_string()).filter(|v| v != "auto"),
         Id::Sandbox => s.sandbox = value.into(),
+        Id::ReadBeforeEdit => s.read_before_edit = on,
         Id::AutoCompact => s.auto_compact = value.trim_end_matches('%').parse().unwrap_or(0),
         Id::Sound => s.sound = value.into(),
         Id::Notifications => s.notifications = on,
