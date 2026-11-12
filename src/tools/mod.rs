@@ -527,6 +527,14 @@ pub trait Tool: Send + Sync {
     fn handles_cancel(&self) -> bool {
         false
     }
+    /// Whether the tool only coordinates other work: delegation, the team
+    /// graph, scripts whose sub-calls are dispatched (and take the lease)
+    /// one by one. Such a call never holds the workspace writer lease,
+    /// since waiting on a child that needs it would deadlock, and it is not
+    /// itself a workspace change (no `intent` field, no verify run).
+    fn coordinates(&self) -> bool {
+        false
+    }
 }
 
 /// A change to a [`Registry`] made outside the agent loop (an MCP server

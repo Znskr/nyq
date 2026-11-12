@@ -198,11 +198,10 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
         return ToolOutput::err("Background commands are unavailable during child orchestration: run a bounded foreground command so its writer lease covers its lifetime.");
     }
     let writer = crate::orchestration::writer(&ready.ctx.cwd);
-    let coordination = crate::orchestration::COORDINATION_TOOLS.contains(&ready.name.as_str());
     let _lease = match &ready.footprint.class {
         // W11: coordination tools (subagent, team, scripts) wait on children
         // that need the lease themselves, so they never hold it.
-        _ if coordination => None,
+        _ if tool.coordinates() => None,
         // Reads and pure calls hold no lock. Declared writers share the
         // gate through per-path mutexes; undeclared writers exclude all.
         crate::tools::Concurrency::Pure | crate::tools::Concurrency::ReadFs => None,

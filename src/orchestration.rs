@@ -336,22 +336,6 @@ pub fn writer(cwd: &Path) -> Arc<Writer> {
         .clone()
 }
 
-/// Tools that never take the workspace writer lease: reads, and tools that
-/// only coordinate other work (delegation, the team graph, scripts whose
-/// sub-calls take the lease themselves). Holding it while waiting for a
-/// child that needs it would deadlock.
-pub const COORDINATION_TOOLS: &[&str] = &[
-    "subagent",
-    "team_task_create",
-    "team_task_list",
-    "team_task_claim",
-    "team_task_update",
-    "send_message",
-    "wait_agent",
-    "run_code",
-    "workflow",
-];
-
 /// Deliver a message to the parent: an already-finished job, so the
 /// between-step delivery puts it into the parent's transcript as evidence.
 pub fn post(dir: &Path, from: &str, text: &str) -> Result<String> {

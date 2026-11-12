@@ -39,11 +39,42 @@ pub(super) fn with_trailing_note<'a>(
 }
 
 impl Agent {
+    /// The trailing note for the next request. Each section appears once,
+    /// in this order: the task and its budget, the latest verify state, the
+    /// working set, the recent intents, then the session state. It is
+    /// send-only (see [`with_trailing_note`]): nothing here is stored.
+    pub(super) fn trailing_note(&self) -> String {
+        let (task, verify) = self.task_note_sections();
+        let (workset, intents) = self.workset_sections();
+        let session = self.session_notes(!workset.is_empty());
+        [task, verify, workset, intents, session]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// The working set, rendered from disk now (never stored, so the cached
+    /// prefix stays stable), and the newest intents from the session's one
+    /// intent store.
+    fn workset_sections(&self) -> (String, String) {
+        let settings = crate::settings::current();
+        let ws = crate::tools::workset::lock(&self.workset);
+        let files = if settings.workset.enabled {
+            ws.render(&crate::tools::workset::Budgets::from_settings(
+                self.context_window,
+            ))
+        } else {
+            String::new()
+        };
+        (files, ws.render_intents(settings.intents.show))
+    }
+
     /// Per-request notes on the session's current state: permission mode,
-    /// question UI, background processes. They go at the end of the request
-    /// (see [`with_trailing_note`]), not in the system prompt, so the cached
-    /// prompt prefix survives a change.
-    pub(super) fn session_notes(&self) -> String {
+    /// question UI, background processes. They go at the end of the request,
+    /// not in the system prompt, so the cached prompt prefix survives a
+    /// change.
+    fn session_notes(&self, workset_shown: bool) -> String {
         let mode = self.permission_mode;
         let mut notes = vec![format!(
             "- Permission mode: {} ({}). A call the user or a rule denies must not be retried as is.",
@@ -67,28 +98,14 @@ impl Agent {
                 procs.join("\n")
             ));
         }
-        // The working set is send-only: its contents are read from disk now,
-        // never stored in the transcript, so the cached prefix stays stable.
-        let mut workset_note = String::new();
-        if crate::settings::current().workset.enabled {
-            let rendered = crate::tools::workset::lock(&self.workset).render(
-                &crate::tools::workset::Budgets::from_settings(self.context_window),
+        if workset_shown {
+            notes.push(
+                "- File contents in the working set are read from disk at request time and \
+                 are the current state; earlier `read_file` output for these paths may be stale."
+                    .into(),
             );
-            if rendered.contains("[Working set]") {
-                notes.push(
-                    "- File contents in the working set are read from disk at request time and \
-                     are the current state; earlier `read_file` output for these paths may be stale."
-                        .into(),
-                );
-            }
-            workset_note = rendered;
         }
-        let mut out = format!("[Session state]\n{}", notes.join("\n"));
-        if !workset_note.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(&workset_note);
-        }
-        out
+        format!("[Session state]\n{}", notes.join("\n"))
     }
 }
 
@@ -102,11 +119,11 @@ mod tests {
     fn session_notes_describe_mode_and_question_ui() {
         let mut agent = agent(Response::default(), None);
         agent.permission_mode = crate::permissions::Mode::Ask;
-        let notes = agent.session_notes();
+        let notes = agent.trailing_note();
         assert!(notes.contains("Permission mode: ask"), "{notes}");
         assert!(notes.contains("no question UI"), "{notes}");
         agent.tools.add(Box::new(AskUserTool));
-        assert!(!agent.session_notes().contains("no question UI"));
+        assert!(!agent.trailing_note().contains("no question UI"));
     }
 
     #[test]
@@ -125,7 +142,7 @@ mod tests {
             ws.record_intent("opened a.rs", "to edit it", "make the change");
         }
         let stored = agent.items.clone();
-        let sent = super::with_trailing_note(&agent.items, &agent.session_notes());
+        let sent = super::with_trailing_note(&agent.items, &agent.trailing_note());
         // The stored transcript is untouched; the note is send-only.
         assert_eq!(agent.items, stored);
         let crate::types::Item::User { text, .. } = &sent[sent.len() - 1] else {
@@ -143,7 +160,7 @@ mod tests {
 
         // A later disk write shows up in the next note without any read call.
         std::fs::write(tmp.path().join("a.rs"), "fn a() { v2 }\n").unwrap();
-        let note = agent.session_notes();
+        let note = agent.trailing_note();
         assert!(note.contains("fn a() { v2 }"), "{note}");
         assert!(!note.contains("v1"), "{note}");
     }

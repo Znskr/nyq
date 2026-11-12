@@ -7,24 +7,18 @@ use super::Agent;
 use crate::session::Session;
 use crate::types::StreamEvent;
 
-/// Tools that only read: a call cut off by a crash is safe to repeat, so they
-/// are not journalled.
-const PURE_READS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "glob",
-    "grep",
-    "view_image",
-    "web_fetch",
-    "web_search",
-    crate::tools::artifacts::TOOL,
-    crate::tools::session_search::TOOL,
-    "skill",
-];
+/// Tools that are not in the static built-in registry but only read. The
+/// `skill` tool is registered per session from the skills found, so its
+/// declared effects (reads only) can't be looked up by name here.
+const SESSION_READS: &[&str] = &["skill"];
 
-/// Whether `name` is a pure read (no side effects; safe to repeat).
+/// Whether `name` is a pure read (no side effects; safe to repeat), by its
+/// declared effects: it writes nothing, starts no process, and schedules as
+/// a read. A call cut off by a crash is then safe to repeat, so it is not
+/// journalled. Judged without arguments, so a tool whose effects depend on
+/// them (`memory`: `list` only reads) counts as side-effecting.
 pub(crate) fn is_pure_read(name: &str) -> bool {
-    PURE_READS.contains(&name)
+    SESSION_READS.contains(&name)
         || super::builtin_tool(name).is_some_and(|t| {
             let none = serde_json::json!({});
             t.is_read_only(&none)
@@ -280,5 +274,36 @@ mod tests {
                 json!(["compaction_end", "done"])
             ]
         );
+    }
+    #[test]
+    fn pure_reads_come_from_declared_effects() {
+        for name in [
+            "read_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "view_image",
+            "web_fetch",
+            "web_search",
+            crate::tools::artifacts::TOOL,
+            crate::tools::session_search::TOOL,
+            "skill",
+            "team_task_list",
+        ] {
+            assert!(is_pure_read(name), "{name}");
+        }
+        for name in [
+            "write_file",
+            "edit_file",
+            "multi_edit",
+            "apply_patch",
+            "bash",
+            "memory",
+            "subagent",
+            "team_task_claim",
+            "mcp__x__y",
+        ] {
+            assert!(!is_pure_read(name), "{name}");
+        }
     }
 }

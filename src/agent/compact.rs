@@ -108,6 +108,17 @@ Preserve exact paths, commands, identifiers and error messages. If the conversat
 an earlier summary, merge it: keep what is still true and drop what is stale. Do not mention \
 this request. Do not call tools.";
 
+/// Intents (the session's intent log, newest last) given to the summary.
+const COMPACT_INTENTS: usize = 32;
+
+/// Introduces the harness state appended to [`COMPACT_PROMPT`].
+const COMPACT_STATE: &str = "\
+The harness keeps the state below outside the conversation (in a note sent with each request, \
+which this request does not carry). Carry it into the checkpoint: the task goal and its result \
+schema verbatim under ## Goals, the recorded intents (oldest first) under ## Intent log together \
+with what the conversation shows, and the latest build and test state under ## Build and test \
+state.";
+
 /// What one compaction attempt achieved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Reduced {
@@ -718,13 +729,34 @@ impl Agent {
     /// The request replays the projected prefix the provider has cached,
     /// then asks for the summary. Returns false if cancelled (nothing
     /// changes then).
+    /// The summary request's instructions: [`COMPACT_PROMPT`], plus the
+    /// state the summary must preserve that is not in the transcript (it
+    /// lives in the send-only trailing note): the task's goal, result schema
+    /// and checks, the latest verify state, and the intent log.
+    pub(super) fn compaction_prompt(&self) -> String {
+        let mut prompt = COMPACT_PROMPT.to_string();
+        let task = self.task_compaction_brief();
+        let intents = crate::tools::workset::lock(&self.workset).render_intents(COMPACT_INTENTS);
+        let state: Vec<String> = [task, intents]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !state.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(COMPACT_STATE);
+            prompt.push_str("\n\n");
+            prompt.push_str(&state.join("\n\n"));
+        }
+        prompt
+    }
+
     async fn summarize_span(
         &mut self,
         split: usize,
         ui: &mut dyn Ui,
         cancel: &CancellationToken,
     ) -> Result<bool> {
-        let mut prompt = COMPACT_PROMPT.to_string();
+        let mut prompt = self.compaction_prompt();
         if let Some(ext) = self.hooks.extensions() {
             for extra in ext.before_compact().await {
                 prompt.push_str(&format!(
@@ -1775,6 +1807,82 @@ mod tests {
             .expect("the overflow error");
         assert!(format!("{err:#}").contains("prompt is too long"));
         assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    /// The summary request carries what the trailing note shows but the
+    /// transcript lacks (task goal and schema, verify state, intents), and a
+    /// session resumed after the compaction still has its working set and
+    /// intents.
+    #[tokio::test]
+    async fn compaction_keeps_harness_state_and_resume_restores_the_working_set() {
+        let (provider, log) = fake(|_, _| Ok(says("SUMMARY", 100)));
+        let mut agent = agent_with(provider);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        agent.cwd = dir.path().to_path_buf();
+        agent.session = Some(Session::create(dir.path(), &agent.cwd, "fake").unwrap());
+        let mut spec = crate::task::TaskSpec::typed(
+            "list the parsers",
+            serde_json::json!({"type": "object", "required": ["parsers"]}),
+        );
+        spec.validators = vec![crate::task::ValidatorSpec::Exists("/parsers".into())];
+        agent.set_task(Some(spec));
+        agent.push(Item::user("go"));
+        agent.task_begin();
+        {
+            let mut ws = crate::tools::workset::lock(&agent.workset);
+            ws.open(
+                dir.path(),
+                dir.path().join("a.rs"),
+                crate::tools::workset::Mode::Focused,
+            );
+            ws.record_intent("read the lexer", "find the parsers", "list them");
+        }
+        agent.push(Item::Assistant {
+            text: "looking".into(),
+        });
+        agent.submitted = agent.items.len();
+        assert!(agent
+            .compact(&mut QuietUi, &CancellationToken::new())
+            .await
+            .unwrap());
+        let seen = log.lock().unwrap().clone();
+        let prompt = match seen[0].items.last() {
+            Some(Item::User { text, .. }) => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(prompt.starts_with(COMPACT_PROMPT), "{prompt}");
+        assert!(prompt.contains("Task goal: list the parsers"), "{prompt}");
+        assert!(prompt.contains(r#""required":["parsers"]"#), "{prompt}");
+        assert!(
+            prompt.contains("Checks run on submit: exists:/parsers"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("did: read the lexer · why: find the parsers"),
+            "{prompt}"
+        );
+        // Nothing harness-side leaks into the stored transcript.
+        assert!(matches!(&agent.items[0], Item::Compaction { summary } if summary == "SUMMARY"));
+
+        // Resume: a fresh agent loads the compacted session and gets the
+        // working set and the intents back.
+        let id = agent.session.as_ref().unwrap().id.clone();
+        drop(agent.session.take());
+        let (session, _, items) = crate::session::load(dir.path(), &id, dir.path()).unwrap();
+        assert!(matches!(items[0], Item::Compaction { .. }));
+        let mut resumed = agent_with(fake(|_, _| Ok(says("x", 1))).0);
+        resumed.cwd = dir.path().to_path_buf();
+        resumed.session = Some(session);
+        resumed.items = items;
+        resumed.adopt_transcript();
+        let note = resumed.trailing_note();
+        assert!(note.contains("## a.rs (focused)"), "{note}");
+        assert!(note.contains("did: read the lexer"), "{note}");
+        assert_eq!(
+            crate::tools::workset::lock(&resumed.workset).intents_recorded(),
+            1
+        );
     }
 
     fn agent_with(provider: Box<dyn Provider>) -> Agent {

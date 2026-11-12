@@ -1386,12 +1386,21 @@ fn patch_preview(ctx: &ToolCtx, args: &Value) -> Option<String> {
 #[async_trait::async_trait]
 impl Tool for ApplyPatch {
     fn effects(&self, args: &Value) -> Effects {
-        Effects::writes_to(
+        let paths: Vec<PathBuf> =
             super::patch::paths(args.get("patch").and_then(Value::as_str).unwrap_or(""))
                 .into_iter()
                 .map(PathBuf::from)
-                .collect(),
-        )
+                .collect();
+        // A patch that names no file can't say what it writes: keep the call
+        // serial (as a missing `path` does for the other write tools) until
+        // the patch parser rejects it.
+        if paths.is_empty() {
+            return Effects {
+                writes: super::Writes::Unknown,
+                ..Effects::reads_only()
+            };
+        }
+        Effects::writes_to(paths)
     }
 
     fn spec(&self) -> ToolSpec {

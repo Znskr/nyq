@@ -512,10 +512,9 @@ mod tests {
             const doubled = await pipeline(counts, (c, i) => c.n * 2 + i);
             return {counts, doubled};
         "#;
-        // The workflow call, three children (shared script), the final answer.
-        let child = reply(vec![Item::Assistant {
-            text: r#"{"n": 7}"#.into(),
-        }]);
+        // The workflow call, three typed children that each submit (shared
+        // script), the final answer.
+        let child = reply(vec![call("s", crate::task::SUBMIT, json!({"n": 7}))]);
         agent.provider = Box::new(ScriptedTurns {
             left: Arc::new(std::sync::Mutex::new(vec![
                 reply(vec![call("w1", WORKFLOW, json!({"script": script}))]),

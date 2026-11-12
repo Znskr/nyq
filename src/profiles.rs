@@ -117,9 +117,9 @@ pub fn headless() -> bool {
         .unwrap_or(false)
 }
 
-/// The `verify.required` flag the `ci` profile sets; the task engine and
-/// validation hooks read it.
-#[allow(dead_code)] // Read by the task engine's verify path when it lands.
+/// The `verify.required` flag the `ci` profile sets: the task engine's
+/// background verifier runs whenever a build system is detected
+/// (`crate::task::TaskOptions::current`).
 pub fn verify_required() -> bool {
     crate::settings::current()
         .extra

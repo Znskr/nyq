@@ -252,6 +252,22 @@ impl Tool for Team {
         matches!(self.0, Kind::Wait)
     }
 
+    /// Listing only reads the session's team graph (outside the workspace);
+    /// the other actions change it and keep the conservative default.
+    fn effects(&self, args: &Value) -> crate::tools::Effects {
+        match self.0 {
+            Kind::List => crate::tools::Effects::none(),
+            _ => {
+                let _ = args;
+                crate::tools::Effects::default()
+            }
+        }
+    }
+
+    fn coordinates(&self) -> bool {
+        true
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let (dir, who) = match caller(ctx) {
             Ok(c) => c,

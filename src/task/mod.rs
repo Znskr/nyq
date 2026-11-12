@@ -85,8 +85,8 @@ pub use build::{
 };
 pub use cycle::{Cycle, CycleConfig, CycleDetector, Step};
 pub use engine::{
-    TaskOutcome, TaskReport, TaskSpec, TaskState, Tier, TierPolicy, ValidatorSpec, VerifyMode,
-    SUBMIT,
+    CheckRecord, TaskOutcome, TaskReport, TaskSpec, TaskState, Tier, TierPolicy, ValidatorSpec,
+    VerifyMode, SUBMIT,
 };
 pub use llm::LlmJudge;
 pub use memo::{hash_files, MemoKey, MemoStore};

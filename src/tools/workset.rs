@@ -52,14 +52,86 @@ struct Entry {
     touched: u64,
 }
 
-/// One intent record (`{did, why, next}`), appended by `note_intent` and by
-/// the `intent` field W9 adds to mutating tools.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+/// What kind of entry an intent is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IntentKind {
+    /// Stated by the model: `note_intent`, or the `intent` field of a
+    /// mutating call.
+    #[default]
+    Action,
+    /// A diagnosis the harness injected (escalation ladder rung 3).
+    ApproachCorrection,
+}
+
+impl IntentKind {
+    fn is_action(&self) -> bool {
+        *self == IntentKind::Action
+    }
+}
+
+/// One intent record (`{did, why, next}`): the session's single intent store,
+/// fed by `note_intent`, by the `intent` field the task engine adds to
+/// mutating tools, and by the ladder's diagnosis. Persisted as `intent`
+/// lines in the session file; the fields added after v0.0.1 default when an
+/// older session is loaded.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Intent {
     pub did: String,
+    #[serde(default)]
     pub why: String,
     #[serde(default)]
     pub next: String,
+    /// The tool call it was stated on; empty for `note_intent`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "IntentKind::is_action")]
+    pub kind: IntentKind,
+}
+
+impl Intent {
+    pub(crate) fn new(did: &str, why: &str, next: &str) -> Self {
+        Self {
+            did: did.trim().to_string(),
+            why: why.trim().to_string(),
+            next: next.trim().to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// `did — because why — next: next` on one line: what the cycle
+    /// detector compares.
+    pub(crate) fn line(&self) -> String {
+        let mut s = self.did.clone();
+        if !self.why.is_empty() {
+            s.push_str(" — because ");
+            s.push_str(&self.why);
+        }
+        if !self.next.is_empty() {
+            s.push_str(" — next: ");
+            s.push_str(&self.next);
+        }
+        s
+    }
+
+    /// One bullet of the `[Recent intents]` note section.
+    fn bullet(&self) -> String {
+        let mut out = String::from("- ");
+        if self.kind == IntentKind::ApproachCorrection {
+            out.push_str("[approach correction] ");
+        }
+        out.push_str(&format!("did: {}", one_line(&self.did)));
+        if !self.why.is_empty() {
+            out.push_str(&format!(" · why: {}", one_line(&self.why)));
+        }
+        if !self.next.is_empty() {
+            out.push_str(&format!(" · next: {}", one_line(&self.next)));
+        }
+        if !self.tool.is_empty() {
+            out.push_str(&format!(" ({})", self.tool));
+        }
+        out
+    }
 }
 
 #[derive(Default)]
@@ -73,6 +145,9 @@ pub(crate) struct Workset {
     files_dirty: bool,
     /// Intents not yet appended to the session file.
     pending_intents: Vec<Intent>,
+    /// Intents recorded since the session started (monotonic; restored
+    /// intents count too), so a reader can ask for the ones it has not seen.
+    recorded: u64,
 }
 
 const MAX_ENTRIES: usize = 64;
@@ -83,8 +158,6 @@ pub(crate) struct Budgets {
     pub max_focused: usize,
     /// Token cap for rendered file contents (chars/4 estimate).
     pub max_tokens: u64,
-    /// How many recent intents to show.
-    pub intents: usize,
 }
 
 impl Budgets {
@@ -93,7 +166,6 @@ impl Budgets {
         Budgets {
             max_focused: s.workset.max_focused,
             max_tokens: context_window.saturating_mul(s.workset.max_tokens_pct as u64) / 100,
-            intents: s.intents.show,
         }
     }
 }
@@ -237,19 +309,19 @@ impl Workset {
         })
     }
 
-    /// Append an intent record (`note_intent` tool; W9 feeds the same store
-    /// through this method from mutating tools).
+    /// Append an intent record from `note_intent`.
     pub(crate) fn record_intent(&mut self, did: &str, why: &str, next: &str) {
-        let intent = Intent {
-            did: did.to_string(),
-            why: why.to_string(),
-            next: next.to_string(),
-        };
+        self.record(Intent::new(did, why, next));
+    }
+
+    /// Append an intent record (the one entry point for every source).
+    pub(crate) fn record(&mut self, intent: Intent) {
         if self.intents.len() >= MAX_INTENTS {
             self.intents.remove(0);
         }
         self.intents.push(intent.clone());
         self.pending_intents.push(intent);
+        self.recorded += 1;
     }
 
     /// Intents written since the last `take_pending_intents`.
@@ -257,13 +329,49 @@ impl Workset {
         std::mem::take(&mut self.pending_intents)
     }
 
-    /// Restore intents replayed from the session file (not pending).
-    pub(crate) fn restore_intents(&mut self, intents: Vec<Intent>) {
+    /// Restore intents replayed from the session file (not pending). Only
+    /// the newest [`MAX_INTENTS`] are kept, as when they were recorded.
+    pub(crate) fn restore_intents(&mut self, mut intents: Vec<Intent>) {
+        let extra = intents.len().saturating_sub(MAX_INTENTS);
+        intents.drain(..extra);
+        self.recorded = intents.len() as u64;
         self.intents = intents;
         self.pending_intents.clear();
     }
 
-    /// The working-set section of the trailing note, rendered **from disk**.
+    /// How many intents were recorded so far (see [`Workset::intents_since`]).
+    pub(crate) fn intents_recorded(&self) -> u64 {
+        self.recorded
+    }
+
+    /// The intents recorded after the first `seen`, oldest first.
+    pub(crate) fn intents_since(&self, seen: u64) -> &[Intent] {
+        let new = self.recorded.saturating_sub(seen) as usize;
+        &self.intents[self.intents.len().saturating_sub(new)..]
+    }
+
+    /// The newest `n` intents, oldest first.
+    pub(crate) fn recent_intents(&self, n: usize) -> &[Intent] {
+        &self.intents[self.intents.len().saturating_sub(n)..]
+    }
+
+    /// The `[Recent intents]` section of the trailing note: the newest `n`
+    /// (none when `n` is 0 or nothing was recorded).
+    pub(crate) fn render_intents(&self, n: usize) -> String {
+        let recent = self.recent_intents(n);
+        if recent.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("[Recent intents]");
+        for intent in recent {
+            out.push('\n');
+            out.push_str(&intent.bullet());
+        }
+        out
+    }
+
+    /// The working-set section of the trailing note, rendered **from disk**
+    /// (the intents are a section of their own: [`Workset::render_intents`]).
     /// Order: outlines first, focused last. When over budget, the least
     /// recently focused files demote to outlines; if still over, entries are
     /// omitted oldest-first (outlines, then pinned, then focused).
@@ -355,19 +463,6 @@ impl Workset {
                     omitted.len(),
                     omitted.join(", ")
                 ));
-            }
-        }
-        if budgets.intents > 0 && !self.intents.is_empty() {
-            out.push_str("\n[Recent intents]\n");
-            for intent in self.intents.iter().rev().take(budgets.intents).rev() {
-                out.push_str(&format!("- did: {}", one_line(&intent.did)));
-                if !intent.why.is_empty() {
-                    out.push_str(&format!(" · why: {}", one_line(&intent.why)));
-                }
-                if !intent.next.is_empty() {
-                    out.push_str(&format!(" · next: {}", one_line(&intent.next)));
-                }
-                out.push('\n');
             }
         }
         out.trim_end().to_string()
@@ -875,7 +970,6 @@ mod tests {
         let budgets = Budgets {
             max_focused: 1,
             max_tokens: 1_000_000,
-            intents: 0,
         };
         let note = ws.render(&budgets);
         // f0 is the least recently focused → demoted; f1 stays focused.
@@ -902,7 +996,6 @@ mod tests {
         let budgets = Budgets {
             max_focused: 4,
             max_tokens: 100,
-            intents: 0,
         };
         let note = ws.render(&budgets);
         assert!(note.contains("files omitted"), "{note}");
@@ -915,14 +1008,80 @@ mod tests {
         for i in 0..10 {
             ws.record_intent(&format!("did{i}"), "w", "n");
         }
-        let note = ws.render(&Budgets {
+        // The working set alone never carries the intents.
+        let files = ws.render(&Budgets {
             max_focused: 4,
             max_tokens: 1000,
-            intents: 3,
         });
-        assert!(note.contains("[Recent intents]"), "{note}");
+        assert!(!files.contains("[Recent intents]"), "{files}");
+        let note = ws.render_intents(3);
+        assert!(note.starts_with("[Recent intents]"), "{note}");
         assert!(note.contains("did: did9"), "{note}");
         assert!(note.contains("did: did7"), "{note}");
         assert!(!note.contains("did: did6"), "{note}");
+        assert_eq!(ws.render_intents(0), "");
+        assert_eq!(Workset::default().render_intents(3), "");
+    }
+
+    #[test]
+    fn intents_carry_tool_and_kind_and_roundtrip_old_records() {
+        let mut ws = Workset::default();
+        ws.record(Intent {
+            tool: "edit_file".into(),
+            ..Intent::new("fix a", "it is wrong", "")
+        });
+        ws.record(Intent {
+            kind: IntentKind::ApproachCorrection,
+            ..Intent::new("create the file first", "repeated failures", "")
+        });
+        let note = ws.render_intents(5);
+        assert!(
+            note.contains("- did: fix a · why: it is wrong (edit_file)"),
+            "{note}"
+        );
+        assert!(
+            note.contains("- [approach correction] did: create the file first"),
+            "{note}"
+        );
+        // Session lines: the new fields are omitted when default, and an
+        // old record (did/why/next only) still loads.
+        let saved: Vec<Value> = ws
+            .take_pending_intents()
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap())
+            .collect();
+        assert_eq!(
+            saved[0],
+            json!({"did": "fix a", "why": "it is wrong", "next": "", "tool": "edit_file"})
+        );
+        assert_eq!(saved[1]["kind"], "approach_correction");
+        let old: Intent = serde_json::from_value(json!({"did": "d", "why": "w"})).unwrap();
+        assert_eq!(
+            (old.kind, old.tool.as_str(), old.next.as_str()),
+            (IntentKind::Action, "", "")
+        );
+    }
+
+    #[test]
+    fn readers_see_only_new_intents_and_restore_keeps_the_newest() {
+        let mut ws = Workset::default();
+        ws.record_intent("a", "", "");
+        let seen = ws.intents_recorded();
+        ws.record_intent("b", "", "");
+        ws.record_intent("c", "", "");
+        let new: Vec<&str> = ws
+            .intents_since(seen)
+            .iter()
+            .map(|i| i.did.as_str())
+            .collect();
+        assert_eq!(new, ["b", "c"]);
+        assert!(ws.intents_since(ws.intents_recorded()).is_empty());
+        let many: Vec<Intent> = (0..MAX_INTENTS + 10)
+            .map(|i| Intent::new(&i.to_string(), "", ""))
+            .collect();
+        ws.restore_intents(many);
+        assert_eq!(ws.recent_intents(usize::MAX).len(), MAX_INTENTS);
+        assert_eq!(ws.recent_intents(1)[0].did, (MAX_INTENTS + 9).to_string());
+        assert!(ws.take_pending_intents().is_empty());
     }
 }
