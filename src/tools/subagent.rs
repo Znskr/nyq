@@ -69,10 +69,14 @@ fn label(args: &Value) -> &str {
 }
 
 /// The child's tools: builtins (minus mutating ones for explore), never
-/// itself, plus the session's read-only shared tools (all of them for
-/// general).
-fn child_tools(general: bool, shared: &[Arc<dyn Tool>]) -> Registry {
+/// itself, plus the session's skills and (for general) MCP tools.
+fn child_tools(
+    general: bool,
+    shared: &[Arc<dyn Tool>],
+    ledger: std::sync::Arc<crate::tools::FileLedger>,
+) -> Registry {
     let mut tools = Registry::builtin();
+    tools.share_file_ledger(ledger);
     let none = Value::Object(Default::default());
     let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
     let keep: Vec<String> = names
@@ -268,7 +272,7 @@ fn child(
     }
     Ok(Agent {
         provider,
-        tools: child_tools(general, &ctx.shared_tools),
+        tools: child_tools(general, &ctx.shared_tools, ctx.file_ledger.clone()),
         system,
         items,
         session: None,
@@ -1050,7 +1054,7 @@ mod tests {
         let shared: Vec<Arc<dyn Tool>> =
             vec![Arc::new(Named("skill")), Arc::new(Named("mcp__wiki__ask"))];
         let names = |general| -> Vec<String> {
-            child_tools(general, &shared)
+            child_tools(general, &shared, Default::default())
                 .specs()
                 .into_iter()
                 .map(|s| s.name)
@@ -1086,7 +1090,7 @@ mod tests {
     fn general_mode_needs_approval_and_has_write_tools() {
         assert!(!Subagent.needs_approval(&json!({"task": "x"})));
         assert!(Subagent.needs_approval(&json!({"task": "x", "mode": "general"})));
-        let names: Vec<String> = child_tools(true, &[])
+        let names: Vec<String> = child_tools(true, &[], Default::default())
             .specs()
             .into_iter()
             .map(|s| s.name)

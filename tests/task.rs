@@ -127,7 +127,9 @@ fn a_schema_task_on_a_cargo_crate_prints_the_validated_json() {
     let (url, seen) = fake_server(vec![
         // Submitting while the crate does not build is rejected…
         vec![tool_call("c1", "submit", result.clone())],
-        // …so the model fixes it and submits again.
+        // …so the model reads the file (edits need a prior read)…
+        vec![tool_call("c2r", "read_file", json!({"path": "src/lib.rs"}))],
+        // …fixes it and submits again.
         vec![tool_call(
             "c2",
             "write_file",

@@ -90,6 +90,7 @@ impl UndoLog {
         }
     }
 
+    #[cfg(test)]
     pub fn discard_last(&mut self) {
         self.entries.pop_back();
     }

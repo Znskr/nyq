@@ -548,7 +548,8 @@ fn describe_tool(tool: &str, summary: &str) -> (String, String) {
     let verb = match tool {
         "read_file" => "Read",
         "write_file" => "Wrote",
-        "edit_file" => "Edited",
+        "edit_file" | "multi_edit" | "edit_range" => "Edited",
+        "apply_patch" => "Patched",
         "bash" => "Ran",
         "grep" => "Searched",
         "glob" => "Found",
@@ -572,7 +573,7 @@ fn describe_tool(tool: &str, summary: &str) -> (String, String) {
 fn tool_kind(tool: &str) -> &'static str {
     match tool {
         "read_file" | "grep" | "glob" | "list_dir" | "view_image" => "read",
-        "write_file" | "edit_file" => "edit",
+        "write_file" | "edit_file" | "multi_edit" | "edit_range" | "apply_patch" => "edit",
         "bash" => "command",
         _ => "tool",
     }
@@ -609,7 +610,10 @@ fn classic_tool_row(
     };
     let used = visible_width(lead) + t.verb.chars().count() + note.chars().count() + 1;
     let mut target = paint(fg(GRAY), &truncate(&t.target, w.saturating_sub(used)));
-    if matches!(t.tool.as_str(), "read_file" | "write_file" | "edit_file") {
+    if matches!(
+        t.tool.as_str(),
+        "read_file" | "write_file" | "edit_file" | "multi_edit" | "edit_range"
+    ) {
         if let Some(url) = file_url(cwd, &t.target) {
             target = link(&url, &target);
         }
@@ -778,7 +782,10 @@ impl Screen {
             let used = used + visible_width(&took);
             let target = truncate(&t.target, w.saturating_sub(used));
             let mut target = paint(fg(GRAY), &target);
-            if matches!(t.tool.as_str(), "read_file" | "write_file" | "edit_file") {
+            if matches!(
+                t.tool.as_str(),
+                "read_file" | "write_file" | "edit_file" | "multi_edit" | "edit_range"
+            ) {
                 if let Some(url) = file_url(&self.footer.cwd, &t.target) {
                     target = link(&url, &target);
                 }
@@ -2211,7 +2218,12 @@ impl Screen {
         t.took = Some(t.started.elapsed());
         if let Some(d) = output.display.as_deref().filter(|d| looks_like_diff(d)) {
             t.note = diff_stat(d);
-            if !output.is_error && matches!(t.tool.as_str(), "edit_file" | "write_file") {
+            if !output.is_error
+                && matches!(
+                    t.tool.as_str(),
+                    "edit_file" | "write_file" | "multi_edit" | "edit_range" | "apply_patch"
+                )
+            {
                 t.diff = Some(sanitize_text(d));
             }
         }

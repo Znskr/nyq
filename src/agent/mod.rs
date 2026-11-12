@@ -24,7 +24,7 @@ pub use permission_rules::{
 #[allow(unused_imports)]
 pub(crate) use permission_rules::{
     builtin_tool, file_grant_ok, file_grant_ok_in, inside, inside_any, is_file_tool, lexical,
-    normalize_url, path_under_git, program_base, resolved, subagent_mode,
+    normalize_url, path_under_git, paths_under_git, program_base, resolved, subagent_mode,
 };
 pub use step::step_limit;
 pub use task::TaskRuntime;
@@ -251,6 +251,7 @@ impl Agent {
         self.submitted = 0;
         self.undo = Default::default();
         crate::tools::workset::lock(&self.workset).clear();
+        self.tools.file_ledger().clear();
     }
 
     /// Drop the transcript in place: same session id, model, sandbox and rules.
@@ -278,6 +279,7 @@ impl Agent {
         self.compaction.clear();
         self.submitted = 0;
         self.undo = Default::default();
+        self.tools.file_ledger().clear();
         self.allowed.clear();
         crate::tools::workset::lock(&self.workset).clear();
         Ok(())

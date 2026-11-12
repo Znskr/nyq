@@ -227,8 +227,10 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
             _ = cancel.cancelled() => ToolOutput::err("Cancelled by user."),
         }
     };
-    if out.is_error && !out.changed && !undo.is_empty() {
-        undo.discard_last();
+    // The local log holds only this call's snapshots: a failed call that
+    // changed nothing drops all of them (a multi-file patch has several).
+    if out.is_error && !out.changed {
+        undo = Default::default();
     }
     undo.append(std::mem::take(&mut out.undo));
     out.undo = undo;
@@ -788,6 +790,7 @@ impl Agent {
                 .map(|s| crate::subagents::store_dir(&s.path)),
             shared_tools: self.tools.shared(),
             workset: std::sync::Arc::clone(&self.workset),
+            file_ledger: self.tools.file_ledger(),
         };
         let summary_of = |args: &Value| {
             if meta {
