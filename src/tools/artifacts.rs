@@ -216,6 +216,12 @@ impl Tool for ReadToolResult {
         }
     }
 
+    fn effects(&self, _args: &Value) -> super::Effects {
+        // Reads stored results under ~/.nyq — outside the workspace conflict
+        // graph, so plain reads.
+        super::Effects::reads_only()
+    }
+
     fn summary(&self, args: &Value) -> String {
         let id = args.get("id").and_then(Value::as_str).unwrap_or("");
         match (

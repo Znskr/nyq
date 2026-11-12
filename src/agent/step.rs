@@ -445,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_step_limit_ends_the_turn_with_a_notice() {
-        let (tool, _) = probe("mcp__x__go", false);
+        let (tool, _) = probe("mcp__x__go", unknown_fx, false);
         let script = (0..MAX_STEPS)
             .map(|_| reply(vec![call("a", "mcp__x__go", serde_json::json!({}))]))
             .collect();

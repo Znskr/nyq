@@ -22,8 +22,8 @@ pub use permission_rules::{
 };
 #[allow(unused_imports)]
 pub(crate) use permission_rules::{
-    file_grant_ok, file_grant_ok_in, inside, inside_any, is_file_tool, lexical, normalize_url,
-    path_under_git, program_base, resolved, subagent_mode,
+    builtin_tool, file_grant_ok, file_grant_ok_in, inside, inside_any, is_file_tool, lexical,
+    normalize_url, path_under_git, program_base, resolved, subagent_mode,
 };
 pub use step::step_limit;
 #[cfg(test)]
@@ -365,7 +365,6 @@ mod tests {
 
     #[test]
     fn reset_drops_the_undo_log() {
-        use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let mut agent = agent(Response::default(), None);
         agent.cwd = dir.path().to_path_buf();
@@ -373,8 +372,7 @@ mod tests {
         agent.undo.snapshot(
             &agent.cwd,
             crate::sandbox::Mode::WorkspaceWrite,
-            "edit_file",
-            &json!({"path": "f.txt"}),
+            &[std::path::PathBuf::from("f.txt")],
         );
         assert_eq!(agent.undo.len(), 1);
         agent.suppress_auto_compact = true;

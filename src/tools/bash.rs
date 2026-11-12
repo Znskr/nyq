@@ -53,6 +53,41 @@ impl Tool for Bash {
         true
     }
 
+    fn effects(&self, _args: &Value) -> super::Effects {
+        super::Effects {
+            reads: false,
+            writes: super::Writes::Unknown,
+            exec: true,
+            net: false,
+        }
+    }
+
+    /// A read-only pipeline is `ReadFs`; anything else runs alone as `Exec`.
+    fn concurrency_in(
+        &self,
+        args: &Value,
+        cwd: &std::path::Path,
+        extra: &[std::path::PathBuf],
+    ) -> super::Concurrency {
+        match self
+            .shell_command(args)
+            .and_then(|c| crate::command_effect::read_only(&c, cwd, extra))
+        {
+            Some(_) => super::Concurrency::ReadFs,
+            None => super::Concurrency::Exec,
+        }
+    }
+
+    /// The command to run, unless it goes to the background table.
+    fn shell_command(&self, args: &Value) -> Option<String> {
+        if args.get("run_in_background").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        args.get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     fn summary(&self, args: &Value) -> String {
         let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
         cmd.lines().next().unwrap_or("").chars().take(120).collect()

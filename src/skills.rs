@@ -708,6 +708,11 @@ impl Tool for SkillTool {
         }
     }
 
+    fn effects(&self, _args: &Value) -> crate::tools::Effects {
+        // Reads skill files under ~/.nyq or the project .nyq directory.
+        crate::tools::Effects::reads_only()
+    }
+
     async fn run(&self, args: Value, _ctx: &ToolCtx) -> ToolOutput {
         let Some(name) = args["name"].as_str().map(str::trim) else {
             return ToolOutput::err("skill: \"name\" is required");

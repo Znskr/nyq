@@ -20,11 +20,13 @@ use serde_json::Value;
 use crate::agent::{bash_matches, is_file_tool, program_base, subagent_mode};
 
 /// Read tools ask only for paths outside the workspace; a persistent allow
-/// never covers those.
-const READ_TOOLS: &[&str] = &["read_file", "list_dir", "glob", "grep", "view_image"];
-
+/// never covers those. A tool counts as a read tool when it declares
+/// read-only filesystem effects.
 pub(crate) fn is_read_tool(tool: &str) -> bool {
-    READ_TOOLS.contains(&tool)
+    crate::agent::builtin_tool(tool).is_some_and(|t| {
+        let e = t.effects(&Value::Object(Default::default()));
+        e.is_read_only() && e.reads
+    })
 }
 
 /// How undecided risky calls are handled. Deny rules still block in every mode.
@@ -599,7 +601,7 @@ fn allow_applies(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) -> boo
         let path = args.get("path").and_then(Value::as_str).unwrap_or("");
         return crate::agent::file_grant_ok_in(path, cwd, extra);
     }
-    !READ_TOOLS.contains(&tool)
+    !is_read_tool(tool)
 }
 
 /// Whether the session's "always" rule for this call may also be saved.
@@ -663,8 +665,8 @@ pub fn matches(pattern: &str, tool: &str, args: &Value, strict: bool) -> bool {
     call_keys(tool, args).iter().any(|k| glob(pattern, k))
 }
 
-/// The path category of a tool: `read` for the read tools, `edit` for
-/// `write_file` / `edit_file`.
+/// The path category of a call: `read` for read tools, `edit` for tools
+/// that write the named `path`/`paths`.
 fn path_kind(tool: &str) -> Option<&'static str> {
     if is_read_tool(tool) {
         Some("read")

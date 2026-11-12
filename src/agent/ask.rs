@@ -60,6 +60,9 @@ impl crate::tools::Tool for AskUserTool {
             .map(|(q, _)| q)
             .unwrap_or_default()
     }
+    fn effects(&self, _args: &Value) -> crate::tools::Effects {
+        crate::tools::Effects::none()
+    }
     async fn run(&self, _args: Value, _ctx: &ToolCtx) -> ToolOutput {
         ToolOutput::err("ask_user_question is answered by the user interface")
     }

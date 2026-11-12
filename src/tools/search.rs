@@ -130,6 +130,14 @@ impl Tool for GlobFiles {
         super::outside_path_arg(cwd, args)
     }
 
+    fn effects(&self, _args: &Value) -> super::Effects {
+        super::Effects::reads_only()
+    }
+
+    fn read_paths(&self, args: &Value, cwd: &Path) -> Vec<PathBuf> {
+        super::fs::dir_read_paths(args, cwd)
+    }
+
     fn handles_cancel(&self) -> bool {
         true
     }
@@ -283,6 +291,14 @@ impl Tool for Grep {
 
     fn needs_approval_for(&self, args: &Value, cwd: &Path) -> bool {
         super::outside_path_arg(cwd, args)
+    }
+
+    fn effects(&self, _args: &Value) -> super::Effects {
+        super::Effects::reads_only()
+    }
+
+    fn read_paths(&self, args: &Value, cwd: &Path) -> Vec<PathBuf> {
+        super::fs::dir_read_paths(args, cwd)
     }
 
     fn handles_cancel(&self) -> bool {

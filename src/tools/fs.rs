@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use similar::udiff;
 use similar::Algorithm;
 
-use super::{Registry, Tool, ToolCtx, ToolOutput};
+use super::{Effects, Registry, Tool, ToolCtx, ToolOutput};
 use crate::types::ToolSpec;
 
 /// Resolve a possibly relative path against `cwd`.
@@ -66,6 +66,21 @@ fn head(text: &str, n: usize) -> String {
 fn int_arg(args: &Value, name: &str) -> Option<i64> {
     args.get(name)
         .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+}
+
+/// The `path` argument as a write target, unresolved (dispatch resolves it
+/// against the workspace). A missing path counts as the root, keeping the
+/// call serial until argument validation rejects it anyway.
+fn write_target(args: &Value) -> Vec<PathBuf> {
+    vec![PathBuf::from(
+        args.get("path").and_then(Value::as_str).unwrap_or_default(),
+    )]
+}
+
+/// The directory a `path`-or-root tool reads (list_dir, glob, grep).
+pub(super) fn dir_read_paths(args: &Value, cwd: &Path) -> Vec<PathBuf> {
+    let p = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    crate::agent::lexical(cwd, p).into_iter().collect()
 }
 
 /// `edit_file` refuses files larger than this rather than rewriting a prefix.
@@ -286,6 +301,10 @@ impl Tool for ReadFile {
         super::outside_path_arg(cwd, args)
     }
 
+    fn effects(&self, _args: &Value) -> Effects {
+        Effects::reads_only()
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(p) = args.get("path").and_then(Value::as_str) else {
             return ToolOutput::err("read_file: missing required argument `path`.");
@@ -389,6 +408,14 @@ impl Tool for ListDir {
         super::outside_path_arg(cwd, args)
     }
 
+    fn effects(&self, _args: &Value) -> Effects {
+        Effects::reads_only()
+    }
+
+    fn read_paths(&self, args: &Value, cwd: &Path) -> Vec<PathBuf> {
+        dir_read_paths(args, cwd)
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let user = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let path = resolve(&ctx.cwd, user);
@@ -482,6 +509,10 @@ impl Tool for WriteFile {
         true
     }
 
+    fn effects(&self, args: &Value) -> Effects {
+        Effects::writes_to(write_target(args))
+    }
+
     fn summary(&self, args: &Value) -> String {
         summary_path(args)
     }
@@ -549,6 +580,10 @@ impl Tool for EditFile {
 
     fn needs_approval(&self, _args: &Value) -> bool {
         true
+    }
+
+    fn effects(&self, args: &Value) -> Effects {
+        Effects::writes_to(write_target(args))
     }
 
     fn summary(&self, args: &Value) -> String {

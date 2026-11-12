@@ -258,13 +258,15 @@ pub(crate) fn scripted(script: Vec<Response>) -> Agent {
 }
 
 /// A tool under any name that sleeps, tracks how many runs overlap, and
-/// answers with its `n` argument (or fails when `fail` is set).
+/// answers with its `n` argument (or fails when `fail` is set). Its
+/// `effects` function decides the wave class the scheduler gives it.
 pub(crate) struct Probe {
     pub(crate) name: &'static str,
     pub(crate) live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) fail: bool,
     pub(crate) delay_ms: u64,
+    pub(crate) effects: fn(&Value) -> crate::tools::Effects,
 }
 
 #[async_trait::async_trait]
@@ -275,6 +277,9 @@ impl crate::tools::Tool for Probe {
             description: String::new(),
             parameters: serde_json::json!({}),
         }
+    }
+    fn effects(&self, args: &Value) -> crate::tools::Effects {
+        (self.effects)(args)
     }
     fn summary(&self, _: &Value) -> String {
         String::new()
@@ -292,8 +297,36 @@ impl crate::tools::Tool for Probe {
     }
 }
 
+/// Effects for a read-only probe.
+pub(crate) fn read_fx(_: &Value) -> crate::tools::Effects {
+    crate::tools::Effects::reads_only()
+}
+
+/// Effects for a probe that writes its `path` argument.
+pub(crate) fn write_fx(args: &Value) -> crate::tools::Effects {
+    crate::tools::Effects::writes_to(vec![PathBuf::from(
+        args.get("path").and_then(Value::as_str).unwrap_or_default(),
+    )])
+}
+
+/// Effects for a probe that runs a process.
+pub(crate) fn exec_fx(_: &Value) -> crate::tools::Effects {
+    crate::tools::Effects {
+        reads: false,
+        writes: crate::tools::Writes::Unknown,
+        exec: true,
+        net: false,
+    }
+}
+
+/// Effects for an undeclared (barrier) probe.
+pub(crate) fn unknown_fx(_: &Value) -> crate::tools::Effects {
+    crate::tools::Effects::default()
+}
+
 pub(crate) fn probe(
     name: &'static str,
+    effects: fn(&Value) -> crate::tools::Effects,
     fail: bool,
 ) -> (Probe, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -303,6 +336,7 @@ pub(crate) fn probe(
         peak: peak.clone(),
         fail,
         delay_ms: if name == "grep" { 100 } else { 1 },
+        effects,
     };
     (tool, peak)
 }

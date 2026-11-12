@@ -517,6 +517,17 @@ impl Tool for WebFetch {
         true
     }
 
+    fn effects(&self, _args: &Value) -> super::Effects {
+        // Fetches remote content only (downloads land under ~/.nyq, a
+        // store outside the workspace conflict graph).
+        super::Effects {
+            reads: false,
+            writes: super::Writes::Known(vec![]),
+            exec: false,
+            net: true,
+        }
+    }
+
     fn summary(&self, args: &Value) -> String {
         args["url"].as_str().unwrap_or("").to_string()
     }
@@ -769,6 +780,15 @@ impl Tool for WebSearch {
                 },
                 "required": ["query"]
             }),
+        }
+    }
+
+    fn effects(&self, _args: &Value) -> super::Effects {
+        super::Effects {
+            reads: false,
+            writes: super::Writes::Known(vec![]),
+            exec: false,
+            net: true,
         }
     }
 

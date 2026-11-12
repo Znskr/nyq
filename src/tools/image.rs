@@ -121,6 +121,10 @@ impl Tool for Vision {
         })
     }
 
+    fn effects(&self, _args: &Value) -> super::Effects {
+        super::Effects::reads_only()
+    }
+
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
         let paths: Vec<&str> = args["paths"]
             .as_array()
@@ -319,6 +323,10 @@ impl Tool for ViewImage {
         args["path"]
             .as_str()
             .is_some_and(|raw| !crate::agent::inside(cwd, &resolve(cwd, raw).to_string_lossy()))
+    }
+
+    fn effects(&self, _args: &Value) -> super::Effects {
+        super::Effects::reads_only()
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
