@@ -815,12 +815,19 @@ they can read everything but write only inside the workspace and temp dirs.
 workspace, and `--sandbox off` runs commands with your full permissions. Linux uses
 Landlock (kernel 5.13+, TCP rules need 6.7+) plus a seccomp filter that fails
 `socket()` with EACCES for IPv4 and IPv6 of any type — UDP included — and for
-Unix-domain sockets. `NYQ_SANDBOX_UNIX=1` re-allows Unix-domain sockets only.
+Unix-domain sockets, and fails the `io_uring` syscalls with EPERM so the
+socket filter cannot be bypassed through `IORING_OP_SOCKET`.
+`NYQ_SANDBOX_UNIX=1` re-allows Unix-domain sockets only.
 macOS uses `sandbox-exec`, which denies those sockets when the network is off.
 On both, `.git/hooks`, `.git/config` and `.git/info` are made read-only inside
 the sandbox while the rest of `.git` stays writable, so `git commit` still works
 but a sandboxed command cannot plant hooks or Git config that would run later
-with your full permissions; `NYQ_SANDBOX_GIT_WRITABLE=1` opts out. Where a part
+with your full permissions; `NYQ_SANDBOX_GIT_WRITABLE=1` opts out. On Linux the
+git dirs themselves are also pinned with private mounts, so they cannot be
+renamed aside and replaced; worktree and submodule gitdirs, `commondir`,
+`config.worktree` and a configured `core.hooksPath` get the same treatment,
+and `NYQ_SANDBOX_GIT_STRICT=1` refuses to run the command when the protection
+cannot be applied instead of only warning. Where a part
 of the policy cannot be enforced — an old kernel, missing seccomp or
 user-namespace support — the banner and `nyq status --json` say `partial` and
 why. `write_file`/`edit_file` always ask before touching anything under `.git`,
