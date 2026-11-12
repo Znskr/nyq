@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+use super::compact::Reduced;
 use super::note::with_trailing_note;
 use super::{Agent, TurnEnd, Ui};
 use crate::tools::ToolCtx;
@@ -44,6 +45,20 @@ const CONTINUE_NOTE: &str = "\n\nThe previous response was interrupted or cut of
 const INTERRUPTED: &str = "[interrupted by the user]";
 
 impl Agent {
+    /// The system prompt as sent: stable between requests (so providers can
+    /// cache it); per-request state goes in a trailing note instead.
+    pub(super) fn request_system(&self, continue_note: bool) -> String {
+        let mut system = self.system.clone();
+        if let Some(section) = crate::tools::mcp_search::notes_section(&self.tools.mcp_notes()) {
+            system.push_str("\n\n");
+            system.push_str(&section);
+        }
+        if continue_note {
+            system.push_str(CONTINUE_NOTE);
+        }
+        system
+    }
+
     /// Steering messages from the user and from extensions (`session/send`).
     fn take_steering(&self, ui: &mut dyn Ui) -> Vec<Item> {
         let mut items = ui.take_steering();
@@ -172,6 +187,8 @@ impl Agent {
         let mut stop_continued = false;
         // Failing calls by (tool, arguments), to stop the model looping on one.
         let mut failures: HashMap<(String, String), usize> = HashMap::new();
+        // A context-overflow error is retried once after compacting.
+        let mut overflow_retried = false;
         for _ in 0..max_steps {
             if cancel.is_cancelled() {
                 return Ok(TurnEnd::Cancelled);
@@ -184,18 +201,12 @@ impl Agent {
             // MCP servers that connected or changed their tools since the last step.
             self.tools.refresh();
             let specs = self.advertised();
-            // The system prompt stays stable between requests (so providers
-            // can cache it); per-request state goes in a trailing note.
-            let mut system = self.system.clone();
-            if let Some(section) = crate::tools::mcp_search::notes_section(&self.tools.mcp_notes())
-            {
-                system.push_str("\n\n");
-                system.push_str(&section);
-            }
-            if continue_note {
-                system.push_str(CONTINUE_NOTE);
-            }
-            let items = with_trailing_note(&self.items, &self.session_notes());
+            let system = self.request_system(continue_note);
+            // Older items as pruned by compaction (tier 1), then the note.
+            let projected = super::compact::project(&self.items, &self.compaction);
+            let items = with_trailing_note(&projected, &self.session_notes());
+            // To calibrate the token estimate on the reported usage.
+            let raw = self.raw_request(&system, &items, &specs);
             crate::trace::log("provider", || {
                 format!(
                     "request {}/{} · {} items · {} tools",
@@ -247,12 +258,26 @@ impl Agent {
                 ),
                 Err(e) => format!("error after {}ms: {e:#}", started.elapsed().as_millis()),
             });
-            let response = result?;
+            let response = match result {
+                Ok(response) => response,
+                // Too long for the context window: compact, then retry once.
+                Err(e) if !overflow_retried && super::compact::is_context_overflow(&e) => {
+                    overflow_retried = true;
+                    match self.recover_overflow(raw, ui, &cancel).await? {
+                        Reduced::Cancelled => return Ok(TurnEnd::Cancelled),
+                        Reduced::Smaller => continue,
+                        Reduced::Unchanged => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            overflow_retried = false;
             if response.truncated {
                 ui.notice("The reply was cut off at the output limit.");
             }
             self.account_usage(response.usage, ui);
             if let Some(u) = response.usage {
+                self.calibrate(raw, u.input_tokens);
                 self.context_tokens = u.input_tokens + u.output_tokens;
                 self.context_estimated = false;
             } else {

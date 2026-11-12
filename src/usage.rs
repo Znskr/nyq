@@ -615,6 +615,463 @@ fn duration(d: Duration) -> String {
         _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
     }
 }
+/// Token estimates for context accounting, used until (and between) the
+/// provider's own usage reports.
+///
+/// There is no tokenizer here: real vocabularies are megabytes each. Text
+/// is split into classes that tokenize differently (letters and word
+/// breaks, punctuation, digits, other non-ASCII, CJK), the letter rate
+/// shifts from prose toward code as punctuation gets denser, and each model
+/// family scales the result. A per-session correction factor, fitted to the
+/// provider-reported input tokens, absorbs what the heuristic misses
+/// (message framing, tool-schema rendering, a family's real vocabulary).
+pub mod tokens {
+    use base64::Engine;
+
+    use crate::types::Image;
+
+    /// Tokenizer families with measurably different rates.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum Family {
+        /// Unknown model: slightly pessimistic rates.
+        #[default]
+        Other,
+        /// GPT-4o and later (o200k-style vocabularies), Codex.
+        OpenAi,
+        Anthropic,
+        Gemini,
+        DeepSeek,
+        /// Qwen, GLM, Kimi: large vocabularies with many CJK merges.
+        Qwen,
+    }
+
+    impl Family {
+        pub fn detect(provider: &str, model: &str) -> Family {
+            let model = model.to_ascii_lowercase();
+            let has = |s: &str| model.contains(s);
+            if has("claude") || provider == "anthropic" {
+                Family::Anthropic
+            } else if has("gemini") || has("gemma") {
+                Family::Gemini
+            } else if has("deepseek") {
+                Family::DeepSeek
+            } else if has("qwen") || has("glm") || has("kimi") || has("moonshot") {
+                Family::Qwen
+            } else if has("gpt")
+                || has("codex")
+                || model.starts_with("o1")
+                || model.starts_with("o3")
+                || model.starts_with("o4")
+                || matches!(provider, "openai" | "codex")
+            {
+                Family::OpenAi
+            } else {
+                Family::Other
+            }
+        }
+
+        /// Multiplier on the Latin/code part, relative to an o200k-style
+        /// vocabulary.
+        fn latin(self) -> f64 {
+            match self {
+                Family::OpenAi | Family::Gemini => 1.0,
+                Family::Anthropic => 1.12,
+                Family::DeepSeek | Family::Qwen => 1.05,
+                Family::Other => 1.1,
+            }
+        }
+
+        /// Tokens per CJK character.
+        fn cjk(self) -> f64 {
+            match self {
+                Family::DeepSeek | Family::Qwen => 0.7,
+                Family::OpenAi | Family::Gemini => 0.85,
+                Family::Anthropic => 1.1,
+                Family::Other => 1.0,
+            }
+        }
+
+        /// Tokens per other non-ASCII character (accented Latin, Cyrillic,
+        /// symbols, emoji bytes).
+        fn other(self) -> f64 {
+            match self {
+                Family::Anthropic | Family::Other => 0.8,
+                _ => 0.5,
+            }
+        }
+    }
+
+    /// Letters (plus word breaks) per token in prose and in dense code.
+    const PROSE_LETTERS: f64 = 4.4;
+    const CODE_LETTERS: f64 = 3.6;
+    /// Punctuation share (of non-space characters) at which text counts as
+    /// fully code- or JSON-like.
+    const CODE_DENSITY: f64 = 0.25;
+    const PUNCT: f64 = 0.6;
+    const DIGITS_PER_TOKEN: f64 = 2.5;
+    /// An image whose size cannot be read.
+    pub const IMAGE_FALLBACK: u64 = 1_500;
+    /// Requests smaller than this tell too little to calibrate on.
+    const MIN_CALIBRATION: f64 = 256.0;
+    /// Weight of the newest sample in the running factor.
+    const ALPHA: f64 = 0.3;
+
+    /// Hangul, kana, CJK ideographs and fullwidth forms.
+    fn is_cjk(c: char) -> bool {
+        matches!(c as u32,
+            0x1100..=0x11FF | 0x2E80..=0x2FDF | 0x3000..=0x30FF | 0x3100..=0x31FF
+            | 0x3200..=0x4DBF | 0x4E00..=0x9FFF | 0xA960..=0xA97F | 0xAC00..=0xD7FF
+            | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x3FFFF)
+    }
+
+    /// Family-independent counts for one text.
+    #[derive(Default, Debug, PartialEq)]
+    struct Counts {
+        letters: u64,
+        breaks: u64,
+        punct: u64,
+        digits: u64,
+        other: u64,
+        cjk: u64,
+    }
+
+    fn count(text: &str) -> Counts {
+        let mut c = Counts::default();
+        let mut in_space = false;
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                // A run of whitespace (indentation, a blank line) mostly
+                // merges into one token or into the next word.
+                if !in_space {
+                    c.breaks += 1;
+                }
+                in_space = true;
+                continue;
+            }
+            in_space = false;
+            if ch.is_ascii_alphabetic() || ch == '_' {
+                c.letters += 1;
+            } else if ch.is_ascii_digit() {
+                c.digits += 1;
+            } else if ch.is_ascii() {
+                c.punct += 1;
+            } else if is_cjk(ch) {
+                c.cjk += 1;
+            } else {
+                c.other += 1;
+            }
+        }
+        c
+    }
+
+    /// Running estimator for one session.
+    #[derive(Clone, Debug)]
+    pub struct Estimator {
+        family: Family,
+        /// Provider-reported tokens per estimated token, fitted per session.
+        factor: f64,
+        samples: u32,
+    }
+
+    impl Default for Estimator {
+        fn default() -> Self {
+            Estimator {
+                family: Family::Other,
+                factor: 1.0,
+                samples: 0,
+            }
+        }
+    }
+
+    impl Estimator {
+        pub fn new(family: Family) -> Self {
+            Estimator {
+                family,
+                ..Default::default()
+            }
+        }
+
+        pub fn family(&self) -> Family {
+            self.family
+        }
+
+        /// Follow a model switch. A new family starts uncalibrated.
+        pub fn set_family(&mut self, family: Family) {
+            if family != self.family {
+                *self = Estimator::new(family);
+            }
+        }
+
+        pub fn factor(&self) -> f64 {
+            self.factor
+        }
+
+        /// Uncalibrated tokens for `text`.
+        pub fn raw_text(&self, text: &str) -> f64 {
+            if text.is_empty() {
+                return 0.0;
+            }
+            let c = count(text);
+            let dense = (c.punct + c.letters + c.digits).max(1) as f64;
+            let code = ((c.punct as f64 / dense) / CODE_DENSITY).min(1.0);
+            let letters_per_token = PROSE_LETTERS + (CODE_LETTERS - PROSE_LETTERS) * code;
+            let latin = (c.letters + c.breaks) as f64 / letters_per_token
+                + c.punct as f64 * PUNCT
+                + c.digits as f64 / DIGITS_PER_TOKEN;
+            latin * self.family.latin()
+                + c.cjk as f64 * self.family.cjk()
+                + c.other as f64 * self.family.other()
+        }
+
+        /// Uncalibrated tokens for one image. Sizes are read from the PNG,
+        /// GIF, JPEG or WebP header; anything else costs a flat amount.
+        pub fn raw_image(&self, image: &Image) -> f64 {
+            let Some((w, h)) = image_size(&image.data) else {
+                return IMAGE_FALLBACK as f64;
+            };
+            let (w, h) = (w as f64, h as f64);
+            match self.family {
+                Family::OpenAi => {
+                    // Fit 2048², shortest side to 768, then 512-px tiles.
+                    let s = (2048.0 / w.max(h)).min(1.0);
+                    let (w, h) = (w * s, h * s);
+                    let s = (768.0 / w.min(h)).min(1.0);
+                    let (w, h) = (w * s, h * s);
+                    85.0 + 170.0 * ((w / 512.0).ceil() * (h / 512.0).ceil())
+                }
+                Family::Gemini if w <= 384.0 && h <= 384.0 => 258.0,
+                Family::Gemini => 258.0 * (w / 768.0).ceil() * (h / 768.0).ceil(),
+                _ => {
+                    // Anthropic-style: long edge to 1568 px and about
+                    // 1.15 MP, then one token per 750 px².
+                    let s = (1568.0 / w.max(h)).min(1.0);
+                    let (w, h) = (w * s, h * s);
+                    let s = (1_150_000.0 / (w * h)).sqrt().min(1.0);
+                    (w * s * h * s / 750.0).max(1.0)
+                }
+            }
+        }
+
+        /// Calibrated tokens for an uncalibrated amount.
+        pub fn tokens(&self, raw: f64) -> u64 {
+            (raw * self.factor).ceil() as u64
+        }
+
+        pub fn text(&self, text: &str) -> u64 {
+            self.tokens(self.raw_text(text))
+        }
+
+        /// Fit the factor to a provider report: `raw` was this estimator's
+        /// uncalibrated count for the whole request, `actual` the reported
+        /// input tokens.
+        pub fn calibrate(&mut self, raw: f64, actual: u64) {
+            if raw < MIN_CALIBRATION || actual == 0 {
+                return;
+            }
+            let ratio = (actual as f64 / raw).clamp(0.5, 2.5);
+            self.factor = if self.samples == 0 {
+                ratio
+            } else {
+                self.factor * (1.0 - ALPHA) + ratio * ALPHA
+            };
+            self.samples = self.samples.saturating_add(1);
+        }
+
+        /// The provider rejected a request estimated at `raw` as larger than
+        /// `window`: estimates must at least reach the window from now on.
+        pub fn overflowed(&mut self, raw: f64, window: u64) {
+            if raw >= MIN_CALIBRATION && raw * self.factor < window as f64 {
+                self.factor = (window as f64 * 1.05 / raw).clamp(self.factor, 2.5);
+                self.samples = self.samples.max(1);
+            }
+        }
+    }
+
+    /// Width and height from an image's base64 data, when the format is known.
+    pub fn image_size(data: &str) -> Option<(u32, u32)> {
+        // Headers are at the start, except JPEG's frame header, which
+        // follows any metadata segments: decode at most 64 KiB.
+        let take = data.len().min(87_384) / 4 * 4;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&data.as_bytes()[..take])
+            .ok()?;
+        let be16 = |i: usize| -> Option<u32> {
+            Some(u32::from(u16::from_be_bytes(
+                bytes.get(i..i + 2)?.try_into().ok()?,
+            )))
+        };
+        let le16 = |i: usize| -> Option<u32> {
+            Some(u32::from(u16::from_le_bytes(
+                bytes.get(i..i + 2)?.try_into().ok()?,
+            )))
+        };
+        let le24 = |i: usize| -> Option<u32> {
+            let b = bytes.get(i..i + 3)?;
+            Some(u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16)
+        };
+        let size = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            let w = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+            let h = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+            (w, h)
+        } else if bytes.starts_with(b"GIF8") {
+            (le16(6)?, le16(8)?)
+        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+            match bytes.get(12..16)? {
+                b"VP8X" => (le24(24)? + 1, le24(27)? + 1),
+                b"VP8L" => {
+                    let b = u32::from_le_bytes(bytes.get(21..25)?.try_into().ok()?);
+                    ((b & 0x3FFF) + 1, ((b >> 14) & 0x3FFF) + 1)
+                }
+                b"VP8 " => (le16(26)? & 0x3FFF, le16(28)? & 0x3FFF),
+                _ => return None,
+            }
+        } else if bytes.starts_with(&[0xFF, 0xD8]) {
+            let mut i = 2;
+            loop {
+                if *bytes.get(i)? != 0xFF {
+                    return None;
+                }
+                let marker = *bytes.get(i + 1)?;
+                // SOF0..SOF15 except DHT, JPG and DAC carry the frame size.
+                if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                    break (be16(i + 7)?, be16(i + 5)?);
+                }
+                i += 2 + be16(i + 2)? as usize;
+            }
+        } else {
+            return None;
+        };
+        (size.0 > 0 && size.1 > 0).then_some(size)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn png(w: u32, h: u32) -> Image {
+            let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            bytes.extend(w.to_be_bytes());
+            bytes.extend(h.to_be_bytes());
+            bytes.extend([8, 6, 0, 0, 0]);
+            Image {
+                media_type: "image/png".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            }
+        }
+
+        #[test]
+        fn families_are_detected_from_provider_and_model() {
+            for (provider, model, family) in [
+                ("anthropic", "x", Family::Anthropic),
+                ("openrouter", "anthropic/claude-sonnet-5", Family::Anthropic),
+                ("codex", "gpt-5.3-codex", Family::OpenAi),
+                ("openai", "o3-mini", Family::OpenAi),
+                ("deepseek", "deepseek-chat", Family::DeepSeek),
+                ("opencode-go", "glm-5.3", Family::Qwen),
+                ("google", "gemini-3-pro", Family::Gemini),
+                ("ollama", "llama3", Family::Other),
+            ] {
+                assert_eq!(Family::detect(provider, model), family, "{model}");
+            }
+        }
+
+        #[test]
+        fn code_and_json_cost_more_per_char_than_prose_and_cjk_counts_per_char() {
+            let e = Estimator::new(Family::OpenAi);
+            let prose = "The quick brown fox jumps over the lazy dog while the farmer watches \
+                         from the porch and wonders whether the fence will hold this winter.";
+            let code = r#"fn main() { let x: Vec<u8> = vec![1, 2]; println!("{:?}", &x[..]); }"#;
+            let json = r#"{"path":"src/main.rs","offset":10,"limit":[1,2,3],"ok":true}"#;
+            let per_char = |s: &str| e.raw_text(s) / s.chars().count() as f64;
+            assert!(per_char(prose) < 0.27, "{}", per_char(prose));
+            assert!(per_char(code) > per_char(prose) * 1.3, "{}", per_char(code));
+            assert!(per_char(json) > per_char(prose) * 1.3, "{}", per_char(json));
+            // About 10 tokens for a classic 44-char sentence.
+            let fox = e.raw_text("The quick brown fox jumps over the lazy dog.");
+            assert!((9.0..12.0).contains(&fox), "{fox}");
+            // Indentation is cheap: a run of spaces is one break.
+            let flat = e.raw_text("a = b;\nc = d;");
+            let indented = e.raw_text("a = b;\n                c = d;");
+            assert!((indented - flat).abs() < 0.01);
+            // CJK: one weight per character, above bytes/4.
+            let cjk = "你好世界，这是一个测试";
+            let n = cjk.chars().count() as f64;
+            assert!((e.raw_text(cjk) - n * Family::OpenAi.cjk()).abs() < 1.0);
+            assert!(e.raw_text(cjk) > cjk.len() as f64 / 4.0);
+            let claude = Estimator::new(Family::Anthropic);
+            assert!(claude.raw_text(prose) > e.raw_text(prose));
+            assert_eq!(e.text(""), 0);
+        }
+
+        #[test]
+        fn calibration_follows_provider_usage_and_overflow() {
+            let mut e = Estimator::new(Family::Other);
+            assert_eq!(e.factor(), 1.0);
+            // Too small to tell anything.
+            e.calibrate(100.0, 500);
+            assert_eq!(e.factor(), 1.0);
+            e.calibrate(1_000.0, 1_300);
+            assert!((e.factor() - 1.3).abs() < 1e-9);
+            assert_eq!(e.tokens(1_000.0), 1_300);
+            // Later samples move the factor gradually.
+            e.calibrate(1_000.0, 1_000);
+            assert!((e.factor() - 1.21).abs() < 1e-9, "{}", e.factor());
+            for _ in 0..40 {
+                e.calibrate(2_000.0, 2_000);
+            }
+            assert!((e.factor() - 1.0).abs() < 0.01);
+            // Outliers are clamped.
+            let mut wild = Estimator::new(Family::Other);
+            wild.calibrate(1_000.0, 100_000);
+            assert_eq!(wild.factor(), 2.5);
+            // An overflow lifts the estimate to at least the window.
+            let mut e = Estimator::new(Family::Other);
+            e.overflowed(50_000.0, 100_000);
+            assert!(e.tokens(50_000.0) >= 100_000);
+            let before = e.factor();
+            e.overflowed(200_000.0, 100_000);
+            assert_eq!(e.factor(), before);
+            // A model switch to another family starts over.
+            e.set_family(Family::Other);
+            assert_eq!(e.factor(), before);
+            e.set_family(Family::Anthropic);
+            assert_eq!(e.factor(), 1.0);
+        }
+
+        #[test]
+        fn image_cost_comes_from_dimensions() {
+            assert_eq!(image_size(&png(800, 600).data), Some((800, 600)));
+            let gif = base64::engine::general_purpose::STANDARD
+                .encode(b"GIF89a\x40\x01\xf0\x00\x00\x00\x00");
+            assert_eq!(image_size(&gif), Some((320, 240)));
+            let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0, 0];
+            jpeg.extend([0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x03]);
+            let jpeg = base64::engine::general_purpose::STANDARD.encode(jpeg);
+            assert_eq!(image_size(&jpeg), Some((640, 480)));
+            let mut webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
+            webp.extend([0x1F, 0x03, 0x00, 0x57, 0x02, 0x00]);
+            let webp = base64::engine::general_purpose::STANDARD.encode(webp);
+            assert_eq!(image_size(&webp), Some((800, 600)));
+            assert_eq!(image_size("not base64!"), None);
+
+            let claude = Estimator::new(Family::Anthropic);
+            assert_eq!(claude.raw_image(&png(750, 100)).round(), 100.0);
+            let huge = claude.raw_image(&png(8000, 8000));
+            assert!((1_400.0..1_600.0).contains(&huge), "{huge}");
+            let gpt = Estimator::new(Family::OpenAi);
+            assert_eq!(gpt.raw_image(&png(512, 512)), 255.0);
+            assert_eq!(gpt.raw_image(&png(2048, 4096)), 85.0 + 170.0 * 6.0);
+            let gemini = Estimator::new(Family::Gemini);
+            assert_eq!(gemini.raw_image(&png(300, 300)), 258.0);
+            let unknown = Image {
+                media_type: "image/png".into(),
+                data: "A".repeat(4_000),
+            };
+            assert_eq!(claude.raw_image(&unknown), IMAGE_FALLBACK as f64);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

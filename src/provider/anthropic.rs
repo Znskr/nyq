@@ -513,6 +513,9 @@ impl Provider for AnthropicProvider {
     fn set_effort(&mut self, effort: Option<String>) {
         self.effort = effort.filter(|e| e != "auto");
     }
+    fn max_output_tokens(&self) -> Option<u64> {
+        Some(self.max_tokens)
+    }
     fn fork(&self) -> Box<dyn Provider> {
         Box::new(self.clone())
     }

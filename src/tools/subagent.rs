@@ -291,7 +291,7 @@ fn child(
         context_window,
         context_tokens: 0,
         context_estimated: false,
-        suppress_auto_compact: false,
+        compaction: Default::default(),
         submitted: 0,
         // The parent's tool hooks also vet the subagent's calls.
         hooks: std::sync::Arc::new(ctx.hooks.for_subagent()),
