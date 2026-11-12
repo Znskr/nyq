@@ -153,6 +153,18 @@ impl UndoLog {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// The files this log holds snapshots of (absolute, each once): the
+    /// files the calls it records changed.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for e in &self.entries {
+            if !out.contains(&e.path) {
+                out.push(e.path.clone());
+            }
+        }
+        out
+    }
 }
 
 /// Put `bytes` back without truncating in place. Sandboxed restores use the

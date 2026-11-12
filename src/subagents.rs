@@ -65,6 +65,10 @@ pub struct Record {
     /// The child's live worktree; None once merged or removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<crate::worktree::Worktree>,
+    /// The taint its current message was delegated with, kept so a resumed
+    /// turn still treats that message as evidence (see `crate::taint`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<crate::taint::Delegation>,
 }
 
 impl Record {
@@ -83,6 +87,7 @@ impl Record {
             items: Vec::new(),
             isolation: None,
             worktree: None,
+            delegation: None,
         }
     }
 

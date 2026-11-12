@@ -11,7 +11,7 @@
 //! - [`budget`]: [`Budget`] (two failure counters, steps, tokens, cost,
 //!   deadline) and the [`EscalationLadder`] state machine.
 //! - [`cycle`]: [`CycleDetector`], loop detection over steps and intents.
-//! - [`memo`]: [`MemoStore`], results cached under `.nyq/cache`.
+//! - [`memo`]: [`MemoStore`], results cached under `~/.nyq/cache/<workspace>`.
 //!
 //! The runtime layer, which `crate::agent::task` wires into the loop:
 //!
@@ -89,7 +89,7 @@ pub use engine::{
     VerifyMode, SUBMIT,
 };
 pub use llm::LlmJudge;
-pub use memo::{hash_files, MemoKey, MemoStore};
+pub use memo::{fingerprint, hash_files, MemoKey, MemoStore};
 pub use options::TaskOptions;
 pub use validate::{
     All, AlwaysPass, BuildValidator, CustomCommandValidator, ExistsValidator, FailKind,

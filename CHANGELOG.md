@@ -23,8 +23,10 @@ graph, scripts). Old sessions, settings and permission files keep loading.
 - **`edit_range`**: replace a line range found by start and end regexes, with
   nearest-line hints, robust when line numbers drift.
 - **Read-before-edit guard**: an edit or overwrite of an existing file needs a
-  read of it earlier in the session, and is refused if the file changed on disk
-  since (`read_before_edit = false` turns it off).
+  read of it earlier in the session (`read_file`, `open` or `focus`; for a
+  binary file, being listed is enough), and is refused if the file changed on
+  disk since (`read_before_edit = false` turns it off). Each subagent keeps its
+  own record.
 
 ### Safety
 
@@ -36,7 +38,9 @@ graph, scripts). Old sessions, settings and permission files keep loading.
   server, child, exec). `ask`/`deny` rules can be conditional, such as
   `"deny": ["exec when tainted-by:web"]`, and apply in every mode. The
   classifier now reviews every tool, not only `bash`. `"taint": {"mode":
-  "strict"}` turns on built-in rules.
+  "strict"}` turns on built-in rules. Taint follows a delegated task into the
+  subagent, sticks to every later call of a script that read untrusted
+  content, and stays on a script's result.
 - **Parallel waves and argument validation**: each tool declares its effects.
   Reads run in parallel, writes to disjoint paths run together, commands run
   alone. Arguments are checked against the tool's schema before anything runs
@@ -54,7 +58,9 @@ graph, scripts). Old sessions, settings and permission files keep loading.
 - **`--budget`**: `syntax=N,semantic=N,steps=N,tokens=N,cost=X,wall=S`.
   Malformed and rejected submissions are counted separately.
 - **`--memo`** / `--memo-file`: reuse the result of an identical earlier task,
-  keyed by the prompt, schema, checks and the listed files' contents.
+  keyed by the prompt, schema, checks, model and workspace (the listed files'
+  contents, or the git state). The checks run again on a cached result before
+  it is used. Results live in `~/.nyq/cache/`, never in the workspace.
 - **Escalation ladder**: when a task stalls (repeated failures, a loop, a
   budget running low), nyq climbs a ladder: nudge, progress check, diagnosis,
   context reset, a higher model tier (`[tier]` settings), then escalation.

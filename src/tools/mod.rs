@@ -282,6 +282,10 @@ pub struct ToolCtx {
     /// Files this session read or wrote, for the read-before-edit and mtime
     /// guard the mutating file tools enforce.
     pub file_ledger: std::sync::Arc<FileLedger>,
+    /// For a `subagent` call whose arguments copy untrusted content: the
+    /// taint the child inherits (see `crate::taint::Delegation`). Set by
+    /// dispatch, never by the model.
+    pub delegation: Option<crate::taint::Delegation>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -802,14 +806,9 @@ impl Registry {
         self.skills = skills;
     }
 
-    /// The session's file ledger (shared with subagents' registries).
+    /// The session's file ledger (a subagent's registry has its own).
     pub fn file_ledger(&self) -> std::sync::Arc<FileLedger> {
         self.file_ledger.clone()
-    }
-
-    /// Use `ledger` instead of a fresh one (a subagent shares its parent's).
-    pub(crate) fn share_file_ledger(&mut self, ledger: std::sync::Arc<FileLedger>) {
-        self.file_ledger = ledger;
     }
 
     /// Instructions of connected MCP servers, by server name.

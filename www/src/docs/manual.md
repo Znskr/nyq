@@ -347,7 +347,7 @@ runs out or the task escalates it exits 2 with a JSON report on stderr.
 | `--schema FILE\|JSON` | the result's JSON Schema |
 | `--validate CHECK` | repeatable, run in order on each submission: `build`, `tests`, `lint`, `cmd:<shell>` (exit 0 passes), `exists:<json-pointer>` (paths in the result must exist), `judge:<rubric>` (a model checks the change is present and complete), `touched:<path,…>` (the task must have changed them). `TaskValidate` [hooks](#hooks) run after these |
 | `--budget LIMITS` | `syntax=N` malformed submissions (3), `semantic=N` rejected ones (5), `steps=N` (100), `tokens=N`, `cost=X` dollars, `wall=S` (or `90s`, `5m`, `1h`) |
-| `--memo`, `--memo-file PATH` | reuse the cached result of an identical earlier task: same prompt, schema, checks and contents of the listed files |
+| `--memo`, `--memo-file PATH` | reuse the cached result of an identical earlier task: same prompt, schema, checks, model and workspace (the contents of the listed files, or without any the git state: HEAD, `git status`, the diffs and untracked files). The checks run again on a cached result, and one that fails is discarded. Results are kept in `~/.nyq/cache/`, never in the workspace; outside a git repository `--memo` needs `--memo-file` |
 
 When a task stalls (repeated rejections, a red build that doesn't improve, or the
 same actions in a loop), nyq climbs an escalation ladder: a nudge, a cheap progress
@@ -601,9 +601,12 @@ embedded QuickJS without file, network or process access, that calls your tools 
 description, shown as menus). `/undo` reverts nyq's file changes one at a time;
 `/copy` copies the last answer.
 
-Edits and overwrites of an existing file need a read of it earlier in the session,
-and are refused when the file changed on disk since (`read_before_edit = false`
-turns this off).
+Edits and overwrites of an existing file need a read of it earlier in the session
+(`read_file`, or `open`/`focus` in the working set), and are refused when the file
+changed on disk since (`read_before_edit = false` turns this off). A binary file
+can't be read as text, so `read_file` reporting it as binary, or a `list_dir` or
+`glob` listing it, is enough to overwrite or delete it. Each subagent keeps its own
+record: it reads a file before editing it even when its parent already did.
 
 **Working set.** `open` adds a file to the working set, `focus` shows it in full,
 `unfocus` turns it back into an outline, `close` drops it, and `workset` lists them.
@@ -933,6 +936,15 @@ The part before `when` is any rule pattern or an effect (`exec`, `net`, `write`,
 `read`). `"taint": {"mode": "strict"}` adds two built-in rules (`ask` for
 `exec when tainted-by:web` and `net when tainted-by:mcp`), and
 `"workspace_files": "untrusted"` treats workspace files as untrusted too.
+
+Taint follows work that is handed on. A `subagent` call has the `exec`, `net`
+and `write` effects; when its task copies untrusted text, the child starts out
+knowing that, so its own calls that copy the task are tainted the same way, and
+its classifier sees the task as evidence and your request to the parent as the
+only authorization. A `run_code` or `workflow` script has every effect; once one
+of its tool calls has returned untrusted content, every later call in the script
+is tainted by it, whatever its text, and the script's result keeps the labels of
+everything its calls returned (also after a resume).
 
 A project may add rules in `.nyq/permissions.json`, but only `ask` and `deny`: an
 `allow` there is ignored, so a repository can't grant itself permissions. A
