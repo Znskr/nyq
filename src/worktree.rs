@@ -47,6 +47,41 @@ pub enum Merge {
     Conflict { files: Vec<String>, detail: String },
 }
 
+/// Config every nyq-run `git` gets, ahead of its own arguments: diff output
+/// must not depend on the user's (or a repository's) porcelain settings, and
+/// no hook may run.
+const NEUTRAL_CONFIG: [&str; 8] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.mnemonicPrefix=false",
+    "-c",
+    "diff.external=",
+];
+
+/// Environment for the same purpose: no user or system git config at all.
+const NEUTRAL_ENV: [(&str, &str); 5] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_EXTERNAL_DIFF", ""),
+];
+
+/// Flags that make `git diff` print a plain, applyable patch whatever the
+/// config or a `.gitattributes` in the (child-controlled) tree says.
+const PATCH_FLAGS: [&str; 7] = [
+    "--binary",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+];
+
 async fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = git_raw(dir, args, None).await?;
     if !out.status.success() {
@@ -62,11 +97,12 @@ async fn git(dir: &Path, args: &[&str]) -> Result<String> {
 async fn git_raw(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<std::process::Output> {
     use tokio::io::AsyncWriteExt;
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C")
+    cmd.args(NEUTRAL_CONFIG)
+        .arg("-C")
         .arg(dir)
         .args(args)
-        // A user's hooks, pager or editor must not run or block here.
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(NEUTRAL_ENV)
+        // A user's pager or editor must not run or block here.
         .env("GIT_EDITOR", "true")
         .env("GIT_PAGER", "cat")
         .stdin(if stdin.is_some() {
@@ -160,14 +196,22 @@ impl Worktree {
             bail!("worktree {} is gone", self.path.display());
         }
         git(&self.path, &["add", "-A"]).await?;
-        let patch = git(
-            &self.path,
-            &["diff", "--cached", "--binary", "--no-color", &self.base],
-        )
-        .await?;
+        let mut args = vec!["diff", "--cached"];
+        args.extend(PATCH_FLAGS);
+        args.push(&self.base);
+        let patch = git(&self.path, &args).await?;
         let stat = git(
             &self.path,
-            &["diff", "--cached", "--stat", "--no-color", &self.base],
+            &[
+                "diff",
+                "--cached",
+                "--stat",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                &self.base,
+            ],
         )
         .await?;
         Ok((patch, stat.trim_end().to_string()))
@@ -209,13 +253,18 @@ impl Worktree {
     /// when there is nothing to apply) the worktree is removed; on conflict
     /// nothing is written and it is kept for inspection.
     /// Files about to change are snapshotted into `undo` first.
-    pub async fn merge(&self, undo: &mut crate::undo::UndoLog) -> Result<Merge> {
+    ///
+    /// `roots` are the parent's writable roots: a patch touching a path
+    /// outside them is refused (the worktree is made from the repository
+    /// root, which may be wider than the parent's cwd).
+    pub async fn merge(&self, undo: &mut crate::undo::UndoLog, roots: &[PathBuf]) -> Result<Merge> {
         let (patch, stat) = self.diff().await?;
         if patch.trim().is_empty() {
             self.remove()?;
             return Ok(Merge::Empty);
         }
-        let files = patch_files(&patch);
+        let files = self.patch_files(&patch).await?;
+        check_roots(&self.repo, &files, roots)?;
         let check = git_raw(
             &self.repo,
             &["apply", "--check", "--binary", "--whitespace=nowarn", "-"],
@@ -257,15 +306,42 @@ impl Worktree {
         Ok(Merge::Applied { files, stat })
     }
 
+    /// Paths the patch touches, as git itself reads them (`apply --numstat -z`
+    /// is NUL-separated and unquoted, unlike the `diff --git` headers).
+    async fn patch_files(&self, patch: &str) -> Result<Vec<String>> {
+        let out = git_raw(
+            &self.repo,
+            &["apply", "--numstat", "-z", "--binary", "-"],
+            Some(patch.as_bytes()),
+        )
+        .await?;
+        if !out.status.success() {
+            // An unreadable patch is a conflict later; list what the headers say.
+            return Ok(header_files(patch));
+        }
+        let mut files: Vec<String> = Vec::new();
+        for rec in out.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let text = String::from_utf8_lossy(rec);
+            // "<added>\t<deleted>\t<path>"
+            if let Some(path) = text.splitn(3, '\t').nth(2) {
+                if !files.iter().any(|f| f == path) {
+                    files.push(path.to_string());
+                }
+            }
+        }
+        Ok(files)
+    }
+
     /// Remove the worktree and its branch. Missing pieces are not an error.
     /// Blocking but quick; also used from the synchronous `/agents stop`.
     pub fn remove(&self) -> Result<()> {
         let git = |args: &[&str]| {
             std::process::Command::new("git")
+                .args(NEUTRAL_CONFIG)
                 .arg("-C")
                 .arg(&self.repo)
                 .args(args)
-                .env("GIT_TERMINAL_PROMPT", "0")
+                .envs(NEUTRAL_ENV)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
@@ -286,8 +362,39 @@ impl Worktree {
     }
 }
 
+/// Refuse patch paths that leave the parent's writable roots (or touch git
+/// metadata). Paths are relative to the repository root.
+fn check_roots(repo: &Path, files: &[String], roots: &[PathBuf]) -> Result<()> {
+    use std::path::Component;
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
+        .collect();
+    for f in files {
+        let rel = Path::new(f);
+        let plain = rel
+            .components()
+            .all(|c| matches!(c, Component::Normal(n) if n != ".git"));
+        if !plain || rel.as_os_str().is_empty() {
+            bail!("the patch touches `{f}`, which is not a plain path inside the workspace; nothing was written");
+        }
+        let abs = repo.join(rel);
+        if !roots.iter().any(|root| abs.starts_with(root)) {
+            bail!(
+                "the patch touches `{f}`, outside your writable roots ({}); nothing was written and the worktree is kept",
+                roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Paths a patch touches, from its `diff --git a/x b/y` headers.
-fn patch_files(patch: &str) -> Vec<String> {
+fn header_files(patch: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("diff --git a/") {
@@ -402,7 +509,11 @@ pub(crate) mod tests {
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
             "one\ntwo\nthree\n"
         );
-        match wt.merge(&mut Default::default()).await.unwrap() {
+        match wt
+            .merge(&mut Default::default(), &[d.path().to_path_buf()])
+            .await
+            .unwrap()
+        {
             Merge::Applied { files, .. } => {
                 assert_eq!(files, ["a.txt", "new.txt"]);
             }
@@ -429,7 +540,10 @@ pub(crate) mod tests {
         std::fs::write(wt.path.join("b.txt"), "child file\n").unwrap();
         // The parent edits the same line meanwhile.
         std::fs::write(d.path().join("a.txt"), "one\nparent\nthree\n").unwrap();
-        let merge = wt.merge(&mut Default::default()).await.unwrap();
+        let merge = wt
+            .merge(&mut Default::default(), &[d.path().to_path_buf()])
+            .await
+            .unwrap();
         match &merge {
             Merge::Conflict { files, detail } => {
                 assert_eq!(files, &["a.txt"], "{detail}");
@@ -455,7 +569,9 @@ pub(crate) mod tests {
         let wt = create(d.path(), "idle").await.unwrap();
         assert!(wt.summary("idle").await.contains("no changes"));
         assert_eq!(
-            wt.merge(&mut Default::default()).await.unwrap(),
+            wt.merge(&mut Default::default(), &[d.path().to_path_buf()])
+                .await
+                .unwrap(),
             Merge::Empty
         );
         assert!(!wt.path.exists());
@@ -468,5 +584,161 @@ pub(crate) mod tests {
     fn parses_apply_errors() {
         let err = "error: patch failed: src/a.rs:3\nerror: src/a.rs: patch does not apply\nerror: b.txt: already exists in working directory\n";
         assert_eq!(conflict_files(err), ["src/a.rs", "b.txt"]);
+    }
+
+    fn write(dir: &Path, rel: &str, text: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    fn read(dir: &Path, rel: &str) -> String {
+        std::fs::read_to_string(dir.join(rel)).unwrap()
+    }
+
+    /// Child changes: a nested new file plus an edit.
+    fn child_edits(wt: &Worktree) {
+        write(&wt.path, "src/sub/only_new.txt", "brand new\n");
+        write(&wt.path, "a.txt", "one\nTWO\nthree\n");
+    }
+
+    fn assert_merged_in_place(d: &Path) {
+        assert_eq!(read(d, "src/sub/only_new.txt"), "brand new\n");
+        assert!(!d.join("sub/only_new.txt").exists());
+        assert_eq!(read(d, "a.txt"), "one\nTWO\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn repo_diff_config_does_not_change_the_merge() {
+        let d = repo();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(d.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        let ext = d.path().join("ext.sh");
+        std::fs::write(&ext, "#!/bin/sh\necho EXTERNAL DIFF OUTPUT\n").unwrap();
+        run(&["config", "diff.noprefix", "true"]);
+        run(&["config", "diff.mnemonicPrefix", "true"]);
+        run(&["config", "diff.external", &format!("sh {}", ext.display())]);
+        // A textconv driver selected by the child's own .gitattributes.
+        run(&["config", "diff.evil.textconv", "echo CONVERTED #"]);
+        let wt = create(d.path(), "cfg").await.unwrap();
+        child_edits(&wt);
+        write(&wt.path, ".gitattributes", "*.txt diff=evil\n");
+        let (patch, _) = wt.diff().await.unwrap();
+        assert!(
+            !patch.contains("EXTERNAL") && !patch.contains("CONVERTED"),
+            "{patch}"
+        );
+        assert!(patch.contains("diff --git a/src/sub/only_new.txt b/src/sub/only_new.txt"));
+        let merged = wt
+            .merge(&mut Default::default(), &[d.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(matches!(merged, Merge::Applied { .. }), "{merged:?}");
+        assert_merged_in_place(d.path());
+        assert_eq!(read(d.path(), ".gitattributes"), "*.txt diff=evil\n");
+    }
+
+    /// The user's own gitconfig (HOME) must not leak into the patch either.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Serializes env-var mutation.
+    async fn user_gitconfig_noprefix_and_external_diff_are_ignored() {
+        let _lock = crate::provider::sse::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let ext = home.path().join("ext.sh");
+        std::fs::write(&ext, "#!/bin/sh\necho EXTERNAL DIFF OUTPUT\n").unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            format!(
+                "[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n\texternal = sh {}\n",
+                ext.display()
+            ),
+        )
+        .unwrap();
+        let old: Vec<_> = ["HOME", "XDG_CONFIG_HOME"]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("XDG_CONFIG_HOME", home.path().join("xdg"));
+        let d = repo();
+        let result = async {
+            let wt = create(d.path(), "home").await.unwrap();
+            child_edits(&wt);
+            wt.merge(&mut Default::default(), &[d.path().to_path_buf()])
+                .await
+        }
+        .await;
+        for (k, v) in old {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let merged = result.unwrap();
+        assert!(matches!(merged, Merge::Applied { .. }), "{merged:?}");
+        assert_merged_in_place(d.path());
+    }
+
+    #[tokio::test]
+    async fn patch_outside_the_parents_roots_is_rejected() {
+        let d = repo();
+        write(d.path(), "sub/in.txt", "in\n");
+        write(d.path(), "other/out.txt", "out\n");
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(d.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "more"]);
+        let wt = create(d.path(), "scoped").await.unwrap();
+        write(&wt.path, "sub/in.txt", "in changed\n");
+        write(&wt.path, "other/out.txt", "out changed\n");
+        let roots = [d.path().join("sub")];
+        let err = wt
+            .merge(&mut Default::default(), &roots)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("other/out.txt") && err.contains("outside"),
+            "{err}"
+        );
+        // Nothing written, worktree kept.
+        assert_eq!(read(d.path(), "sub/in.txt"), "in\n");
+        assert_eq!(read(d.path(), "other/out.txt"), "out\n");
+        assert!(wt.path.is_dir());
+        // Narrowing the child's work to the root merges fine.
+        write(&wt.path, "other/out.txt", "out\n");
+        let merged = wt.merge(&mut Default::default(), &roots).await.unwrap();
+        assert!(matches!(merged, Merge::Applied { .. }), "{merged:?}");
+        assert_eq!(read(d.path(), "sub/in.txt"), "in changed\n");
+    }
+
+    #[test]
+    fn check_roots_rejects_escapes_and_git_metadata() {
+        let repo = Path::new("/r");
+        let roots = [PathBuf::from("/r")];
+        let ok = |f: &str| check_roots(repo, &[f.to_string()], &roots);
+        assert!(ok("src/a.rs").is_ok());
+        assert!(ok("../x").is_err());
+        assert!(ok("/etc/passwd").is_err());
+        assert!(ok(".git/hooks/pre-commit").is_err());
+        assert!(ok("a/.git/config").is_err());
+        assert!(check_roots(repo, &["src/a.rs".into()], &[PathBuf::from("/r/lib")]).is_err());
     }
 }
