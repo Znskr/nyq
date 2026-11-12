@@ -161,7 +161,7 @@ fn a_schema_task_on_a_cargo_crate_prints_the_validated_json() {
     assert_eq!(printed, result, "stdout is the validated value alone");
 
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 3);
+    assert_eq!(seen.len(), 4);
     let tools: Vec<&str> = seen[0]["tools"]
         .as_array()
         .unwrap()
