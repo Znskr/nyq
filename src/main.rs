@@ -40,6 +40,7 @@ mod skill_invoke;
 mod skills;
 mod slash;
 mod subagents;
+mod task;
 mod templates;
 mod tool_list;
 mod tools;
