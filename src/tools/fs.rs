@@ -1275,8 +1275,55 @@ struct PlannedFile {
     plan: Planned,
 }
 
+/// How a file was first touched by a patch, for files named more than once.
+#[derive(Clone, Copy)]
+enum Touched {
+    /// Updated; planned at this index. Later updates fold into it.
+    Updated(usize),
+    Added,
+    Deleted,
+}
+
+impl Touched {
+    fn verb(self) -> &'static str {
+        match self {
+            Touched::Updated(_) => "update",
+            Touched::Added => "add",
+            Touched::Deleted => "delete",
+        }
+    }
+}
+
+fn change_verb(change: &super::patch::Change) -> &'static str {
+    match change {
+        super::patch::Change::Update(_) => "update",
+        super::patch::Change::Create(_) => "add",
+        super::patch::Change::Delete => "delete",
+    }
+}
+
+/// One key per file however a patch spells it (`f.txt`, `./f.txt`, an
+/// absolute path, a symlink to it): the canonical path, or for a file that
+/// does not exist yet its canonical parent plus its name.
+fn patch_key(path: &Path) -> PathBuf {
+    if let Ok(p) = fs::canonicalize(path) {
+        return p;
+    }
+    let lexical: PathBuf = path.components().collect();
+    match (lexical.parent(), lexical.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or(lexical),
+        _ => lexical,
+    }
+}
+
 /// Parse `args` and compute every file's outcome without writing. Also the
 /// preview's source of truth, so what the approver sees is what runs.
+///
+/// A file may have several update sections: they are applied in order to one
+/// in-memory buffer, so every one of them lands. Any other repeat (add then
+/// update, anything after a delete, a second add) is refused.
 fn plan_patch(ctx: &ToolCtx, args: &Value) -> Result<Vec<PlannedFile>, ToolOutput> {
     let Some(text) = args.get("patch").and_then(Value::as_str) else {
         return Err(ToolOutput::err(
@@ -1285,12 +1332,47 @@ fn plan_patch(ctx: &ToolCtx, args: &Value) -> Result<Vec<PlannedFile>, ToolOutpu
     };
     let files =
         super::patch::parse(text).map_err(|e| ToolOutput::err(format!("apply_patch: {e}")))?;
-    let mut planned = Vec::with_capacity(files.len());
+    let mut planned: Vec<PlannedFile> = Vec::with_capacity(files.len());
+    let mut touched: HashMap<PathBuf, Touched> = HashMap::new();
     for file in &files {
         let path = resolve(&ctx.cwd, &file.path);
         if let Some(msg) = sandbox_denied(ctx, &file.path, &path, "apply_patch") {
             return Err(ToolOutput::err(msg));
         }
+        let key = patch_key(&path);
+        match (touched.get(&key).copied(), &file.change) {
+            (None, _) => {}
+            (Some(Touched::Updated(i)), super::patch::Change::Update(_)) => {
+                let Planned::Write { bytes } = &planned[i].plan else {
+                    unreachable!("an updated file is planned as a write");
+                };
+                // Earlier sections produced this text from UTF-8 text.
+                let old = String::from_utf8_lossy(bytes).into_owned();
+                let new = super::patch::apply(&file.path, &old, &file.change)
+                    .map_err(|e| ToolOutput::err(format!("apply_patch: {e}")))?;
+                planned[i].plan = Planned::Write {
+                    bytes: new.into_bytes(),
+                };
+                continue;
+            }
+            (Some(first), change) => {
+                return Err(ToolOutput::err(format!(
+                    "apply_patch: {} appears more than once in this patch ({}, then {}). Only \
+                     repeated updates of one file are combined; merge these sections into one.",
+                    display_path(&path),
+                    first.verb(),
+                    change_verb(change)
+                )));
+            }
+        }
+        touched.insert(
+            key,
+            match &file.change {
+                super::patch::Change::Update(_) => Touched::Updated(planned.len()),
+                super::patch::Change::Create(_) => Touched::Added,
+                super::patch::Change::Delete => Touched::Deleted,
+            },
+        );
         match &file.change {
             super::patch::Change::Create(lines) => {
                 if path.exists() {
@@ -1314,6 +1396,16 @@ fn plan_patch(ctx: &ToolCtx, args: &Value) -> Result<Vec<PlannedFile>, ToolOutpu
                 if !path.exists() {
                     return Err(ToolOutput::err(format!(
                         "apply_patch: file not found: {}",
+                        display_path(&path)
+                    )));
+                }
+                // Restoring a deleted file after a later file fails needs its
+                // whole contents in memory; above the cap it would come back
+                // truncated, so it must be deleted on its own.
+                if files.len() > 1 && fs::metadata(&path).is_ok_and(|m| m.len() > MAX_SCAN_BYTES) {
+                    return Err(ToolOutput::err(format!(
+                        "apply_patch: {} is larger than 8 MiB and could not be restored if \
+                         another file in this patch failed. Delete it in a patch of its own.",
                         display_path(&path)
                     )));
                 }
@@ -1447,11 +1539,34 @@ impl Tool for ApplyPatch {
             Err(e) => return e,
         };
         let preview = patch_preview(ctx, &args).unwrap_or_default();
-        // Snapshot for rollback, then write. A failure after some commits
-        // restores them best-effort.
+        // Snapshot every file for rollback before the first write; a file
+        // that cannot be snapshotted whole stops the patch before anything
+        // changes. A failure after some commits restores them best-effort.
+        let mut snapshots = Vec::with_capacity(planned.len());
+        if planned.len() > 1 {
+            for file in &planned {
+                match super::safeio::read_capped(&file.path, MAX_SCAN_BYTES) {
+                    Ok(bytes) if bytes.len() as u64 > MAX_SCAN_BYTES => {
+                        return ToolOutput::err(format!(
+                            "apply_patch: {} is larger than 8 MiB and could not be restored if \
+                             another file in this patch failed; nothing was changed.",
+                            display_path(&file.path)
+                        ));
+                    }
+                    Ok(bytes) => snapshots.push(Some(bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => snapshots.push(None),
+                    Err(e) => {
+                        return ToolOutput::err(format!(
+                            "apply_patch: {e}: {} (nothing was changed)",
+                            display_path(&file.path)
+                        ));
+                    }
+                }
+            }
+        }
         let mut done: Vec<(PathBuf, String, Option<Vec<u8>>)> = Vec::new();
-        for file in &planned {
-            let before = super::safeio::read_capped(&file.path, MAX_SCAN_BYTES).ok();
+        for (i, file) in planned.iter().enumerate() {
+            let before = snapshots.get_mut(i).and_then(Option::take);
             let result = match &file.plan {
                 Planned::Write { bytes } => commit_bytes(ctx, &file.user_path, &file.path, bytes),
                 Planned::Delete => commit_delete(ctx, &file.user_path, &file.path),
@@ -2058,6 +2173,161 @@ diff --git a/a.txt b/a.txt
             std::fs::read_to_string(dir.path().join("notes.md")).unwrap(),
             "hello\n"
         );
+    }
+
+    #[test]
+    fn apply_patch_folds_repeated_updates_of_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        prime(&c, "f.txt");
+        let patch = "\
+*** Begin Patch
+*** Update File: f.txt
+-one
++ONE
+ two
+*** Update File: f.txt
+ two
+-three
++THREE
+*** End Patch
+";
+        let args = json!({"patch": patch});
+        let preview = ApplyPatch.preview(&args, &c).unwrap();
+        assert!(
+            preview.contains("+ONE") && preview.contains("+THREE"),
+            "{preview}"
+        );
+        let out = run_ctx(&ApplyPatch, args, &c);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("Patched 1 file(s)"), "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "ONE\ntwo\nTHREE\n"
+        );
+
+        // Different spellings of one file fold too (unified diff), in order:
+        // the second section sees the first one's result.
+        prime(&c, "f.txt");
+        let abs = dir.path().join("f.txt");
+        let patch = format!(
+            "--- a/./f.txt\n+++ b/./f.txt\n@@ -1 +1 @@\n-ONE\n+uno\n\
+             --- {0}\n+++ {0}\n@@ -1 +1 @@\n-uno\n+eins\n",
+            abs.display()
+        );
+        let out = run_ctx(&ApplyPatch, json!({"patch": patch}), &c);
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "eins\ntwo\nTHREE\n");
+    }
+
+    #[test]
+    fn apply_patch_refuses_other_repeats_of_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        std::fs::write(dir.path().join("d.txt"), "gone\n").unwrap();
+        prime(&c, "d.txt");
+        let cases = [
+            (
+                "*** Begin Patch\n*** Add File: n.txt\n+a\n*** Update File: n.txt\n-a\n+b\n*** End Patch\n",
+                "(add, then update)",
+            ),
+            (
+                "*** Begin Patch\n*** Delete File: d.txt\n*** Update File: d.txt\n-gone\n+back\n*** End Patch\n",
+                "(delete, then update)",
+            ),
+            (
+                "*** Begin Patch\n*** Delete File: d.txt\n*** Add File: d.txt\n+new\n*** End Patch\n",
+                "(delete, then add)",
+            ),
+            (
+                "*** Begin Patch\n*** Add File: n.txt\n+a\n*** Add File: ./n.txt\n+b\n*** End Patch\n",
+                "(add, then add)",
+            ),
+        ];
+        for (patch, want) in cases {
+            let out = run_ctx(&ApplyPatch, json!({"patch": patch}), &c);
+            assert!(
+                out.is_error
+                    && out.content.contains("more than once")
+                    && out.content.contains(want),
+                "{want}: {}",
+                out.content
+            );
+            assert!(!dir.path().join("n.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("d.txt")).unwrap(),
+                "gone\n"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_patch_never_deletes_a_file_it_cannot_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        let big = vec![b'x'; MAX_SCAN_BYTES as usize + 4096];
+        std::fs::write(dir.path().join("big.bin"), &big).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        prime(&c, "a.txt");
+        c.file_ledger.note(&dir.path().join("big.bin"));
+        let patch = "\
+*** Begin Patch
+*** Delete File: big.bin
+*** Update File: a.txt
+-a
++b
+*** End Patch
+";
+        let out = run_ctx(&ApplyPatch, json!({"patch": patch}), &c);
+        assert!(
+            out.is_error && out.content.contains("larger than 8 MiB"),
+            "{}",
+            out.content
+        );
+        assert_eq!(std::fs::read(dir.path().join("big.bin")).unwrap(), big);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\n"
+        );
+        // On its own it needs no rollback and is allowed.
+        let patch = "*** Begin Patch\n*** Delete File: big.bin\n*** End Patch\n";
+        let out = run_ctx(&ApplyPatch, json!({"patch": patch}), &c);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!dir.path().join("big.bin").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_rollback_restores_a_deleted_file_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        // Below the cap, but well over any small read buffer.
+        let body: Vec<u8> = (0..3_000_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        std::fs::write(dir.path().join("del.txt"), &body).unwrap();
+        c.file_ledger.note(&dir.path().join("del.txt"));
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(ro.join("probe"), "x").is_ok() {
+            return; // running as root: the write would not fail
+        }
+        let patch = "\
+*** Begin Patch
+*** Delete File: del.txt
+*** Add File: ro/new.txt
++x
+*** End Patch
+";
+        let out = run_ctx(&ApplyPatch, json!({"patch": patch}), &c);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            out.is_error && out.content.contains("restored"),
+            "{}",
+            out.content
+        );
+        assert_eq!(std::fs::read(dir.path().join("del.txt")).unwrap(), body);
     }
 
     #[test]

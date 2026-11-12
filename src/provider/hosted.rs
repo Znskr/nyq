@@ -792,6 +792,11 @@ impl Provider for HostedProvider {
         })
     }
     fn set_conversation(&mut self, id: &str) {
+        if self.session != id {
+            // Another conversation (`/new`, `/resume`): DeepSeek's remembered
+            // system and tool baselines belong to the old one.
+            *self.deepseek.lock().unwrap_or_else(|e| e.into_inner()) = deepseek::State::default();
+        }
         self.session = id.to_string();
     }
     fn fork(&self) -> Box<dyn Provider> {
@@ -1370,6 +1375,74 @@ mod tests {
         assert_eq!(p.efforts(), ["off", "low", "high", "max"]);
         assert_eq!(p.context_window(), Some(1_048_576));
         assert_eq!(p.protocol(), Protocol::Anthropic);
+    }
+
+    #[tokio::test]
+    async fn deepseek_wire_state_follows_the_conversation() {
+        let reply = events(&[
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hi"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let listing = json!({"data":[{"id":"deepseek-flash","api_capabilities":{"anthropic_messages":{"system_prompt_update":"in-history","tool_update":"addition-only"}}}]});
+        let (url, mut requests, task) = server(vec![
+            (200, listing.to_string()),
+            (200, reply.clone()),
+            (200, reply.clone()),
+            (200, reply),
+        ])
+        .await;
+        let mut p = provider(
+            Service::DeepSeek,
+            &format!("{url}/anthropic/v1"),
+            "deepseek-flash",
+        );
+        let history = [
+            Item::user("hi"),
+            Item::Assistant { text: "hey".into() },
+            Item::user("more"),
+        ];
+        async fn send(p: &HostedProvider, system: &str, items: &[Item]) {
+            let req = Request {
+                system,
+                items,
+                tools: &[],
+            };
+            p.stream(req, &mut |_| {}).await.unwrap();
+        }
+        p.set_conversation("conv-a");
+        send(&p, "P1", &history[..1]).await;
+        p.set_conversation("conv-a");
+        send(&p, "P2", &history).await;
+        // `/new` (or `/resume`) binds another conversation, here one that
+        // opens with the same words, so only the new id can tell.
+        p.set_conversation("conv-b");
+        send(&p, "P2", &history[..1]).await;
+        let _listing = requests.recv().await.unwrap();
+        let bodies: Vec<Value> = [
+            requests.recv().await.unwrap(),
+            requests.recv().await.unwrap(),
+            requests.recv().await.unwrap(),
+        ]
+        .iter()
+        .map(|r| body_of(r))
+        .collect();
+        task.await.unwrap();
+        let system_messages = |b: &Value| {
+            b["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "system")
+                .count()
+        };
+        // Within one conversation the leading system stays; the change rides
+        // the history.
+        assert_eq!(bodies[1]["system"], "P1");
+        assert_eq!(system_messages(&bodies[1]), 1);
+        // The new conversation leads with the current prompt, sent once.
+        assert_eq!(bodies[2]["system"], "P2");
+        assert_eq!(system_messages(&bodies[2]), 0);
     }
 
     #[tokio::test]

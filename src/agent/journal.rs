@@ -80,7 +80,7 @@ impl Agent {
         }
     }
 
-    /// Mark a compaction as done, after its summary is saved.
+    /// Mark a compaction as done, after its summary and kept tail are saved.
     pub(super) fn compaction_ended(&mut self) {
         if let Some(session) = &mut self.session {
             report("compaction marker", session.compaction_end());
