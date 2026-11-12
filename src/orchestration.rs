@@ -277,6 +277,27 @@ pub fn writer(cwd: &Path) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// Tools that never take the workspace writer lease: reads, and tools that
+/// only coordinate other work (delegation, the team graph, scripts whose
+/// sub-calls take the lease themselves). Holding it while waiting for a
+/// child that needs it would deadlock.
+pub const COORDINATION_TOOLS: &[&str] = &[
+    "subagent",
+    "team_task_create",
+    "team_task_list",
+    "team_task_claim",
+    "team_task_update",
+    "send_message",
+    "wait_agent",
+    "run_code",
+    "workflow",
+];
+
+/// Whether a call to `name` must hold the per-workspace writer lease.
+pub fn takes_writer(name: &str) -> bool {
+    !COORDINATION_TOOLS.contains(&name) && !crate::permissions::is_read_tool(name)
+}
+
 /// Child contexts inherit the parent's usage session ID, not its journal path.
 pub fn enabled(session_id: &str) -> bool {
     STORES.get().is_some_and(|stores| {

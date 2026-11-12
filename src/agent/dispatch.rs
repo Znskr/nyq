@@ -87,7 +87,7 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
         return ToolOutput::err("Background commands are unavailable during child orchestration: run a bounded foreground command so its writer lease covers its lifetime.");
     }
     let writer = crate::orchestration::writer(&ready.ctx.cwd);
-    let _lease = if ready.name != "subagent" && !crate::permissions::is_read_tool(&ready.name) {
+    let _lease = if crate::orchestration::takes_writer(&ready.name) {
         Some(tokio::select! {
             lock = writer.lock() => lock,
             _ = cancel.cancelled() => return ToolOutput::err("Cancelled waiting for workspace writer"),

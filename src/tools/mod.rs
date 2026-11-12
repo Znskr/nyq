@@ -14,6 +14,7 @@ pub(crate) mod redact;
 pub(crate) mod safeio;
 mod search;
 pub mod subagent;
+pub(crate) mod team;
 pub mod web;
 
 use std::collections::{BTreeMap, HashSet};
@@ -434,6 +435,7 @@ impl Registry {
         image::register(&mut r);
         web::register(&mut r);
         subagent::register(&mut r);
+        team::register(&mut r);
         r
     }
 
