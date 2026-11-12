@@ -3,15 +3,13 @@
 //! (`settle`), and recording results.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::ask::{ask_user, questions};
-use super::permission_rules::{
-    grant_rule_in, inside, inside_any, is_file_tool, lexical, rule_label,
-};
+use super::permission_rules::{grant_rule_in, inside, inside_any, rule_label};
 use super::{Agent, Approval, ApprovalRequest, Ui, ASK_USER};
 use crate::permissions::Decision;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
@@ -23,33 +21,117 @@ const REPEAT_LIMIT: usize = 3;
 /// Nested instruction files are cut to this many characters.
 const NESTED_INSTRUCTIONS_MAX: usize = 64 * 1024;
 
-/// Tools that only read, so consecutive calls to them can run at once.
-const PARALLEL_TOOLS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "glob",
-    "grep",
-    "view_image",
-    "web_fetch",
-    "web_search",
-    crate::tools::artifacts::TOOL,
-    "skill",
-];
+/// `p` resolved against `cwd` and normalized lexically, so different
+/// spellings of one file compare equal in the wave's conflict sets.
+fn norm_path(cwd: &Path, p: &Path) -> PathBuf {
+    let full = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    let mut out = PathBuf::new();
+    for c in full.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
 
-/// Whether this call may run alongside its read-only neighbours: read tools,
-/// and subagent runs (independent by contract).
-fn runs_in_parallel(name: &str, arguments: &str) -> bool {
-    if PARALLEL_TOOLS.contains(&name) {
-        return true;
+/// A call's wave footprint: its class plus the normalized paths it reads
+/// and writes (empty for classes that carry none).
+#[derive(Clone)]
+struct Footprint {
+    class: crate::tools::Concurrency,
+    reads: Vec<PathBuf>,
+    writes: Vec<PathBuf>,
+}
+
+impl Footprint {
+    /// A call that touches nothing: answered without running.
+    fn vacant() -> Self {
+        Self {
+            class: crate::tools::Concurrency::Pure,
+            reads: Vec::new(),
+            writes: Vec::new(),
+        }
     }
-    if name != "subagent" {
-        return false;
+}
+
+/// Two paths conflict when one covers the other (a directory read and a
+/// file write beneath it do).
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// The filesystem scope a wave already has in flight, for conflict checks.
+#[derive(Default)]
+struct Busy {
+    reads: Vec<PathBuf>,
+    writes: Vec<PathBuf>,
+    /// A member reads an unbounded scope (a `ReadFs` call that cannot list
+    /// its paths); any write must assume a conflict with it.
+    unbounded_reads: bool,
+    /// An `Exec` or `Barrier` member already fills the wave: it runs alone.
+    solo: bool,
+}
+
+impl Busy {
+    /// Whether `candidate` may share the wave: `Pure` and `ReadFs` never
+    /// write; a `WriteFs` joins only when none of the paths it touches
+    /// collides with the wave's writes or its writes with the wave's reads.
+    /// `Exec` and `Barrier` never share.
+    fn accepts(&self, candidate: &Footprint) -> bool {
+        use crate::tools::Concurrency;
+        if self.solo {
+            return false;
+        }
+        match &candidate.class {
+            Concurrency::Exec | Concurrency::Barrier => return false,
+            Concurrency::Pure => return true,
+            _ => {}
+        }
+        if self.writes.iter().any(|w| {
+            candidate
+                .reads
+                .iter()
+                .chain(&candidate.writes)
+                .any(|p| overlaps(p, w))
+        }) {
+            return false;
+        }
+        if !candidate.writes.is_empty()
+            && (self.unbounded_reads
+                || self
+                    .reads
+                    .iter()
+                    .any(|r| candidate.writes.iter().any(|w| overlaps(w, r))))
+        {
+            return false;
+        }
+        // A read whose scope the tool cannot enumerate conflicts with any
+        // write already in the wave.
+        matches!(&candidate.class, Concurrency::WriteFs(_))
+            || !candidate.reads.is_empty()
+            || self.writes.is_empty()
     }
-    let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-    matches!(
-        args.get("action").and_then(Value::as_str),
-        None | Some("run")
-    )
+
+    fn add(&mut self, candidate: &Footprint) {
+        use crate::tools::Concurrency;
+        if matches!(candidate.class, Concurrency::Exec | Concurrency::Barrier) {
+            self.solo = true;
+            return;
+        }
+        self.reads.extend(candidate.reads.iter().cloned());
+        self.writes.extend(candidate.writes.iter().cloned());
+        if matches!(candidate.class, Concurrency::ReadFs) && candidate.reads.is_empty() {
+            self.unbounded_reads = true;
+        }
+    }
 }
 
 /// An approved call, ready to run.
@@ -60,6 +142,8 @@ struct Ready {
     args: Value,
     ctx: ToolCtx,
     summary: String,
+    /// The call's scheduling class and touched paths (normalized).
+    footprint: Footprint,
     /// Arguments for the PostToolUse hook, when one observes this tool.
     hook_args: Option<Value>,
     /// The note the user attached when approving, passed on with the result.
@@ -68,10 +152,33 @@ struct Ready {
     taint: std::collections::BTreeSet<crate::taint::Label>,
 }
 
+impl Ready {
+    /// Every filesystem path the call touches (its reads and its writes),
+    /// for nested-instruction lookup.
+    fn touched(&self) -> Vec<PathBuf> {
+        self.footprint
+            .reads
+            .iter()
+            .chain(&self.footprint.writes)
+            .cloned()
+            .collect()
+    }
+}
+
 enum Prepared {
     /// Answered without running the tool.
     Done(ToolOutput),
     Run(Box<Ready>),
+}
+
+impl Prepared {
+    /// The wave footprint: `Done` calls touch nothing and always fit.
+    fn footprint(&self) -> Footprint {
+        match self {
+            Prepared::Done(_) => Footprint::vacant(),
+            Prepared::Run(ready) => ready.footprint.clone(),
+        }
+    }
 }
 
 async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) -> ToolOutput {
@@ -91,20 +198,26 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
         return ToolOutput::err("Background commands are unavailable during child orchestration: run a bounded foreground command so its writer lease covers its lifetime.");
     }
     let writer = crate::orchestration::writer(&ready.ctx.cwd);
-    let _lease = if ready.name != "subagent" && !crate::permissions::is_read_tool(&ready.name) {
-        Some(tokio::select! {
-            lock = writer.lock() => lock,
+    let _lease = match &ready.footprint.class {
+        // Reads and pure calls hold no lock. Declared writers share the
+        // gate through per-path mutexes; undeclared writers exclude all.
+        crate::tools::Concurrency::Pure | crate::tools::Concurrency::ReadFs => None,
+        crate::tools::Concurrency::WriteFs(paths) => Some(tokio::select! {
+            guard = writer.lock_paths(paths) => guard,
             _ = cancel.cancelled() => return ToolOutput::err("Cancelled waiting for workspace writer"),
-        })
-    } else {
-        None
+        }),
+        crate::tools::Concurrency::Exec | crate::tools::Concurrency::Barrier => {
+            Some(tokio::select! {
+                guard = writer.lock_unknown() => guard,
+                _ = cancel.cancelled() => return ToolOutput::err("Cancelled waiting for workspace writer"),
+            })
+        }
     };
     let mut undo = crate::undo::UndoLog::default();
     undo.snapshot(
         &ready.ctx.cwd,
         ready.ctx.sandbox.mode,
-        &ready.name,
-        &ready.args,
+        &ready.footprint.writes,
     );
     let mut out = if tool.handles_cancel() {
         tool.run(ready.args.clone(), &ready.ctx).await
@@ -123,10 +236,59 @@ async fn run_ready(tools: &Registry, ready: &Ready, cancel: &CancellationToken) 
 }
 
 impl Agent {
-    /// Run one response's tool calls in order, consecutive read-only calls
-    /// together, and record their results. `failures` is the repeat guard's
-    /// count of failing calls for the turn. Returns the images the calls
-    /// produced, or None if cancelled (every call left then gets a result).
+    /// The call's tentative wave footprint from its raw arguments. Calls
+    /// that cannot be classified (unknown tool, malformed JSON) are treated
+    /// as `Barrier`; `prepare` recomputes the real one from the args the
+    /// hooks left.
+    fn footprint_of(&self, name: &str, arguments: &str) -> Footprint {
+        let raw = if arguments.trim().is_empty() {
+            "{}"
+        } else {
+            arguments
+        };
+        let Ok(args) = serde_json::from_str::<Value>(raw) else {
+            return Footprint {
+                class: crate::tools::Concurrency::Barrier,
+                reads: Vec::new(),
+                writes: Vec::new(),
+            };
+        };
+        self.footprint_from(name, &args)
+            .unwrap_or_else(|| Footprint {
+                class: crate::tools::Concurrency::Barrier,
+                reads: Vec::new(),
+                writes: Vec::new(),
+            })
+    }
+
+    /// The footprint from parsed args and the tool's declared effects;
+    /// None when `name` is not a callable tool.
+    fn footprint_from(&self, name: &str, args: &Value) -> Option<Footprint> {
+        use crate::tools::Concurrency;
+        let tool = self.tools.get(name)?;
+        let class = tool.concurrency_in(args, &self.cwd, &self.sandbox.writable);
+        let writes = match &class {
+            Concurrency::WriteFs(paths) => paths.clone(),
+            _ => Vec::new(),
+        };
+        let reads = match &class {
+            Concurrency::Pure | Concurrency::Exec | Concurrency::Barrier => Vec::new(),
+            _ => tool.read_paths(args, &self.cwd),
+        };
+        Some(Footprint {
+            class,
+            reads: reads.iter().map(|p| norm_path(&self.cwd, p)).collect(),
+            writes: writes.iter().map(|p| norm_path(&self.cwd, p)).collect(),
+        })
+    }
+
+    /// Run one response's tool calls in order: consecutive calls form
+    /// waves whose members may run together (pure calls and filesystem
+    /// reads always may; writes may when their paths are disjoint; `Exec`
+    /// and `Barrier` calls run alone). Results are recorded in model
+    /// order. `failures` is the repeat guard's count of failing calls for
+    /// the turn. Returns the images the calls produced, or None if
+    /// cancelled (every call left then gets a result).
     pub(super) async fn run_calls(
         &mut self,
         calls: &[(String, String, String)],
@@ -149,20 +311,44 @@ impl Agent {
                 }
                 return None;
             }
-            // Consecutive read-only calls (and subagents) run together.
-            let run = calls[i..]
-                .iter()
-                .take_while(|(_, name, arguments)| runs_in_parallel(name, arguments))
-                .count()
-                .max(1);
-            let batch = &calls[i..i + run];
-            let outs = if run > 1 {
-                self.call_parallel(batch, ui, cancel).await
-            } else {
-                let (id, name, arguments) = &batch[0];
-                vec![self.call_tool(id, name, arguments, ui, cancel).await]
-            };
-            for ((id, name, arguments), mut out) in batch.iter().zip(outs) {
+            // Group the next wave: always the call at i, then every
+            // following call that fits alongside those already in it.
+            let mut busy = Busy::default();
+            let mut end = i;
+            for (_, name, arguments) in &calls[i..] {
+                let f = self.footprint_of(name, arguments);
+                if end > i && !busy.accepts(&f) {
+                    break;
+                }
+                busy.add(&f);
+                end += 1;
+            }
+            // Approvals (and hooks, validation, classifier reviews) are
+            // collected before anything in the wave runs.
+            let mut prepared = Vec::with_capacity(end - i);
+            for (id, name, arguments) in &calls[i..end] {
+                prepared.push(self.prepare(id, name, arguments, ui, cancel).await);
+            }
+            // A hook may have rewritten arguments into another class, so
+            // re-partition by each prepared call's final footprint.
+            let mut outs: Vec<(ToolOutput, Vec<PathBuf>)> =
+                Vec::with_capacity(prepared.len());
+            let mut start = 0;
+            let mut busy = Busy::default();
+            for (j, p) in prepared.iter().enumerate() {
+                let f = p.footprint();
+                if j > start && !busy.accepts(&f) {
+                    outs.extend(self.exec_wave(&prepared[start..j], ui, cancel).await);
+                    busy = Busy::default();
+                    start = j;
+                }
+                busy.add(&f);
+            }
+            outs.extend(self.exec_wave(&prepared[start..], ui, cancel).await);
+
+            for ((id, name, arguments), (mut out, touched)) in
+                calls[i..end].iter().zip(outs)
+            {
                 if out.is_error {
                     let n = failures
                         .entry((name.clone(), arguments.clone()))
@@ -175,11 +361,11 @@ impl Agent {
                         ));
                     }
                 } else {
-                    self.add_nested_instructions(name, arguments, &mut out);
+                    self.add_nested_instructions(&touched, &mut out);
                 }
                 images.extend(self.record_result(id, name, out));
             }
-            i += run;
+            i = end;
         }
         Some(images)
     }
@@ -223,27 +409,32 @@ impl Agent {
         out.images
     }
 
-    /// After a successful file or search call, append any `AGENTS.md` (or
-    /// `CLAUDE.md`) from workspace subdirectories it touched, once per
-    /// conversation (an earlier copy in the transcript counts).
-    fn add_nested_instructions(&self, name: &str, arguments: &str, out: &mut ToolOutput) {
-        let file_tool = matches!(name, "read_file" | "edit_file" | "write_file");
-        if !file_tool && !matches!(name, "list_dir" | "glob" | "grep") {
-            return;
+    /// After a successful call, append any `AGENTS.md` (or `CLAUDE.md`)
+    /// from workspace subdirectories its touched paths (`reads`/`writes`
+    /// from the call's footprint) fall under, once per conversation (an
+    /// earlier copy in the transcript counts).
+    fn add_nested_instructions(&self, touched: &[PathBuf], out: &mut ToolOutput) {
+        let mut seen = std::collections::HashSet::new();
+        let mut dirs = Vec::new();
+        for full in touched {
+            if !inside(&self.cwd, &full.to_string_lossy()) {
+                continue;
+            }
+            let dir = if full.is_dir() {
+                full.clone()
+            } else {
+                full.parent().map(Path::to_path_buf).unwrap_or_default()
+            };
+            if seen.insert(dir.clone()) {
+                dirs.push((dir, full.clone()));
+            }
         }
-        let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let Some(full) = lexical(&self.cwd, path) else {
-            return;
-        };
-        if !inside(&self.cwd, path) {
-            return;
+        for (dir, full) in dirs {
+            self.nested_from(&dir, &full, out);
         }
-        let dir = if file_tool || !full.is_dir() {
-            full.parent().map(Path::to_path_buf).unwrap_or_default()
-        } else {
-            full.clone()
-        };
+    }
+
+    fn nested_from(&self, dir: &Path, full: &Path, out: &mut ToolOutput) {
         let Ok(rel) = dir.strip_prefix(&self.cwd) else {
             return;
         };
@@ -296,7 +487,13 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> crate::classifier::ReviewResult {
         let tool = self.tools.get(name);
-        let file_change = is_file_tool(name).then(|| {
+        let writes_files = tool.is_some_and(|t| {
+            matches!(
+                t.effects(args).writes,
+                crate::tools::Writes::Known(paths) if !paths.is_empty()
+            )
+        });
+        let file_change = writes_files.then(|| {
             let path = args.get("path").and_then(Value::as_str).unwrap_or("");
             let existed = !path.is_empty() && self.cwd.join(path).exists();
             let preview = tool.and_then(|t| t.preview(args, ctx)).unwrap_or_default();
@@ -388,39 +585,17 @@ impl Agent {
         result
     }
 
-    async fn call_tool(
+    /// Run one wave of prepared calls: the runnable members concurrently,
+    /// in the order they were approved, with each member's output and the
+    /// filesystem paths it touched (for nested-instruction lookup). `Done`
+    /// members pass their stored answer through at their position.
+    async fn exec_wave(
         &mut self,
-        id: &str,
-        name: &str,
-        arguments: &str,
+        prepared: &[Prepared],
         ui: &mut dyn Ui,
         cancel: &CancellationToken,
-    ) -> ToolOutput {
-        let ready = match self.prepare(id, name, arguments, ui, cancel).await {
-            Prepared::Done(out) => return out,
-            Prepared::Run(ready) => ready,
-        };
-        ui.tool_start(name, &ready.summary);
-        let mut out = run_ready(&self.tools, &ready, cancel).await;
-        ui.tool_end(name, &out);
-        self.settle(&ready, &mut out, cancel).await;
-        out
-    }
-
-    /// Run a batch of read-only calls (and subagents) concurrently. They are
-    /// approved one by one first; the UI then sees each start and finish in
-    /// order while all of them make progress.
-    async fn call_parallel(
-        &mut self,
-        batch: &[(String, String, String)],
-        ui: &mut dyn Ui,
-        cancel: &CancellationToken,
-    ) -> Vec<ToolOutput> {
+    ) -> Vec<(ToolOutput, Vec<PathBuf>)> {
         use futures::StreamExt;
-        let mut prepared = Vec::new();
-        for (id, name, arguments) in batch {
-            prepared.push(self.prepare(id, name, arguments, ui, cancel).await);
-        }
         let mut outs = Vec::new();
         {
             let tools = &self.tools;
@@ -431,9 +606,9 @@ impl Agent {
                     Prepared::Done(_) => None,
                 })
                 .collect();
-            for p in &prepared {
+            for p in prepared {
                 outs.push(match p {
-                    Prepared::Done(out) => out.clone(),
+                    Prepared::Done(out) => (out.clone(), Vec::new()),
                     Prepared::Run(ready) => {
                         ui.tool_start(&ready.name, &ready.summary);
                         let out = running
@@ -441,12 +616,12 @@ impl Agent {
                             .await
                             .unwrap_or_else(|| ToolOutput::err("The call did not run."));
                         ui.tool_end(&ready.name, &out);
-                        out
+                        (out, ready.touched())
                     }
                 });
             }
         }
-        for (p, out) in prepared.iter().zip(outs.iter_mut()) {
+        for (p, (out, _)) in prepared.iter().zip(outs.iter_mut()) {
             if let Prepared::Run(ready) = p {
                 self.settle(ready, out, cancel).await;
             }
@@ -459,9 +634,9 @@ impl Agent {
     /// PostToolUse hooks.
     async fn settle(&mut self, ready: &Ready, out: &mut ToolOutput, cancel: &CancellationToken) {
         self.undo.append(std::mem::take(&mut out.undo));
-        if matches!(ready.name.as_str(), "write_file" | "edit_file") && !out.is_error {
+        if !ready.footprint.writes.is_empty() && !out.is_error {
             self.stats
-                .file_change(&ready.name, &ready.args, out.display.as_deref());
+                .file_change(true, &ready.args, out.display.as_deref());
         }
         crate::trace::log("tool", || {
             format!(
@@ -550,6 +725,13 @@ impl Agent {
                 return Prepared::Done(ToolOutput::err(format!("Invalid JSON arguments: {e}")))
             }
         };
+        // The model sometimes sends the argument object as a JSON string;
+        // unpack it once.
+        if let Value::String(s) = &args {
+            if let Ok(unpacked) = serde_json::from_str::<Value>(s) {
+                args = unpacked;
+            }
+        }
         let ctx = ToolCtx {
             cwd: self.cwd.clone(),
             cancel: cancel.clone(),
@@ -614,11 +796,38 @@ impl Agent {
         }
         let arguments = arguments.as_ref();
 
+        // A malformed call never runs (and never asks the user about itself).
+        let footprint = match self.footprint_from(name, &args) {
+            Some(f) => Some(f),
+            None if !meta => {
+                return done(
+                    ui,
+                    name,
+                    &summary,
+                    ToolOutput::err(format!("Unknown tool `{name}`.")),
+                )
+            }
+            None => None,
+        };
+        if !meta {
+            if let Some(spec) = self.tools.spec_of(name) {
+                let problems = crate::mcp_schema::check(&spec.parameters, &args);
+                if !problems.is_empty() {
+                    return done(ui, name, &summary, ToolOutput::err(problems.join("; ")));
+                }
+            }
+        }
+
         let mut needs_approval = self
             .tools
             .get(name)
             .is_some_and(|tool| tool.needs_approval_for(&args, &self.cwd));
-        if needs_approval && crate::permissions::is_read_tool(name) {
+        if needs_approval
+            && matches!(
+                footprint.as_ref().map(|f| &f.class),
+                Some(crate::tools::Concurrency::ReadFs)
+            )
+        {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             if inside_any(&self.cwd, &self.sandbox.writable, path) {
                 needs_approval = false;
@@ -627,14 +836,10 @@ impl Agent {
         // Shell commands: read-only pipelines run without asking (and run as
         // the rebuilt, hardened command); auto mode skips the classifier for
         // known reversible dev commands.
-        let command = (name == "bash"
-            && args.get("run_in_background").and_then(Value::as_bool) != Some(true))
-        .then(|| {
-            args.get("command")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .flatten();
+        let command = self
+            .tools
+            .get(name)
+            .and_then(|tool| tool.shell_command(&args));
         let read_only = command
             .as_deref()
             .and_then(|c| crate::command_effect::read_only(c, &self.cwd, &self.sandbox.writable));
@@ -825,7 +1030,11 @@ impl Agent {
         }
         // The user approved the diff they saw. If the file changed while the
         // prompt was open, applying the call now would write something else.
-        if asked && is_file_tool(name) && preview.is_some() {
+        let writes_files = matches!(
+            footprint.as_ref().map(|f| &f.class),
+            Some(crate::tools::Concurrency::WriteFs(paths)) if !paths.is_empty()
+        );
+        if asked && writes_files && preview.is_some() {
             let now = self
                 .tools
                 .get(name)
@@ -874,6 +1083,7 @@ impl Agent {
             args,
             ctx,
             summary,
+            footprint: footprint.unwrap_or_else(Footprint::vacant),
             hook_args,
             note,
             taint: taint.labels,
@@ -917,6 +1127,9 @@ mod tests {
         }
         fn needs_approval(&self, _: &Value) -> bool {
             true
+        }
+        fn shell_command(&self, args: &Value) -> Option<String> {
+            args["command"].as_str().map(str::to_string)
         }
         fn summary(&self, args: &Value) -> String {
             args["command"].as_str().unwrap_or("").into()
@@ -1284,6 +1497,11 @@ mod tests {
                     description: String::new(),
                     parameters: serde_json::json!({}),
                 }
+            }
+            fn effects(&self, args: &Value) -> crate::tools::Effects {
+                crate::tools::Effects::writes_to(vec![PathBuf::from(
+                    args["path"].as_str().unwrap_or_default(),
+                )])
             }
             fn summary(&self, _: &Value) -> String {
                 "f.txt".into()
@@ -1853,8 +2071,8 @@ mod tests {
 
     #[tokio::test]
     async fn consecutive_read_calls_run_together_in_order() {
-        let (grep, peak) = probe("grep", false);
-        let (other, _) = probe("mcp__x__write", false);
+        let (grep, peak) = probe("grep", read_fx, false);
+        let (other, _) = probe("mcp__x__write", unknown_fx, false);
         let mut agent = scripted(vec![
             reply(vec![
                 call("a", "grep", serde_json::json!({"n": 1})),
@@ -1877,17 +2095,195 @@ mod tests {
             results(&agent),
             ["result 1", "result 2", "result 3", "result 4"]
         );
-        assert!(runs_in_parallel("subagent", r#"{"task": "x"}"#));
-        assert!(!runs_in_parallel(
-            "subagent",
-            r#"{"action": "stop", "name": "x"}"#
-        ));
-        assert!(!runs_in_parallel("bash", "{}"));
+    }
+
+    #[tokio::test]
+    async fn disjoint_writes_run_together_overlapping_writes_serialize() {
+        let (writer, peak) = probe("write_file", write_fx, false);
+        let mut agent = scripted(vec![
+            reply(vec![
+                call("a", "write_file", serde_json::json!({"n": 1, "path": "a.txt"})),
+                call("b", "write_file", serde_json::json!({"n": 2, "path": "b.txt"})),
+            ]),
+            reply(vec![
+                call("c", "write_file", serde_json::json!({"n": 3, "path": "c.txt"})),
+                call("d", "write_file", serde_json::json!({"n": 4, "path": "c.txt"})),
+            ]),
+            reply(vec![Item::Assistant {
+                text: "done".into(),
+            }]),
+        ]);
+        agent.tools.add(Box::new(writer));
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        // The disjoint pair overlapped (peak 2); the same-path pair did not.
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            results(&agent),
+            ["result 1", "result 2", "result 3", "result 4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exec_call_runs_alone() {
+        let (reader, rpeak) = probe("grep", read_fx, false);
+        let (exec, epeak) = probe("bash", exec_fx, false);
+        let mut agent = scripted(vec![
+            reply(vec![
+                call("a", "grep", serde_json::json!({"n": 1})),
+                call("b", "bash", serde_json::json!({"n": 2})),
+                call("c", "grep", serde_json::json!({"n": 3})),
+            ]),
+            reply(vec![Item::Assistant {
+                text: "done".into(),
+            }]),
+        ]);
+        agent.tools.add(Box::new(reader));
+        agent.tools.add(Box::new(exec));
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(rpeak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(epeak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            results(&agent),
+            ["result 1", "result 2", "result 3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_after_a_cancel_get_cancelled_results() {
+        let (grep, _) = probe("grep", read_fx, false);
+        let (exec, _) = probe("bash", exec_fx, false);
+        let cancel = CancellationToken::new();
+        let script = vec![
+            reply(vec![
+                call("a", "grep", serde_json::json!({"n": 1})),
+                call("b", "bash", serde_json::json!({"n": 2})),
+                call("c", "grep", serde_json::json!({"n": 3})),
+            ]),
+            reply(vec![Item::Assistant {
+                text: "done".into(),
+            }]),
+        ];
+        let mut agent = agent(Response::default(), Some(cancel.clone()));
+        agent.context_window = 0;
+        agent.tools.add(Box::new(grep));
+        agent.tools.add(Box::new(exec));
+        agent.provider = Box::new(ScriptedTurns {
+            left: std::sync::Arc::new(std::sync::Mutex::new(script)),
+        });
+        // Cancel while the first wave runs: every call ends with a result.
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            c.cancel();
+        });
+        agent
+            .turn(Item::user("go"), &mut QuietUi, cancel)
+            .await
+            .unwrap();
+        let results = results(&agent);
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|r| r.contains("Cancelled")),
+            "{results:?}"
+        );
+    }
+
+    /// A tool with a schema and a run counter, for validation tests.
+    struct SchemaTool(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SchemaTool {
+        fn spec(&self) -> crate::types::ToolSpec {
+            crate::types::ToolSpec {
+                name: "checked".into(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "limit": {"type": "integer"},
+                        "mode": {"type": "string", "enum": ["a", "b"]},
+                        "tags": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            }
+        }
+        fn effects(&self, _: &Value) -> crate::tools::Effects {
+            crate::tools::Effects::none()
+        }
+        fn summary(&self, _: &Value) -> String {
+            String::new()
+        }
+        async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ToolOutput::ok("ran")
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_fail_before_the_tool_runs() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = scripted(vec![
+            reply(vec![
+                call("a", "checked", serde_json::json!({})),
+                call("b", "checked", serde_json::json!({"path": "p", "limit": "x"})),
+                call("c", "checked", serde_json::json!({"path": "p", "mode": "z"})),
+                call("d", "checked", serde_json::json!({"path": "p", "tags": [1]})),
+                call("e", "checked", serde_json::json!({"path": "p", "nope": 1})),
+                call("f", "checked", serde_json::json!({"path": "p"})),
+            ]),
+            reply(vec![Item::Assistant {
+                text: "done".into(),
+            }]),
+        ]);
+        agent.tools.add(Box::new(SchemaTool(ran.clone())));
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        let results = results(&agent);
+        assert!(results[0].contains("`path`"), "{}", results[0]);
+        assert!(results[1].contains("`limit`"), "{}", results[1]);
+        assert!(results[2].contains("`mode`"), "{}", results[2]);
+        assert!(results[3].contains("tags"), "{}", results[3]);
+        assert!(results[4].contains("`nope`"), "{}", results[4]);
+        assert_eq!(results[5], "ran");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_object_sent_as_a_json_string_is_unpacked_once() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The arguments are a JSON string containing the object.
+        let mut agent = scripted(vec![
+            reply(vec![Item::ToolCall {
+                id: "a".into(),
+                name: "checked".into(),
+                arguments: serde_json::json!("{\"path\": \"p\"}").to_string(),
+            }]),
+            reply(vec![Item::Assistant {
+                text: "done".into(),
+            }]),
+        ]);
+        agent.tools.add(Box::new(SchemaTool(ran.clone())));
+        agent
+            .turn(Item::user("go"), &mut QuietUi, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(results(&agent), ["ran"]);
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn a_call_that_keeps_failing_gets_a_nudge() {
-        let (tool, _) = probe("mcp__x__go", true);
+        let (tool, _) = probe("mcp__x__go", unknown_fx, true);
         let same = || reply(vec![call("a", "mcp__x__go", serde_json::json!({}))]);
         let mut agent = scripted(vec![
             same(),
@@ -1926,6 +2322,11 @@ mod tests {
             }
             fn needs_approval(&self, _: &Value) -> bool {
                 true
+            }
+            fn effects(&self, args: &Value) -> crate::tools::Effects {
+                crate::tools::Effects::writes_to(vec![PathBuf::from(
+                    args["path"].as_str().unwrap_or_default(),
+                )])
             }
             fn summary(&self, _: &Value) -> String {
                 String::new()
@@ -1982,7 +2383,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
         std::fs::write(dir.path().join("sub/AGENTS.md"), "Use tabs in sub.\n").unwrap();
-        let (tool, _) = probe("read_file", false);
+        let (tool, _) = probe("read_file", read_fx, false);
         let touch = |id: &str| {
             reply(vec![call(
                 id,

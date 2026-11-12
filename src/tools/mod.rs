@@ -303,9 +303,191 @@ impl ToolOutput {
     }
 }
 
+/// The filesystem paths a call may write, when it can enumerate them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Writes {
+    /// Exactly these paths (an empty list means the call writes nothing).
+    Known(Vec<PathBuf>),
+    /// The call may write anywhere; its paths can't be listed (a shell
+    /// command, an undeclared MCP or extension tool).
+    Unknown,
+}
+
+impl Default for Writes {
+    /// The safe default for a tool that does not declare its writes.
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl Writes {
+    /// True when the call provably writes nothing.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Known(paths) if paths.is_empty())
+    }
+
+    /// The known write paths; empty when unknown.
+    #[allow(dead_code)] // Part of the effects API; used by callers outside dispatch.
+    pub fn paths(&self) -> &[PathBuf] {
+        match self {
+            Self::Known(paths) => paths,
+            Self::Unknown => &[],
+        }
+    }
+}
+
+/// What a call with a given argument set may touch: filesystem, child
+/// processes, the network. `Tool::effects` returns this per call.
+#[derive(Clone, Debug)]
+pub struct Effects {
+    /// Reads filesystem state (files or directories).
+    pub reads: bool,
+    /// Paths written, or [`Writes::Unknown`] when they can't be listed.
+    pub writes: Writes,
+    /// Starts a child process.
+    pub exec: bool,
+    /// Talks to the network.
+    #[allow(dead_code)] // Declared for consumers of the effects model (permissions, scheduling).
+    pub net: bool,
+}
+
+impl Default for Effects {
+    /// The safe default for a tool that declares no effects: it may write
+    /// anywhere, so it schedules alone and holds the writer lease.
+    fn default() -> Self {
+        Self {
+            reads: false,
+            writes: Writes::Unknown,
+            exec: false,
+            net: false,
+        }
+    }
+}
+
+impl Effects {
+    /// Reads only; touches nothing else.
+    pub fn reads_only() -> Self {
+        Self {
+            reads: true,
+            writes: Writes::Known(vec![]),
+            exec: false,
+            net: false,
+        }
+    }
+
+    /// Reads, and writes exactly `paths` (as given in the arguments).
+    pub fn writes_to(paths: Vec<PathBuf>) -> Self {
+        Self {
+            reads: true,
+            writes: Writes::Known(paths),
+            exec: false,
+            net: false,
+        }
+    }
+
+    /// No filesystem or process effects.
+    pub fn none() -> Self {
+        Self {
+            reads: false,
+            writes: Writes::Known(vec![]),
+            exec: false,
+            net: false,
+        }
+    }
+
+    /// Whether the call mutates nothing: no writes and no child process.
+    pub fn is_read_only(&self) -> bool {
+        !self.exec && self.writes.is_empty()
+    }
+
+    /// The schedule class derived from the effects.
+    fn concurrency(&self) -> Concurrency {
+        if self.exec {
+            return Concurrency::Exec;
+        }
+        match &self.writes {
+            Writes::Unknown => Concurrency::Barrier,
+            Writes::Known(paths) if !paths.is_empty() => Concurrency::WriteFs(paths.clone()),
+            _ if self.reads => Concurrency::ReadFs,
+            _ => Concurrency::Pure,
+        }
+    }
+}
+
+/// How a call may run alongside its neighbours in the same tool round
+/// (design §3). `Exec` and `Barrier` always run alone; `Pure`, `ReadFs`
+/// and non-conflicting `WriteFs` calls may share a wave.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Concurrency {
+    /// No filesystem or process effects; always parallel-safe.
+    Pure,
+    /// Reads the filesystem.
+    ReadFs,
+    /// Writes these paths; parallel when they are disjoint from every
+    /// other read or write path in the wave.
+    WriteFs(Vec<PathBuf>),
+    /// Runs a process; may read or write anywhere.
+    Exec,
+    /// Unanalyzable or destructive.
+    Barrier,
+}
+
+/// Path arguments a call reads, best effort: `path` plus the strings in
+/// `paths`, resolved against `cwd` (unresolvable `..` escapes are dropped).
+pub(crate) fn arg_paths(args: &Value, cwd: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push = |s: &str| {
+        if let Some(p) = crate::agent::lexical(cwd, s) {
+            out.push(p);
+        }
+    };
+    if let Some(p) = args.get("path").and_then(Value::as_str) {
+        push(p);
+    }
+    if let Some(paths) = args.get("paths").and_then(Value::as_array) {
+        for p in paths.iter().filter_map(Value::as_str) {
+            push(p);
+        }
+    }
+    out
+}
+
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// What this call may touch; the conservative default is "unknown, may
+    /// write anywhere" so undeclared tools never run in parallel.
+    fn effects(&self, _args: &Value) -> Effects {
+        Effects::default()
+    }
+    /// Whether this call only reads: no writes and no child process. A
+    /// network read still counts as read-only here; approval rules decide
+    /// whether a remote call asks.
+    fn is_read_only(&self, args: &Value) -> bool {
+        self.effects(args).is_read_only()
+    }
+    /// How this call may be scheduled relative to its neighbours.
+    fn concurrency(&self, args: &Value) -> Concurrency {
+        self.effects(args).concurrency()
+    }
+    /// Like [`Tool::concurrency`], for tools whose class needs the
+    /// workspace: bash's read-only command detection resolves the command's
+    /// paths against `cwd` and the extra writable roots.
+    fn concurrency_in(&self, args: &Value, cwd: &Path, extra: &[PathBuf]) -> Concurrency {
+        let _ = (cwd, extra);
+        self.concurrency(args)
+    }
+    /// Paths this call reads, best effort, resolved against `cwd` — the
+    /// `path`/`paths` arguments by default. Used for wave conflict checks
+    /// and nested-instruction lookup, never for permissions.
+    fn read_paths(&self, args: &Value, cwd: &Path) -> Vec<PathBuf> {
+        arg_paths(args, cwd)
+    }
+    /// The shell command this call runs, when the tool runs shell commands
+    /// in the foreground (bash). Enables read-only and reversibility checks.
+    fn shell_command(&self, _args: &Value) -> Option<String> {
+        None
+    }
     /// Whether running this call needs user approval (mutations, shell, MCP).
     fn needs_approval(&self, _args: &Value) -> bool {
         false
@@ -324,9 +506,9 @@ pub trait Tool: Send + Sync {
         None
     }
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput;
-    /// When true, [`crate::agent::Agent::call_tool`] waits for `run` after
-    /// cancellation so the tool can kill children and notify peers. Tools
-    /// that only need the request dropped leave this false.
+    /// When true, dispatch waits for `run` after cancellation so the tool
+    /// can kill children and notify peers. Tools that only need the request
+    /// dropped leave this false.
     fn handles_cancel(&self) -> bool {
         false
     }
@@ -366,9 +548,17 @@ impl LiveTools {
     }
 }
 
+/// A registered tool plus its spec, cached once so lookups never rebuild
+/// the parameter JSON. A patch replaces the entry, so live tool changes
+/// refresh the cache without extra bookkeeping.
+struct Entry {
+    tool: std::sync::Arc<dyn Tool>,
+    spec: ToolSpec,
+}
+
 #[derive(Default)]
 pub struct Registry {
-    tools: Vec<std::sync::Arc<dyn Tool>>,
+    tools: Vec<Entry>,
     /// MCP tools picked with `mcp_select_tool` while MCP tools are deferred.
     selected: HashSet<String>,
     live: Option<LiveTools>,
@@ -398,7 +588,7 @@ pub fn unknown_tool_names(names: &[String]) -> Vec<String> {
     let known = Registry::all_builtin()
         .tools
         .iter()
-        .map(|t| t.spec().name)
+        .map(|e| e.spec.name.clone())
         .collect::<Vec<_>>();
     names
         .iter()
@@ -423,7 +613,7 @@ impl Registry {
         r
     }
 
-    fn all_builtin() -> Self {
+    pub(crate) fn all_builtin() -> Self {
         let mut r = Self::default();
         fs::register(&mut r);
         search::register(&mut r);
@@ -454,13 +644,12 @@ impl Registry {
         let none = Value::Object(Default::default());
         self.tools
             .iter()
-            .map(|t| {
-                let spec = t.spec();
-                let disabled = self.disabled.contains(&spec.name);
+            .map(|e| {
+                let disabled = self.disabled.contains(&e.spec.name);
                 // Reads inside the workspace never ask (see `Agent::prepare`).
-                let asks = t.needs_approval_for(&none, cwd)
-                    && !crate::permissions::is_read_tool(&spec.name);
-                (spec, disabled, asks)
+                let asks = e.tool.needs_approval_for(&none, cwd)
+                    && !matches!(e.tool.concurrency(&none), Concurrency::ReadFs);
+                (e.spec.clone(), disabled, asks)
             })
             .collect()
     }
@@ -510,11 +699,11 @@ impl Registry {
 
     /// Like [`Registry::try_insert`], for a tool another registry also holds.
     pub fn try_insert_shared(&mut self, tool: std::sync::Arc<dyn Tool>) -> Result<(), String> {
-        let name = tool.spec().name.clone();
-        if self.tools.iter().any(|t| t.spec().name == name) {
-            return Err(format!("tool `{name}` collides with an existing tool"));
+        let spec = tool.spec();
+        if self.tools.iter().any(|e| e.spec.name == spec.name) {
+            return Err(format!("tool `{}` collides with an existing tool", spec.name));
         }
-        self.tools.push(tool);
+        self.tools.push(Entry { tool, spec });
         Ok(())
     }
 
@@ -523,14 +712,14 @@ impl Registry {
     pub fn shared(&self) -> Vec<std::sync::Arc<dyn Tool>> {
         self.tools
             .iter()
-            .filter(|t| {
-                let name = t.spec().name;
-                !self.disabled.contains(&name)
-                    && (mcp_search::is_mcp(&name)
+            .filter(|e| {
+                let name = &e.spec.name;
+                !self.disabled.contains(name)
+                    && (mcp_search::is_mcp(name)
                         || name.starts_with(crate::extensions::TOOL_PREFIX)
                         || SHARED.contains(&name.as_str()))
             })
-            .cloned()
+            .map(|e| e.tool.clone())
             .collect()
     }
 
@@ -539,11 +728,11 @@ impl Registry {
             return;
         }
         self.tools
-            .retain(|t| !names.iter().any(|n| n == &t.spec().name));
+            .retain(|e| !names.iter().any(|n| n == &e.spec.name));
     }
 
     pub fn remove_prefix(&mut self, prefix: &str) {
-        self.tools.retain(|t| !t.spec().name.starts_with(prefix));
+        self.tools.retain(|e| !e.spec.name.starts_with(prefix));
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
@@ -552,14 +741,25 @@ impl Registry {
         }
         self.tools
             .iter()
-            .find(|t| t.spec().name == name)
-            .map(|t| t.as_ref())
+            .find(|e| e.spec.name == name)
+            .map(|e| e.tool.as_ref())
+    }
+
+    /// The cached spec for `name`, built once when the tool was inserted.
+    pub(crate) fn spec_of(&self, name: &str) -> Option<&ToolSpec> {
+        if self.disabled.contains(name) {
+            return None;
+        }
+        self.tools
+            .iter()
+            .find(|e| e.spec.name == name)
+            .map(|e| &e.spec)
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools
             .iter()
-            .map(|t| t.spec())
+            .map(|e| e.spec.clone())
             .filter(|s| !self.disabled.contains(&s.name))
             .collect()
     }
@@ -654,6 +854,80 @@ impl SecretRoots {
             roots,
             open: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts how often its spec is built.
+    struct Counted {
+        calls: std::sync::Arc<AtomicUsize>,
+        name: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl Tool for Counted {
+        fn spec(&self) -> ToolSpec {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ToolSpec {
+                name: self.name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            }
+        }
+        fn summary(&self, _: &Value) -> String {
+            String::new()
+        }
+        async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
+            ToolOutput::ok("x")
+        }
+    }
+
+    #[test]
+    fn a_spec_is_built_once_per_registration() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut r = Registry::default();
+        r.add(Box::new(Counted {
+            calls: calls.clone(),
+            name: "t",
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Lookups, listings and catalog probes reuse the cached spec.
+        for _ in 0..3 {
+            r.get("t");
+            r.spec_of("t");
+            r.specs();
+            r.catalog(Path::new("."));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_live_patch_refreshes_the_cached_spec() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let live = LiveTools::default();
+        let mut r = Registry::default();
+        r.attach(live.clone());
+        r.add(Box::new(Counted {
+            calls: calls.clone(),
+            name: "t",
+        }));
+        // A patch that swaps the tool builds its spec on insertion.
+        let c = calls.clone();
+        live.push(Box::new(move |r: &mut Registry| {
+            r.remove_names(&["t".to_string()]);
+            r.add(Box::new(Counted {
+                calls: c,
+                name: "t",
+            }));
+        }));
+        r.refresh();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(r.get("t").is_some());
+        r.specs();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
 

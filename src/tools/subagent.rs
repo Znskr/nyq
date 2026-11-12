@@ -20,16 +20,6 @@ const TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// How long a timed-out subagent gets to kill its tools before we drop it.
 const CLEANUP: Duration = Duration::from_secs(5);
 const MAX_REPORT: usize = 20_000;
-/// Tools an explore subagent may use (those present in the builtins).
-const READ_ONLY: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "glob",
-    "grep",
-    "view_image",
-    "web_fetch",
-    "web_search",
-];
 
 const DESCRIPTION: &str = "Delegate substantial independent work. Use action spawn with name and task to run a child independently; send queues a follow-up for that name. Up to three children execute concurrently with FIFO inboxes. Reports arrive automatically between parent model requests, and finishing waits for outstanding children: do not poll. Children receive only the supplied task, so include paths, constraints and acceptance criteria. explore (default) is read-only; general can edit, run commands and use MCP after permission checks. Parent and children share one workspace writer. model and effort override inherited settings; permission_mode can only narrow authority. request_id makes an exact spawn/send retry idempotent. inspect/list show state; stop/cancel/close cancel current and queued work; resume reopens a stopped child. Legacy run executes synchronously, optionally retaining named context. Interrupted work is not automatically replayed: inspect its checkpoint and workspace before sending a replacement task. Children cannot delegate or message peers. Avoid delegation for quick lookups.";
 
@@ -79,40 +69,36 @@ fn label(args: &Value) -> &str {
 }
 
 /// The child's tools: builtins (minus mutating ones for explore), never
-/// itself, plus the session's skills and (for general) MCP tools.
+/// itself, plus the session's read-only shared tools (all of them for
+/// general).
 fn child_tools(general: bool, shared: &[Arc<dyn Tool>]) -> Registry {
     let mut tools = Registry::builtin();
+    let none = Value::Object(Default::default());
     let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
-    let keep: Vec<&str> = if general {
-        names
-            .iter()
-            .map(String::as_str)
-            .filter(|n| *n != NAME)
-            .collect()
-    } else {
-        READ_ONLY
-            .iter()
-            .copied()
-            .filter(|n| names.iter().any(|m| m == n))
-            .collect()
-    };
-    for name in &names {
-        // remove_prefix is the only removal API; don't let it take a kept tool.
-        if !keep.contains(&name.as_str()) && !keep.iter().any(|k| k.starts_with(name.as_str())) {
-            tools.remove_prefix(name);
-        }
-    }
+    let keep: Vec<String> = names
+        .iter()
+        .filter(|n| n.as_str() != NAME)
+        .filter(|n| {
+            general
+                || tools
+                    .get(n)
+                    .is_some_and(|t| t.is_read_only(&none))
+        })
+        .cloned()
+        .collect();
+    let drop: Vec<String> = names
+        .iter()
+        .filter(|n| !keep.contains(n))
+        .cloned()
+        .collect();
+    tools.remove_names(&drop);
     for tool in shared {
-        let name = tool.spec().name;
-        if general || READ_ONLY_SHARED.contains(&name.as_str()) {
+        if general || tool.is_read_only(&none) {
             let _ = tools.try_insert_shared(tool.clone());
         }
     }
     tools
 }
-
-/// Inherited session tools an explore subagent may use.
-const READ_ONLY_SHARED: &[&str] = &["skill", "mcp_list_resources", "mcp_read_resource"];
 
 /// One approval prompt at a time: parallel subagents may ask together.
 static APPROVALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -168,6 +154,17 @@ impl Tool for Subagent {
 
     fn handles_cancel(&self) -> bool {
         true
+    }
+
+    /// A run or resume hosts a nested agent whose own calls take the
+    /// workspace writer lease, so the delegating call itself stays `Pure`:
+    /// holding the lease here would deadlock the child's writes. The other
+    /// actions change orchestration state and run alone.
+    fn concurrency(&self, args: &Value) -> super::Concurrency {
+        match action(args) {
+            "run" | "resume" => super::Concurrency::Pure,
+            _ => super::Concurrency::Barrier,
+        }
     }
 
     fn preview(&self, args: &Value, _: &ToolCtx) -> Option<String> {
@@ -1033,6 +1030,13 @@ mod tests {
         }
         fn summary(&self, _: &Value) -> String {
             String::new()
+        }
+        fn effects(&self, _: &Value) -> crate::tools::Effects {
+            if self.0 == "skill" {
+                crate::tools::Effects::reads_only()
+            } else {
+                crate::tools::Effects::default()
+            }
         }
         async fn run(&self, _: Value, _: &ToolCtx) -> ToolOutput {
             ToolOutput::ok("")

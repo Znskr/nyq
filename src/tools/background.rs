@@ -659,6 +659,16 @@ impl Tool for ProcessWrite {
         true
     }
 
+    fn effects(&self, _args: &Value) -> super::Effects {
+        // Writes to a child process's stdin.
+        super::Effects {
+            reads: false,
+            writes: super::Writes::Unknown,
+            exec: true,
+            net: false,
+        }
+    }
+
     fn summary(&self, args: &Value) -> String {
         let text: String = args
             .get("text")
@@ -725,6 +735,16 @@ impl Tool for ProcessWait {
                 },
                 "required": ["id"]
             }),
+        }
+    }
+
+    fn effects(&self, _args: &Value) -> super::Effects {
+        // Only observes a process (and optionally probes a local port).
+        super::Effects {
+            reads: false,
+            writes: super::Writes::Known(vec![]),
+            exec: false,
+            net: true,
         }
     }
 
@@ -804,6 +824,10 @@ impl Tool for BashOutput {
         }
     }
 
+    fn effects(&self, _args: &Value) -> super::Effects {
+        super::Effects::none()
+    }
+
     fn summary(&self, args: &Value) -> String {
         args.get("id")
             .map(|v| {
@@ -838,6 +862,16 @@ impl Tool for KillShell {
                 "properties": {"id": {"type": "integer", "description": ID_SCHEMA}},
                 "required": ["id"]
             }),
+        }
+    }
+
+    fn effects(&self, _args: &Value) -> super::Effects {
+        // Signals a child process's group.
+        super::Effects {
+            reads: false,
+            writes: super::Writes::Unknown,
+            exec: true,
+            net: false,
         }
     }
 

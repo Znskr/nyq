@@ -261,8 +261,44 @@ pub fn bash_matches(prefix: &str, cmd: &str) -> bool {
             .eq(want.iter().copied())
 }
 
+/// A builtin tool by name, for effect queries independent of the session's
+/// live registry. Session tools (MCP, extensions) classify as "other",
+/// matching the fixed lists this replaces.
+pub(crate) fn builtin_tool(name: &str) -> Option<&'static dyn crate::tools::Tool> {
+    static R: std::sync::OnceLock<crate::tools::Registry> = std::sync::OnceLock::new();
+    R.get_or_init(crate::tools::Registry::all_builtin).get(name)
+}
+
+/// The raw `path`/`paths` arguments, unresolved.
+fn named_paths(args: &Value) -> Vec<PathBuf> {
+    args.get("path")
+        .and_then(Value::as_str)
+        .into_iter()
+        .chain(
+            args.get("paths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Whether `tool` writes exactly the files named by its `path`/`paths`
+/// arguments (write_file, edit_file): probed with a placeholder path, so a
+/// missing or empty path still classifies correctly. Grants for such calls
+/// scope to the file's directory.
 pub(crate) fn is_file_tool(tool: &str) -> bool {
-    matches!(tool, "write_file" | "edit_file")
+    let Some(t) = builtin_tool(tool) else {
+        return false;
+    };
+    let args = serde_json::json!({"path": "x", "paths": ["y"]});
+    let crate::tools::Writes::Known(writes) = t.effects(&args).writes else {
+        return false;
+    };
+    let named = named_paths(&args);
+    !writes.is_empty() && writes.iter().all(|w| named.contains(w))
 }
 
 /// A subagent call's mode: `general` or (by default) `explore`.
@@ -321,10 +357,10 @@ pub fn grant_rule_in(tool: &str, args: &Value, cwd: &Path, extra: &[PathBuf]) ->
         }
         let full = resolved(cwd, path)?;
         // A file grants its directory; a searched or listed directory itself.
-        let dir = if matches!(tool, "read_file" | "view_image") || !read {
-            full.parent()?.to_path_buf()
-        } else {
+        let dir = if full.is_dir() {
             full
+        } else {
+            full.parent()?.to_path_buf()
         };
         // Never the whole filesystem.
         dir.parent()?;

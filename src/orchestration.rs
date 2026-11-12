@@ -265,15 +265,74 @@ pub fn acknowledge(dir: &Path, id: &str) -> Result<()> {
     }
     s.commit(next)
 }
-pub fn writer(cwd: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    static WRITERS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
-        OnceLock::new();
+/// Per-workspace write exclusion. Every mutating call holds this while it
+/// runs. Writers that declare their paths share a gate through per-path
+/// mutexes, so disjoint writes (checked by the dispatch wave scheduler)
+/// overlap; a writer that cannot declare its paths takes the gate
+/// exclusively and excludes all other writers.
+pub struct Writer {
+    /// Shared by declared-path writers; exclusive for unknown writers.
+    gate: Arc<tokio::sync::RwLock<()>>,
+    /// One mutex per declared write path.
+    paths: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// A held writer lock: the gate plus any per-path mutexes.
+pub struct WriterGuard {
+    _read: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _write: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    _paths: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Writer {
+    /// Lock the declared write `paths`: shared gate plus each path's mutex,
+    /// taken in sorted order so concurrent writers cannot deadlock.
+    pub async fn lock_paths(self: &Arc<Self>, paths: &[PathBuf]) -> WriterGuard {
+        let gate = self.gate.clone().read_owned().await;
+        let mut sorted: Vec<PathBuf> = paths.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let mut held = Vec::with_capacity(sorted.len());
+        for path in sorted {
+            let lock = self
+                .paths
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(path)
+                .or_default()
+                .clone();
+            held.push(lock.lock_owned().await);
+        }
+        WriterGuard {
+            _read: Some(gate),
+            _write: None,
+            _paths: held,
+        }
+    }
+
+    /// Exclusive access for a call whose write paths cannot be listed.
+    pub async fn lock_unknown(self: &Arc<Self>) -> WriterGuard {
+        WriterGuard {
+            _read: None,
+            _write: Some(self.gate.clone().write_owned().await),
+            _paths: Vec::new(),
+        }
+    }
+}
+
+pub fn writer(cwd: &Path) -> Arc<Writer> {
+    static WRITERS: OnceLock<Mutex<HashMap<PathBuf, Arc<Writer>>>> = OnceLock::new();
     WRITERS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned()))
-        .or_default()
+        .or_insert_with(|| {
+            Arc::new(Writer {
+                gate: Arc::new(tokio::sync::RwLock::new(())),
+                paths: Mutex::new(HashMap::new()),
+            })
+        })
         .clone()
 }
 

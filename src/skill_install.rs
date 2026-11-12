@@ -842,6 +842,16 @@ impl Tool for InstallSkill {
         true
     }
 
+    fn effects(&self, _: &Value) -> crate::tools::Effects {
+        // Clones a remote repo and writes it into a skills directory.
+        crate::tools::Effects {
+            reads: false,
+            writes: crate::tools::Writes::Unknown,
+            exec: true,
+            net: true,
+        }
+    }
+
     fn summary(&self, args: &Value) -> String {
         let source = args["source"].as_str().unwrap_or_default();
         match args["skill"].as_str().filter(|s| !s.is_empty()) {

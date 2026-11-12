@@ -1100,6 +1100,16 @@ impl McpManager {
                 schema,
                 tool: t.name.to_string(),
                 server: server.to_string(),
+                read_only: t
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.read_only_hint)
+                    .unwrap_or(false),
+                destructive: t
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.destructive_hint)
+                    .unwrap_or(false),
                 mcp: self.clone(),
             }));
         }
@@ -1912,6 +1922,10 @@ struct McpTool {
     /// The tool's name on the server.
     tool: String,
     server: String,
+    /// `readOnlyHint` (default false): the tool declares it changes nothing.
+    read_only: bool,
+    /// `destructiveHint` (default false): the tool may destroy data.
+    destructive: bool,
     mcp: McpManager,
 }
 
@@ -1959,8 +1973,20 @@ impl Tool for McpTool {
         }
     }
 
+    /// `readOnlyHint` tools follow the read-only rules: they never ask.
+    /// `destructiveHint` (and undeclared) tools always need approval.
     fn needs_approval(&self, _args: &Value) -> bool {
-        true
+        self.destructive || !self.read_only
+    }
+
+    /// `readOnlyHint` maps to a read (Pure/ReadFs); `destructiveHint` maps
+    /// to Barrier. An undeclared MCP tool may do anything.
+    fn effects(&self, _args: &Value) -> crate::tools::Effects {
+        if self.destructive || !self.read_only {
+            crate::tools::Effects::default()
+        } else {
+            crate::tools::Effects::reads_only()
+        }
     }
 
     fn handles_cancel(&self) -> bool {
@@ -3411,5 +3437,43 @@ for line in sys.stdin:
             Scope::Profile,
         );
         assert!(mgr.connect(&bad).await.is_err());
+    }
+
+    #[test]
+    fn annotations_map_to_effects_and_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |read_only, destructive| McpTool {
+            name: "mcp__s__t".into(),
+            description: String::new(),
+            schema: serde_json::json!({"type": "object"}),
+            tool: "t".into(),
+            server: "s".into(),
+            read_only,
+            destructive,
+            mcp: McpManager::new(dir.path().into()),
+        };
+        let args = serde_json::json!({});
+        // readOnlyHint: a read (parallel-safe), no approval anywhere.
+        let ro = tool(true, false);
+        assert!(matches!(
+            ro.concurrency(&args),
+            crate::tools::Concurrency::ReadFs
+        ));
+        assert!(ro.is_read_only(&args));
+        assert!(!ro.needs_approval(&args));
+        // destructiveHint wins over readOnlyHint: a barrier that always asks.
+        let d = tool(true, true);
+        assert!(matches!(
+            d.concurrency(&args),
+            crate::tools::Concurrency::Barrier
+        ));
+        assert!(d.needs_approval(&args));
+        // Undeclared: anything is possible, so a barrier that asks.
+        let unknown = tool(false, false);
+        assert!(matches!(
+            unknown.concurrency(&args),
+            crate::tools::Concurrency::Barrier
+        ));
+        assert!(unknown.needs_approval(&args));
     }
 }

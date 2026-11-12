@@ -194,6 +194,14 @@ impl Tool for Memory {
         !matches!(args.get("action").and_then(Value::as_str), Some("list"))
     }
 
+    fn effects(&self, args: &Value) -> super::Effects {
+        // add/remove write the facts store; list only reads it.
+        match args.get("action").and_then(Value::as_str) {
+            Some("list") => super::Effects::reads_only(),
+            _ => super::Effects::writes_to(vec![path(&crate::config::home())]),
+        }
+    }
+
     fn summary(&self, args: &Value) -> String {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
         match args.get("fact").and_then(Value::as_str) {

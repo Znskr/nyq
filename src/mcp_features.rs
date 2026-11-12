@@ -701,6 +701,16 @@ impl Tool for ListResources {
         true
     }
 
+    fn effects(&self, _args: &Value) -> crate::tools::Effects {
+        // Reads remote resources only; the workspace never changes.
+        crate::tools::Effects {
+            reads: false,
+            writes: crate::tools::Writes::Known(vec![]),
+            exec: false,
+            net: true,
+        }
+    }
+
     async fn run(&self, args: Value, _ctx: &ToolCtx) -> ToolOutput {
         let only = args
             .get("server")
@@ -787,6 +797,16 @@ impl Tool for ReadResource {
 
     fn needs_approval(&self, _args: &Value) -> bool {
         true
+    }
+
+    fn effects(&self, _args: &Value) -> crate::tools::Effects {
+        // Reads one remote resource; the workspace never changes.
+        crate::tools::Effects {
+            reads: false,
+            writes: crate::tools::Writes::Known(vec![]),
+            exec: false,
+            net: true,
+        }
     }
 
     async fn run(&self, args: Value, _ctx: &ToolCtx) -> ToolOutput {

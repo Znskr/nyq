@@ -547,8 +547,14 @@ impl Stats {
     }
 
     /// Count the lines a successful file write or edit changed.
-    pub fn file_change(&mut self, tool: &str, args: &serde_json::Value, display: Option<&str>) {
-        if !matches!(tool, "write_file" | "edit_file") {
+    /// `writes_file` comes from `Tool::effects().writes` being non-empty.
+    pub fn file_change(
+        &mut self,
+        writes_file: bool,
+        args: &serde_json::Value,
+        display: Option<&str>,
+    ) {
+        if !writes_file {
             return;
         }
         let Some(display) = display else { return };
@@ -1316,13 +1322,13 @@ mod tests {
     fn activity_counts_changed_lines_and_formats_durations() {
         let mut stats = Stats::default();
         let diff = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n+more\n keep\n";
-        stats.file_change("edit_file", &serde_json::json!({}), Some(diff));
+        stats.file_change(true, &serde_json::json!({}), Some(diff));
         stats.file_change(
-            "write_file",
+            true,
             &serde_json::json!({"content": "a\nb\nc\n"}),
             Some("new file: y\na\nb\nc"),
         );
-        stats.file_change("bash", &serde_json::json!({}), Some(diff));
+        stats.file_change(false, &serde_json::json!({}), Some(diff));
         assert_eq!((stats.lines_added, stats.lines_removed), (5, 1));
         stats.api_time = Duration::from_secs(75);
         let u = Usage {

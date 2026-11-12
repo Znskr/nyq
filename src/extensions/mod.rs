@@ -1166,6 +1166,16 @@ impl Tool for ExtTool {
         !self.def.read_only
     }
 
+    fn effects(&self, _args: &Value) -> crate::tools::Effects {
+        // The manifest's `read_only` is the extension's own declaration;
+        // anything else stays unknown and schedules alone.
+        if self.def.read_only {
+            crate::tools::Effects::reads_only()
+        } else {
+            crate::tools::Effects::default()
+        }
+    }
+
     fn summary(&self, args: &Value) -> String {
         crate::ui::one_line(&args.to_string(), 100)
     }
