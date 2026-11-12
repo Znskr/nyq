@@ -6,17 +6,24 @@
 //! - a user+mount namespace that re-binds `.git/hooks`, `.git/config` and
 //!   `.git/info` (for `attributes`) read-only over each writable root's `.git`,
 //!   so commits and branches keep working while planted hooks and config
-//!   redirects cannot run unsandboxed later;
+//!   redirects cannot run unsandboxed later. Self-bind mounts pin `.git`,
+//!   the directories holding it, discovered worktree/submodule gitdirs and
+//!   `core.hooksPath` targets, so `mv .git aside` fails with EBUSY instead
+//!   of carrying the read-only mounts along;
 //! - Landlock: reads everywhere, writes only to allowed roots, and TCP
 //!   bind/connect denied on ABI v4+ when the network policy is off;
 //! - a seccomp filter, also only when the network policy is off, that fails
 //!   `socket()` with EACCES for AF_INET/AF_INET6 of any type (covering UDP)
-//!   and for AF_UNIX. `NYQ_SANDBOX_UNIX=1` re-allows AF_UNIX.
+//!   and for AF_UNIX — `NYQ_SANDBOX_UNIX=1` re-allows AF_UNIX — and fails
+//!   `io_uring_setup`/`io_uring_enter`/`io_uring_register` with EPERM so
+//!   IORING_OP_SOCKET cannot bypass the family check.
 //!
 //! macOS wraps the shell in `sandbox-exec` with an equivalent Seatbelt
 //! profile, including deny rules for the same `.git` paths. Other platforms
 //! have no sandbox; `check` reports that. `NYQ_SANDBOX_GIT_WRITABLE=1` opts
-//! out of git-metadata protection on both.
+//! out of git-metadata protection on both, `NYQ_SANDBOX_GIT_STRICT=1`
+//! refuses to run when that protection cannot be applied (the default is a
+//! warning and `partial` enforcement status).
 #![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
@@ -49,6 +56,10 @@ pub struct Policy {
     /// sandbox, opting out of git-metadata protection
     /// (`NYQ_SANDBOX_GIT_WRITABLE=1` sets the default).
     pub git_writable: bool,
+    /// Refuse to run the command when `.git` metadata protection cannot be
+    /// applied, instead of warning and continuing
+    /// (`NYQ_SANDBOX_GIT_STRICT=1` sets the default).
+    pub git_strict: bool,
     /// Extra writable roots besides the workspace (WorkspaceWrite only).
     pub writable: Vec<PathBuf>,
 }
@@ -60,6 +71,7 @@ impl Default for Policy {
             network: false,
             unix_sockets: env_flag("NYQ_SANDBOX_UNIX"),
             git_writable: env_flag("NYQ_SANDBOX_GIT_WRITABLE"),
+            git_strict: env_flag("NYQ_SANDBOX_GIT_STRICT"),
             writable: Vec::new(),
         }
     }
@@ -164,57 +176,369 @@ fn common_gitdir(gitdir: &Path) -> PathBuf {
         .unwrap_or_else(|| gitdir.to_path_buf())
 }
 
-/// `.git` paths a sandboxed command must not write: hooks and config under
-/// every reachable git dir, so a planted hook or `core.hooksPath` redirect
-/// cannot run later outside the sandbox. `cwd` and `writable` are the same
-/// roots the command may write. Paths are returned whether or not they exist;
-/// a caller that needs a real mount point may create a missing `hooks`
-/// directory or `config` file.
-fn protected_git_paths(cwd: &Path, writable: &[PathBuf]) -> Vec<PathBuf> {
-    let mut gitdirs: Vec<PathBuf> = Vec::new();
-    let mut pointers: Vec<PathBuf> = Vec::new();
-    let mut consider = |dir: &Path| {
-        if !writable.iter().any(|root| dir.starts_with(root)) {
+/// What to create when a required `.git` path is missing, so it can be
+/// bound read-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ensure {
+    /// A single directory (e.g. `.git/hooks`).
+    Dir,
+    /// A directory chain (e.g. a `core.hooksPath` target).
+    DirAll,
+    /// An empty regular file (e.g. `.git/config`).
+    File,
+}
+
+/// `.git` metadata a sandboxed command must not write or replace. Read-only
+/// binds cover the contents; read-write self-binds pin the directories so
+/// `rename`/`rmdir` fails with EBUSY — without them `mv .git .git-old`
+/// carried the read-only mounts along and a fresh, writable `.git` took
+/// their place. `cwd` and `writable` are the same roots the command may
+/// write; paths are returned whether or not they exist.
+#[derive(Clone, Debug, Default)]
+pub struct GitTargets {
+    /// Directories to self-bind over themselves (still writable): `.git`,
+    /// the directories containing it, discovered gitdirs and their common
+    /// dirs, `modules`/`worktrees` holders, `core.hooksPath` targets and
+    /// every ancestor down to and including a writable root.
+    pub pin: Vec<PathBuf>,
+    /// Paths to create when missing, then bind read-only.
+    pub required: Vec<(PathBuf, Ensure)>,
+    /// Paths to bind read-only when they exist.
+    pub readonly: Vec<PathBuf>,
+    /// Coverage gaps worth telling the user about (e.g. `.git` is a
+    /// symlink, which can be renamed even though its target is bound).
+    pub notes: Vec<String>,
+}
+
+/// Collapse `.` and `..` lexically without touching the filesystem.
+fn normalize_path(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Unescape and un-comment a git config value.
+fn unquote_git(v: &str) -> String {
+    let mut s = String::new();
+    let mut quoted = false;
+    let mut chars = v.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => quoted = !quoted,
+            '\\' => match chars.next() {
+                Some('n') => s.push('\n'),
+                Some('t') => s.push('\t'),
+                Some(other) => s.push(other),
+                None => {}
+            },
+            '#' | ';' if !quoted => break,
+            c => s.push(c),
+        }
+    }
+    s.trim_end().to_string()
+}
+
+/// Resolve an `[include] path` value: `~/` to home, relative to the
+/// directory of the config file that contains it.
+fn expand_config_path(v: &str, dir: Option<&Path>) -> PathBuf {
+    if let Some(rest) = v.strip_prefix("~/") {
+        if let Some(h) = dirs::home_dir() {
+            return h.join(rest);
+        }
+    }
+    let p = PathBuf::from(v);
+    if p.is_absolute() {
+        p
+    } else {
+        dir.map(|d| d.join(&p)).unwrap_or(p)
+    }
+}
+
+/// All values for `key` in `section` of a git config file, following
+/// unconditional `[include] path=` chains up to four levels deep (parsing
+/// the file directly, so no git command or hook runs). Section matches
+/// `name` or `name.sub`, keys and names case-insensitively.
+fn git_config_values(path: &Path, section: &str, key: &str, depth: u8) -> Vec<String> {
+    if depth > 4 {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            current = match rest.split_once('"') {
+                // [name "sub"] → name.sub
+                Some((name, sub)) => format!(
+                    "{}.{}",
+                    name.trim().to_lowercase(),
+                    sub.split('"').next().unwrap_or(sub).trim().to_lowercase()
+                ),
+                None => rest.split(']').next().unwrap_or("").trim().to_lowercase(),
+            };
+            continue;
+        }
+        let (k, v) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), unquote_git(v.trim())),
+            None => (line.trim(), "true".to_string()), // a bare key means true
+        };
+        if current == section && k.eq_ignore_ascii_case(key) {
+            out.push(v.clone());
+        }
+        if current == "include" && k.eq_ignore_ascii_case("path") && !v.is_empty() {
+            let inc = expand_config_path(&v, path.parent());
+            out.extend(git_config_values(&inc, section, key, depth + 1));
+        }
+    }
+    out
+}
+
+/// Last value wins across `files` (worktree config outranks common config).
+fn git_config_last(files: &[PathBuf], section: &str, key: &str) -> Option<String> {
+    files
+        .iter()
+        .flat_map(|f| git_config_values(f, section, key, 0))
+        .last()
+}
+
+/// Whether a boolean config key (e.g. `extensions.worktreeConfig`) is set.
+fn git_config_truthy(path: &Path, section: &str, key: &str) -> bool {
+    git_config_values(path, section, key, 0)
+        .last()
+        .is_some_and(|v| matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1"))
+}
+
+/// The worktree top-level behind a linked-worktree gitdir: the `<gitdir>/gitdir`
+/// back-pointer holds the worktree's `.git` file path.
+fn worktree_root(gitdir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(gitdir.join("gitdir")).ok()?;
+    let n = normalize_path(&PathBuf::from(text.trim()));
+    n.parent().map(Path::to_path_buf)
+}
+
+/// A submodule's worktree directory from `core.worktree` in its config,
+/// resolved relative to the gitdir.
+fn module_root(gitdir: &Path) -> Option<PathBuf> {
+    let w = git_config_last(&[gitdir.join("config")], "core", "worktree")?;
+    let p = PathBuf::from(w);
+    Some(normalize_path(&if p.is_absolute() {
+        p
+    } else {
+        gitdir.join(p)
+    }))
+}
+
+/// The `core.hooksPath` directory for `gitdir`, if configured. Relative
+/// paths resolve against the worktree top-level (where hooks run).
+fn hooks_path(gitdir: &Path, common: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    let files = vec![
+        common.join("config"),
+        gitdir.join("config"),
+        gitdir.join("config.worktree"),
+    ];
+    let v = git_config_last(&files, "core", "hookspath")?;
+    if v.trim().is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(v);
+    let resolved = if p.is_absolute() {
+        normalize_path(&p)
+    } else {
+        let root = root
+            .map(Path::to_path_buf)
+            .or_else(|| worktree_root(gitdir))
+            .or_else(|| module_root(gitdir))?;
+        normalize_path(&root.join(p))
+    };
+    // A hooks path that is the whole worktree cannot be carved out without
+    // making the workspace read-only; that is not a real configuration.
+    if root.is_some_and(|r| resolved == normalize_path(r)) {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// `dir` plus every ancestor that still sits under a writable root becomes
+/// a mount point, so none of them can be moved aside. `dir` itself is
+/// pinned even outside the roots (a gitdir need not be writable).
+fn push_pin(
+    out: &mut GitTargets,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    dir: &Path,
+    under: &dyn Fn(&Path) -> bool,
+) {
+    let mut d = Some(dir.to_path_buf());
+    while let Some(p) = d {
+        let inside = under(&p);
+        if inside || p == *dir {
+            if let Ok(c) = std::fs::canonicalize(&p) {
+                if seen.insert(c.clone()) {
+                    out.pin.push(c);
+                }
+            }
+        }
+        if !inside {
+            break;
+        }
+        d = p.parent().map(Path::to_path_buf);
+    }
+}
+
+/// Every `.git` path the sandbox pins or makes read-only: hooks, config and
+/// metadata under every reachable git dir, so a planted hook or
+/// `core.hooksPath` redirect cannot run later outside the sandbox — and
+/// directories that must not be moved aside to hide the protection.
+/// Submodule (`modules/*`) and linked-worktree (`worktrees/*`) gitdirs are
+/// covered wherever they sit.
+fn git_targets(cwd: &Path, writable: &[PathBuf]) -> GitTargets {
+    let under = |p: &Path| writable.iter().any(|root| p.starts_with(root));
+    let mut out = GitTargets::default();
+    let mut pin_seen = std::collections::HashSet::new();
+    // Queue of (gitdir, worktree top-level) pairs to expand.
+    let mut work: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+
+    let consider = |dir: &Path,
+                    out: &mut GitTargets,
+                    pin_seen: &mut std::collections::HashSet<PathBuf>,
+                    work: &mut Vec<(PathBuf, Option<PathBuf>)>| {
+        if !under(dir) {
             return;
         }
         let git = dir.join(".git");
         match std::fs::metadata(&git) {
-            Ok(m) if m.is_dir() => gitdirs.push(git),
+            Ok(m) if m.is_dir() => {
+                // `.git` a directory — or a symlink to one. A symlink cannot
+                // be a mount point, so the link itself stays replaceable
+                // (`mv .git aside` works); the resolved gitdir still gets
+                // pinned and read-only below, and the gap is reported.
+                push_pin(out, pin_seen, dir, &under);
+                if let Ok(gd) = std::fs::canonicalize(&git) {
+                    if git.is_symlink() {
+                        out.notes.push(format!(
+                            "{} is a symlink; it can be renamed aside inside the sandbox",
+                            git.display()
+                        ));
+                    }
+                    push_pin(out, pin_seen, &gd, &under);
+                    work.push((gd, Some(dir.to_path_buf())));
+                }
+            }
             Ok(_) => {
+                // A `gitdir:` pointer file (worktree, submodule): the file
+                // gets a read-only bind, which also pins it against rename.
                 if let Some(gd) = resolve_gitfile(&git) {
-                    pointers.push(git);
-                    gitdirs.push(gd);
+                    out.readonly.push(git);
+                    push_pin(out, pin_seen, dir, &under);
+                    work.push((gd, Some(dir.to_path_buf())));
                 }
             }
             Err(_) => {}
         }
     };
     for root in writable {
-        consider(root);
+        consider(root, &mut out, &mut pin_seen, &mut work);
     }
     let mut dir = Some(cwd);
     while let Some(d) = dir {
-        consider(d);
+        consider(d, &mut out, &mut pin_seen, &mut work);
         dir = d.parent();
     }
 
     let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<PathBuf> = pointers;
-    for gitdir in gitdirs {
-        let gd = common_gitdir(&gitdir);
-        if !seen.insert(gd.clone()) {
+    let mut common_seen = std::collections::HashSet::new();
+    while let Some((gitdir, root)) = work.pop() {
+        if !seen.insert(gitdir.clone()) {
             continue;
         }
-        out.extend([gd.join("hooks"), gd.join("config")]);
-        let info = gd.join("info");
-        if info.join("attributes").exists() || info.is_dir() {
-            out.push(if info.join("attributes").exists() {
-                info.join("attributes")
-            } else {
-                info
-            });
+        let common = common_gitdir(&gitdir);
+        push_pin(&mut out, &mut pin_seen, &gitdir, &under);
+        push_pin(&mut out, &mut pin_seen, &common, &under);
+        if common_seen.insert(common.clone()) {
+            out.required.extend([
+                (common.join("config"), Ensure::File),
+                (common.join("hooks"), Ensure::Dir),
+            ]);
+            let info = common.join("info");
+            if info.join("attributes").exists() {
+                out.readonly.push(info.join("attributes"));
+            } else if info.is_dir() {
+                out.readonly.push(info);
+            }
+            // `hooks` may be a symlink whose target lives in a writable
+            // root; the bind lands on the target through the link, but list
+            // the real path too (it is what seatbelt matches). The link
+            // itself cannot be pinned — a symlink is never a mount point.
+            let hooks = common.join("hooks");
+            if hooks.is_symlink() {
+                out.notes.push(format!(
+                    "{} is a symlink; it can be renamed aside inside the sandbox",
+                    hooks.display()
+                ));
+            }
+            if let Ok(real) = std::fs::canonicalize(&hooks) {
+                if real != hooks && under(&real) {
+                    out.readonly.push(real.clone());
+                    push_pin(&mut out, &mut pin_seen, &real, &under);
+                }
+            }
+        }
+        // Per-gitdir files that steer where shared metadata lives.
+        for f in ["commondir", "gitdir", "config.worktree"] {
+            let p = gitdir.join(f);
+            if p.exists() {
+                out.readonly.push(p);
+            }
+        }
+        if git_config_truthy(&common.join("config"), "extensions", "worktreeconfig") {
+            out.required
+                .push((gitdir.join("config.worktree"), Ensure::File));
+        }
+        // Where hooks actually run when core.hooksPath is set.
+        if let Some(hp) = hooks_path(&gitdir, &common, root.as_deref()) {
+            if under(&hp) {
+                out.required.push((hp.clone(), Ensure::DirAll));
+                push_pin(&mut out, &mut pin_seen, &hp, &under);
+            }
+        }
+        // Submodule and linked-worktree gitdirs under the common dir; the
+        // holders get pinned so `mv .git/modules aside` fails too.
+        for nest in ["modules", "worktrees"] {
+            let holder = common.join(nest);
+            if holder.is_dir() {
+                push_pin(&mut out, &mut pin_seen, &holder, &under);
+                if let Ok(entries) = std::fs::read_dir(&holder) {
+                    for e in entries.flatten() {
+                        if e.file_type().is_ok_and(|t| t.is_dir()) {
+                            if let Ok(sub) = std::fs::canonicalize(e.path()) {
+                                work.push((sub, None));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+    // The same path can arrive from several discoveries.
+    let mut ro_seen = std::collections::HashSet::new();
+    out.readonly.retain(|p| ro_seen.insert(p.clone()));
+    let mut req_seen = std::collections::HashSet::new();
+    out.required.retain(|(p, _)| req_seen.insert(p.clone()));
+    out.notes.dedup();
     out
 }
 
@@ -343,9 +667,9 @@ fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<St
 fn wrap(policy: &Policy, cwd: &Path, argv: Vec<String>) -> anyhow::Result<Vec<String>> {
     let writable = writable_roots(policy, cwd);
     let git = if policy.git_writable {
-        Vec::new()
+        GitTargets::default()
     } else {
-        protected_git_paths(cwd, &writable)
+        git_targets(cwd, &writable)
     };
     let mut v = vec![
         "/usr/bin/sandbox-exec".to_string(),
@@ -361,11 +685,12 @@ fn wrap(_policy: &Policy, _cwd: &Path, _argv: Vec<String>) -> anyhow::Result<Vec
     anyhow::bail!("sandboxing is not supported on this platform")
 }
 
-/// A macOS Seatbelt (SBPL) profile allowing writes only under `roots`. `git`
-/// lists the `.git` paths that stay read-only; deny rules come last because
-/// Seatbelt lets later rules win.
+/// A macOS Seatbelt (SBPL) profile allowing writes only under `roots`.
+/// `git.required`/`git.readonly` list the `.git` paths that stay read-only
+/// and `git.pin` the directories that must not be moved aside; deny rules
+/// come last because Seatbelt lets later rules win.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn seatbelt_profile(roots: &[PathBuf], network: bool, git: &[PathBuf]) -> String {
+fn seatbelt_profile(roots: &[PathBuf], network: bool, git: &GitTargets) -> String {
     let quote = |p: &Path| {
         format!(
             "\"{}\"",
@@ -389,10 +714,29 @@ fn seatbelt_profile(roots: &[PathBuf], network: bool, git: &[PathBuf]) -> String
         // profile cannot carve AF_UNIX back out safely.
         s.push_str("(deny network*)\n");
     }
-    if !git.is_empty() {
-        s.push_str("(deny file-write*");
-        for p in git {
-            s.push_str(&format!(" (literal {}) (subpath {})", quote(p), quote(p)));
+    let readonly = git
+        .required
+        .iter()
+        .map(|(p, _)| p)
+        .chain(git.readonly.iter());
+    let mut has_ro = false;
+    for p in readonly {
+        if !has_ro {
+            s.push_str("(deny file-write*");
+            has_ro = true;
+        }
+        s.push_str(&format!(" (literal {}) (subpath {})", quote(p), quote(p)));
+    }
+    if has_ro {
+        s.push_str(")\n");
+    }
+    if !git.pin.is_empty() {
+        // Seatbelt cannot self-bind; denying file-write-unlink on the
+        // directory node stops `mv .git aside` and `rmdir` the same way the
+        // mount-point EBUSY does on Linux.
+        s.push_str("(deny file-write-unlink");
+        for p in &git.pin {
+            s.push_str(&format!(" (literal {})", quote(p)));
         }
         s.push_str(")\n");
     }
@@ -475,11 +819,21 @@ pub fn status(policy: &Policy) -> SandboxStatus {
                 reasons.push("no seccomp socket filter: UDP and unix sockets stay open".into());
             }
         }
-        if policy.mode == Mode::WorkspaceWrite
-            && !policy.git_writable
-            && !linux::git::userns_available()
-        {
-            reasons.push(".git hooks/config stay writable (user namespaces unavailable)".into());
+        if policy.mode == Mode::WorkspaceWrite && !policy.git_writable {
+            match linux::git::probe() {
+                // The runtime outcome decides: the helper reports whether
+                // its mounts applied, so Docker and pre-5.12 kernels show
+                // partial instead of silently claiming full.
+                Some(Err(e)) => reasons.push(format!(".git protection open: {e}")),
+                Some(Ok(())) => {}
+                None => {
+                    if !linux::git::userns_available() {
+                        reasons.push(
+                            ".git hooks/config stay writable (user namespaces unavailable)".into(),
+                        );
+                    }
+                }
+            }
         }
         return SandboxStatus {
             backend: Backend::Landlock,
@@ -573,7 +927,7 @@ mod linux {
         })
     }
 
-    /// `exe __sandbox [--net] [--unix] [--git-writable] [--write PATH]... -- argv...`
+    /// `exe __sandbox [--net] [--unix] [--git-writable] [--git-strict] [--write PATH]... -- argv...`
     pub fn helper_args(
         exe: &Path,
         writable: &[PathBuf],
@@ -589,6 +943,9 @@ mod linux {
         }
         if policy.git_writable {
             v.push("--git-writable".into());
+        }
+        if policy.git_strict {
+            v.push("--git-strict".into());
         }
         for w in writable {
             v.push("--write".into());
@@ -607,16 +964,23 @@ mod linux {
         pub unix_sockets: bool,
         /// Leave `.git` metadata (hooks/config) writable.
         pub git_writable: bool,
+        /// Refuse to run when `.git` protection cannot be applied.
+        pub git_strict: bool,
+        /// Probe mode: apply `.git` protection, report, and exit.
+        pub git_probe: bool,
         pub argv: Vec<String>,
     }
 
-    /// Inverse of `helper_args` (without exe and HELPER_ARG).
+    /// Inverse of `helper_args` (without exe and HELPER_ARG). Also accepts
+    /// the internal `--git-probe`, used by the status check.
     pub fn parse(args: &[String]) -> Result<Spec, String> {
         let mut spec = Spec {
             writable: Vec::new(),
             network: false,
             unix_sockets: false,
             git_writable: false,
+            git_strict: false,
+            git_probe: false,
             argv: Vec::new(),
         };
         let mut it = args.iter();
@@ -625,6 +989,8 @@ mod linux {
                 "--net" => spec.network = true,
                 "--unix" => spec.unix_sockets = true,
                 "--git-writable" => spec.git_writable = true,
+                "--git-strict" => spec.git_strict = true,
+                "--git-probe" => spec.git_probe = true,
                 "--write" => spec
                     .writable
                     .push(PathBuf::from(it.next().ok_or("--write needs a path")?)),
@@ -666,10 +1032,36 @@ mod linux {
             std::process::exit(126)
         };
         let spec = parse(&args).unwrap_or_else(|e| fail(e));
+        if spec.git_probe {
+            // Used by `status()` to learn whether the mount-based `.git`
+            // protection really applies here: prints a marker and exits
+            // before Landlock, so the answer is about the mounts alone.
+            let t = super::git_targets(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+                &spec.writable,
+            );
+            match if spec.git_writable {
+                Ok(())
+            } else {
+                git::protect(&t)
+            } {
+                Ok(()) => {
+                    eprintln!("nyq sandbox: git protection available");
+                    std::process::exit(0);
+                }
+                Err(e) => fail(format!(".git metadata protection failed: {e}")),
+            }
+        }
         if !spec.git_writable {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-            let targets = super::protected_git_paths(&cwd, &spec.writable);
+            let targets = super::git_targets(&cwd, &spec.writable);
+            for note in &targets.notes {
+                eprintln!("nyq sandbox: {note}");
+            }
             if let Err(e) = git::protect(&targets) {
+                if spec.git_strict {
+                    fail(format!(".git metadata protection failed: {e}"));
+                }
                 eprintln!("nyq sandbox: .git metadata stays writable: {e}");
             }
         }
@@ -700,9 +1092,14 @@ mod linux {
     /// seccomp-bpf that makes `socket()` fail with EACCES for AF_INET,
     /// AF_INET6 (any type, so UDP too) and, unless the policy allows it,
     /// AF_UNIX. Landlock can only gate TCP; this closes the UDP and
-    /// unix-socket gaps. The filter is installed via
-    /// `prctl(PR_SET_NO_NEW_PRIVS)` + `seccomp(SECCOMP_SET_MODE_FILTER)` with
-    /// a hand-written BPF program checked against the build architecture.
+    /// unix-socket gaps. `io_uring` could repeat `socket()` in the kernel
+    /// (`IORING_OP_SOCKET`) without ever calling the syscall, so its three
+    /// setup/enter/register syscalls fail with EPERM as well. `socketpair()`
+    /// stays allowed: it only creates an already-connected anonymous pair —
+    /// there is no address to reach the host with. The filter is installed
+    /// via `prctl(PR_SET_NO_NEW_PRIVS)` + `seccomp(SECCOMP_SET_MODE_FILTER)`
+    /// with a hand-written BPF program checked against the build
+    /// architecture.
     pub mod seccomp {
         /// The socket filter has checked syscall numbers and audit arches for
         /// x86_64 and aarch64 only.
@@ -724,14 +1121,18 @@ mod linux {
             }
         }
 
-        /// Install the socket filter. `allow_unix` leaves AF_UNIX open.
+        #[cfg(target_arch = "x86_64")]
+        const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+        #[cfg(target_arch = "aarch64")]
+        const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
+
+        /// Build the BPF program for the socket filter. `allow_unix` leaves
+        /// AF_UNIX open. Kept separate from installation so tests can
+        /// interpret the program.
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        pub fn deny_sockets(allow_unix: bool) -> Result<(), String> {
-            #[cfg(target_arch = "x86_64")]
-            const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
-            #[cfg(target_arch = "aarch64")]
-            const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
+        fn filter_program(allow_unix: bool) -> Vec<libc::sock_filter> {
             const EACCES: u32 = 13;
+            const EPERM: u32 = 1;
 
             // seccomp_data offsets: nr @0, arch @4, args[0] @16 (little-endian).
             const OFF_NR: u32 = 0;
@@ -759,8 +1160,20 @@ mod linux {
                 k,
             };
 
-            // Syscall numbers to check. On x86_64 the x32 ABI reuses the same
+            // io_uring issues IORING_OP_SOCKET (and bind/connect/accept) inside
+            // the kernel during io_uring_enter, never touching socket() — it
+            // bypassed the family check and reached the host over UDP and unix
+            // sockets. Fail all three io_uring syscalls with EPERM when the
+            // network is off. Numbers are 425/426/427 on both x86_64 and
+            // aarch64 (asm-generic). On x86_64 the x32 ABI reuses the same
             // numbers with __X32_SYSCALL_BIT set; deny that variant too.
+            let mut uring_nrs = vec![425u32, 426, 427];
+            #[cfg(target_arch = "x86_64")]
+            for nr in [425u32, 426, 427] {
+                uring_nrs.push(nr | 0x4000_0000);
+            }
+            // socketpair() stays allowed: it only makes a connected AF_UNIX
+            // pair and cannot name or reach a host socket.
             let mut socket_nrs = vec![libc::SYS_socket as u32];
             #[cfg(target_arch = "x86_64")]
             socket_nrs.push((libc::SYS_socket as u32) | 0x4000_0000);
@@ -768,21 +1181,31 @@ mod linux {
             if !allow_unix {
                 denied.push(libc::AF_UNIX as u32);
             }
-            let (n, m) = (socket_nrs.len(), denied.len());
-            let allow_idx = 3 + n + 1 + m; // instruction index of `ret ALLOW`
+            let (n, k, m) = (socket_nrs.len(), uring_nrs.len(), denied.len());
+            let allow1 = 3 + n + k; // ret ALLOW after the nr checks
+            let domain = allow1 + 1; // `ld args[0]` — only reached for socket()
+            let allow2 = domain + 1 + m;
+            let eacces = allow2 + 1;
+            let eperm = eacces + 1;
+            let kill = eperm + 1;
 
-            let mut f = Vec::with_capacity(allow_idx + 3);
+            let mut f = Vec::with_capacity(kill + 1);
             f.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH));
             // Wrong architecture (e.g. i386 compat, where socket() rides
             // socketcall): kill rather than risk a bypass.
-            f.push(jeq(AUDIT_ARCH, 0, (allow_idx + 2 - 2) as u8));
+            f.push(jeq(AUDIT_ARCH, 0, (kill - 2) as u8));
             f.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR));
             for (i, nr) in socket_nrs.iter().enumerate() {
-                // A match jumps to the domain checks; the last nr check must
-                // jump to ALLOW on mismatch, not fall through to them.
-                let jf = if i + 1 == n { (m + 1) as u8 } else { 0 };
-                f.push(jeq(*nr, (n - 1 - i) as u8, jf));
+                // A match jumps to the domain checks; a mismatch falls
+                // through to the next nr check, then to io_uring checks.
+                f.push(jeq(*nr, (domain - (3 + i) - 1) as u8, 0));
             }
+            for (i, nr) in uring_nrs.iter().enumerate() {
+                // io_uring is denied outright: its socket ops never call
+                // socket(), so checking the family cannot help.
+                f.push(jeq(*nr, (eperm - (3 + n + i) - 1) as u8, 0));
+            }
+            f.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW));
             // args[0] is the socket domain; the kernel reads an int, so the
             // low 32 bits decide. Matching only the low word also denies a
             // domain smuggled in the high bits.
@@ -792,8 +1215,15 @@ mod linux {
             }
             f.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW));
             f.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ERRNO | EACCES));
+            f.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ERRNO | EPERM));
             f.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
+            f
+        }
 
+        /// Install the socket filter. `allow_unix` leaves AF_UNIX open.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        pub fn deny_sockets(allow_unix: bool) -> Result<(), String> {
+            let f = filter_program(allow_unix);
             let prog = libc::sock_fprog {
                 len: f.len() as u16,
                 filter: f.as_ptr() as *mut libc::sock_filter,
@@ -818,6 +1248,96 @@ mod linux {
         pub fn deny_sockets(_allow_unix: bool) -> Result<(), String> {
             let _ = available();
             Err("seccomp socket filter is not built for this architecture".into())
+        }
+
+        #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+        mod tests {
+            use super::*;
+
+            /// Run the built program against a fake seccomp_data (nr, arch,
+            /// args[0]) and return the SECCOMP_RET_* value it produces.
+            /// Only the three opcodes the filter emits are interpreted.
+            fn run(prog: &[libc::sock_filter], nr: u32, arch: u32, arg0: u64) -> u32 {
+                let mut data = [0u8; 64];
+                data[0..4].copy_from_slice(&nr.to_le_bytes());
+                data[4..8].copy_from_slice(&arch.to_le_bytes());
+                data[16..24].copy_from_slice(&arg0.to_le_bytes());
+                let mut a: u32 = 0;
+                let mut pc: usize = 0;
+                loop {
+                    let ins = &prog[pc];
+                    match ins.code {
+                        // ld [k]
+                        0x20 => {
+                            a = u32::from_le_bytes(
+                                data[ins.k as usize..ins.k as usize + 4].try_into().unwrap(),
+                            );
+                            pc += 1;
+                        }
+                        // jeq k
+                        0x15 => {
+                            pc += 1 + if a == ins.k { ins.jt } else { ins.jf } as usize;
+                        }
+                        // ret k
+                        0x06 => return ins.k,
+                        c => panic!("unexpected opcode {c:#x}"),
+                    }
+                }
+            }
+
+            const ALLOW: u32 = libc::SECCOMP_RET_ALLOW;
+            const EACCES_RET: u32 = libc::SECCOMP_RET_ERRNO | 13;
+            const EPERM_RET: u32 = libc::SECCOMP_RET_ERRNO | 1;
+            const KILL_RET: u32 = libc::SECCOMP_RET_KILL_PROCESS;
+
+            #[test]
+            fn io_uring_syscalls_fail_with_eperm() {
+                let prog = filter_program(false);
+                for nr in [425u32, 426, 427] {
+                    assert_eq!(run(&prog, nr, AUDIT_ARCH, 0), EPERM_RET, "nr {nr}");
+                }
+                #[cfg(target_arch = "x86_64")]
+                for nr in [425u32 | 0x4000_0000, 426 | 0x4000_0000, 427 | 0x4000_0000] {
+                    assert_eq!(run(&prog, nr, AUDIT_ARCH, 0), EPERM_RET, "x32 nr {nr:#x}");
+                }
+                // A wrong-arch trap still kills rather than bypass.
+                assert_eq!(run(&prog, 425, 0x4000_0028, 0), KILL_RET);
+            }
+
+            #[test]
+            fn socket_family_and_other_calls_unchanged() {
+                let prog = filter_program(false);
+                let sock = libc::SYS_socket as u32;
+                assert_eq!(
+                    run(&prog, sock, AUDIT_ARCH, libc::AF_INET as u64),
+                    EACCES_RET
+                );
+                assert_eq!(
+                    run(&prog, sock, AUDIT_ARCH, libc::AF_INET6 as u64),
+                    EACCES_RET
+                );
+                assert_eq!(
+                    run(&prog, sock, AUDIT_ARCH, libc::AF_UNIX as u64),
+                    EACCES_RET
+                );
+                // Non-denied families (NETLINK) and unrelated calls pass.
+                assert_eq!(run(&prog, sock, AUDIT_ARCH, libc::AF_NETLINK as u64), ALLOW);
+                assert_eq!(run(&prog, libc::SYS_openat as u32, AUDIT_ARCH, 0), ALLOW);
+                // socketpair() rides its own syscall and stays allowed.
+                assert_eq!(
+                    run(&prog, libc::SYS_socketpair as u32, AUDIT_ARCH, 0),
+                    ALLOW
+                );
+                // --unix re-allows AF_UNIX only.
+                let prog = filter_program(true);
+                assert_eq!(run(&prog, sock, AUDIT_ARCH, libc::AF_UNIX as u64), ALLOW);
+                assert_eq!(
+                    run(&prog, sock, AUDIT_ARCH, libc::AF_INET as u64),
+                    EACCES_RET
+                );
+                // io_uring stays denied: IORING_OP_SOCKET ignores AF_UNIX.
+                assert_eq!(run(&prog, 425, AUDIT_ARCH, 0), EPERM_RET);
+            }
         }
     }
 
@@ -895,10 +1415,21 @@ mod linux {
                 .map_err(|_| format!("{}: path contains NUL", path.display()))
         }
 
-        /// Re-bind `path` read-only over itself (open_tree + mount_setattr +
-        /// move_mount), inside the private mount namespace.
-        fn bind_read_only(path: &Path) -> Result<(), String> {
+        /// Re-bind `path` over itself inside the private mount namespace
+        /// (open_tree + optional mount_setattr + move_mount). A read-write
+        /// self-bind keeps the contents writable but makes the path a mount
+        /// point, so `rename`/`rmdir`/`umount` on it fails with EBUSY — this
+        /// is what stops `mv .git .git-old` and planting a fresh `.git`.
+        /// A symlink can never be a mount point, so for link destinations
+        /// `MOVE_MOUNT_T_SYMLINKS` follows the link and the clone lands on
+        /// the resolved target instead of failing with EINVAL.
+        fn bind(path: &Path, read_only: bool) -> Result<(), String> {
             let c = c_path(path)?;
+            let dest_flags = if path.is_symlink() {
+                libc::MOVE_MOUNT_F_EMPTY_PATH | libc::MOVE_MOUNT_T_SYMLINKS
+            } else {
+                libc::MOVE_MOUNT_F_EMPTY_PATH
+            };
             unsafe {
                 let tree = libc::syscall(
                     libc::SYS_open_tree,
@@ -913,24 +1444,26 @@ mod linux {
                         std::io::Error::last_os_error()
                     ));
                 }
-                let attr = libc::mount_attr {
-                    attr_set: libc::MOUNT_ATTR_RDONLY,
-                    attr_clr: 0,
-                    propagation: 0,
-                    userns_fd: 0,
-                };
-                if libc::syscall(
-                    libc::SYS_mount_setattr,
-                    tree,
-                    c"".as_ptr(),
-                    libc::AT_EMPTY_PATH,
-                    &attr,
-                    std::mem::size_of::<libc::mount_attr>(),
-                ) != 0
-                {
-                    let e = std::io::Error::last_os_error();
-                    libc::close(tree as i32);
-                    return Err(format!("mount_setattr {}: {e}", path.display()));
+                if read_only {
+                    let attr = libc::mount_attr {
+                        attr_set: libc::MOUNT_ATTR_RDONLY,
+                        attr_clr: 0,
+                        propagation: 0,
+                        userns_fd: 0,
+                    };
+                    if libc::syscall(
+                        libc::SYS_mount_setattr,
+                        tree,
+                        c"".as_ptr(),
+                        libc::AT_EMPTY_PATH,
+                        &attr,
+                        std::mem::size_of::<libc::mount_attr>(),
+                    ) != 0
+                    {
+                        let e = std::io::Error::last_os_error();
+                        libc::close(tree as i32);
+                        return Err(format!("mount_setattr {}: {e}", path.display()));
+                    }
                 }
                 if libc::syscall(
                     libc::SYS_move_mount,
@@ -938,7 +1471,7 @@ mod linux {
                     c"".as_ptr(),
                     libc::AT_FDCWD,
                     c.as_ptr(),
-                    libc::MOVE_MOUNT_F_EMPTY_PATH,
+                    dest_flags,
                 ) != 0
                 {
                     let e = std::io::Error::last_os_error();
@@ -950,32 +1483,50 @@ mod linux {
             Ok(())
         }
 
-        /// Bind every `.git` metadata path read-only, then drop CAP_SYS_ADMIN
-        /// from the bounding set so the command cannot undo the mounts.
-        pub fn protect(targets: &[PathBuf]) -> Result<(), String> {
+        /// Pin `targets.pin` with self-binds and bind every read-only path,
+        /// then drop CAP_SYS_ADMIN from the bounding set so the command
+        /// cannot undo the mounts.
+        pub fn protect(targets: &super::super::GitTargets) -> Result<(), String> {
+            // Capture the cwd before unshare: it points into the original
+            // mount, and lookups that start from a stale cwd or dirfd never
+            // cross the mounts we stack on top. Re-resolving it after the
+            // binds lands the command inside the pinned view.
+            let cwd = std::env::current_dir().ok();
+            let pins: Vec<PathBuf> = targets.pin.iter().filter(|p| p.is_dir()).cloned().collect();
             let mut mounts = Vec::new();
-            for target in targets {
-                if !target.exists() {
-                    // A missing hooks dir or config could be created inside
-                    // the sandbox; make it real first so it can be bound.
-                    let name = target.file_name().and_then(|n| n.to_str());
-                    let created = match name {
-                        Some("hooks") => std::fs::create_dir(target),
-                        Some("config") => std::fs::write(target, ""),
-                        _ => continue,
+            for (path, ensure) in &targets.required {
+                if !path.exists() {
+                    // A missing hooks dir, config or hooksPath could be
+                    // created inside the sandbox; make it real first so it
+                    // can be bound. If we cannot create it, neither can the
+                    // sandboxed command.
+                    let created = match ensure {
+                        super::super::Ensure::Dir => std::fs::create_dir(path).map(|_| ()),
+                        super::super::Ensure::DirAll => std::fs::create_dir_all(path).map(|_| ()),
+                        super::super::Ensure::File => std::fs::write(path, ""),
                     };
                     if created.is_err() {
                         continue;
                     }
                 }
-                mounts.push(target.clone());
+                mounts.push(path.clone());
             }
-            if mounts.is_empty() {
+            for path in &targets.readonly {
+                if path.exists() {
+                    mounts.push(path.clone());
+                }
+            }
+            if pins.is_empty() && mounts.is_empty() {
                 return Ok(());
             }
             enter_namespaces()?;
+            // Pins first: the read-only binds then land inside an already
+            // pinned tree.
+            for p in &pins {
+                bind(p, false)?;
+            }
             for m in &mounts {
-                bind_read_only(m)?;
+                bind(m, true)?;
             }
             // Without CAP_SYS_ADMIN in the bounding set, nothing in the
             // command tree can umount or rebind these paths — even inside a
@@ -987,7 +1538,50 @@ mod linux {
                     std::io::Error::last_os_error()
                 ));
             }
+            if let Some(dir) = cwd {
+                std::env::set_current_dir(&dir)
+                    .map_err(|e| format!("re-enter {} through the mounts: {e}", dir.display()))?;
+            }
             Ok(())
+        }
+
+        /// Run `nyq __sandbox --git-probe` in a scratch repo to learn whether
+        /// the mount-based `.git` protection really works on this system
+        /// (unshare, open_tree, mount_setattr, move_mount — kernel 5.12+).
+        /// `None` means the probe could not run — notably under `cargo test`,
+        /// where `current_exe` is the test binary, not nyq. The answer is
+        /// cached for the process.
+        pub fn probe() -> Option<Result<(), String>> {
+            static RESULT: std::sync::OnceLock<Option<Result<(), String>>> =
+                std::sync::OnceLock::new();
+            RESULT.get_or_init(probe_once).clone()
+        }
+
+        fn probe_once() -> Option<Result<(), String>> {
+            let exe = std::env::current_exe().ok()?;
+            let dir = std::env::temp_dir().join(format!("nyq-gitprobe-{}", std::process::id()));
+            let found = (|| {
+                std::fs::create_dir_all(dir.join(".git/hooks")).ok()?;
+                std::fs::write(dir.join(".git/config"), "").ok()?;
+                let out = std::process::Command::new(exe)
+                    .args([super::super::HELPER_ARG, "--git-probe", "--write"])
+                    .arg(&dir)
+                    .args(["--", "true"])
+                    .current_dir(&dir)
+                    .output()
+                    .ok()?;
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if out.status.success() && stderr.contains("git protection available") {
+                    Some(Ok(()))
+                } else {
+                    stderr
+                        .lines()
+                        .find_map(|l| l.strip_prefix("nyq sandbox: "))
+                        .map(|msg| Err(msg.to_string()))
+                }
+            })();
+            let _ = std::fs::remove_dir_all(&dir);
+            found
         }
     }
 
@@ -1002,6 +1596,7 @@ mod linux {
                 network: true,
                 unix_sockets: true,
                 git_writable: true,
+                git_strict: true,
                 ..Default::default()
             };
             let v = helper_args(
@@ -1013,7 +1608,8 @@ mod linux {
             assert_eq!(&v[..2], ["/bin/nyq", "__sandbox"]);
             let spec = parse(&v[2..]).unwrap();
             assert_eq!(spec.writable, vec![PathBuf::from("/w s")]);
-            assert!(spec.network && spec.unix_sockets && spec.git_writable);
+            assert!(spec.network && spec.unix_sockets && spec.git_writable && spec.git_strict);
+            assert!(!spec.git_probe);
             assert_eq!(spec.argv, argv);
             assert!(parse(&["--net".into()]).is_err());
             assert!(parse(&["--bogus".into(), "--".into(), "x".into()]).is_err());
@@ -1064,10 +1660,15 @@ mod tests {
 
     #[test]
     fn seatbelt_profile_escapes_and_denies() {
-        let git = vec![
-            PathBuf::from("/w/.git/hooks"),
-            PathBuf::from("/w/.git/config"),
-        ];
+        let git = GitTargets {
+            pin: vec![PathBuf::from("/w"), PathBuf::from("/w/.git")],
+            required: vec![
+                (PathBuf::from("/w/.git/hooks"), Ensure::Dir),
+                (PathBuf::from("/w/.git/config"), Ensure::File),
+            ],
+            readonly: vec![PathBuf::from("/w/.git/info")],
+            notes: Vec::new(),
+        };
         let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false, &git);
         assert!(p.contains("(deny file-write*)"));
         assert!(p.contains(r#""/tmp/a\"b""#));
@@ -1078,22 +1679,37 @@ mod tests {
         assert!(p.contains(r#"(literal "/w/.git/config")"#));
         assert!(p.contains(r#"(subpath "/w/.git/hooks")"#));
         assert!(p.find(".git").unwrap() > p.find("allow file-write*").unwrap());
-        assert!(!seatbelt_profile(&[], true, &[]).contains("deny network"));
-        assert!(!seatbelt_profile(&[], false, &[]).contains(".git"));
+        // .git itself and the repo dir are denied rename/unlink so the
+        // deny rules cannot be moved aside (the Linux pins do the same).
+        assert!(p.contains(r#"(deny file-write-unlink (literal "/w") (literal "/w/.git"))"#));
+        let empty = GitTargets::default();
+        assert!(!seatbelt_profile(&[], true, &empty).contains("deny network"));
+        assert!(!seatbelt_profile(&[], false, &empty).contains(".git"));
     }
 
     #[test]
-    fn protected_git_paths_cover_dirs_and_worktrees() {
+    fn git_targets_cover_dirs_and_worktrees() {
         let root = tempfile::tempdir().unwrap();
         let git = root.path().join(".git");
         std::fs::create_dir_all(git.join("hooks")).unwrap();
         std::fs::write(git.join("config"), "").unwrap();
         std::fs::create_dir_all(git.join("info")).unwrap();
         let roots = &[root.path().to_path_buf()];
-        let out = protected_git_paths(root.path(), roots);
-        assert!(out.contains(&git.join("hooks")), "{out:?}");
-        assert!(out.contains(&git.join("config")), "{out:?}");
-        assert!(out.contains(&git.join("info")), "{out:?}");
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let t = git_targets(root.path(), roots);
+        assert!(
+            t.required.contains(&(git.join("hooks"), Ensure::Dir)),
+            "{t:?}"
+        );
+        assert!(
+            t.required.contains(&(git.join("config"), Ensure::File)),
+            "{t:?}"
+        );
+        assert!(t.readonly.contains(&git.join("info")), "{t:?}");
+        // The repo dir, `.git` and the writable root are pinned so `mv .git`
+        // and `mv repo` fail with EBUSY.
+        assert!(t.pin.contains(&canon(&git)), "{t:?}");
+        assert!(t.pin.contains(&canon(root.path())), "{t:?}");
 
         // A `.git` file (worktree pointer) is protected itself plus the real
         // gitdir's shared metadata.
@@ -1104,10 +1720,93 @@ mod tests {
         let wt = root.path().join("wt");
         std::fs::create_dir(&wt).unwrap();
         std::fs::write(wt.join(".git"), format!("gitdir: {}", real_gd.display())).unwrap();
-        let out = protected_git_paths(&wt, roots);
-        assert!(out.contains(&wt.join(".git")), "{out:?}");
-        assert!(out.contains(&real_gd.join("hooks")), "{out:?}");
-        assert!(out.contains(&real_gd.join("config")), "{out:?}");
+        let t = git_targets(&wt, roots);
+        assert!(t.readonly.contains(&wt.join(".git")), "{t:?}");
+        assert!(
+            t.required.contains(&(real_gd.join("hooks"), Ensure::Dir)),
+            "{t:?}"
+        );
+        assert!(
+            t.required.contains(&(real_gd.join("config"), Ensure::File)),
+            "{t:?}"
+        );
+        assert!(t.pin.contains(&canon(&wt)), "{t:?}");
+        assert!(t.pin.contains(&canon(&real_gd)), "{t:?}");
+    }
+
+    #[test]
+    fn git_targets_cover_modules_hookspath_and_worktree_config() {
+        let root = tempfile::tempdir().unwrap();
+        let git = root.path().join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        // Submodule gitdir under .git/modules, a hooksPath target inside the
+        // workspace, and extensions.worktreeConfig = true.
+        let module = git.join("modules/sub");
+        std::fs::create_dir_all(module.join("hooks")).unwrap();
+        std::fs::write(module.join("config"), "").unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[core]\n\thooksPath = custom/hooks\n[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        // A linked worktree gitdir with a commondir back-pointer.
+        let wt_gd = git.join("worktrees/wt1");
+        std::fs::create_dir_all(&wt_gd).unwrap();
+        std::fs::write(wt_gd.join("commondir"), "../..").unwrap();
+        let t = git_targets(root.path(), &[root.path().to_path_buf()]);
+        // The submodule's own config and hooks are protected, not only the
+        // main repo's.
+        assert!(
+            t.required.contains(&(module.join("config"), Ensure::File)),
+            "{t:?}"
+        );
+        assert!(
+            t.required.contains(&(module.join("hooks"), Ensure::Dir)),
+            "{t:?}"
+        );
+        assert!(t.pin.contains(&canon(&module)), "{t:?}");
+        // core.hooksPath is read without running git; the target must exist
+        // (DirAll) so it can be bound read-only.
+        assert!(
+            t.required
+                .contains(&(root.path().join("custom/hooks"), Ensure::DirAll)),
+            "{t:?}"
+        );
+        // The worktree gitdir keeps its commondir and gets config.worktree.
+        assert!(t.readonly.contains(&wt_gd.join("commondir")), "{t:?}");
+        assert!(
+            t.required
+                .contains(&(wt_gd.join("config.worktree"), Ensure::File)),
+            "{t:?}"
+        );
+        assert!(t.pin.contains(&canon(&wt_gd)), "{t:?}");
+        assert!(t.pin.contains(&canon(&git.join("modules"))), "{t:?}");
+        assert!(t.pin.contains(&canon(&git.join("worktrees"))), "{t:?}");
+    }
+
+    #[test]
+    fn git_config_reads_sections_includes_and_bools() {
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("inc.conf");
+        std::fs::write(&inc, "[core]\n\thooksPath = \"a/b\" # tail\n").unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::write(
+            &cfg,
+            "; c\n[CORE]\n\thooksPath = first\n[include]\n\tpath = inc.conf\n[extensions]\n\tworktreeConfig\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_config_last(std::slice::from_ref(&cfg), "core", "hookspath"),
+            Some("a/b".into())
+        );
+        assert!(git_config_truthy(&cfg, "extensions", "worktreeconfig"));
+        assert!(!git_config_truthy(&cfg, "extensions", "objectformat"));
+        // A relative include resolves against the config file's directory.
+        assert_eq!(
+            expand_config_path("inc.conf", Some(dir.path())),
+            dir.path().join("inc.conf")
+        );
     }
 
     #[test]
