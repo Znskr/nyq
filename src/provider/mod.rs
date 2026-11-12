@@ -43,6 +43,11 @@ pub trait Provider: Send + Sync {
     fn context_window(&self) -> Option<u64> {
         None
     }
+    /// The output cap a request reserves (`max_tokens`), when the provider
+    /// sets one. Compaction keeps room for it.
+    fn max_output_tokens(&self) -> Option<u64> {
+        None
+    }
     /// Fast mode (Codex: the `priority` service tier).
     fn fast(&self) -> bool {
         false

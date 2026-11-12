@@ -635,6 +635,15 @@ impl Provider for HostedProvider {
             .and_then(|i| i.context)
             .or_else(|| self.meta().and_then(|m| m.context))
     }
+    fn max_output_tokens(&self) -> Option<u64> {
+        // Matches the cap `stream_anthropic` sends; other protocols send none.
+        (self.service == Service::Anthropic).then(|| {
+            self.info()
+                .and_then(|i| i.max_output)
+                .or_else(|| self.meta().and_then(|m| m.output))
+                .map_or(32_000, |o| o.clamp(1_024, 64_000))
+        })
+    }
     fn set_conversation(&mut self, id: &str) {
         self.session = id.to_string();
     }

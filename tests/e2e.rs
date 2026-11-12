@@ -225,7 +225,13 @@ fn session_items(home: &std::path::Path) -> Vec<Value> {
 fn auto_compaction_and_resume_discard_earlier_tool_output() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(work.path().join("notes.txt"), "earlier unique tool output").unwrap();
+    // Larger than the newest ~16% of the window that a summary keeps
+    // verbatim, so the summary has to cover the tool output too.
+    let notes = format!(
+        "earlier unique tool output\n{}",
+        "filler line\n".repeat(300)
+    );
+    std::fs::write(work.path().join("notes.txt"), notes).unwrap();
     let summary = "Read notes.txt; continue the requested work.";
     let (url, seen) = fake_server(vec![
         vec![
@@ -389,7 +395,11 @@ fn oversized_compaction_warns_and_continues() {
         .unwrap();
     assert_success(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Automatic compaction is off"), "{stderr}");
+    // Compaction never switches itself off: it says so and carries on.
+    assert!(
+        stderr.contains("still above the compaction threshold"),
+        "{stderr}"
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("Continued."));
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 3);
@@ -546,7 +556,11 @@ fn print_mode_runs_user_hooks_but_not_untrusted_project_hooks() {
         )],
         vec![delta(json!({"content": "Okay."}))],
     ]);
+    // Not a compaction test: this server reports no usage, and the
+    // estimated request (tool definitions included) would not fit the
+    // 1000-token test window.
     let out = print_command(work.path(), home.path(), &url)
+        .env("NYQ_CONTEXT_WINDOW", "200000")
         .arg("write x")
         .output()
         .unwrap();

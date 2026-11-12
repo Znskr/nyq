@@ -207,7 +207,7 @@ impl Agent {
         if !self.context_estimated {
             self.context_tokens = self
                 .context_tokens
-                .saturating_add((out.content.len() as u64).div_ceil(4));
+                .saturating_add(self.text_tokens(&out.content));
         }
         self.push(Item::ToolResult {
             id: id.to_string(),

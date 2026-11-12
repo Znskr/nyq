@@ -30,8 +30,6 @@ pub use step::step_limit;
 pub(crate) use test_support::test_agent;
 pub use ui::{Approval, ApprovalRequest, Approver, Ui};
 
-use compact::{estimate_context, item_tokens};
-
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -77,11 +75,11 @@ pub struct Agent {
     pub context_window: u64,
     /// Latest context size (input plus output), or an estimate after compaction.
     pub context_tokens: u64,
-    /// `context_tokens` is a chars/4 estimate, refreshed from the transcript
-    /// until a provider reports usage.
+    /// `context_tokens` is an estimate (see `crate::usage::tokens`),
+    /// refreshed from the transcript until a provider reports usage.
     pub context_estimated: bool,
-    /// Set when compaction cannot get under the limit, so later turns don't retry.
-    pub(crate) suppress_auto_compact: bool,
+    /// Tier-1 pruning overlay and the calibrated token estimator.
+    pub(crate) compaction: compact::CompactState,
     /// How many leading transcript items have already been sent to the provider.
     /// Automatic compaction may summarize only that prefix, so a user message
     /// that has not been submitted yet is kept verbatim.
@@ -215,7 +213,7 @@ impl Agent {
         self.stats = Default::default();
         self.context_tokens = 0;
         self.context_estimated = false;
-        self.suppress_auto_compact = false;
+        self.compaction.clear();
         self.submitted = 0;
         self.undo = Default::default();
     }
@@ -242,7 +240,7 @@ impl Agent {
         self.stats.id = stats_id;
         self.context_tokens = 0;
         self.context_estimated = false;
-        self.suppress_auto_compact = false;
+        self.compaction.clear();
         self.submitted = 0;
         self.undo = Default::default();
         self.allowed.clear();
@@ -293,8 +291,9 @@ impl Agent {
             }
         }
 
+        self.compaction.clear();
         self.context_estimated = true;
-        self.context_tokens = estimate_context(&self.system, &self.items);
+        self.context_tokens = self.estimate_request();
         self.submitted = self.items.len();
     }
 
@@ -311,7 +310,7 @@ impl Agent {
             }
         }
         if !self.context_estimated {
-            self.context_tokens = self.context_tokens.saturating_add(item_tokens(&item));
+            self.context_tokens = self.context_tokens.saturating_add(self.item_tokens(&item));
         }
         self.push(item);
     }
@@ -377,12 +376,10 @@ mod tests {
             &json!({"path": "f.txt"}),
         );
         assert_eq!(agent.undo.len(), 1);
-        agent.suppress_auto_compact = true;
         agent.context_estimated = true;
         agent.context_tokens = 40;
         agent.reset(None);
         assert!(agent.undo.is_empty());
-        assert!(!agent.suppress_auto_compact);
         assert!(!agent.context_estimated);
         assert_eq!(agent.context_tokens, 0);
 
@@ -393,7 +390,6 @@ mod tests {
         assert_eq!(agent.context_tokens, 2);
         agent.set_context_window(1000);
         assert_eq!(agent.context_window, 1000);
-        assert!(!agent.suppress_auto_compact);
     }
 
     #[test]

@@ -520,6 +520,9 @@ impl Provider for CustomProvider {
     fn context_window(&self) -> Option<u64> {
         metadata(&self.definition, self.model()).and_then(|m| m.choice.context_window)
     }
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.inner.max_output_tokens()
+    }
     fn efforts(&self) -> Vec<String> {
         metadata(&self.definition, self.model())
             .map(|m| m.choice.efforts)

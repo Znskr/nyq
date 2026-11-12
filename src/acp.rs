@@ -584,7 +584,7 @@ async fn open(
         context_window: 0,
         context_tokens: 0,
         context_estimated: false,
-        suppress_auto_compact: false,
+        compaction: Default::default(),
         submitted: 0,
         hooks: Arc::new(hooks),
         sandbox,

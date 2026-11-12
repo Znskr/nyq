@@ -70,6 +70,34 @@ pub(crate) fn spill(home: &Path, key: &str, call_id: &str, tool: &str, content: 
     if content.len() <= SPILL_AT || tool == TOOL || tool == "skill" {
         return content;
     }
+    let head = floor(&content, HEAD);
+    let tail = ceil(&content, content.len() - TAIL).max(head);
+    let total = content.len();
+    let note = match store_result(home, key, call_id, tool, &content) {
+        Ok(id) => format!(
+            "[Full output: {total} bytes, stored as tool result \"{id}\". Call {TOOL} with {{\"id\": \"{id}\", \"offset\": {head}}} \
+             to page through it (limit up to {READ_MAX} bytes), or with \"query\" to find matching lines.]"
+        ),
+        Err(e) => format!("[Output was {total} bytes; the middle was dropped (could not store it: {e}).]"),
+    };
+    format!(
+        "{}\n… [{} bytes omitted] …\n{}\n{note}",
+        &content[..head],
+        tail - head,
+        &content[tail..]
+    )
+}
+
+/// Store a tool result in full, whatever its size, and return its id for
+/// `read_tool_result`. The id depends only on the call and the content, so
+/// storing the same result again reuses it.
+pub(crate) fn store_result(
+    home: &Path,
+    key: &str,
+    call_id: &str,
+    tool: &str,
+    content: &str,
+) -> std::io::Result<String> {
     let mut hash = Sha256::new();
     hash.update(call_id.as_bytes());
     hash.update([0]);
@@ -84,26 +112,11 @@ pub(crate) fn spill(home: &Path, key: &str, call_id: &str, tool: &str, content: 
         "{}-{digest}",
         safe(tool).chars().take(40).collect::<String>()
     );
-    let head = floor(&content, HEAD);
-    let tail = ceil(&content, content.len() - TAIL).max(head);
-    let total = content.len();
-    let stored = crate::session::write_private(
+    crate::session::write_private(
         &dir(home, key).join(format!("{id}.txt")),
         content.as_bytes(),
-    );
-    let note = match stored {
-        Ok(()) => format!(
-            "[Full output: {total} bytes, stored as tool result \"{id}\". Call {TOOL} with {{\"id\": \"{id}\", \"offset\": {head}}} \
-             to page through it (limit up to {READ_MAX} bytes), or with \"query\" to find matching lines.]"
-        ),
-        Err(e) => format!("[Output was {total} bytes; the middle was dropped (could not store it: {e}).]"),
-    };
-    format!(
-        "{}\n… [{} bytes omitted] …\n{}\n{note}",
-        &content[..head],
-        tail - head,
-        &content[tail..]
-    )
+    )?;
+    Ok(id)
 }
 
 /// Keep a downloaded file (a PDF or image from `web_fetch`) with the session's

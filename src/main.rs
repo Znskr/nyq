@@ -349,7 +349,7 @@ async fn run() -> Result<()> {
         context_window: 0,
         context_tokens: 0,
         context_estimated: false,
-        suppress_auto_compact: false,
+        compaction: Default::default(),
         submitted: 0,
         hooks: std::sync::Arc::new(hooks),
         sandbox,
@@ -912,7 +912,6 @@ async fn model_command(
             // Fast mode is checked against the provider when it is applied.
             models::check_options(&choice, wanted.effort.as_deref(), None)?;
             agent.provider.set_model(choice.model.clone());
-            agent.suppress_auto_compact = false;
             ui::info(&format!(
                 "  Model set to {} (not in the model list).",
                 choice.model
