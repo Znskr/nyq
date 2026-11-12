@@ -38,6 +38,14 @@ pub enum Item {
         output: String,
         #[serde(default)]
         is_error: bool,
+        /// Provenance (see `crate::taint`). Stored with the session, never
+        /// sent to the model; absent in sessions written before it existed.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "crate::taint::de_labels"
+        )]
+        labels: crate::taint::Labels,
     },
     /// Summary that replaces everything before it (see `Agent::compact`).
     /// Providers send it as a user message; session loading starts here.

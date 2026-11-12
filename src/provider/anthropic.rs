@@ -142,6 +142,7 @@ impl AnthropicProvider {
                     id,
                     output,
                     is_error,
+                    ..
                 } => push(
                     "user",
                     json!({"type":"tool_result","tool_use_id":id,"content":if output.is_empty() { "(no output)" } else { output },"is_error":is_error}),
@@ -723,11 +724,13 @@ mod tests {
                 id: "t1".into(),
                 output: "contents".into(),
                 is_error: false,
+                labels: Vec::new(),
             },
             Item::ToolResult {
                 id: "t2".into(),
                 output: String::new(),
                 is_error: true,
+                labels: Vec::new(),
             },
             Item::Reasoning {
                 id: Some(REDACTED.into()),
@@ -1062,6 +1065,7 @@ mod tests {
                 id: "t".into(),
                 output: "ok".into(),
                 is_error: false,
+                labels: Vec::new(),
             },
         ];
         let body = p.body(Request {

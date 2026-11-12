@@ -589,6 +589,7 @@ async fn open(
         hooks: Arc::new(hooks),
         sandbox,
         undo: Default::default(),
+        taint: Default::default(),
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());
@@ -1198,6 +1199,7 @@ fn replay(cx: &ConnectionTo<Client>, session: &acp::SessionId, agent: &Agent) {
                 id,
                 output,
                 is_error,
+                ..
             } => {
                 let fields = acp::ToolCallUpdateFields::new()
                     .status(if *is_error {

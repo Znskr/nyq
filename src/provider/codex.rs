@@ -591,6 +591,7 @@ mod tests {
                 id: "c".into(),
                 output: "done".into(),
                 is_error: false,
+                labels: Vec::new(),
             },
         ];
         let tools = vec![ToolSpec {

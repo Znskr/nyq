@@ -40,6 +40,7 @@ mod skill_invoke;
 mod skills;
 mod slash;
 mod subagents;
+mod taint;
 mod templates;
 mod tool_list;
 mod tools;
@@ -354,6 +355,7 @@ async fn run() -> Result<()> {
         hooks: std::sync::Arc::new(hooks),
         sandbox,
         undo: Default::default(),
+        taint: Default::default(),
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());

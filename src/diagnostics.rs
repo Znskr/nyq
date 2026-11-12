@@ -202,6 +202,7 @@ mod tests {
                 id: "1".into(),
                 output: "x".repeat(1000),
                 is_error: false,
+                labels: Vec::new(),
             },
         ];
         let info = TraceInfo {

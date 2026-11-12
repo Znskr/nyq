@@ -91,6 +91,8 @@ pub struct Agent {
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
     /// File contents before each write/edit, for `/undo`.
     pub undo: crate::undo::UndoLog,
+    /// Provenance of earlier tool results, for taint checks (see `crate::taint`).
+    pub(crate) taint: crate::taint::Index,
 }
 
 impl Agent {

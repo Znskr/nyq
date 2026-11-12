@@ -1128,6 +1128,7 @@ pub(crate) fn repairs(items: &[Item]) -> Vec<Item> {
                     id: id.clone(),
                     output: INTERRUPTED.into(),
                     is_error: true,
+                    labels: Vec::new(),
                 })
             }
             _ => None,
@@ -1241,6 +1242,7 @@ mod tests {
             id: "c1".into(),
             output: "ok".into(),
             is_error: false,
+            labels: Vec::new(),
         })
         .unwrap();
         drop(s);
@@ -1263,7 +1265,8 @@ mod tests {
             Item::ToolResult {
                 id: "c2".into(),
                 output: INTERRUPTED.into(),
-                is_error: true
+                is_error: true,
+                labels: Vec::new(),
             }
         );
         s.append(&Item::Assistant {

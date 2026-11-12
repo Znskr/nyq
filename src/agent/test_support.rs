@@ -68,6 +68,7 @@ pub(crate) fn test_agent() -> Agent {
         hooks: Default::default(),
         sandbox: Default::default(),
         undo: Default::default(),
+        taint: Default::default(),
     }
 }
 
@@ -121,6 +122,7 @@ pub(crate) fn agent(response: Response, cancel: Option<CancellationToken>) -> Ag
         hooks: Default::default(),
         sandbox: Default::default(),
         undo: Default::default(),
+        taint: Default::default(),
     }
 }
 
