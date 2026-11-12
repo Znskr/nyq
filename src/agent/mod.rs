@@ -7,6 +7,7 @@ mod dispatch;
 mod note;
 mod permission_rules;
 mod step;
+mod task;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod ui;
@@ -26,6 +27,7 @@ pub(crate) use permission_rules::{
     path_under_git, program_base, resolved, subagent_mode,
 };
 pub use step::step_limit;
+pub use task::TaskRuntime;
 #[cfg(test)]
 pub(crate) use test_support::test_agent;
 pub use ui::{Approval, ApprovalRequest, Approver, Ui};
@@ -91,6 +93,9 @@ pub struct Agent {
     pub sandbox: std::sync::Arc<crate::sandbox::Policy>,
     /// File contents before each write/edit, for `/undo`.
     pub undo: crate::undo::UndoLog,
+    /// The task engine: the active task, its budget and ladder, the
+    /// background verifier (see `task.rs`). Default: plain chat.
+    pub task: TaskRuntime,
 }
 
 impl Agent {

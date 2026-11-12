@@ -144,6 +144,25 @@ impl Agent {
                 }
                 return None;
             }
+            // W9: `submit` belongs to the task engine, not the tool registry.
+            if self.task_owns(&calls[i].1) {
+                let (id, name, arguments) = &calls[i];
+                let out = self.task_submit(arguments, ui, cancel).await;
+                images.extend(self.record_result(id, name, out));
+                i += 1;
+                if self.task_done() {
+                    // Every call needs a result; the rest do not run.
+                    for (id, ..) in &calls[i..] {
+                        self.push(Item::ToolResult {
+                            id: id.clone(),
+                            output: "Not run: the task's result was already accepted.".into(),
+                            is_error: true,
+                        });
+                    }
+                    break;
+                }
+                continue;
+            }
             // Consecutive read-only calls (and subagents) run together.
             let run = calls[i..]
                 .iter()
@@ -158,6 +177,8 @@ impl Agent {
                 vec![self.call_tool(id, name, arguments, ui, cancel).await]
             };
             for ((id, name, arguments), mut out) in batch.iter().zip(outs) {
+                // W9: touched files, the background verifier, the cycle detector.
+                self.task_observe(name, arguments, &out);
                 if out.is_error {
                     let n = failures
                         .entry((name.clone(), arguments.clone()))
@@ -298,8 +319,10 @@ impl Agent {
             .filter(|_| crate::tools::mcp_search::is_mcp(name))
             .map(|t| t.spec().parameters.to_string());
         let mut provider = self.provider.fork();
-        if let Some(model) =
-            crate::settings::classifier_model().or_else(|| provider.reviewer_model())
+        // W9: `tier.low` stands in when no classifier model is set.
+        let opts = crate::task::TaskOptions::current();
+        if let Some(model) = crate::task::tier::classifier_model(provider.as_ref(), &opts)
+            .or_else(|| provider.reviewer_model())
         {
             provider.set_model(model);
         }
@@ -508,6 +531,10 @@ impl Agent {
                 return Prepared::Done(ToolOutput::err(format!("Invalid JSON arguments: {e}")))
             }
         };
+        // W9: the `intent` field never reaches the tool; a required one may be missing.
+        if let Some(out) = self.task_prepare_call(name, &mut args) {
+            return Prepared::Done(out);
+        }
         let ctx = ToolCtx {
             cwd: self.cwd.clone(),
             cancel: cancel.clone(),

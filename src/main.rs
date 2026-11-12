@@ -355,6 +355,7 @@ async fn run() -> Result<()> {
         hooks: std::sync::Arc::new(hooks),
         sandbox,
         undo: Default::default(),
+        task: Default::default(),
     };
     agent.context_window =
         config::context_window_for(agent.provider.name(), agent.provider.context_window());
@@ -1106,16 +1107,31 @@ async fn print_mode(
 ) -> Result<()> {
     let (cancel, signal) = cancel_on_signal();
     let mut plain = ui::PlainUi::new(agent.permission_mode.is_yolo());
-    plain.quiet = ask.quiet || ask.json;
+    // W9: a typed task's stdout is its JSON result alone.
+    plain.quiet = ask.quiet || ask.json || ask.task.is_task();
     plain.prompt = ask.prompt_permissions;
     plain.record = ask.json.then(ui::RunRecord::default);
     let requests_before = agent.stats.requests;
+    // W9: a `--memo` hit, and the key to store a fresh result under.
+    let mut memo_hit: Option<serde_json::Value> = None;
+    let mut memo_key: Option<task::MemoKey> = None;
     let result = async {
         if text.trim().is_empty() && !ask.continue_recovery {
             match read_print_input(std::io::stdin(), &cancel).await? {
                 Some(input) => text.push_str(&input),
                 None => return Ok(TurnEnd::Cancelled),
             }
+        }
+        // W9: a typed task; a memo hit answers without calling the model.
+        if let Some(spec) = ask.task.spec(text, &agent.cwd)? {
+            memo_key = spec.memo_key(&agent.cwd);
+            if let Some(key) = &memo_key {
+                memo_hit = task::MemoStore::new(&agent.cwd).get(key);
+                if memo_hit.is_some() {
+                    return Ok(TurnEnd::Done);
+                }
+            }
+            agent.set_task(Some(spec));
         }
         let mut images = Vec::new();
         for path in &ask.image {
@@ -1158,7 +1174,16 @@ async fn print_mode(
         }
     }
     .await;
+    // W9: how a typed task ended: 0 validated, 2 exhausted or escalated.
+    let typed = memo_hit.is_some() || agent.task_spec().is_some_and(|s| s.is_typed());
+    let fresh = memo_hit.is_none();
+    let outcome = match memo_hit.take() {
+        Some(v) => Some(task::TaskOutcome::Submitted(v)),
+        None => agent.take_task_outcome(),
+    };
+    agent.stop_verifier();
     let code = match &result {
+        Ok(TurnEnd::Done) if typed => outcome.as_ref().map_or(1, task::TaskOutcome::exit_code),
         Ok(TurnEnd::Done) => 0,
         Ok(TurnEnd::Cancelled) => match signal.load(std::sync::atomic::Ordering::SeqCst) {
             0 => 130,
@@ -1166,6 +1191,11 @@ async fn print_mode(
         },
         Err(_) => 1,
     };
+    if let (true, Some(key), Some(task::TaskOutcome::Submitted(v))) = (fresh, &memo_key, &outcome) {
+        if let Err(e) = task::MemoStore::new(&agent.cwd).put(key, v) {
+            ui::error(&format!("could not save the --memo result: {e}"));
+        }
+    }
     cancel.cancel();
     tools::background::kill_all();
     mcp.shutdown().await;
@@ -1174,7 +1204,7 @@ async fn print_mode(
         let _ = s.flush();
     }
     if ask.json {
-        let value = ask_json(
+        let mut value = ask_json(
             plain.record.as_ref(),
             code,
             Some(agent.provider.model()),
@@ -1182,12 +1212,32 @@ async fn print_mode(
             agent.stats.requests - requests_before,
             result.as_ref().err().map(|e| format!("{e:#}")),
         );
+        // W9: the typed result, or why there is none.
+        match &outcome {
+            Some(task::TaskOutcome::Submitted(v)) => value["result"] = v.clone(),
+            Some(o) => value["report"] = serde_json::to_value(o.report()).unwrap_or_default(),
+            None => {}
+        }
         println!("{value}");
         return if code == 0 {
             Ok(())
         } else {
             Err(Exit(code).into())
         };
+    }
+    // W9: print the validated value; a report on stderr when it gave up.
+    if typed && result.is_ok() {
+        match &outcome {
+            Some(task::TaskOutcome::Submitted(v)) => println!("{v}"),
+            Some(o) => eprintln!("{}", serde_json::to_string(&o.report()).unwrap_or_default()),
+            None if matches!(result, Ok(TurnEnd::Done)) => {
+                return Err(anyhow::anyhow!("the task ended without a result"));
+            }
+            None => {}
+        }
+        if code == 2 {
+            return Err(Exit(2).into());
+        }
     }
     match result {
         Ok(TurnEnd::Done) => Ok(()),

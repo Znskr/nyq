@@ -344,6 +344,11 @@ pub(crate) const VALUE_LONG: &[&str] = &[
     "--context-limit",
     "--system",
     "--image",
+    // W9: typed-task flags (print mode only, listed so parsing stays exact).
+    "--schema",
+    "--validate",
+    "--budget",
+    "--memo-file",
 ];
 pub(crate) const VALUE_SHORT: &[char] = &['m'];
 /// Flags that must not carry over: they pick or start a conversation, or (a

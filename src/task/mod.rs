@@ -1,6 +1,6 @@
-//! The task engine's standalone library layer (design §4).
+//! The task engine (design §4).
 //!
-//! Nothing here is wired into the agent loop yet. The pieces:
+//! The library layer:
 //!
 //! - [`build`]: [`BuildSystem`] detection and the verifier primitives (build,
 //!   test, lint, format check) behind an injectable [`CommandRunner`], with
@@ -12,6 +12,17 @@
 //!   deadline) and the [`EscalationLadder`] state machine.
 //! - [`cycle`]: [`CycleDetector`], loop detection over steps and intents.
 //! - [`memo`]: [`MemoStore`], results cached under `.nyq/cache`.
+//!
+//! The runtime layer, which `crate::agent::task` wires into the loop:
+//!
+//! - [`engine`]: [`TaskSpec`], [`TaskState`], [`TaskOutcome`] and the texts
+//!   the model sees (trailing-note task section, nudges, interventions).
+//! - [`verifier`]: the debounced background [`Verifier`].
+//! - [`llm`]: the forced-tool helper calls (progress check, diagnosis) and the
+//!   [`LlmJudge`].
+//! - [`tier`]: providers per model tier; [`options`]: the `[tier]`,
+//!   `[verify]` and `[intents]` settings; [`intent`]: the intent field.
+//! - [`headless`]: `nyq -p --schema` and friends.
 //!
 //! # How the wiring stage uses this
 //!
@@ -53,8 +64,15 @@
 pub mod budget;
 pub mod build;
 pub mod cycle;
+pub mod engine;
+pub mod headless;
+pub mod intent;
+pub mod llm;
 pub mod memo;
+pub mod options;
+pub mod tier;
 pub mod validate;
+pub mod verifier;
 
 pub use budget::{
     Budget, BudgetLimits, EscalationLadder, Exhaustion, LadderAction, LadderEvent, Rung,
@@ -66,10 +84,17 @@ pub use build::{
     StepState, TestScope, VerifyState,
 };
 pub use cycle::{Cycle, CycleConfig, CycleDetector, Step};
+pub use engine::{
+    TaskOutcome, TaskReport, TaskSpec, TaskState, Tier, TierPolicy, ValidatorSpec, VerifyMode,
+    SUBMIT,
+};
+pub use llm::LlmJudge;
 pub use memo::{hash_files, MemoKey, MemoStore};
+pub use options::TaskOptions;
 pub use validate::{
     All, AlwaysPass, BuildValidator, CustomCommandValidator, ExistsValidator, FailKind,
     FilesTouchedValidator, FormatValidator, JudgeRunner, JudgeValidator, JudgeVerdict,
     LintValidator, PathSource, Same, SchemaValidator, TestsValidator, ValidateCx, Validator,
     Verdict,
 };
+pub use verifier::Verifier;
