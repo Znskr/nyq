@@ -1478,12 +1478,13 @@ fn patch_preview(ctx: &ToolCtx, args: &Value) -> Option<String> {
 #[async_trait::async_trait]
 impl Tool for ApplyPatch {
     fn effects(&self, args: &Value) -> Effects {
-        Effects::writes_to(
-            super::patch::paths(args.get("patch").and_then(Value::as_str).unwrap_or(""))
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
-        )
+        let paths = super::patch::paths(args.get("patch").and_then(Value::as_str).unwrap_or(""));
+        if paths.is_empty() {
+            // Nothing parseable names a file: assume it may write anywhere,
+            // so it runs alone under the full writer lease.
+            return Effects::default();
+        }
+        Effects::writes_to(paths.into_iter().map(PathBuf::from).collect())
     }
 
     /// Its paths come from `patch`, so a probe of its effects without one
@@ -1624,6 +1625,17 @@ pub fn register(r: &mut Registry) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_apply_patch_naming_no_file_schedules_alone() {
+        use crate::tools::{Concurrency, Tool};
+        let none = ApplyPatch.concurrency(&serde_json::json!({"patch": "not a patch"}));
+        assert!(matches!(none, Concurrency::Barrier));
+        let one = ApplyPatch.concurrency(&serde_json::json!({
+            "patch": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch\n"
+        }));
+        assert!(matches!(one, Concurrency::WriteFs(_)));
+    }
     use super::*;
 
     #[cfg(unix)]
