@@ -298,6 +298,49 @@ pub fn takes_writer(name: &str) -> bool {
     !COORDINATION_TOOLS.contains(&name) && !crate::permissions::is_read_tool(name)
 }
 
+/// Deliver a message to the parent: an already-finished job, so the
+/// between-step delivery puts it into the parent's transcript as evidence.
+pub fn post(dir: &Path, from: &str, text: &str) -> Result<String> {
+    let shared = store(dir)?;
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if s.jobs.len() >= 1000 {
+        bail!("Session orchestration limit of 1000 tasks reached");
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut next = s.jobs.clone();
+    next.push(Job {
+        id: id.clone(),
+        name: from.into(),
+        args: serde_json::json!({"action": "message"}),
+        state: "succeeded".into(),
+        result: Some(format!("[message from {from}] {text}")),
+        delivered: false,
+    });
+    s.commit(next)?;
+    Ok(id)
+}
+
+/// Jobs whose id or child name is in `ids`, in journal order.
+pub fn matching(dir: &Path, ids: &[String]) -> Result<Vec<Job>> {
+    Ok(store(dir)?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .jobs
+        .iter()
+        .filter(|j| ids.iter().any(|i| *i == j.id || *i == j.name))
+        .cloned()
+        .collect())
+}
+
+/// Take a finished job's full output (its undo log), if the worker left one.
+pub fn take_output(dir: &Path, id: &str) -> Result<Option<crate::tools::ToolOutput>> {
+    Ok(store(dir)?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .outputs
+        .remove(id))
+}
+
 /// Child contexts inherit the parent's usage session ID, not its journal path.
 pub fn enabled(session_id: &str) -> bool {
     STORES.get().is_some_and(|stores| {
@@ -361,6 +404,24 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("explicitly resend"));
+    }
+
+    #[test]
+    fn posted_message_is_a_pending_result() {
+        let d = tempfile::tempdir().unwrap();
+        let id = post(d.path(), "worker", "found it").unwrap();
+        let results = results(d.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, id);
+        assert!(results[0].1.contains("[message from worker] found it"));
+        assert!(!pending(d.path()).unwrap());
+        assert_eq!(matching(d.path(), &["worker".into()]).unwrap().len(), 1);
+        assert_eq!(
+            matching(d.path(), std::slice::from_ref(&id)).unwrap().len(),
+            1
+        );
+        assert!(matching(d.path(), &["other".into()]).unwrap().is_empty());
+        assert!(take_output(d.path(), &id).unwrap().is_none());
     }
 
     #[test]
