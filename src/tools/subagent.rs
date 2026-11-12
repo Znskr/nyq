@@ -29,9 +29,15 @@ const READ_ONLY: &[&str] = &[
     "view_image",
     "web_fetch",
     "web_search",
+    // Scripts only reach the tools the child itself has.
+    "run_code",
+    "team_task_list",
 ];
 
-const DESCRIPTION: &str = "Delegate substantial independent work. Use action spawn with name and task to run a child independently; send queues a follow-up for that name. Up to three children execute concurrently with FIFO inboxes. Reports arrive automatically between parent model requests, and finishing waits for outstanding children: do not poll. Children receive only the supplied task, so include paths, constraints and acceptance criteria. explore (default) is read-only; general can edit, run commands and use MCP after permission checks. Parent and children share one workspace writer. model and effort override inherited settings; permission_mode can only narrow authority. request_id makes an exact spawn/send retry idempotent. inspect/list show state; stop/cancel/close cancel current and queued work; resume reopens a stopped child. Legacy run executes synchronously, optionally retaining named context. Interrupted work is not automatically replayed: inspect its checkpoint and workspace before sending a replacement task. Children cannot delegate or message peers. Avoid delegation for quick lookups.";
+/// Tools no child gets: children don't delegate further.
+const NO_CHILD: &[&str] = &[NAME, "workflow"];
+
+const DESCRIPTION: &str = "Delegate substantial independent work. Typed children: output_schema makes the child finish with JSON matching that schema, and validators (build, tests, lint, cmd:<shell>, exists:<json pointer>) check it; a failing check gets one retry and the result comes back as JSON labelled as evidence. isolation \"worktree\" gives the child its own git worktree and branch from HEAD; you get a diff summary, then action merge (name) applies it as a patch (conflicts are reported, never resolved) and stop discards it. mode \"external:<name>\" runs one task on an external ACP agent configured as agents.external.<name> in the user's settings (action run only). Use action spawn with name and task to run a child independently; send queues a follow-up for that name. Up to three children execute concurrently with FIFO inboxes. Reports arrive automatically between parent model requests, and finishing waits for outstanding children: do not poll. Children receive only the supplied task, so include paths, constraints and acceptance criteria. explore (default) is read-only; general can edit, run commands and use MCP after permission checks. Parent and children share one workspace writer. model and effort override inherited settings; permission_mode can only narrow authority. request_id makes an exact spawn/send retry idempotent. inspect/list show state; stop/cancel/close cancel current and queued work; resume reopens a stopped child. Legacy run executes synchronously, optionally retaining named context. Interrupted work is not automatically replayed: inspect its checkpoint and workspace before sending a replacement task. Children cannot delegate or message peers. Avoid delegation for quick lookups.";
 
 const PREAMBLE: &str = "\
 You are a subagent: another agent delegated the task below to you. You have none of its \
@@ -56,8 +62,40 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The requested mode: `mode`, else general for a worktree child (it exists
+/// to make changes), else explore.
+fn mode_of(args: &Value) -> &str {
+    str_arg(args, "mode").unwrap_or(if wants_worktree(args) {
+        "general"
+    } else {
+        "explore"
+    })
+}
+
 fn is_general(args: &Value) -> bool {
-    args.get("mode").and_then(Value::as_str) == Some("general")
+    mode_of(args) == "general"
+}
+
+/// `<name>` of `mode: "external:<name>"`.
+fn external_name(args: &Value) -> Option<&str> {
+    mode_of(args)
+        .strip_prefix("external:")
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+}
+
+fn wants_worktree(args: &Value) -> bool {
+    str_arg(args, "isolation") == Some("worktree")
+}
+
+/// The child's name: `name`, or its alias `id`.
+fn name_arg(args: &Value) -> Option<&str> {
+    str_arg(args, "name").or_else(|| str_arg(args, "id"))
+}
+
+/// A fresh id for a child that wasn't given a name.
+fn fresh_id(prefix: &str) -> String {
+    format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
 }
 
 fn action(args: &Value) -> &str {
@@ -87,7 +125,7 @@ fn child_tools(general: bool, shared: &[Arc<dyn Tool>]) -> Registry {
         names
             .iter()
             .map(String::as_str)
-            .filter(|n| *n != NAME)
+            .filter(|n| !NO_CHILD.contains(n))
             .collect()
     } else {
         READ_ONLY
@@ -137,9 +175,13 @@ impl Tool for Subagent {
                 "properties": {
                     "task": {"type": "string", "description": "Complete, self-contained instructions (or, for an existing named subagent, the follow-up message). The subagent sees nothing else."},
                     "description": {"type": "string", "description": "Short 3-6 word label for the task, shown to the user."},
-                    "mode": {"type": "string", "enum": ["explore", "general"], "description": "explore (default): read-only tools. general: may also edit files and run commands. Fixed when a named subagent is created."},
+                    "mode": {"type": "string", "description": "explore (default; general with isolation worktree): read-only tools. general: may also edit files and run commands. external:<name>: an external ACP agent from settings (one task, action run). Fixed when a named subagent is created."},
+                    "output_schema": {"type": "object", "description": "JSON Schema the child's final answer must match; the result comes back as JSON."},
+                    "validators": {"type": "array", "items": {"type": "string"}, "description": "Checks on the result, in order: build, tests, lint, cmd:<shell command> (exit 0 passes), exists:<json pointer to path(s) in the result>."},
+                    "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "shared (default): your workspace, writes serialized by the writer lock. worktree: a separate git worktree under .nyq/worktrees/<name>; merge it afterwards. Fixed when a named subagent is created."},
+                    "id": {"type": "string", "description": "Alias of name for merge/inspect/stop."},
                     "name": {"type": "string", "description": "Keep the subagent under this name (letters, digits, - and _) so later calls can send it follow-ups."},
-                    "action": {"type": "string", "enum": ["run", "spawn", "send", "list", "inspect", "stop", "cancel", "close", "resume"], "description": "spawn/send: queue task for name. run: synchronous task. list/inspect: state. stop/cancel/close: stop work. resume: reopen."},
+                    "action": {"type": "string", "enum": ["run", "spawn", "send", "list", "inspect", "stop", "cancel", "close", "resume", "merge"], "description": "spawn/send: queue task for name. run: synchronous task. list/inspect: state. stop/cancel/close: stop work (and discard an unmerged worktree). resume: reopen. merge: apply an isolated child's worktree to your workspace."},
                     "request_id": {"type":"string", "description":"Stable retry key for spawn/send; reuse only for the exact same task."},
                     "model": {"type": "string", "description": "Model for this subagent (default: yours), e.g. a faster one for simple searches."},
                     "effort": {"type": "string", "description": "Reasoning effort for this subagent (e.g. low, medium, high)."},
@@ -150,12 +192,18 @@ impl Tool for Subagent {
     }
 
     fn needs_approval(&self, args: &Value) -> bool {
-        is_general(args) && matches!(action(args), "run" | "spawn" | "send")
+        let starts = matches!(action(args), "run" | "spawn" | "send");
+        let executes = crate::tools::typed::Typed::from_args(args)
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.executes());
+        (starts && (is_general(args) || external_name(args).is_some() || executes))
+            || action(args) == "merge"
     }
 
     fn summary(&self, args: &Value) -> String {
         let label = label(args);
-        let name = str_arg(args, "name");
+        let name = name_arg(args);
         match (action(args), name) {
             ("run", None) if is_general(args) => format!("{label} (general)"),
             ("run", None) => label.to_string(),
@@ -175,21 +223,52 @@ impl Tool for Subagent {
             .get("task")
             .and_then(Value::as_str)
             .filter(|t| !t.trim().is_empty())?;
-        let mode = if is_general(args) {
-            "general"
-        } else {
-            "explore"
-        };
+        let mode = mode_of(args);
         let name = str_arg(args, "name")
             .map(|n| format!(" · name: {n}"))
             .unwrap_or_default();
-        Some(format!("mode: {mode}{name}\n{task}"))
+        let mut head = format!("mode: {mode}{name}");
+        if wants_worktree(args) {
+            head.push_str(" · isolation: worktree");
+        }
+        if let Some(ext) = external_name(args) {
+            if let Ok(cfg) = crate::external_agent::config(ext) {
+                head.push_str(&format!(
+                    "\ncommand: {} {} (runs outside nyq's sandbox)",
+                    cfg.command,
+                    cfg.args.join(" ")
+                ));
+            }
+        }
+        if let Ok(Some(typed)) = crate::tools::typed::Typed::from_args(args) {
+            head.push('\n');
+            head.push_str(&typed.describe());
+        }
+        Some(format!("{head}\n{task}"))
     }
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> ToolOutput {
-        let name = str_arg(&args, "name");
+        let name = name_arg(&args);
         let dir = ctx.subagent_dir.as_deref();
+        if let Err(e) = crate::tools::typed::Typed::from_args(&args) {
+            return ToolOutput::err(format!("Invalid typed subagent arguments: {e}"));
+        }
+        if !matches!(str_arg(&args, "isolation"), None | Some("shared" | "worktree")) {
+            return ToolOutput::err("isolation must be \"shared\" or \"worktree\".");
+        }
+        if let Some(ext) = external_name(&args) {
+            return external(&args, ext, ctx).await;
+        }
+        if !matches!(mode_of(&args), "explore" | "general") {
+            return ToolOutput::err("mode must be explore, general or external:<name>.");
+        }
         match (action(&args), name, dir) {
+            ("run", None, Some(dir)) if wants_worktree(&args) => {
+                named_run(&args, &fresh_id("wt"), dir, ctx).await
+            }
+            ("run", None, None) if wants_worktree(&args) => ToolOutput::err(
+                "Worktree isolation is unavailable here: isolated children are kept with a saved session.",
+            ),
             ("run", None, _) => one_shot(&args, ctx).await,
             ("list", _, Some(dir)) => ToolOutput::ok(subagents::list_lines(dir).join("\n")),
             ("list", _, None) | (_, Some(_), None) => {
@@ -218,7 +297,8 @@ impl Tool for Subagent {
                 Err(e) => ToolOutput::err(format!("{e:#}")),
             },
             ("resume", Some(n), Some(dir)) => resume(n, dir, ctx).await,
-            (other, _, _) => ToolOutput::err(format!("Unknown action `{other}` (run, list, inspect, stop, resume).")),
+            ("merge", Some(n), Some(dir)) => merge(n, dir, ctx).await,
+            (other, _, _) => ToolOutput::err(format!("Unknown action `{other}` (run, spawn, send, list, inspect, stop, resume, merge).")),
         }
     }
 }
@@ -231,7 +311,10 @@ fn child(
     persistent: bool,
     items: Vec<Item>,
     args: &Value,
+    cwd: Option<&Path>,
 ) -> Result<Agent, ToolOutput> {
+    // A worktree child works (and is sandboxed) in its own checkout.
+    let cwd = cwd.map(Path::to_path_buf).unwrap_or_else(|| ctx.cwd.clone());
     let Some(provider) = &ctx.provider else {
         return Err(ToolOutput::err(
             "Subagents are unavailable: no model provider in this context.",
@@ -264,7 +347,7 @@ fn child(
     let context_window = crate::config::context_window_for(provider.name(), None);
     let mut system = format!(
         "{}\n\n{PREAMBLE}",
-        crate::prompt::system(&ctx.cwd, &ctx.sandbox)
+        crate::prompt::system(&cwd, &ctx.sandbox)
     );
     if persistent {
         system.push_str(&format!("\n\n{PERSISTENT}"));
@@ -276,7 +359,7 @@ fn child(
         items,
         session: None,
         usage_session_id: ctx.session_id.clone(),
-        cwd: ctx.cwd.clone(),
+        cwd,
         // Inherit the parent's mode (or a stricter one), "always" grants
         // and rules. Calls that still need approval are forwarded to the
         // parent's approver, or denied when there is none: approving this
@@ -307,7 +390,91 @@ struct Outcome {
     undo: crate::undo::UndoLog,
     /// Cancelled by a `stop` (not by the parent or a timeout).
     stopped: bool,
+    /// A typed child's checked answer and how many answers it took.
+    typed: Option<(crate::tools::typed::Checked, u32)>,
 }
+
+/// What a typed child is checked against, and where.
+struct TypedRun {
+    typed: crate::tools::typed::Typed,
+    /// The child's workspace (its worktree when isolated).
+    root: std::path::PathBuf,
+    sandbox: Arc<crate::sandbox::Policy>,
+}
+
+impl TypedRun {
+    fn from_args(args: &Value, root: &Path, ctx: &ToolCtx) -> Option<Self> {
+        let typed = crate::tools::typed::Typed::from_args(args).ok().flatten()?;
+        Some(Self {
+            typed,
+            root: root.to_path_buf(),
+            sandbox: ctx.sandbox.clone(),
+        })
+    }
+
+    /// Check an answer; validators that run commands hold the workspace
+    /// writer so they see a quiescent tree.
+    async fn check(
+        &self,
+        text: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> crate::tools::typed::Checked {
+        let writer = crate::orchestration::writer(&self.root);
+        let _lease = if self.typed.executes() {
+            tokio::select! {
+                lock = writer.lock() => Some(lock),
+                _ = cancel.cancelled() => None,
+            }
+        } else {
+            None
+        };
+        self.typed
+            .check(text, &self.root, &self.sandbox, cancel)
+            .await
+    }
+}
+
+/// Typed children's task text: the task plus how to finish.
+fn with_instructions(task: &str, typed: Option<&TypedRun>) -> String {
+    match typed {
+        Some(t) => format!("{task}{}", t.typed.instructions()),
+        None => task.to_string(),
+    }
+}
+
+fn last_answer(agent: &Agent) -> &str {
+    agent
+        .items
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            Item::Assistant { text } if !text.trim().is_empty() => Some(text.trim()),
+            _ => None,
+        })
+        .unwrap_or("")
+}
+
+/// Run `fut` as team member `name` when there is a team store.
+async fn as_member<F: std::future::Future>(dir: Option<&Path>, name: &str, fut: F) -> F::Output {
+    match dir {
+        Some(dir) => {
+            crate::team::MEMBER
+                .scope(
+                    crate::team::Member {
+                        dir: dir.to_path_buf(),
+                        name: name.to_string(),
+                    },
+                    fut,
+                )
+                .await
+        }
+        None => fut.await,
+    }
+}
+
+/// Children running at once, across sync runs, background workers and
+/// external agents.
+static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
 
 /// Run one turn of `agent` (a new message, or a continuation when `input` is
 /// None), with a live progress line and approvals forwarded to the parent.
@@ -318,8 +485,8 @@ async fn drive_child(
     origin: String,
     live: LiveGuard,
     cancel: tokio_util::sync::CancellationToken,
+    typed: Option<&TypedRun>,
 ) -> Outcome {
-    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
     // Legacy synchronous children share the same execution cap.
     let _slot = tokio::select! {
         slot = SLOTS.acquire() => slot.ok(),
@@ -332,13 +499,13 @@ async fn drive_child(
         live,
         note: None,
     };
-    let result = match input {
+    let mut result = match input {
         Some(item) => {
             drive_turn(
                 agent.turn(item, &mut ui, cancel.clone()),
                 TIMEOUT,
                 CLEANUP,
-                cancel,
+                cancel.clone(),
             )
             .await
         }
@@ -347,11 +514,32 @@ async fn drive_child(
                 agent.continue_turn(&mut ui, cancel.clone()),
                 TIMEOUT,
                 CLEANUP,
-                cancel,
+                cancel.clone(),
             )
             .await
         }
     };
+    // A typed child's answer is checked; a failure goes back to it once.
+    let mut checked = None;
+    if let Some(t) = typed {
+        let mut attempts = 0;
+        while matches!(result, Ok(TurnEnd::Done)) {
+            attempts += 1;
+            let c = t.check(last_answer(agent), &cancel).await;
+            let retry = c.failure.clone().filter(|_| {
+                attempts < crate::tools::typed::ATTEMPTS && !cancel.is_cancelled()
+            });
+            checked = Some((c, attempts));
+            let Some(feedback) = retry else { break };
+            result = drive_turn(
+                agent.turn(Item::user(feedback), &mut ui, cancel.clone()),
+                TIMEOUT,
+                CLEANUP,
+                cancel.clone(),
+            )
+            .await;
+        }
+    }
     ctx.granted
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -361,6 +549,7 @@ async fn drive_child(
         calls: std::mem::take(&mut ui.calls),
         undo: std::mem::take(&mut agent.undo),
         stopped: ui.live.stopped(),
+        typed: checked,
     }
 }
 
@@ -375,8 +564,15 @@ fn display(calls: &[(String, String)]) -> String {
         .join("\n")
 }
 
-/// The tool output for a finished turn: the report or the failure.
-fn report(outcome: Outcome, agent: &Agent, footer: String) -> ToolOutput {
+/// The tool output for a finished turn: the report or the failure. `child`
+/// is the evidence label's id; `changes` an isolated child's diff summary.
+fn report(
+    outcome: Outcome,
+    agent: &Agent,
+    footer: String,
+    child: &str,
+    changes: Option<String>,
+) -> ToolOutput {
     let display = Some(display(&outcome.calls));
     let undo = outcome.undo;
     let fail = |msg: String| ToolOutput {
@@ -395,22 +591,39 @@ fn report(outcome: Outcome, agent: &Agent, footer: String) -> ToolOutput {
         Ok(TurnEnd::Cancelled) => return fail(format!("Subagent cancelled{footer}.")),
         Ok(TurnEnd::Done) => {}
     }
-    let report = agent
-        .items
-        .iter()
-        .rev()
-        .find_map(|i| match i {
-            Item::Assistant { text } if !text.trim().is_empty() => Some(text.trim()),
-            _ => None,
-        })
-        .unwrap_or("(the subagent produced no report)");
-    let mut content = truncate(report, MAX_REPORT);
-    content.push_str(&format!(
-        "\n\n(subagent used {} tool calls, ↑{} ↓{} tokens{footer})",
+    let stats = format!(
+        "subagent used {} tool calls, ↑{} ↓{} tokens{footer}",
         outcome.calls.len(),
         agent.usage.input_tokens,
         agent.usage.output_tokens
-    ));
+    );
+    if let Some((checked, attempts)) = &outcome.typed {
+        let mut extra = json!({ "note": stats });
+        if let Some(changes) = changes {
+            extra["changes"] = Value::String(changes);
+        }
+        let content = crate::tools::typed::render(child, checked, *attempts, extra);
+        return ToolOutput {
+            display,
+            undo,
+            is_error: checked.failure.is_some(),
+            ..ToolOutput::ok(truncate(&content, MAX_REPORT * 2))
+        };
+    }
+    let report = match last_answer(agent) {
+        "" => "(the subagent produced no report)",
+        text => text,
+    };
+    let mut content = format!(
+        "{}\n{}",
+        crate::tools::typed::evidence(child),
+        truncate(report, MAX_REPORT)
+    );
+    content.push_str(&format!("\n\n({stats})"));
+    if let Some(changes) = changes {
+        content.push_str("\n\n");
+        content.push_str(&changes);
+    }
     ToolOutput {
         display,
         undo,
@@ -426,25 +639,32 @@ async fn one_shot(args: &Value, ctx: &ToolCtx) -> ToolOutput {
     else {
         return ToolOutput::err("Missing required argument `task`.");
     };
-    let mut agent = match child(ctx, is_general(args), false, Vec::new(), args) {
+    let mut agent = match child(ctx, is_general(args), false, Vec::new(), args, None) {
         Ok(a) => a,
         Err(e) => return e,
     };
+    let id = fresh_id("run");
+    let typed = TypedRun::from_args(args, &ctx.cwd, ctx);
     let label = one_line(label(args));
     let cancel = ctx.cancel.child_token();
     let Some(live) = LiveGuard::start(None, &label, cancel.clone()) else {
         return ToolOutput::err("Subagent could not start.");
     };
-    let outcome = drive_child(
-        &mut agent,
-        Some(Item::user(task)),
-        ctx,
-        format!("subagent: {label}"),
-        live,
-        cancel,
+    let outcome = as_member(
+        ctx.subagent_dir.as_deref(),
+        &id,
+        drive_child(
+            &mut agent,
+            Some(Item::user(with_instructions(task, typed.as_ref()))),
+            ctx,
+            format!("subagent: {label}"),
+            live,
+            cancel,
+            typed.as_ref(),
+        ),
     )
     .await;
-    report(outcome, &agent, String::new())
+    report(outcome, &agent, String::new(), &id, None)
 }
 
 /// Create the named subagent `name`, or send it a follow-up message.
@@ -462,16 +682,33 @@ async fn named_run(args: &Value, name: &str, dir: &Path, ctx: &ToolCtx) -> ToolO
                 "Subagent `{name}` is stopped; call subagent with action \"resume\" and name \"{name}\" to reopen it."
             ));
         }
+        Ok(Some(r)) if wants_worktree(args) && r.isolation.is_none() => {
+            return ToolOutput::err(format!(
+                "Subagent `{name}` shares your workspace; isolation is fixed when a child is created. Use a new name for an isolated child."
+            ));
+        }
         Ok(Some(r)) => r,
-        Ok(None) => Record::new(
-            name,
-            if is_general(args) {
-                "general"
-            } else {
-                "explore"
-            },
-            label(args),
-        ),
+        Ok(None) => {
+            let mut r = Record::new(
+                name,
+                if is_general(args) {
+                    "general"
+                } else {
+                    "explore"
+                },
+                label(args),
+            );
+            if wants_worktree(args) {
+                match crate::worktree::create(&ctx.cwd, name).await {
+                    Ok(wt) => {
+                        r.isolation = Some("worktree".into());
+                        r.worktree = Some(wt);
+                    }
+                    Err(e) => return ToolOutput::err(format!("Could not create a worktree: {e:#}")),
+                }
+            }
+            r
+        }
         Err(e) => return ToolOutput::err(format!("{e:#}")),
     };
     run_named(record, Some(Item::user(task)), dir, ctx, args).await
@@ -518,6 +755,24 @@ pub(crate) async fn run_named(
     args: &Value,
 ) -> ToolOutput {
     let name = record.name.clone();
+    if record.isolation.is_some() && record.worktree.is_none() {
+        return ToolOutput::err(format!(
+            "Subagent `{name}`'s worktree was merged or removed; start a new isolated child instead."
+        ));
+    }
+    let cwd = record
+        .worktree
+        .as_ref()
+        .map(|w| w.path.clone())
+        .unwrap_or_else(|| ctx.cwd.clone());
+    let typed = TypedRun::from_args(args, &cwd, ctx);
+    let input = match input {
+        Some(Item::User { text, images }) => Some(Item::User {
+            text: with_instructions(&text, typed.as_ref()),
+            images,
+        }),
+        other => other,
+    };
     let cancel = ctx.cancel.child_token();
     let live_label = if record.description.is_empty() {
         name.clone()
@@ -537,7 +792,14 @@ pub(crate) async fn run_named(
     let mut items = std::mem::take(&mut record.items);
     let repairs = crate::session::repairs(&items);
     items.extend(repairs);
-    let mut agent = match child(ctx, record.mode == "general", true, items, args) {
+    let mut agent = match child(
+        ctx,
+        record.mode == "general",
+        true,
+        items,
+        args,
+        Some(&cwd),
+    ) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -549,8 +811,10 @@ pub(crate) async fn run_named(
     if let Err(e) = subagents::save(dir, &record) {
         return ToolOutput::err(format!("{e:#}"));
     }
-    let outcome = crate::subagents::CHECKPOINT
-        .scope(
+    let outcome = as_member(
+        Some(dir),
+        &name,
+        crate::subagents::CHECKPOINT.scope(
             (dir.to_owned(), name.clone()),
             drive_child(
                 &mut agent,
@@ -559,9 +823,11 @@ pub(crate) async fn run_named(
                 format!("subagent {name}"),
                 live,
                 cancel,
+                typed.as_ref(),
             ),
-        )
-        .await;
+        ),
+    )
+    .await;
     record.status = match &outcome.result {
         Ok(TurnEnd::Done) => Status::Idle,
         _ if outcome.stopped => Status::Stopped,
@@ -572,6 +838,16 @@ pub(crate) async fn run_named(
     record.tool_calls += outcome.calls.len() as u64;
     record.usage.add(&agent.usage);
     record.updated = chrono::Utc::now();
+    // A stopped isolated child's worktree is discarded; a finished one's
+    // changes are summarized for review and merge.
+    let mut changes = None;
+    if record.status == Status::Stopped {
+        if let Some(wt) = record.worktree.take() {
+            let _ = wt.remove();
+        }
+    } else if let (Some(wt), Ok(TurnEnd::Done)) = (&record.worktree, &outcome.result) {
+        changes = Some(wt.summary(&name).await);
+    }
     let saved = subagents::save(dir, &record);
     let footer = match record.status {
         Status::Idle => {
@@ -580,13 +856,202 @@ pub(crate) async fn run_named(
         Status::Stopped => format!("; `{name}` was stopped"),
         _ => format!("; `{name}` can finish this with action \"resume\""),
     };
-    let mut out = report(outcome, &agent, footer);
+    let mut out = report(outcome, &agent, footer, &name, changes);
     if let Err(e) = saved {
         out.is_error = true;
         out.content
             .push_str(&format!("\n(could not save subagent `{name}`: {e:#})"));
     }
     out
+}
+
+/// `merge`: apply an isolated child's worktree to the workspace as a patch.
+/// A patch that doesn't apply is reported and nothing is written.
+async fn merge(name: &str, dir: &Path, ctx: &ToolCtx) -> ToolOutput {
+    let mut record = match subagents::load(dir, name) {
+        Ok(Some(r)) => r,
+        Ok(None) => return ToolOutput::err(format!("No subagent named `{name}` in this session.")),
+        Err(e) => return ToolOutput::err(format!("{e:#}")),
+    };
+    let Some(wt) = record.worktree.clone() else {
+        return ToolOutput::err(format!(
+            "Subagent `{name}` has no worktree to merge (it shares your workspace, or was already merged or stopped)."
+        ));
+    };
+    if subagents::is_live(&subagents::key(dir, name)) {
+        return ToolOutput::err(format!(
+            "Subagent `{name}` is still working; wait for it before merging."
+        ));
+    }
+    // The patch writes the parent's workspace: take its writer lease.
+    let writer = crate::orchestration::writer(&ctx.cwd);
+    let _lease = tokio::select! {
+        lock = writer.lock() => lock,
+        _ = ctx.cancel.cancelled() => return ToolOutput::err("Cancelled waiting for workspace writer"),
+    };
+    let mut undo = crate::undo::UndoLog::default();
+    let merged = match wt.merge(&mut undo).await {
+        Ok(m) => m,
+        Err(e) => return ToolOutput::err(format!("Merge of `{name}` failed: {e:#}")),
+    };
+    let (text, is_error) = crate::worktree::describe(name, &merged);
+    let applied = matches!(merged, crate::worktree::Merge::Applied { .. });
+    if !matches!(merged, crate::worktree::Merge::Conflict { .. }) {
+        record.worktree = None;
+        record.status = Status::Stopped;
+        record.updated = chrono::Utc::now();
+        if let Err(e) = subagents::save(dir, &record) {
+            return ToolOutput::err(format!("{text}\n(could not save `{name}`: {e:#})"));
+        }
+    }
+    ToolOutput {
+        content: text,
+        is_error,
+        changed: applied,
+        undo,
+        ..Default::default()
+    }
+}
+
+/// `mode: "external:<name>"`: one task on an external ACP agent. With
+/// worktree isolation the agent works in its own worktree, kept under a
+/// generated child name for `merge`.
+async fn external(args: &Value, ext: &str, ctx: &ToolCtx) -> ToolOutput {
+    if action(args) != "run" {
+        return ToolOutput::err(
+            "External agents run a single task: use action \"run\" (they can't be spawned, sent follow-ups or resumed).",
+        );
+    }
+    if str_arg(args, "name").is_some() {
+        return ToolOutput::err("External agents are single-task and can't be named.");
+    }
+    let Some(task) = str_arg(args, "task") else {
+        return ToolOutput::err("Missing required argument `task`.");
+    };
+    let cfg = match crate::external_agent::config(ext) {
+        Ok(c) => c,
+        Err(e) => return ToolOutput::err(format!("{e:#}")),
+    };
+    let label = one_line(label(args));
+    let mode = format!("external:{ext}");
+    // An isolated run is saved like a named child so it can be merged.
+    let mut saved: Option<(Record, std::path::PathBuf)> = None;
+    if wants_worktree(args) {
+        let Some(dir) = &ctx.subagent_dir else {
+            return ToolOutput::err(
+                "Worktree isolation is unavailable here: isolated children are kept with a saved session.",
+            );
+        };
+        let id = fresh_id("ext");
+        let mut r = Record::new(&id, &mode, &label);
+        match crate::worktree::create(&ctx.cwd, &id).await {
+            Ok(wt) => {
+                r.isolation = Some("worktree".into());
+                r.worktree = Some(wt);
+            }
+            Err(e) => return ToolOutput::err(format!("Could not create a worktree: {e:#}")),
+        }
+        r.status = Status::Running;
+        if let Err(e) = subagents::save(dir, &r) {
+            return ToolOutput::err(format!("{e:#}"));
+        }
+        saved = Some((r, dir.clone()));
+    }
+    let id = saved
+        .as_ref()
+        .map(|(r, _)| r.name.clone())
+        .unwrap_or_else(|| fresh_id("ext"));
+    let cwd = saved
+        .as_ref()
+        .and_then(|(r, _)| r.worktree.as_ref())
+        .map(|w| w.path.clone())
+        .unwrap_or_else(|| ctx.cwd.clone());
+    let typed = TypedRun::from_args(args, &cwd, ctx);
+    let prompt = with_instructions(task, typed.as_ref());
+    let cancel = ctx.cancel.child_token();
+    let Some(live) = LiveGuard::start(None, &format!("{ext}: {label}"), cancel.clone()) else {
+        return ToolOutput::err("Subagent could not start.");
+    };
+    let live = Arc::new(live);
+    let observer = live.clone();
+    let _slot = tokio::select! {
+        slot = SLOTS.acquire() => slot.ok(),
+        _ = cancel.cancelled() => None,
+    };
+    let result = crate::external_agent::run(
+        &cfg,
+        crate::external_agent::Run {
+            task: &prompt,
+            cwd: &cwd,
+            approver: ctx.approver.clone(),
+            auto_approve: ctx.yolo || ctx.permission_mode.is_yolo(),
+            origin: format!("external {ext}: {label}"),
+            cancel: cancel.clone(),
+            timeout: TIMEOUT,
+            on_tool: Some(Box::new(move |t, s| observer.tool(t, &one_line(s)))),
+        },
+    )
+    .await;
+    let display = match &result {
+        Ok(o) => Some(display(&o.tool_calls)),
+        Err(_) => None,
+    };
+    let finish = |content: String, is_error: bool| ToolOutput {
+        content,
+        is_error,
+        display: display.clone(),
+        ..Default::default()
+    };
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            if let Some((mut r, dir)) = saved {
+                if let Some(wt) = r.worktree.take() {
+                    let _ = wt.remove();
+                }
+                r.status = Status::Stopped;
+                let _ = subagents::save(&dir, &r);
+            }
+            return finish(format!("External agent `{ext}` failed: {e:#}"), true);
+        }
+    };
+    let mut changes = None;
+    if let Some((mut r, dir)) = saved {
+        r.items = vec![Item::user(prompt.clone()), Item::Assistant { text: outcome.text.clone() }];
+        r.status = Status::Idle;
+        r.turns = 1;
+        r.tool_calls = outcome.tool_calls.len() as u64;
+        r.updated = chrono::Utc::now();
+        if let Some(wt) = &r.worktree {
+            changes = Some(wt.summary(&r.name).await);
+        }
+        let _ = subagents::save(&dir, &r);
+    }
+    let stats = format!(
+        "external agent {ext} reported {} tool calls, stop reason {}",
+        outcome.tool_calls.len(),
+        outcome.stop_reason
+    );
+    if let Some(t) = &typed {
+        // A single task: no retry for external agents.
+        let checked = t.check(&outcome.text, &cancel).await;
+        let mut extra = json!({ "note": stats });
+        if let Some(c) = changes {
+            extra["changes"] = Value::String(c);
+        }
+        let failed = checked.failure.is_some();
+        return finish(crate::tools::typed::render(&id, &checked, 1, extra), failed);
+    }
+    let mut content = format!(
+        "{}\n{}\n\n({stats})",
+        crate::tools::typed::evidence(&id),
+        truncate(outcome.text.trim(), MAX_REPORT)
+    );
+    if let Some(c) = changes {
+        content.push_str("\n\n");
+        content.push_str(&c);
+    }
+    finish(content, false)
 }
 
 async fn drive_turn(

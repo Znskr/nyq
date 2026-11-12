@@ -58,6 +58,13 @@ pub struct Record {
     pub usage: Usage,
     #[serde(default)]
     pub items: Vec<Item>,
+    /// "worktree" when the child works in its own git worktree; fixed at
+    /// creation. Absent (shared workspace) in records from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
+    /// The child's live worktree; None once merged or removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<crate::worktree::Worktree>,
 }
 
 impl Record {
@@ -74,6 +81,8 @@ impl Record {
             tool_calls: 0,
             usage: Usage::default(),
             items: Vec::new(),
+            isolation: None,
+            worktree: None,
         }
     }
 
@@ -178,13 +187,22 @@ pub fn stop(dir: &Path, name: &str) -> Result<String> {
         bail!("No subagent named `{name}` in this session.");
     };
     let was_live = cancel_live(&key(dir, name));
+    let mut removed = String::new();
     if !was_live {
         record.status = Status::Stopped;
         record.updated = Utc::now();
+        // Stopping discards an isolated child's unmerged worktree. A live
+        // child's runner removes it once the turn has wound down.
+        if let Some(wt) = record.worktree.take() {
+            wt.remove()?;
+            removed = format!(" Its worktree {} was removed.", wt.path.display());
+        }
         save(dir, &record)?;
     }
     Ok(if was_live {
         format!("Stopping `{name}`; its current work is cancelled.")
+    } else if record.isolation.is_some() {
+        format!("Stopped `{name}`.{removed}")
     } else {
         format!("Stopped `{name}`. Resume it to send it more messages.")
     })
