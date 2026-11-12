@@ -191,23 +191,24 @@ const NET_PROGRAMS: &[&str] = &[
     "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "telnet", "ftp", "socat",
 ];
 
-/// The effects of a call, by tool name (and the command, for `bash`).
-/// Stands in for `Tool::effects` until every tool declares its own.
+/// The effects of a call in the taint policy's vocabulary (`deny exec when
+/// tainted-by:web`, the classifier's `effects`). Built-in tools answer from
+/// their declared effects (`Tool::effects`): a process is `exec`, a declared
+/// or unknown write is `write`, otherwise a filesystem read is `read`; a
+/// coordination tool has none of its own (its children's and sub-calls'
+/// calls are checked one by one). The names below are classified by name on
+/// purpose, where the policy must not simply take a tool's declaration:
+///
+/// - `bash`: `exec`, plus `net` when the command reaches the network;
+/// - `subagent`: `exec`, since a child can run anything;
+/// - web tools and MCP resources: `read` and `net` (remote content);
+/// - MCP tools: `net` whatever their server-declared annotations say;
+/// - extension tools: `exec`; `install_skill`: `write` and `net`;
+/// - `bash_output`/`process_wait` observe a process: a `read`;
+/// - `skill` is registered per session, so it has no static entry to ask.
 pub fn effects(tool: &str, args: &Value) -> Vec<Effect> {
     use Effect::*;
     match tool {
-        "read_file"
-        | "list_dir"
-        | "glob"
-        | "grep"
-        | "view_image"
-        | "bash_output"
-        | "process_wait"
-        | "skill"
-        | crate::tools::artifacts::TOOL => vec![Read],
-        "write_file" | "edit_file" | "multi_edit" | "apply_patch" | "edit_range" | "memory" => {
-            vec![Write]
-        }
         "bash" => {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             if reaches_network(command) {
@@ -216,15 +217,37 @@ pub fn effects(tool: &str, args: &Value) -> Vec<Effect> {
                 vec![Exec]
             }
         }
-        "process_write" | "kill_shell" => vec![Exec],
         // A child can run anything; its own calls are checked again.
         "subagent" => vec![Exec],
-        "web_fetch" | "web_search" => vec![Read, Net],
+        "web_fetch" | "web_search" | "mcp_list_resources" | "mcp_read_resource" => {
+            vec![Read, Net]
+        }
         "install_skill" => vec![Write, Net],
-        "mcp_list_resources" | "mcp_read_resource" => vec![Read, Net],
+        "bash_output" | "process_wait" | "skill" => vec![Read],
         _ if tool.starts_with("mcp__") => vec![Net],
         _ if tool.starts_with(crate::extensions::TOOL_PREFIX) => vec![Exec],
-        _ => Vec::new(),
+        _ => declared_effects(tool, args),
+    }
+}
+
+/// A built-in tool's declared effects as taint effects (none for a name
+/// that is not a built-in tool).
+fn declared_effects(tool: &str, args: &Value) -> Vec<Effect> {
+    let Some(t) = crate::agent::builtin_tool(tool) else {
+        return Vec::new();
+    };
+    if t.coordinates() {
+        return Vec::new();
+    }
+    let fx = t.effects(args);
+    if fx.exec {
+        vec![Effect::Exec]
+    } else if !fx.writes.is_empty() {
+        vec![Effect::Write]
+    } else if fx.reads {
+        vec![Effect::Read]
+    } else {
+        Vec::new()
     }
 }
 
@@ -304,7 +327,10 @@ pub fn is_user_message(item: &Item) -> bool {
     matches!(item, Item::User { text, .. } if orchestration_child(text).is_none())
 }
 
-/// Provenance of one call's result.
+/// Provenance of one call's result. Keyed by name on purpose: a label says
+/// where the result's *content* came from (the file a path names, a process,
+/// a URL), which depends on each tool's arguments, not on its effects; an
+/// unknown tool's result gets the conservative labels below.
 pub fn labels_for(call_id: &str, tool: &str, args: &Value, cwd: &Path, index: &Index) -> Labels {
     let mut labels = BTreeSet::new();
     let file = |path: &str, labels: &mut BTreeSet<Label>| {
@@ -1179,5 +1205,41 @@ mod tests {
             [Effect::Read, Effect::Net]
         );
         assert_eq!(effects("edit_file", &json!({})), [Effect::Write]);
+    }
+
+    /// Built-in tools answer from their declared effects; the table above
+    /// keeps what the old name list said for every one of them.
+    #[test]
+    fn built_in_effects_come_from_declarations() {
+        use Effect::*;
+        for (tool, want) in [
+            ("read_file", vec![Read]),
+            ("list_dir", vec![Read]),
+            ("glob", vec![Read]),
+            ("grep", vec![Read]),
+            ("view_image", vec![Read]),
+            ("bash_output", vec![Read]),
+            ("process_wait", vec![Read]),
+            ("skill", vec![Read]),
+            (crate::tools::artifacts::TOOL, vec![Read]),
+            ("write_file", vec![Write]),
+            ("edit_file", vec![Write]),
+            ("multi_edit", vec![Write]),
+            ("apply_patch", vec![Write]),
+            ("edit_range", vec![Write]),
+            ("memory", vec![Write]),
+            ("process_write", vec![Exec]),
+            ("kill_shell", vec![Exec]),
+            ("subagent", vec![Exec]),
+            ("team_task_create", vec![]),
+            ("run_code", vec![]),
+            ("install_skill", vec![Write, Net]),
+            ("ext__x__y", vec![Exec]),
+            ("not_a_tool", vec![]),
+        ] {
+            assert_eq!(effects(tool, &json!({})), want, "{tool}");
+        }
+        // Arguments count: listing memories only reads.
+        assert_eq!(effects("memory", &json!({"action": "list"})), [Read]);
     }
 }

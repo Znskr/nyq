@@ -1525,6 +1525,10 @@ impl Ui for AcpUi {
 }
 
 // ------------------------------------------------------------ presentation
+//
+// Presentation is keyed by tool name on purpose: the kind, verb and file
+// location shown depend on what each built-in tool's summary is (a path, a
+// command), not on its effects. Unknown tools get a generic rendering.
 
 fn tool_kind(tool: &str) -> acp::ToolKind {
     match tool {
