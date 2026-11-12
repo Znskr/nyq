@@ -105,6 +105,7 @@ impl Agent {
             }
         }
         items.push(Item::user(prompt));
+        self.compaction_started();
         let req = Request {
             system: &self.system,
             items: &items,
@@ -158,6 +159,7 @@ impl Agent {
         let before = self.items.len();
         self.items.clear();
         self.push(Item::Compaction { summary });
+        self.compaction_ended();
         self.submitted = self.items.len();
         ui.notice(&format!("Compacted {before} messages into a summary."));
         Ok(true)

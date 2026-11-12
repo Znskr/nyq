@@ -484,6 +484,9 @@ async fn run() -> Result<()> {
     if let Some(meta) = &resumed {
         ui::replay(&agent.items);
         ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+        if let Some(s) = &agent.session {
+            ui::recovery(&s.recovery);
+        }
         ui::set_session_title(&meta.title);
     }
     // Prompt commands follow servers that connect or change later.
@@ -1124,6 +1127,9 @@ async fn print_mode(
         }
         if let Some(meta) = resumed {
             ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+            if let Some(s) = &agent.session {
+                ui::recovery(&s.recovery);
+            }
             ui::set_session_title(&meta.title);
         }
         ext.start();
@@ -1323,6 +1329,9 @@ async fn resume_session(
     agent.adopt_transcript();
     grants::restore(agent);
     ui::info(&format!("Resumed {} · {}", meta.id, meta.title));
+    if let Some(s) = &agent.session {
+        ui::recovery(&s.recovery);
+    }
     ui::set_session_title(&meta.title);
     hooks::session_start(agent, "resume").await;
     Ok(())

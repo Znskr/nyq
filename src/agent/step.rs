@@ -216,6 +216,7 @@ impl Agent {
                     if let StreamEvent::Text(text) = &ev {
                         partial.push_str(text);
                     }
+                    super::journal::note_retry(&mut self.session, &ev, &partial);
                     ui.stream(&ev)
                 };
                 let r = tokio::select! {
@@ -246,6 +247,7 @@ impl Agent {
                 ),
                 Err(e) => format!("error after {}ms: {e:#}", started.elapsed().as_millis()),
             });
+            self.record_failed_attempt(&result, &partial);
             let response = result?;
             if response.truncated {
                 ui.notice("The reply was cut off at the output limit.");
@@ -273,6 +275,7 @@ impl Agent {
             for item in response.items {
                 self.push(item);
             }
+            self.journal_requested(&calls);
             crate::subagents::checkpoint(&self.items)?;
             if calls.is_empty() {
                 // This response has been shown to the model. A later tool

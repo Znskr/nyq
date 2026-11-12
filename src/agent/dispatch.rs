@@ -33,6 +33,7 @@ const PARALLEL_TOOLS: &[&str] = &[
     "web_fetch",
     "web_search",
     crate::tools::artifacts::TOOL,
+    crate::tools::session_search::TOOL,
     "skill",
 ];
 
@@ -373,6 +374,7 @@ impl Agent {
             Prepared::Done(out) => return out,
             Prepared::Run(ready) => ready,
         };
+        self.journal_started(id, &ready.summary);
         ui.tool_start(name, &ready.summary);
         let mut out = run_ready(&self.tools, &ready, cancel).await;
         ui.tool_end(name, &out);
@@ -393,6 +395,11 @@ impl Agent {
         let mut prepared = Vec::new();
         for (id, name, arguments) in batch {
             prepared.push(self.prepare(id, name, arguments, ui, cancel).await);
+        }
+        for ((id, ..), p) in batch.iter().zip(&prepared) {
+            if let Prepared::Run(ready) = p {
+                self.journal_started(id, &ready.summary);
+            }
         }
         let mut outs = Vec::new();
         {

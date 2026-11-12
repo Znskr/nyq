@@ -4,6 +4,7 @@
 mod ask;
 mod compact;
 mod dispatch;
+mod journal;
 mod note;
 mod permission_rules;
 mod step;
@@ -16,6 +17,7 @@ mod ui;
 // workstreams' code, hence the `allow`.
 pub use ask::{AskUserTool, ASK_USER};
 pub use compact::set_auto_compact_percent;
+pub(crate) use journal::is_pure_read;
 #[allow(unused_imports)]
 pub use permission_rules::{
     bash_matches, bash_prefix, grant_rule, grant_rule_in, is_allowed, is_allowed_in, rule_label,
