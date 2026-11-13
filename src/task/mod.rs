@@ -4,14 +4,18 @@
 //!
 //! - [`build`]: [`BuildSystem`] detection and the verifier primitives (build,
 //!   test, lint, format check) behind an injectable [`CommandRunner`], with
-//!   timeouts, cancellation, error condensing and single-test reruns. Also
+//!   timeouts, cancellation, error condensing and single-test reruns, and
+//!   each ecosystem's add-a-dependency command (`add_dep_command`, library
+//!   only: no model tool runs it). Also
 //!   [`VerifyState`], which renders the "LATEST COMPILE/TEST STATE" note.
 //! - [`validate`]: the [`Validator`] trait, [`Verdict`] and the built-in
 //!   validators and combinators.
 //! - [`budget`]: [`Budget`] (two failure counters, steps, tokens, cost,
 //!   deadline) and the [`EscalationLadder`] state machine.
 //! - [`cycle`]: [`CycleDetector`], loop detection over steps and intents.
-//! - [`memo`]: [`MemoStore`], results cached under `~/.nyq/cache/<workspace>`.
+//! - [`memo`]: [`MemoStore`], results cached under `~/.nyq/cache/<workspace>`,
+//!   with the [`memo::Evidence`] a replay needs (touched-file hashes, judge
+//!   passes).
 //!
 //! The runtime layer, which `crate::agent::task` wires into the loop:
 //!

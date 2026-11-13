@@ -347,7 +347,7 @@ runs out or the task escalates it exits 2 with a JSON report on stderr.
 | `--schema FILE\|JSON` | the result's JSON Schema |
 | `--validate CHECK` | repeatable, run in order on each submission: `build`, `tests`, `lint`, `cmd:<shell>` (exit 0 passes), `exists:<json-pointer>` (paths in the result must exist), `judge:<rubric>` (a model checks the change is present and complete), `touched:<path,…>` (the task must have changed them). `TaskValidate` [hooks](#hooks) run after these |
 | `--budget LIMITS` | `syntax=N` malformed submissions (3), `semantic=N` rejected ones (5), `steps=N` (100), `tokens=N`, `cost=X` dollars, `wall=S` (or `90s`, `5m`, `1h`) |
-| `--memo`, `--memo-file PATH` | reuse the cached result of an identical earlier task: same prompt, schema, checks, model and workspace (the contents of the listed files, or without any the git state: HEAD, `git status`, the diffs and untracked files). The checks run again on a cached result, and one that fails is discarded. Results are kept in `~/.nyq/cache/`, never in the workspace; outside a git repository `--memo` needs `--memo-file` |
+| `--memo`, `--memo-file PATH` | reuse the cached result of an identical earlier task: same prompt, schema, checks, model and workspace (the contents of the listed files, or without any the git state: HEAD, `git status`, the diffs and untracked files). The checks run again on a cached result, and one that fails is discarded. Results are kept in `~/.nyq/cache/`, never in the workspace; outside a git repository `--memo` needs `--memo-file`. See [memoised results](#memoised-results) |
 
 When a task stalls (repeated rejections, a red build that doesn't improve, or the
 same actions in a loop), nyq climbs an escalation ladder: a nudge, a cheap progress
@@ -355,6 +355,37 @@ check, a diagnosis by a stronger model, a context reset from a summary, a switch
 the `tier.high` model, and finally escalation (exit 2). Mutating tools offer an
 `intent` field (what the call does, why, what comes next) during tasks; the recent
 intents are shown back to the model on every request.
+
+#### Memoised results
+
+A `--memo` result is stored under a key taken when the task **starts**: the prompt,
+schema, checks, model and the workspace state at that moment. A later run with the
+same key reuses the result without calling the model, after its checks pass again:
+
+- `build`, `tests`, `lint`, `cmd:` and `exists:` run again on the workspace as it is.
+- `touched:` and `judge:` look at the files the task changed, which a run that
+  doesn't do the task can't know. The cache keeps that list, with a hash of each
+  file's contents when the result was accepted. A hit uses it only if every one of
+  those files still has exactly that content; if one was edited, deleted or created
+  since, it is a miss and the task runs again.
+- A `judge:` check that passed is not asked again when its rubric, the result, the
+  workspace state, the judge model (`tier.high`, or the session model) and the
+  touched files' contents are all the same as when it passed. If any of them
+  differs, the judge runs again, and a judge that now rejects the result makes it a
+  miss.
+
+**Tasks that write files hit only when the workspace is back in its start state.**
+This is intended. The key describes the workspace the task started from, so a
+cached result is reused only for the inputs it was produced from. Once the task
+has changed the workspace, the same command is a different question (the work is
+already there), and nyq runs it rather than guessing. In practice:
+
+- With the git state as the key, the result is reused after the task's changes are
+  undone (`git stash`, `git checkout`). A task with `touched:` or `judge:` still
+  misses then, because the touched files no longer hold what the task wrote.
+- With `--memo-file`, only the listed files count. A writing task hits while they
+  are unchanged and the files it touched still hold what it wrote. List the task's
+  inputs, not its outputs.
 
 **Background verifier.** For a task with a `build`, `tests` or `lint` check (or
 with `[verify] auto = true`, or under the `ci` profile), nyq builds the project in
