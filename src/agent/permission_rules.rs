@@ -277,12 +277,22 @@ pub(crate) fn is_file_tool(tool: &str) -> bool {
     builtin_tool(tool).is_some_and(|t| t.kind() == crate::tools::ToolKind::FileWrite)
 }
 
-/// A subagent call's mode: `general` or (by default) `explore`.
-pub(crate) fn subagent_mode(args: &Value) -> &'static str {
-    if args.get("mode").and_then(Value::as_str) == Some("general") {
-        "general"
-    } else {
-        "explore"
+/// A subagent call's mode as its grant and permission key reads it:
+/// `general`, `external:<name>` for an external ACP agent, or (by default)
+/// `explore`. A worktree child without a mode is `general`, as the tool runs
+/// it. Each external agent has its own key, so a grant for one never covers
+/// another, nor a typed `explore`/`general` child, and an old
+/// `subagent:explore` grant never covers an external agent.
+pub(crate) fn subagent_mode(args: &Value) -> String {
+    let mode = args.get("mode").and_then(Value::as_str).map(str::trim);
+    if let Some(name) = mode.and_then(|m| m.strip_prefix("external:")) {
+        return format!("external:{}", name.trim());
+    }
+    let worktree = args.get("isolation").and_then(Value::as_str).map(str::trim) == Some("worktree");
+    match mode.filter(|m| !m.is_empty()) {
+        Some("general") => "general".into(),
+        None if worktree => "general".into(),
+        _ => "explore".into(),
     }
 }
 
@@ -375,6 +385,9 @@ pub fn rule_label(rule: &str) -> String {
         return format!("`{p} …`");
     }
     if let Some(mode) = rule.strip_prefix("subagent:") {
+        if let Some(name) = mode.strip_prefix("external:") {
+            return format!("`subagent` external agent `{name}`");
+        }
         return format!("`subagent` ({mode})");
     }
     if let Some(url) = rule.strip_prefix("web_fetch:") {
@@ -931,6 +944,69 @@ mod tests {
             std::os::unix::fs::symlink(outside.path(), cwd.join("link")).unwrap();
             assert!(!ok("write_file", json!({"path": "link/x.txt"})));
         }
+    }
+
+    /// Each external agent has its own grant key: "always" on one covers
+    /// only that agent, never another external agent or a typed child, and
+    /// neither an old `subagent:explore` grant nor a `subagent:general` one
+    /// covers an external agent.
+    #[test]
+    fn external_subagent_grants_cover_only_that_agent() {
+        use serde_json::json;
+        let cwd = Path::new("/w");
+        let ext = |name: &str| json!({"mode": format!("external:{name}"), "task": "x"});
+        assert_eq!(
+            grant_rule("subagent", &ext("claude")).as_deref(),
+            Some("subagent:external:claude")
+        );
+        assert_eq!(
+            grant_rule(
+                "subagent",
+                &json!({"mode": " external: codex ", "task": "x"})
+            )
+            .as_deref(),
+            Some("subagent:external:codex")
+        );
+        // A worktree child without a mode runs as general, and is keyed so.
+        assert_eq!(
+            grant_rule("subagent", &json!({"isolation": "worktree", "task": "x"})).as_deref(),
+            Some("subagent:general")
+        );
+        assert_eq!(
+            grant_rule(
+                "subagent",
+                &json!({"isolation": "worktree", "mode": "explore", "task": "x"})
+            )
+            .as_deref(),
+            Some("subagent:explore")
+        );
+        assert_eq!(
+            rule_label("subagent:external:claude"),
+            "`subagent` external agent `claude`"
+        );
+
+        let grants =
+            |rules: &[&str]| -> HashSet<String> { rules.iter().map(|r| r.to_string()).collect() };
+        let explore = json!({"task": "x"});
+        let general = json!({"mode": "general", "task": "x"});
+
+        let claude = grants(&["subagent:external:claude"]);
+        assert!(is_allowed(&claude, "subagent", &ext("claude"), cwd));
+        assert!(!is_allowed(&claude, "subagent", &ext("codex"), cwd));
+        assert!(!is_allowed(&claude, "subagent", &explore, cwd));
+        assert!(!is_allowed(&claude, "subagent", &general, cwd));
+        // The reverse: typed-child grants (an old saved `subagent:explore`
+        // among them) never cover an external agent.
+        for old in ["subagent:explore", "subagent:general", "subagent"] {
+            let g = grants(&[old]);
+            assert!(!is_allowed(&g, "subagent", &ext("claude"), cwd), "{old}");
+        }
+        assert!(is_allowed(
+            &grants(&["subagent:explore"]),
+            "subagent",
+            &explore,
+            cwd
+        ));
     }
 
     #[test]

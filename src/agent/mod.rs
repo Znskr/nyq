@@ -141,6 +141,15 @@ impl Agent {
         }
     }
 
+    /// Save the taint ledger with the session when it changed, so a resumed
+    /// session still knows the files written from untrusted content.
+    fn sync_taint(&mut self) {
+        let Some(s) = &mut self.session else { return };
+        if let Err(e) = s.save_taint(&self.taint.ledger()) {
+            crate::ui::error(&format!("could not save the taint ledger: {e:#}"));
+        }
+    }
+
     pub fn push(&mut self, item: Item) {
         self.stats.item(&item);
         self.sync_prefs();
@@ -150,6 +159,7 @@ impl Agent {
             }
         }
         self.sync_workset();
+        self.sync_taint();
         self.items.push(item);
         if let Err(e) = crate::subagents::checkpoint(&self.items) {
             crate::ui::error(&format!("Child checkpoint failed: {e:#}"));
@@ -335,6 +345,11 @@ impl Agent {
         self.context_tokens = self.estimate_request();
         self.submitted = self.items.len();
         self.restore_workset();
+        // Results come back from the transcript with their labels; files
+        // written from untrusted content come from the saved ledger.
+        if let Some(s) = &self.session {
+            self.taint.restore(&s.saved_taint());
+        }
     }
 
     /// Restore the working set and intent log saved with the session.

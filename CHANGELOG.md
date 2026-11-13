@@ -44,7 +44,13 @@ graph, scripts). Old sessions, settings and permission files keep loading.
   script's result. An external agent's report and the files it changed (found
   from git) carry `external:<name>` and its task's taint; a tainted task for
   one always needs a person's approval (denied headless) and runs in its own
-  worktree when it can.
+  worktree when it can. The main agent's taint (files written from untrusted
+  content) is saved with the session and still applies after `--resume` or
+  `--continue`.
+- **Per-agent external grants**: an external agent's call has its own
+  permission key, `subagent:external:<name>`, so "always" covers only that
+  agent, never another external agent or an `explore`/`general` child. An
+  older `subagent:explore` grant or rule no longer covers external agents.
 - **Parallel waves and argument validation**: each tool declares its effects.
   Reads run in parallel, writes to disjoint paths run together, commands run
   alone. Arguments are checked against the tool's schema before anything runs

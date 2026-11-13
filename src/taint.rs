@@ -30,7 +30,10 @@
 //!
 //! A named child's index is rebuilt every turn; what the transcript can't
 //! rebuild (its tainted inputs, files written from untrusted content) is
-//! saved with the child as a [`Ledger`].
+//! saved with the child as a [`Ledger`]. The main agent's ledger is saved
+//! with its session the same way (see `crate::session::Session::save_taint`)
+//! and restored on resume, so a resumed session still flags a call that
+//! reads a file written from untrusted content in an earlier run.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -718,7 +721,14 @@ impl Ledger {
 /// dropped (with its taint) instead of failing the whole record.
 pub fn de_ledger<'de, D: Deserializer<'de>>(d: D) -> Result<Ledger, D::Error> {
     let raw = Option::<Value>::deserialize(d)?.unwrap_or_default();
-    Ok(serde_json::from_value(raw).unwrap_or_default())
+    Ok(ledger_from(Some(&raw)))
+}
+
+/// A saved [`Ledger`] read leniently: missing (an older session) or
+/// unreadable (a newer build's) is an empty ledger.
+pub fn ledger_from(raw: Option<&Value>) -> Ledger {
+    raw.and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }
 
 /// Shingle index over earlier tool results (see the module docs).

@@ -883,8 +883,12 @@ Persistent rules live in `~/.nyq/permissions.json`:
 ```
 
 Each entry is a tool name with `*` wildcards (`web_fetch`, `mcp__deepwiki__*`,
-`mcp__*`), `subagent:explore` / `subagent:general`, `web_fetch:<url>`, or
-`bash:<prefix>`. In `allow`, a bash prefix covers the same plain commands an
+`mcp__*`), `subagent:explore` / `subagent:general` /
+`subagent:external:<name>` (one external agent; `subagent:external:*` for all
+of them), `web_fetch:<url>`, or `bash:<prefix>`. Answering "always" for an
+external agent grants only that agent, never another external agent or an
+`explore`/`general` child, and an older `subagent:explore` rule or grant does
+not cover external agents. In `allow`, a bash prefix covers the same plain commands an
 "always" grant would (no `;`, `&&`, pipes, redirects, dollar signs or
 backticks, including `$'…'` and `$"…"` quoting); in `ask`/`deny` it also
 catches the words anywhere in the command (`ls; git push`, `sh -c 'git push'`) —
@@ -979,7 +983,10 @@ is tainted by it, whatever its text, and the script's result keeps the labels of
 everything its calls returned (also after a resume). A named child keeps this
 across its messages: a later message, or the same child after you resume the
 session, still flags a call that copies an earlier tainted message or reads a
-file the child wrote from untrusted content.
+file the child wrote from untrusted content. The main agent saves the same
+record with its session, so after `--resume` or `--continue` reading a file it
+wrote from untrusted content (a download, a web-tainted edit, an external
+agent's edits) is still flagged.
 
 An external agent (`mode: "external:<name>"`) runs outside nyq, so nyq cannot
 check its calls; it labels what follows from it instead. Its report carries
@@ -1003,10 +1010,7 @@ in files git ignores or is told to overlook (`assume-unchanged`,
 `skip-worktree`) or in a workspace that is not a git repository are invisible to
 nyq, and its permission requests are only the ones it chooses to send. In a
 shared workspace, anything else that changes a file while it runs (another
-child, a background command) is attributed to it too. The main agent's list of files
-written from untrusted content (downloads, web-tainted edits, an external
-agent's edits) is not saved with the session, so after a resume reading such a
-file is no longer flagged; named children save theirs.
+child, a background command) is attributed to it too.
 
 A project may add rules in `.nyq/permissions.json`, but only `ask` and `deny`: an
 `allow` there is ignored, so a repository can't grant itself permissions. A
