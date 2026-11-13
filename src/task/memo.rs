@@ -13,6 +13,22 @@
 //! validators before it is used (`crate::task::headless::memo_lookup`). The
 //! entry also remembers which `(goal, inputs)` slot it belongs to, so storing
 //! a new result evicts the old ones for that slot.
+//!
+//! An entry also keeps [`Evidence`] from the run that produced it, for the
+//! checks a replay cannot redo from the workspace alone:
+//!
+//! - the files the task touched, with their content hashes when the result
+//!   was accepted. `touched:` and the judge read that set; a hit restores it
+//!   only when every file still has its hash, and is a miss otherwise.
+//! - the judges that passed, each under a key of its rubric, the value, the
+//!   workspace fingerprint, the judge model and the touched files' hashes.
+//!   A hit whose judge has the same key reuses the pass instead of calling
+//!   the model; any difference re-judges.
+//!
+//! The key is the workspace fingerprint taken when the task *started*, so a
+//! task that writes files hits only once the workspace is back in that state
+//! (with the git fingerprint), or as long as the `--memo-file` files are
+//! unchanged.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -64,6 +80,15 @@ fn hash_file(h: &mut Sha256, path: &Path) {
         Ok(_) => h.update(b"special"),
         Err(_) => h.update(b"missing"),
     }
+}
+
+/// The hash of one file's contents (as [`hash_files`] counts them: a missing
+/// file, a symlink or a special file each hash differently from any regular
+/// file). `path` is relative to `root` or absolute.
+pub fn hash_file_at(root: &Path, path: &Path) -> String {
+    let mut h = Sha256::new();
+    hash_file(&mut h, &root.join(path));
+    hex(&h.finalize())
 }
 
 /// A hash over the listed files: their relative paths and contents. A missing
@@ -197,12 +222,155 @@ impl MemoKey {
     }
 }
 
+/// A file the task touched and its content hash when the result was
+/// accepted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TouchedFile {
+    /// Relative to the workspace, or absolute under another writable root.
+    pub path: PathBuf,
+    /// [`hash_file_at`].
+    pub hash: String,
+}
+
+/// A judge that passed the result: its rubric, model and [`judge_key`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgePass {
+    pub rubric: String,
+    pub model: String,
+    pub key: String,
+}
+
+/// What a memoised result was accepted on, beyond the key (see the module
+/// docs). Entries written before it existed read as empty: no touched
+/// files, no judge passes, so `touched:` misses and judges run again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evidence {
+    #[serde(default)]
+    pub touched: Vec<TouchedFile>,
+    #[serde(default)]
+    pub judges: Vec<JudgePass>,
+}
+
+/// The cache key of a judge's pass. It covers every input the judge sees on
+/// a replay: the rubric, the value, the workspace fingerprint (the goal is
+/// in the memo slot), the judge model, and the touched files with their
+/// hashes (the judge reads their contents). Two equal keys mean the judge
+/// would be asked the same question about the same files.
+pub fn judge_key(
+    rubric: &str,
+    value: &Value,
+    fingerprint: &str,
+    model: &str,
+    touched: &[TouchedFile],
+) -> String {
+    let mut h = Sha256::new();
+    for part in [rubric, &super::cycle::canonical(value), fingerprint, model] {
+        h.update(part.len().to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    let mut files: Vec<&TouchedFile> = touched.iter().collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    for f in files {
+        let path = f.path.to_string_lossy();
+        h.update(path.len().to_le_bytes());
+        h.update(path.as_bytes());
+        h.update(f.hash.as_bytes());
+    }
+    hex(&h.finalize())
+}
+
+impl Evidence {
+    /// The touched files and their current hashes (duplicates dropped).
+    pub fn capture(root: &Path, touched: &[PathBuf]) -> Self {
+        let mut paths: Vec<&PathBuf> = touched.iter().collect();
+        paths.sort();
+        paths.dedup();
+        Self {
+            touched: paths
+                .into_iter()
+                .map(|p| TouchedFile {
+                    path: p.clone(),
+                    hash: hash_file_at(root, p),
+                })
+                .collect(),
+            judges: Vec::new(),
+        }
+    }
+
+    /// Record that the judge `model` passed `value` under `rubric`.
+    pub fn add_judge(&mut self, rubric: &str, model: &str, value: &Value, fingerprint: &str) {
+        let key = judge_key(rubric, value, fingerprint, model, &self.touched);
+        if !self.judges.iter().any(|j| j.key == key) {
+            self.judges.push(JudgePass {
+                rubric: rubric.to_string(),
+                model: model.to_string(),
+                key,
+            });
+        }
+    }
+
+    /// The touched paths, when every file still has the hash it had when
+    /// the result was accepted; None when one changed (or appeared, or went
+    /// away).
+    pub fn intact(&self, root: &Path) -> Option<Vec<PathBuf>> {
+        self.touched
+            .iter()
+            .all(|f| hash_file_at(root, &f.path) == f.hash)
+            .then(|| self.touched.iter().map(|f| f.path.clone()).collect())
+    }
+
+    /// Whether the judge `model` already passed `value` under `rubric`, with
+    /// this fingerprint and these touched files.
+    pub fn judge_passed(
+        &self,
+        rubric: &str,
+        model: &str,
+        value: &Value,
+        fingerprint: &str,
+    ) -> bool {
+        let key = judge_key(rubric, value, fingerprint, model, &self.touched);
+        self.judges.iter().any(|j| j.key == key)
+    }
+}
+
+/// What a `--memo` entry keeps from the run that produced its result: the
+/// touched files with their hashes when it was accepted, and the judges
+/// that passed it (rubric and model). [`MemoEvidence::seal`] turns it into
+/// the stored [`Evidence`] once the memo key is known.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemoEvidence {
+    /// The touched files and their hashes ([`Evidence::capture`]).
+    pub touched: Evidence,
+    /// `(rubric, model)` of each judge that passed.
+    pub judges: Vec<(String, String)>,
+}
+
+impl MemoEvidence {
+    /// The stored evidence for `value` under the memo key's `fingerprint`.
+    pub fn seal(self, value: &Value, fingerprint: &str) -> Evidence {
+        let mut evidence = self.touched;
+        for (rubric, model) in &self.judges {
+            evidence.add_judge(rubric, model, value, fingerprint);
+        }
+        evidence
+    }
+}
+
+/// A `--memo` hit being re-checked: the evidence its entry kept and the
+/// workspace fingerprint of its key.
+pub struct Replay<'a> {
+    pub evidence: &'a Evidence,
+    pub fingerprint: &'a str,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Entry<T> {
     version: u32,
     slot: String,
     fingerprint: String,
     value: T,
+    #[serde(default)]
+    evidence: Evidence,
 }
 
 /// The cache directory of one workspace, under the user's state directory.
@@ -234,21 +402,37 @@ impl MemoStore {
     /// The stored result, if there is one for exactly this goal, input and
     /// workspace state. A corrupt or foreign file reads as a miss.
     pub fn get<T: DeserializeOwned>(&self, key: &MemoKey) -> Option<T> {
+        self.get_with(key).map(|(value, _)| value)
+    }
+
+    /// [`MemoStore::get`], with the evidence the result was accepted on.
+    pub fn get_with<T: DeserializeOwned>(&self, key: &MemoKey) -> Option<(T, Evidence)> {
         let text = std::fs::read_to_string(self.path(key)).ok()?;
         let entry: Entry<T> = serde_json::from_str(&text).ok()?;
         (entry.version == VERSION && entry.slot == key.slot && entry.fingerprint == key.fingerprint)
-            .then_some(entry.value)
+            .then_some((entry.value, entry.evidence))
     }
 
     /// Store a result and evict older results for the same goal and inputs
     /// (their fingerprint differs, so they are stale).
     pub fn put<T: Serialize>(&self, key: &MemoKey, value: &T) -> io::Result<()> {
+        self.put_with(key, value, &Evidence::default())
+    }
+
+    /// [`MemoStore::put`], with the evidence the result was accepted on.
+    pub fn put_with<T: Serialize>(
+        &self,
+        key: &MemoKey,
+        value: &T,
+        evidence: &Evidence,
+    ) -> io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let entry = Entry {
             version: VERSION,
             slot: key.slot.clone(),
             fingerprint: key.fingerprint.clone(),
             value,
+            evidence: evidence.clone(),
         };
         let text = serde_json::to_string(&entry).map_err(io::Error::other)?;
         let path = self.path(key);
@@ -480,6 +664,140 @@ mod tests {
         store.invalidate(&key);
         assert_eq!(store.get::<Value>(&key), None);
         store.invalidate(&key); // no panic when already gone
+    }
+
+    #[test]
+    fn evidence_round_trips_and_older_entries_read_as_empty() {
+        let (_d, root) = setup();
+        let home = tempfile::tempdir().unwrap();
+        let store = MemoStore::for_workspace(home.path(), &root);
+        let key = MemoKey::new("g", &json!({}), "f");
+        let mut evidence = Evidence::capture(
+            &root,
+            &[
+                PathBuf::from("b.rs"),
+                PathBuf::from("a.rs"),
+                PathBuf::from("a.rs"),
+            ],
+        );
+        assert_eq!(
+            evidence
+                .touched
+                .iter()
+                .map(|t| t.path.clone())
+                .collect::<Vec<_>>(),
+            [PathBuf::from("a.rs"), PathBuf::from("b.rs")],
+            "sorted, without duplicates"
+        );
+        evidence.add_judge("r", "p/m", &json!(1), "f");
+        evidence.add_judge("r", "p/m", &json!(1), "f");
+        assert_eq!(evidence.judges.len(), 1, "a pass is recorded once");
+        store.put_with(&key, &json!(1), &evidence).unwrap();
+        assert_eq!(
+            store.get_with::<Value>(&key),
+            Some((json!(1), evidence.clone()))
+        );
+        assert_eq!(store.get::<Value>(&key), Some(json!(1)));
+        // An entry an older nyq wrote has no evidence: it reads as empty.
+        let old = json!({
+            "version": VERSION,
+            "slot": key.slot,
+            "fingerprint": key.fingerprint,
+            "value": 2,
+        });
+        std::fs::write(
+            store.dir().join(format!("{}.json", key.as_str())),
+            old.to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_with::<Value>(&key),
+            Some((json!(2), Evidence::default()))
+        );
+    }
+
+    #[test]
+    fn touched_files_are_intact_only_with_their_recorded_hashes() {
+        let (_d, root) = setup();
+        let files = [PathBuf::from("a.rs"), root.join("new.rs")];
+        let evidence = Evidence::capture(&root, &files);
+        assert_eq!(
+            evidence.intact(&root),
+            Some(vec![root.join("new.rs"), PathBuf::from("a.rs")]),
+            "sorted: an absolute path (under another root) comes first"
+        );
+        // A file that was missing and now exists is not intact.
+        std::fs::write(root.join("new.rs"), "").unwrap();
+        assert_eq!(evidence.intact(&root), None);
+        std::fs::remove_file(root.join("new.rs")).unwrap();
+        assert!(evidence.intact(&root).is_some());
+        // Nor is an edited or a deleted one.
+        std::fs::write(root.join("a.rs"), "fn a() { edited }").unwrap();
+        assert_eq!(evidence.intact(&root), None);
+        std::fs::remove_file(root.join("a.rs")).unwrap();
+        assert_eq!(evidence.intact(&root), None);
+        // Nothing touched is trivially intact.
+        assert_eq!(Evidence::default().intact(&root), Some(vec![]));
+        // Unrelated files do not matter.
+        let a = Evidence::capture(&root, &[PathBuf::from("b.rs")]);
+        std::fs::write(root.join("c.rs"), "x").unwrap();
+        assert!(a.intact(&root).is_some());
+    }
+
+    #[test]
+    fn a_judge_key_covers_every_input() {
+        let t = |path: &str, hash: &str| TouchedFile {
+            path: PathBuf::from(path),
+            hash: hash.into(),
+        };
+        let touched = vec![t("a", "1"), t("b", "2")];
+        let base = judge_key("r", &json!({"x": 1}), "f", "p/m", &touched);
+        assert_eq!(base, judge_key("r", &json!({"x": 1}), "f", "p/m", &touched));
+        // Order of the touched files and of the value's keys is irrelevant.
+        let swapped = vec![t("b", "2"), t("a", "1")];
+        assert_eq!(base, judge_key("r", &json!({"x": 1}), "f", "p/m", &swapped));
+        for other in [
+            judge_key("r2", &json!({"x": 1}), "f", "p/m", &touched),
+            judge_key("r", &json!({"x": 2}), "f", "p/m", &touched),
+            judge_key("r", &json!({"x": 1}), "f2", "p/m", &touched),
+            judge_key("r", &json!({"x": 1}), "f", "p/m2", &touched),
+            judge_key("r", &json!({"x": 1}), "f", "p/m", &[t("a", "1")]),
+            judge_key(
+                "r",
+                &json!({"x": 1}),
+                "f",
+                "p/m",
+                &[t("a", "1"), t("b", "3")],
+            ),
+            judge_key(
+                "r",
+                &json!({"x": 1}),
+                "f",
+                "p/m",
+                &[t("a", "1"), t("c", "2")],
+            ),
+            // Parts are length-prefixed: shifting text between them differs.
+            judge_key("rf", &json!({"x": 1}), "", "p/m", &touched),
+        ] {
+            assert_ne!(base, other);
+        }
+        let mut e = Evidence {
+            touched,
+            judges: Vec::new(),
+        };
+        e.add_judge("r", "p/m", &json!({"x": 1}), "f");
+        assert!(e.judge_passed("r", "p/m", &json!({"x": 1}), "f"));
+        assert!(!e.judge_passed("r", "p/other", &json!({"x": 1}), "f"));
+        assert!(!e.judge_passed("r", "p/m", &json!({"x": 2}), "f"));
+        // Sealing pending evidence adds each judge under the key's
+        // fingerprint.
+        let sealed = MemoEvidence {
+            touched: Evidence::default(),
+            judges: vec![("r".into(), "p/m".into())],
+        }
+        .seal(&json!(7), "fp");
+        assert!(sealed.judge_passed("r", "p/m", &json!(7), "fp"));
+        assert!(!sealed.judge_passed("r", "p/m", &json!(7), "other"));
     }
 
     #[test]

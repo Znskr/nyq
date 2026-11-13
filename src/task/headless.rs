@@ -15,7 +15,7 @@ use crate::agent::{Agent, Ui};
 
 use super::budget::BudgetLimits;
 use super::engine::{parse_budget, MemoSpec, TaskSpec, ValidatorSpec};
-use super::memo::{MemoKey, MemoStore};
+use super::memo::{MemoEvidence, MemoKey, MemoStore, Replay};
 
 /// The task flags of `nyq -p` / `nyq ask`.
 #[derive(clap::Args, Clone, Debug, Default)]
@@ -152,8 +152,21 @@ pub async fn memo_lookup(
         Err(notice) => return MemoLookup::Off(Some(notice)),
     };
     let store = MemoStore::for_workspace(home, &agent.cwd);
-    if let Some(value) = store.get::<Value>(&key) {
-        if agent.recheck(spec, &value, ui, cancel).await {
+    if let Some((value, evidence)) = store.get_with::<Value>(&key) {
+        let replay = Replay {
+            evidence: &evidence,
+            fingerprint: key.fingerprint(),
+        };
+        if let Some(judges) = agent.recheck(spec, &value, Some(&replay), ui, cancel).await {
+            // A judge that ran again (another judge model, say) and passed
+            // is recorded, so the next hit reuses it too.
+            let mut updated = evidence.clone();
+            for (rubric, model) in &judges {
+                updated.add_judge(rubric, model, &value, key.fingerprint());
+            }
+            if updated != evidence {
+                let _ = store.put_with(&key, &value, &updated);
+            }
             return MemoLookup::Hit(value);
         }
         store.invalidate(&key);
@@ -161,9 +174,20 @@ pub async fn memo_lookup(
     MemoLookup::Miss(key)
 }
 
-/// Cache a validated result under `key` in `home`'s cache for `root`.
-pub fn memo_put(home: &Path, root: &Path, key: &MemoKey, value: &Value) -> std::io::Result<()> {
-    MemoStore::for_workspace(home, root).put(key, value)
+/// Cache a validated result under `key` in `home`'s cache for `root`, with
+/// what the run that produced it recorded ([`Agent::take_memo_evidence`]):
+/// the touched files' hashes and the judges that passed it.
+pub fn memo_put(
+    home: &Path,
+    root: &Path,
+    key: &MemoKey,
+    value: &Value,
+    evidence: Option<MemoEvidence>,
+) -> std::io::Result<()> {
+    let evidence = evidence
+        .map(|e| e.seal(value, key.fingerprint()))
+        .unwrap_or_default();
+    MemoStore::for_workspace(home, root).put_with(key, value, &evidence)
 }
 
 #[cfg(test)]
@@ -284,7 +308,7 @@ mod tests {
         let MemoLookup::Miss(key) = lookup(&mut agent, &spec, home.path()).await else {
             panic!("a first lookup misses");
         };
-        memo_put(home.path(), dir.path(), &key, &json!({"s": 1})).unwrap();
+        memo_put(home.path(), dir.path(), &key, &json!({"s": 1}), None).unwrap();
         assert_eq!(
             lookup(&mut agent, &spec, home.path()).await,
             MemoLookup::Hit(json!({"s": 1}))
@@ -346,7 +370,7 @@ mod tests {
         let MemoLookup::Miss(key) = lookup(&mut agent, &spec, home.path()).await else {
             panic!("a first lookup misses");
         };
-        memo_put(home.path(), repo.path(), &key, &json!({"ok": true})).unwrap();
+        memo_put(home.path(), repo.path(), &key, &json!({"ok": true}), None).unwrap();
         assert_eq!(
             lookup(&mut agent, &spec, home.path()).await,
             MemoLookup::Hit(json!({"ok": true}))
@@ -383,7 +407,14 @@ mod tests {
         let MemoLookup::Miss(key) = lookup(&mut agent, &spec, home.path()).await else {
             panic!("a first lookup misses");
         };
-        memo_put(home.path(), dir.path(), &key, &json!({"file": "report.md"})).unwrap();
+        memo_put(
+            home.path(),
+            dir.path(),
+            &key,
+            &json!({"file": "report.md"}),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             lookup(&mut agent, &spec, home.path()).await,
             MemoLookup::Hit(json!({"file": "report.md"}))
@@ -402,7 +433,7 @@ mod tests {
             "the failing entry was dropped"
         );
         // A value that does not match the schema is a miss too.
-        memo_put(home.path(), dir.path(), &key, &json!({"nope": 1})).unwrap();
+        memo_put(home.path(), dir.path(), &key, &json!({"nope": 1}), None).unwrap();
         assert!(matches!(
             lookup(&mut agent, &spec, home.path()).await,
             MemoLookup::Miss(_)
@@ -413,7 +444,7 @@ mod tests {
         let MemoLookup::Miss(fkey) = lookup(&mut agent, &failing, home.path()).await else {
             panic!("a first lookup misses");
         };
-        memo_put(home.path(), dir.path(), &fkey, &json!({"file": "x"})).unwrap();
+        memo_put(home.path(), dir.path(), &fkey, &json!({"file": "x"}), None).unwrap();
         assert!(matches!(
             lookup(&mut agent, &failing, home.path()).await,
             MemoLookup::Miss(_)

@@ -673,6 +673,12 @@ pub trait JudgeRunner: Send + Sync {
         value: &Value,
         cx: &ValidateCx,
     ) -> Result<JudgeVerdict, String>;
+
+    /// The model that judges (`provider/model`), which a `--memo` replay
+    /// compares before it reuses a cached pass. None never reuses one.
+    fn model_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// An LLM checks that the change is present and complete (not that it is

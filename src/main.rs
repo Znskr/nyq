@@ -1274,7 +1274,10 @@ async fn print_mode(
         Err(_) => 1,
     };
     if let (true, Some(key), Some(task::TaskOutcome::Submitted(v))) = (fresh, &memo_key, &outcome) {
-        if let Err(e) = task::headless::memo_put(&crate::config::home(), &agent.cwd, key, v) {
+        let evidence = agent.take_memo_evidence();
+        if let Err(e) =
+            task::headless::memo_put(&crate::config::home(), &agent.cwd, key, v, evidence)
+        {
             ui::error(&format!("could not save the --memo result: {e}"));
         }
     }

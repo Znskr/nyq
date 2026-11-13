@@ -406,6 +406,14 @@ impl JudgeRunner for LlmJudge {
         }
         Ok(JudgeVerdict { complete, feedback })
     }
+
+    fn model_id(&self) -> Option<String> {
+        Some(format!(
+            "{}/{}",
+            self.provider.name(),
+            self.provider.model()
+        ))
+    }
 }
 
 #[cfg(test)]

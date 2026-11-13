@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Agent, TurnEnd, Ui, ASK_USER};
 use crate::task::engine::{self, TaskOutcome, TaskSpec, TaskState, Tier, VerifyMode, SUBMIT};
 use crate::task::intent;
+use crate::task::memo::{Evidence, MemoEvidence, Replay};
 use crate::task::{
     llm, tier, AlwaysPass, BuildSystem, CheckRecord, CommandRunner, Exec, FailKind, JudgeRunner,
     JudgeValidator, LadderAction, LadderEvent, SchemaValidator, ShellRunner, StallReason,
@@ -71,6 +72,18 @@ pub struct TaskRuntime {
     pub(crate) options: Option<TaskOptions>,
     pub(crate) runner: Option<Arc<dyn CommandRunner>>,
     pub(crate) judge: Option<Arc<dyn JudgeRunner>>,
+    /// What the accepted result's `--memo` entry keeps from this run.
+    memo_evidence: Option<MemoEvidence>,
+}
+
+/// How a run of a task's checks ended.
+struct Checked {
+    verdict: Verdict,
+    /// The label of the check that did not pass.
+    by: String,
+    records: Vec<CheckRecord>,
+    /// `(rubric, model)` of each judge check whose model is known.
+    judges: Vec<(String, String)>,
 }
 
 /// What the loop does when a typed task's model stops without `submit`.
@@ -91,6 +104,7 @@ impl Agent {
         self.task.spec = spec;
         self.task.state = None;
         self.task.outcome = None;
+        self.task.memo_evidence = None;
     }
 
     pub fn task_spec(&self) -> Option<&TaskSpec> {
@@ -100,6 +114,12 @@ impl Agent {
     /// How the last turn's task ended: a validated value, or why it gave up.
     pub fn take_task_outcome(&mut self) -> Option<TaskOutcome> {
         self.task.outcome.take()
+    }
+
+    /// What the accepted result's `--memo` entry should keep (set when a
+    /// task with `memo` accepts a submission).
+    pub fn take_memo_evidence(&mut self) -> Option<MemoEvidence> {
+        self.task.memo_evidence.take()
     }
 
     /// The last turn's state (budget, ladder, touched files). For typed
@@ -556,7 +576,14 @@ impl Agent {
                 return self.reject(FailKind::Syntax, &feedback, "schema");
             }
         };
-        let Some((verdict, by, records)) = self.run_checks(&spec, schema, &value, ui, cancel).await
+        let Some(Checked {
+            verdict,
+            by,
+            records,
+            judges,
+        }) = self
+            .run_checks(&spec, schema, &value, None, ui, cancel)
+            .await
         else {
             return ToolOutput::err("Cancelled by user.");
         };
@@ -566,6 +593,18 @@ impl Agent {
                 if let Some(st) = &self.task.state {
                     crate::trace::log("task", || {
                         format!("submit accepted after {} rejections", st.failures)
+                    });
+                }
+                if spec.memo.is_some() {
+                    let touched = self
+                        .task
+                        .state
+                        .as_ref()
+                        .map(|s| s.touched.clone())
+                        .unwrap_or_default();
+                    self.task.memo_evidence = Some(MemoEvidence {
+                        touched: Evidence::capture(&self.cwd, &touched),
+                        judges,
                     });
                 }
                 self.task.outcome = Some(TaskOutcome::Submitted(value));
@@ -586,40 +625,93 @@ impl Agent {
 
     /// Re-run `spec`'s checks (schema, validators, TaskValidate hooks) on a
     /// result cached by an earlier run, outside any task turn: a `--memo`
-    /// hit is used only when they all pass again.
+    /// hit is used only when they all pass again. Some(the judges that
+    /// passed, with their models) when they do; None when one fails.
+    ///
+    /// With `replay`, the checks see the entry's evidence. `touched:` and
+    /// the judge read the touched files: they get the recorded set only when
+    /// every file still has its recorded hash, and otherwise the hit fails
+    /// (a miss). A judge whose pass was recorded under the same key (rubric,
+    /// value, fingerprint, model, touched hashes) is not asked again. So a
+    /// replay passes only checks whose current inputs equal those of a run
+    /// they passed, or that pass again now.
     pub async fn recheck(
         &mut self,
         spec: &TaskSpec,
         value: &Value,
+        replay: Option<&Replay<'_>>,
         ui: &mut dyn Ui,
         cancel: &CancellationToken,
-    ) -> bool {
-        let Some(schema) = spec.schema.clone() else {
-            return false;
+    ) -> Option<Vec<(String, String)>> {
+        let schema = spec.schema.clone()?;
+        let reads_touched = spec
+            .validators
+            .iter()
+            .any(|v| matches!(v, ValidatorSpec::FilesTouched(_) | ValidatorSpec::Judge(_)));
+        let replay = match replay {
+            Some(r) if reads_touched => Some((r.evidence.intact(&self.cwd)?, r)),
+            Some(r) => Some((Vec::new(), r)),
+            None => None,
         };
-        matches!(
-            self.run_checks(spec, schema, value, ui, cancel).await,
-            Some((Verdict::Pass, ..))
-        )
+        let replay = replay.as_ref().map(|(t, r)| (t.as_slice(), *r));
+        match self
+            .run_checks(spec, schema, value, replay, ui, cancel)
+            .await?
+        {
+            Checked {
+                verdict: Verdict::Pass,
+                judges,
+                ..
+            } => Some(judges),
+            _ => None,
+        }
     }
 
     /// The schema check, then `spec`'s validators in order, then the
     /// TaskValidate hooks, stopping at the first that does not pass: its
     /// verdict, its label and every check's record. None when cancelled.
+    /// `replay` (a `--memo` re-check) gives the touched files and the
+    /// recorded judge passes, in place of the turn's.
     async fn run_checks(
         &mut self,
         spec: &TaskSpec,
         schema: Value,
         value: &Value,
+        replay: Option<(&[PathBuf], &Replay<'_>)>,
         ui: &mut dyn Ui,
         cancel: &CancellationToken,
-    ) -> Option<(Verdict, String, Vec<CheckRecord>)> {
-        let cx = self.validate_cx(cancel);
+    ) -> Option<Checked> {
+        let mut cx = self.validate_cx(cancel);
+        if let Some((touched, _)) = replay {
+            cx.touched = touched.to_vec();
+        }
         let mut judges: Vec<Arc<llm::LlmJudge>> = Vec::new();
+        let mut judge_models = Vec::new();
         let mut checks: Vec<(String, Box<dyn Validator>)> =
             vec![("schema".into(), Box::new(SchemaValidator::new(schema)))];
         for v in &spec.validators {
-            checks.push((v.label(), self.validator(v, &mut judges, cancel)));
+            let check = match v {
+                ValidatorSpec::Judge(rubric) => {
+                    let runner = self.judge_runner(&spec.goal, &mut judges, cancel);
+                    let model = runner.model_id();
+                    if let Some(model) = &model {
+                        judge_models.push((rubric.clone(), model.clone()));
+                    }
+                    let cached = replay.zip(model.as_deref()).is_some_and(|((_, r), m)| {
+                        r.evidence.judge_passed(rubric, m, value, r.fingerprint)
+                    });
+                    if cached {
+                        crate::trace::log("task", || {
+                            format!("memo: reusing the judge's pass for `{rubric}`")
+                        });
+                        Box::new(AlwaysPass) as Box<dyn Validator>
+                    } else {
+                        Box::new(JudgeValidator::new(rubric.clone(), runner))
+                    }
+                }
+                _ => self.validator(v),
+            };
+            checks.push((v.label(), check));
         }
         // W12: the TaskValidate hooks are one more check, after the
         // built-in ones.
@@ -672,7 +764,12 @@ impl Agent {
                 self.task_account(Some(u), ui);
             }
         }
-        Some((verdict, by, records))
+        Some(Checked {
+            verdict,
+            by,
+            records,
+            judges: judge_models,
+        })
     }
 
     /// Keep the latest submission and its check verdicts on the turn state.
@@ -731,19 +828,21 @@ impl Agent {
         cx
     }
 
-    fn validator(
+    /// The validator for every spec but the judge ([`Agent::judge_runner`]).
+    fn validator(&self, v: &ValidatorSpec) -> Box<dyn Validator> {
+        v.validator().unwrap_or_else(|| Box::new(AlwaysPass))
+    }
+
+    /// The judge: the injected one, else an LLM judge on the high tier (kept
+    /// in `judges` so its usage can be accounted). `goal` is the task's, for
+    /// a re-check outside any turn.
+    fn judge_runner(
         &self,
-        v: &ValidatorSpec,
+        goal: &str,
         judges: &mut Vec<Arc<llm::LlmJudge>>,
         cancel: &CancellationToken,
-    ) -> Box<dyn Validator> {
-        if let Some(built) = v.validator() {
-            return built;
-        }
-        let ValidatorSpec::Judge(rubric) = v else {
-            return Box::new(AlwaysPass);
-        };
-        let runner: Arc<dyn JudgeRunner> = match &self.task.judge {
+    ) -> Arc<dyn JudgeRunner> {
+        match &self.task.judge {
             Some(j) => j.clone(),
             None => {
                 let opts = self.task_options();
@@ -751,15 +850,14 @@ impl Agent {
                 let st = self.task.state.as_ref();
                 let judge = Arc::new(llm::LlmJudge::new(
                     provider,
-                    st.map(|s| s.goal.clone()).unwrap_or_default(),
+                    st.map_or_else(|| goal.to_string(), |s| s.goal.clone()),
                     st.map(|s| s.originals.clone()).unwrap_or_default(),
                     cancel.clone(),
                 ));
                 judges.push(judge.clone());
                 judge
             }
-        };
-        Box::new(JudgeValidator::new(rubric.clone(), runner))
+        }
     }
 
     /// Whether `intent` in a call to `name` is the task engine's field: the
@@ -2326,5 +2424,269 @@ mod tests {
             recent_actions(&items, 1),
             "- edit_file({\"path\":\"x\"}) → no result"
         );
+    }
+
+    // --- memo replays (G3) ---
+
+    /// A judge that answers `complete` and counts its calls.
+    struct CountingJudge {
+        model: Option<String>,
+        complete: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingJudge {
+        fn new(model: Option<&str>, complete: bool) -> Arc<Self> {
+            Arc::new(Self {
+                model: model.map(String::from),
+                complete,
+                calls: Default::default(),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl JudgeRunner for CountingJudge {
+        async fn judge(&self, _: &str, _: &Value, cx: &ValidateCx) -> Result<JudgeVerdict, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // It reads the touched files, as the LLM judge does.
+            assert!(!cx.touched.is_empty(), "the judge sees the touched files");
+            Ok(JudgeVerdict {
+                complete: self.complete,
+                feedback: "not there".into(),
+            })
+        }
+
+        fn model_id(&self) -> Option<String> {
+            self.model.clone()
+        }
+    }
+
+    async fn memo_lookup(
+        agent: &mut Agent,
+        spec: &TaskSpec,
+        home: &Path,
+    ) -> crate::task::headless::MemoLookup {
+        crate::task::headless::memo_lookup(
+            agent,
+            spec,
+            home,
+            &mut QuietUi,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// A `--memo` task that writes a file keeps the touched files with their
+    /// hashes and the judges that passed. A replay restores the touched set,
+    /// so `touched:` passes, and reuses the judge's pass without asking it,
+    /// until the judge model or a touched file changes.
+    #[tokio::test]
+    async fn a_memo_replay_restores_touched_files_and_reuses_the_judge() {
+        use crate::task::headless::MemoLookup;
+        use crate::task::memo::{hash_file_at, Evidence, MemoStore, TouchedFile};
+
+        let mut spec = TaskSpec::typed("make the file", answer_schema());
+        spec.validators = vec![
+            ValidatorSpec::FilesTouched(vec![PathBuf::from("b.txt")]),
+            ValidatorSpec::Judge("b.txt says hi".into()),
+        ];
+        spec.memo = Some(engine::MemoSpec {
+            files: vec![PathBuf::from("in.txt")],
+        });
+        let mut f = Fixture::new(
+            vec![
+                reply(vec![call(
+                    "1",
+                    "write_file",
+                    json!({"path": "b.txt", "content": "hi\n"}),
+                )]),
+                submit("2", json!({"answer": 1})),
+            ],
+            Some(spec.clone()),
+        );
+        f.agent.tools = crate::tools::Registry::builtin();
+        let root = f.dir.path().to_path_buf();
+        std::fs::write(root.join("in.txt"), "v1").unwrap();
+        let judge = CountingJudge::new(Some("fake/judge"), true);
+        f.agent.task.judge = Some(judge.clone());
+        f.run("go").await;
+        let value = json!({"answer": 1});
+        assert_eq!(
+            f.agent.take_task_outcome(),
+            Some(TaskOutcome::Submitted(value.clone())),
+            "{:?}",
+            results(&f.agent)
+        );
+        assert_eq!(judge.calls(), 1);
+        let evidence = f.agent.take_memo_evidence().expect("memo evidence");
+        assert_eq!(
+            evidence.touched.touched,
+            [TouchedFile {
+                path: PathBuf::from("b.txt"),
+                hash: hash_file_at(&root, Path::new("b.txt")),
+            }]
+        );
+        assert_eq!(
+            evidence.judges,
+            [("b.txt says hi".to_string(), "fake/judge".to_string())]
+        );
+
+        // A later run: no task state, as in `nyq -p --memo`.
+        f.agent.set_task(None);
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let MemoLookup::Miss(key) = memo_lookup(&mut f.agent, &spec, home).await else {
+            panic!("a first lookup misses");
+        };
+        crate::task::headless::memo_put(home, &root, &key, &value, Some(evidence)).unwrap();
+        assert_eq!(
+            memo_lookup(&mut f.agent, &spec, home).await,
+            MemoLookup::Hit(value.clone())
+        );
+        assert_eq!(judge.calls(), 1, "the judge's pass was reused");
+
+        // Another judge model is asked; its pass is recorded and reused.
+        let other = CountingJudge::new(Some("fake/other"), true);
+        f.agent.task.judge = Some(other.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                memo_lookup(&mut f.agent, &spec, home).await,
+                MemoLookup::Hit(value.clone())
+            );
+        }
+        assert_eq!(other.calls(), 1);
+        // A judge without a model id is always asked.
+        let anonymous = CountingJudge::new(None, true);
+        f.agent.task.judge = Some(anonymous.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                memo_lookup(&mut f.agent, &spec, home).await,
+                MemoLookup::Hit(value.clone())
+            );
+        }
+        assert_eq!(anonymous.calls(), 2);
+        // A new judge model that rejects it now: a miss.
+        let strict = CountingJudge::new(Some("fake/strict"), false);
+        f.agent.task.judge = Some(strict.clone());
+        assert_eq!(
+            memo_lookup(&mut f.agent, &spec, home).await,
+            MemoLookup::Miss(key.clone())
+        );
+        assert_eq!(strict.calls(), 1);
+
+        // A touched file that changed since: a miss, without asking the
+        // judge, and the entry is dropped.
+        f.agent.task.judge = Some(judge.clone());
+        let store = MemoStore::for_workspace(home, &root);
+        let mut sealed = Evidence::capture(&root, &[PathBuf::from("b.txt")]);
+        sealed.add_judge("b.txt says hi", "fake/judge", &value, key.fingerprint());
+        store.put_with(&key, &value, &sealed).unwrap();
+        assert_eq!(
+            memo_lookup(&mut f.agent, &spec, home).await,
+            MemoLookup::Hit(value.clone())
+        );
+        std::fs::write(root.join("b.txt"), "bye\n").unwrap();
+        assert_eq!(
+            memo_lookup(&mut f.agent, &spec, home).await,
+            MemoLookup::Miss(key.clone())
+        );
+        assert!(store.get::<Value>(&key).is_none(), "the entry was dropped");
+        // Deleting it misses too.
+        std::fs::write(root.join("b.txt"), "hi\n").unwrap();
+        store.put_with(&key, &value, &sealed).unwrap();
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        assert_eq!(
+            memo_lookup(&mut f.agent, &spec, home).await,
+            MemoLookup::Miss(key.clone())
+        );
+        assert_eq!(judge.calls(), 1, "a changed file is never judged");
+    }
+
+    /// No memo poisoning: a cached result passes only checks its current
+    /// inputs pass. An entry without evidence (an older nyq's) misses on
+    /// `touched:`; a judge's pass recorded for another value, rubric or
+    /// fingerprint is not reused, and the judge is asked.
+    #[tokio::test]
+    async fn a_memo_replay_reuses_nothing_recorded_for_other_inputs() {
+        use crate::task::headless::MemoLookup;
+        use crate::task::memo::{Evidence, MemoStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        std::fs::write(root.join("in.txt"), "v1").unwrap();
+        std::fs::write(root.join("b.txt"), "hi\n").unwrap();
+        let mut agent = crate::agent::test_support::test_agent();
+        agent.cwd = root.to_path_buf();
+        let memo = Some(engine::MemoSpec {
+            files: vec![PathBuf::from("in.txt")],
+        });
+        let value = json!({"answer": 1});
+
+        // `touched:` with no recorded touched files.
+        let mut touched = TaskSpec::typed("make the file", answer_schema());
+        touched.validators = vec![ValidatorSpec::FilesTouched(vec![PathBuf::from("b.txt")])];
+        touched.memo = memo.clone();
+        let MemoLookup::Miss(key) = memo_lookup(&mut agent, &touched, home).await else {
+            panic!("a first lookup misses");
+        };
+        crate::task::headless::memo_put(home, root, &key, &value, None).unwrap();
+        assert_eq!(
+            memo_lookup(&mut agent, &touched, home).await,
+            MemoLookup::Miss(key.clone())
+        );
+        // The touched set must hold the file `touched:` names.
+        let store = MemoStore::for_workspace(home, root);
+        std::fs::write(root.join("c.txt"), "c").unwrap();
+        let other_file = Evidence::capture(root, &[PathBuf::from("c.txt")]);
+        store.put_with(&key, &value, &other_file).unwrap();
+        assert_eq!(
+            memo_lookup(&mut agent, &touched, home).await,
+            MemoLookup::Miss(key.clone())
+        );
+
+        // A judge that would reject the value now.
+        let mut judged = TaskSpec::typed("make the file", answer_schema());
+        judged.validators = vec![ValidatorSpec::Judge("b.txt says hi".into())];
+        judged.memo = memo;
+        let strict = CountingJudge::new(Some("fake/judge"), false);
+        agent.task.judge = Some(strict.clone());
+        let MemoLookup::Miss(key) = memo_lookup(&mut agent, &judged, home).await else {
+            panic!("a first lookup misses");
+        };
+        let fp = key.fingerprint().to_string();
+        let files = [PathBuf::from("b.txt")];
+        for (rubric, judged_value, fingerprint) in [
+            ("b.txt says hi", json!({"answer": 2}), fp.as_str()),
+            ("something else", value.clone(), fp.as_str()),
+            ("b.txt says hi", value.clone(), "files:another"),
+        ] {
+            let mut forged = Evidence::capture(root, &files);
+            forged.add_judge(rubric, "fake/judge", &judged_value, fingerprint);
+            store.put_with(&key, &value, &forged).unwrap();
+            let before = strict.calls();
+            assert_eq!(
+                memo_lookup(&mut agent, &judged, home).await,
+                MemoLookup::Miss(key.clone()),
+                "{rubric} {judged_value} {fingerprint}"
+            );
+            assert_eq!(strict.calls(), before + 1, "the judge was asked");
+        }
+        // The matching record is reused (the judge is not asked).
+        let mut genuine = Evidence::capture(root, &files);
+        genuine.add_judge("b.txt says hi", "fake/judge", &value, &fp);
+        store.put_with(&key, &value, &genuine).unwrap();
+        let before = strict.calls();
+        assert_eq!(
+            memo_lookup(&mut agent, &judged, home).await,
+            MemoLookup::Hit(value.clone())
+        );
+        assert_eq!(strict.calls(), before);
     }
 }
