@@ -147,12 +147,24 @@ args = ["acp"]
   `initialize`, `session/new` and one `session/prompt`, and returns the
   agent's final message.
 - The agent's permission requests go to your approver. Any "yes" is sent as
-  *allow once*, never *always*. In yolo mode they are allowed. They are
-  denied when nobody can be asked.
+  *allow once*, never *always*. In yolo mode they are allowed, unless the task
+  follows untrusted content (below). They are denied when nobody can be asked.
 - External agents run **outside nyq's sandbox**, with their own tools and
   their own permission system. Starting one is a risky call: it asks for
   approval (or goes to the classifier in auto mode), and the prompt shows the
   command.
+- nyq can't check an external agent's calls, so it labels what follows from
+  them. The report carries `external:<name>` and the taint of the task; the
+  files the agent changed, found by comparing `git status` and `HEAD` before
+  and after the run, carry the same labels when read later, and so do the
+  files a `merge` of its worktree applies. Changes outside the repository, in
+  files git ignores or is told to overlook, or in a workspace that is not a
+  git repository are not seen.
+- A task that copies untrusted content (a web page, an MCP answer, another
+  child's report) always asks a person: no grant, allow rule, yolo mode or
+  classifier approves it, and in print mode or under the `ci` profile it is
+  denied. It runs in its own worktree when one can be made, and every
+  permission request the agent sends comes to you.
 - A repository's `.nyq/settings.toml` cannot define external agents.
 - External agents support `action: "run"` only. They take `output_schema`,
   `validators` and `isolation: "worktree"`.

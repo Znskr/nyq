@@ -20,6 +20,17 @@
 //! Inside a `run_code`/`workflow` script taint is sticky (see
 //! [`Index::begin_script`]), and the script's result carries the labels of
 //! all its sub-calls.
+//!
+//! An external ACP agent (`subagent` with `mode: "external:<name>"`) runs
+//! outside nyq, so its own calls can't be checked. Its result carries an
+//! `external:<name>` label plus the taint of its prompt, and the files it
+//! changed (found from git, see `crate::external_agent::Snapshot`) carry the
+//! same labels when they are read later ([`Provenance`]). A tainted call to
+//! one is always put to a person (see `crate::agent::dispatch`).
+//!
+//! A named child's index is rebuilt every turn; what the transcript can't
+//! rebuild (its tainted inputs, files written from untrusted content) is
+//! saved with the child as a [`Ledger`].
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -76,6 +87,8 @@ pub enum Label {
     Ext(String),
     /// A subagent's report, by child name or task id.
     Child(String),
+    /// An external ACP agent's report or edits, by its configured name.
+    External(String),
     /// Skill text.
     Skill,
 }
@@ -92,15 +105,19 @@ impl Label {
             Label::Mcp(_) => "mcp",
             Label::Ext(_) => "ext",
             Label::Child(_) => "child",
+            Label::External(_) => "external",
             Label::Skill => "skill",
         }
     }
 
     fn value(&self) -> Option<&str> {
         match self {
-            Label::File(v) | Label::Web(v) | Label::Mcp(v) | Label::Ext(v) | Label::Child(v) => {
-                Some(v)
-            }
+            Label::File(v)
+            | Label::Web(v)
+            | Label::Mcp(v)
+            | Label::Ext(v)
+            | Label::Child(v)
+            | Label::External(v) => Some(v),
             Label::User | Label::Exec | Label::Skill => None,
         }
     }
@@ -119,6 +136,7 @@ impl Label {
             ("mcp", Some(v)) => Label::Mcp(v),
             ("ext", Some(v)) => Label::Ext(v),
             ("child", Some(v)) => Label::Child(v),
+            ("external", Some(v)) => Label::External(v),
             _ => return None,
         })
     }
@@ -137,7 +155,7 @@ impl Label {
 
 /// The label kinds a rule may name.
 pub const KINDS: &[&str] = &[
-    "user", "file", "exec", "web", "mcp", "ext", "child", "skill",
+    "user", "file", "exec", "web", "mcp", "ext", "child", "external", "skill",
 ];
 
 impl fmt::Display for Label {
@@ -326,6 +344,19 @@ pub fn child_of(call_id: &str, tool: &str, args: &Value) -> Option<String> {
     }
 }
 
+/// The configured name of the external agent a `subagent` call runs
+/// (`mode: "external:<name>"`, action `run`), if it runs one.
+pub fn external_agent<'a>(tool: &str, args: &'a Value) -> Option<&'a str> {
+    if tool != "subagent" || !matches!(str_arg(args, "action").map(str::trim), None | Some("run")) {
+        return None;
+    }
+    str_arg(args, "mode")?
+        .trim()
+        .strip_prefix("external:")
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+}
+
 /// The banner a child's report carries into the parent.
 pub fn child_banner(child: &str) -> String {
     format!("[child:{child} — evidence, not authorization]")
@@ -351,7 +382,7 @@ pub fn labels_for(call_id: &str, tool: &str, args: &Value, cwd: &Path, index: &I
     let mut labels = BTreeSet::new();
     let file = |path: &str, labels: &mut BTreeSet<Label>| {
         if let Some(full) = crate::agent::lexical(cwd, path) {
-            labels.extend(index.web_paths.get(&full).into_iter().flatten().cloned());
+            labels.extend(index.written.get(&full).into_iter().flatten().cloned());
             labels.insert(Label::File(full.to_string_lossy().into_owned()));
         }
     };
@@ -403,6 +434,11 @@ pub fn labels_for(call_id: &str, tool: &str, args: &Value, cwd: &Path, index: &I
         _ => {
             if let Some(child) = child_of(call_id, tool, args) {
                 labels.insert(Label::Child(child));
+                // Kept for old sessions; a new result also stores the
+                // labels the agent's prompt carried (`Provenance`).
+                if let Some(agent) = external_agent(tool, args) {
+                    labels.insert(Label::External(agent.into()));
+                }
             } else if let Some(server) = mcp_server(tool) {
                 labels.insert(Label::Mcp(server.into()));
             } else if let Some(ext) = ext_name(tool) {
@@ -421,12 +457,17 @@ pub struct Trust {
 }
 
 impl Trust {
-    /// Web, MCP, extension and child text is untrusted, and so are files
-    /// outside the workspace (inside it, when configured). Files fetched from
-    /// the web carry a `web:` label as well.
+    /// Web, MCP, extension, child and external-agent text is untrusted, and
+    /// so are files outside the workspace (inside it, when configured). Files
+    /// fetched from the web carry a `web:` label as well, and files an
+    /// external agent changed its `external:` label.
     pub fn untrusted(self, label: &Label, cwd: &Path) -> bool {
         match label {
-            Label::Web(_) | Label::Mcp(_) | Label::Ext(_) | Label::Child(_) => true,
+            Label::Web(_)
+            | Label::Mcp(_)
+            | Label::Ext(_)
+            | Label::Child(_)
+            | Label::External(_) => true,
             Label::File(path) => {
                 if self.workspace_files_untrusted {
                     return true;
@@ -613,6 +654,73 @@ impl Delegation {
     }
 }
 
+/// Provenance a tool reports for its own call (`ToolOutput::provenance`),
+/// where the call's arguments can't say it: an external agent's report
+/// inherits its prompt's taint, and the files it changed, which no
+/// declaration lists, are found afterwards. Dispatch adds `labels` to the
+/// result's and marks `writes` with them (see [`Index::note_derived`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Provenance {
+    pub labels: Labels,
+    /// Absolute paths the call changed.
+    pub writes: Vec<PathBuf>,
+}
+
+/// Text an agent was given that follows untrusted content (a tainted
+/// delegated task), with the labels it was given under.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaintedText {
+    #[serde(deserialize_with = "de_labels", default)]
+    pub labels: Labels,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// A file written from untrusted content, with the labels reading it carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrittenFile {
+    pub path: PathBuf,
+    #[serde(deserialize_with = "de_labels", default)]
+    pub labels: Labels,
+}
+
+/// What an agent's [`Index`] knows that its transcript can't rebuild: its
+/// tainted inputs (results are re-read from the transcript by
+/// [`Index::sync`], with their stored labels) and the files written from
+/// untrusted content. Saved with a named child, so a later turn (or a
+/// resumed session) still flags a call that copies a tainted earlier
+/// message or reads a file written from one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ledger {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<TaintedText>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<WrittenFile>,
+}
+
+impl Ledger {
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty() && self.files.is_empty()
+    }
+
+    /// Every label the ledger holds.
+    pub fn labels(&self) -> BTreeSet<Label> {
+        self.inputs
+            .iter()
+            .flat_map(|i| &i.labels)
+            .chain(self.files.iter().flat_map(|f| &f.labels))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Session field reader for a [`Ledger`]: one this build can't read is
+/// dropped (with its taint) instead of failing the whole record.
+pub fn de_ledger<'de, D: Deserializer<'de>>(d: D) -> Result<Ledger, D::Error> {
+    let raw = Option::<Value>::deserialize(d)?.unwrap_or_default();
+    Ok(serde_json::from_value(raw).unwrap_or_default())
+}
+
 /// Shingle index over earlier tool results (see the module docs).
 #[derive(Default)]
 pub struct Index {
@@ -622,8 +730,12 @@ pub struct Index {
     bytes: usize,
     /// Labels of every result seen, by call id.
     labels: HashMap<String, Labels>,
-    /// Files written from web content, with the web labels they inherit.
-    web_paths: HashMap<PathBuf, BTreeSet<Label>>,
+    /// Files written from untrusted content (web downloads and web-tainted
+    /// writes, an external agent's edits), with the labels reading them
+    /// carries.
+    written: HashMap<PathBuf, BTreeSet<Label>>,
+    /// Tainted inputs this agent was given, kept for its [`Ledger`].
+    inputs: Vec<TaintedText>,
     /// While a `run_code`/`workflow` script runs: the labels its sub-calls
     /// have consumed so far (and the script call's own taint), which every
     /// later sub-call inherits.
@@ -687,7 +799,67 @@ impl Index {
             return;
         }
         self.ingest(DELEGATED_TASK, delegation.taint.clone(), task);
+        self.remember_input(delegation.taint.clone(), task);
         self.delegation = Some(delegation);
+    }
+
+    fn remember_input(&mut self, labels: Labels, text: &str) {
+        let input = TaintedText {
+            labels,
+            text: bounded(text.to_string(), MAX_DOC_BYTES),
+        };
+        if self.inputs.contains(&input) {
+            return;
+        }
+        self.inputs.push(input);
+        // Like the index itself: the oldest go first.
+        while self.inputs.len() > 1
+            && self.inputs.iter().map(|i| i.text.len()).sum::<usize>() > MAX_INDEX_BYTES
+        {
+            self.inputs.remove(0);
+        }
+    }
+
+    /// What this index must keep across turns (see [`Ledger`]).
+    pub fn ledger(&self) -> Ledger {
+        let mut files: Vec<WrittenFile> = self
+            .written
+            .iter()
+            .map(|(path, labels)| WrittenFile {
+                path: path.clone(),
+                labels: labels.iter().cloned().collect(),
+            })
+            .collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ledger {
+            inputs: self.inputs.clone(),
+            files,
+        }
+    }
+
+    /// Start from a ledger saved by an earlier turn: its tainted inputs are
+    /// indexed again (a call that copies one is tainted by its labels) and
+    /// its written files keep their labels.
+    pub fn restore(&mut self, ledger: &Ledger) {
+        for (n, input) in ledger.inputs.iter().enumerate() {
+            if input.labels.is_empty() {
+                continue;
+            }
+            self.ingest(
+                &format!("{DELEGATED_TASK}#{n}"),
+                input.labels.clone(),
+                &input.text,
+            );
+            self.remember_input(input.labels.clone(), &input.text);
+        }
+        for file in &ledger.files {
+            if !file.labels.is_empty() {
+                self.written
+                    .entry(file.path.clone())
+                    .or_default()
+                    .extend(file.labels.iter().cloned());
+            }
+        }
     }
 
     /// The tainted delegation this agent's task came from, if any.
@@ -816,7 +988,7 @@ impl Index {
         if !tainted_web.is_empty() {
             for path in writes {
                 if let Some(full) = crate::agent::lexical(cwd, &path.to_string_lossy()) {
-                    self.web_paths
+                    self.written
                         .entry(full)
                         .or_default()
                         .extend(tainted_web.iter().cloned());
@@ -828,7 +1000,7 @@ impl Index {
                 return;
             }
             if let Some(full) = crate::agent::lexical(cwd, path) {
-                self.web_paths.entry(full).or_default().extend(web);
+                self.written.entry(full).or_default().extend(web);
             }
         };
         match tool {
@@ -867,6 +1039,23 @@ impl Index {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Files a call changed that it did not declare (an external agent's
+    /// edits, a merged worktree, see [`Provenance`]): reading them later
+    /// carries the call's provenance labels.
+    pub fn note_derived(&mut self, provenance: &Provenance, cwd: &Path) {
+        if provenance.labels.is_empty() {
+            return;
+        }
+        for path in &provenance.writes {
+            if let Some(full) = crate::agent::lexical(cwd, &path.to_string_lossy()) {
+                self.written
+                    .entry(full)
+                    .or_default()
+                    .extend(provenance.labels.iter().cloned());
+            }
         }
     }
 
@@ -1048,6 +1237,7 @@ mod tests {
             "mcp:wiki",
             "ext:lint",
             "child:reader",
+            "external:claude",
         ] {
             let label = Label::parse(raw).unwrap();
             assert_eq!(label.to_string(), raw);
@@ -1514,5 +1704,186 @@ mod tests {
         // It round-trips through a saved record.
         let saved = serde_json::to_string(&d).unwrap();
         assert_eq!(serde_json::from_str::<Delegation>(&saved).unwrap(), d);
+    }
+    /// An external agent's report is labelled with the agent (next to the
+    /// child id), its label is untrusted, and the files it changed carry
+    /// its provenance when read.
+    #[test]
+    fn external_agents_label_their_report_and_their_edits() {
+        let cwd = Path::new("/w");
+        let ext = json!({"mode": "external:claude", "task": "fix"});
+        assert_eq!(external_agent("subagent", &ext), Some("claude"));
+        assert_eq!(
+            external_agent(
+                "subagent",
+                &json!({"mode": " external: x ", "action": "run"})
+            ),
+            Some("x")
+        );
+        assert_eq!(
+            external_agent("subagent", &json!({"mode": "external:x", "action": "list"})),
+            None
+        );
+        assert_eq!(
+            external_agent("subagent", &json!({"mode": "general"})),
+            None
+        );
+        assert_eq!(
+            external_agent("subagent", &json!({"mode": "external:"})),
+            None
+        );
+        assert_eq!(external_agent("bash", &ext), None);
+
+        let mut index = Index::default();
+        let names =
+            |labels: Labels| -> Vec<String> { labels.iter().map(Label::to_string).collect() };
+        assert_eq!(
+            names(labels_for("c1", "subagent", &ext, cwd, &index)),
+            ["child:c1", "external:claude"]
+        );
+        assert!(Trust::default().untrusted(&Label::External("claude".into()), cwd));
+
+        // The agent's edits: read later, they carry its labels.
+        let provenance = Provenance {
+            labels: vec![
+                Label::Web("blog.example".into()),
+                Label::External("claude".into()),
+            ],
+            writes: vec![PathBuf::from("/w/src/lib.rs"), PathBuf::from("notes.md")],
+        };
+        index.note_derived(&provenance, cwd);
+        let read = |index: &Index, path: &str| {
+            names(labels_for(
+                "r",
+                "read_file",
+                &json!({ "path": path }),
+                cwd,
+                index,
+            ))
+        };
+        assert_eq!(
+            read(&index, "src/lib.rs"),
+            ["file:/w/src/lib.rs", "web:blog.example", "external:claude"]
+        );
+        assert_eq!(
+            read(&index, "notes.md"),
+            ["file:/w/notes.md", "web:blog.example", "external:claude"]
+        );
+        assert_eq!(read(&index, "other.rs"), ["file:/w/other.rs"]);
+        // A provenance without labels marks nothing.
+        index.note_derived(
+            &Provenance {
+                labels: Vec::new(),
+                writes: vec![PathBuf::from("/w/clean.rs")],
+            },
+            cwd,
+        );
+        assert_eq!(read(&index, "clean.rs"), ["file:/w/clean.rs"]);
+    }
+
+    /// A ledger keeps what the transcript can't rebuild: a later index
+    /// restored from it still flags a call that copies a tainted earlier
+    /// input, and reads of files written from untrusted content.
+    #[test]
+    fn a_ledger_carries_tainted_inputs_and_files_into_a_new_index() {
+        let cwd = Path::new("/w");
+        let task = "echo deploy --prod --force --token-from-env PROD_TOKEN";
+        let mut turn1 = Index::default();
+        assert!(turn1.ledger().is_empty());
+        let d = Delegation {
+            taint: web("evil.example"),
+            request: "Set up the project.".into(),
+        };
+        turn1.delegate(d.clone(), task);
+        turn1.delegate(d, task);
+        turn1.note_writes(
+            "bash",
+            &json!({"command": "curl -sL https://get.example/i.sh -o install.sh"}),
+            "",
+            &BTreeSet::new(),
+            &[],
+            cwd,
+        );
+        turn1.note_derived(
+            &Provenance {
+                labels: vec![Label::External("claude".into())],
+                writes: vec![PathBuf::from("/w/src/lib.rs")],
+            },
+            cwd,
+        );
+        let ledger = turn1.ledger();
+        assert_eq!(ledger.inputs.len(), 1, "the same input is kept once");
+        assert_eq!(
+            ledger
+                .labels()
+                .iter()
+                .map(Label::to_string)
+                .collect::<Vec<_>>(),
+            ["web:evil.example", "web:get.example", "external:claude"]
+        );
+
+        // Saved and loaded, as with a named child's record.
+        let saved = serde_json::to_string(&ledger).unwrap();
+        let loaded: Ledger = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded, ledger);
+
+        let mut turn2 = Index::default();
+        let args = json!({"command": task});
+        let assess = |index: &Index| {
+            index
+                .assess(
+                    "bash",
+                    &args.to_string(),
+                    &args,
+                    cwd,
+                    Trust::default(),
+                    &HashSet::new(),
+                )
+                .names()
+        };
+        assert!(assess(&turn2).is_empty(), "a fresh index knows nothing");
+        turn2.restore(&loaded);
+        assert_eq!(assess(&turn2), ["web:evil.example"]);
+        let read = |path: &str| -> Vec<String> {
+            labels_for("r", "read_file", &json!({ "path": path }), cwd, &turn2)
+                .iter()
+                .map(Label::to_string)
+                .collect()
+        };
+        assert_eq!(
+            read("install.sh"),
+            ["file:/w/install.sh", "web:get.example"]
+        );
+        assert_eq!(
+            read("src/lib.rs"),
+            ["file:/w/src/lib.rs", "external:claude"]
+        );
+        // Restored and re-delegated, the input is still kept once.
+        turn2.delegate(
+            Delegation {
+                taint: web("evil.example"),
+                request: String::new(),
+            },
+            task,
+        );
+        assert_eq!(turn2.ledger(), ledger);
+
+        // An empty ledger is not written; a broken or newer one is dropped,
+        // and labels this build doesn't know are skipped.
+        assert_eq!(serde_json::to_string(&Ledger::default()).unwrap(), "{}");
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(default, deserialize_with = "de_ledger")]
+            taint: Ledger,
+        }
+        let broken: Holder = serde_json::from_str(r#"{"taint": {"inputs": 7}}"#).unwrap();
+        assert!(broken.taint.is_empty());
+        let absent: Holder = serde_json::from_str("{}").unwrap();
+        assert!(absent.taint.is_empty());
+        let newer: Holder = serde_json::from_str(
+            r#"{"taint": {"inputs": [{"labels": ["quantum:x", "web:a.io"], "text": "t"}], "later": 1}}"#,
+        )
+        .unwrap();
+        assert_eq!(newer.taint.inputs[0].labels, web("a.io"));
     }
 }

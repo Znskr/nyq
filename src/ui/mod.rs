@@ -204,7 +204,7 @@ impl Ui for PlainUi {
         }
     }
     async fn approve(&mut self, req: &ApprovalRequest<'_>) -> Approval {
-        if self.yolo {
+        if self.yolo && !req.needs_person {
             return Approval::Yes;
         }
         if can_prompt(self.prompt) {
@@ -212,9 +212,10 @@ impl Ui for PlainUi {
             return ask_terminal(question).await;
         }
         eprintln!(
-            "● {}  {} — denied (use --yolo to allow)",
+            "● {}  {} — denied ({})",
             req.tool,
-            one_line(req.summary, 120)
+            one_line(req.summary, 120),
+            denied_hint(req)
         );
         Approval::No
     }
@@ -236,7 +237,7 @@ struct PlainApprover {
 #[async_trait::async_trait]
 impl Approver for PlainApprover {
     async fn approve(&self, origin: &str, req: &ApprovalRequest<'_>) -> Approval {
-        if self.yolo {
+        if self.yolo && !req.needs_person {
             return Approval::Yes;
         }
         if can_prompt(self.prompt) {
@@ -249,12 +250,22 @@ impl Approver for PlainApprover {
             return ask_terminal(question).await;
         }
         eprintln!(
-            "● {} · {}  {} — denied (use --yolo to allow)",
+            "● {} · {}  {} — denied ({})",
             one_line(origin, 60),
             req.tool,
-            one_line(req.summary, 120)
+            one_line(req.summary, 120),
+            denied_hint(req)
         );
         Approval::No
+    }
+}
+
+/// Why print mode denied a call it could not ask about.
+fn denied_hint(req: &ApprovalRequest<'_>) -> &'static str {
+    if req.needs_person {
+        "it follows untrusted content and needs a person's approval: use --prompt-permissions"
+    } else {
+        "use --yolo to allow"
     }
 }
 

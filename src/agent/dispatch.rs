@@ -873,9 +873,14 @@ impl Agent {
             ));
         }
         // Provenance: label the result, mark a child's report as evidence,
-        // and index the text for later taint checks.
-        let labels =
+        // and index the text for later taint checks. A tool may add labels
+        // and undeclared writes of its own (an external agent's).
+        let provenance = out.provenance.take().map(|p| *p).unwrap_or_default();
+        let mut labels =
             crate::taint::labels_for(&ready.id, &ready.name, &ready.args, &self.cwd, &self.taint);
+        labels.extend(provenance.labels.iter().cloned());
+        labels.sort();
+        labels.dedup();
         if let Some(child) = crate::taint::child_of(&ready.id, &ready.name, &ready.args) {
             // A typed child's JSON result already carries the label inside.
             let banner = crate::taint::child_banner(&child);
@@ -893,6 +898,7 @@ impl Agent {
             &ready.footprint.writes,
             &self.cwd,
         );
+        self.taint.note_derived(&provenance, &self.cwd);
         // Inside a script, later sub-calls inherit what this one consumed.
         self.taint.script_consumed(&labels);
         self.taint.ingest(&ready.id, labels, &out.content);
@@ -1130,6 +1136,16 @@ impl Agent {
                 None => {}
             }
         }
+        // A tainted task for an external agent, whose own calls nyq can't
+        // check: only a person approves it, every time (no grant, allow rule,
+        // yolo mode or classifier). Like any delegation it carries the taint.
+        let needs_person =
+            taint.is_tainted() && crate::taint::external_agent(name, &args).is_some();
+        if needs_person && !matches!(decision, Decision::Deny(_)) {
+            decision = Decision::Ask {
+                forced: Some("tainted external agent".into()),
+            };
+        }
         // Auto mode: a tainted call with an effect goes to the classifier
         // even when it would run unasked.
         if taint.is_tainted()
@@ -1235,6 +1251,7 @@ impl Agent {
                 preview: preview.as_deref(),
                 rule: rule.as_deref().map(rule_label),
                 save_rule: save_rule.clone(),
+                needs_person,
             };
             self.attention("approval", &format!("Approve {name}: {summary}"));
             let decision = tokio::select! {

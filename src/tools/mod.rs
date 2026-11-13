@@ -303,6 +303,10 @@ pub struct ToolOutput {
     pub changed: bool,
     /// File snapshots returned by a subagent, including on failure.
     pub undo: crate::undo::UndoLog,
+    /// Provenance the call's arguments can't tell: an external agent's
+    /// inherited taint and the files it changed (see `crate::taint`).
+    /// Boxed: most results have none.
+    pub provenance: Option<Box<crate::taint::Provenance>>,
 }
 
 impl ToolOutput {

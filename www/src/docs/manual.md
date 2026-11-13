@@ -923,7 +923,8 @@ for every workspace and `l` for this workspace only.
 connected server's resulting default.
 
 **Taint rules.** Every tool result is labelled with where its content came from
-(`web:<host>`, `file:<path>`, `mcp:<server>`, `child:<id>`, `exec`). An `ask` or
+(`web:<host>`, `file:<path>`, `mcp:<server>`, `child:<id>`, `external:<name>`,
+`exec`). An `ask` or
 `deny` rule may add a condition, and then applies only to a call whose arguments
 copy text from a matching result, in every mode including yolo:
 
@@ -944,7 +945,37 @@ its classifier sees the task as evidence and your request to the parent as the
 only authorization. A `run_code` or `workflow` script has every effect; once one
 of its tool calls has returned untrusted content, every later call in the script
 is tainted by it, whatever its text, and the script's result keeps the labels of
-everything its calls returned (also after a resume).
+everything its calls returned (also after a resume). A named child keeps this
+across its messages: a later message, or the same child after you resume the
+session, still flags a call that copies an earlier tainted message or reads a
+file the child wrote from untrusted content.
+
+An external agent (`mode: "external:<name>"`) runs outside nyq, so nyq cannot
+check its calls; it labels what follows from it instead. Its report carries
+`external:<name>` plus the labels of its task, so a later call that copies the
+report is tainted like any untrusted content (`deny exec when
+tainted-by:external` blocks it). nyq compares git's view of the workspace before
+and after the run, and the files the agent edited, created, deleted or committed
+carry the same labels when they are read later; merging an isolated run carries
+them onto your files. When the task itself copies untrusted content, the call
+asks you every time: no "always" grant, allow rule, yolo mode or classifier
+approves it, and where nobody can answer (print mode, the `ci` profile) it is
+denied unless `--prompt-permissions` asks on the terminal. It then runs in its
+own worktree when one can be made (a saved session and a git repository with a
+commit), and every permission request the agent sends comes to you, in yolo mode
+too.
+
+What taint does not cover: it is found by text overlap, so a paraphrase of
+untrusted content is not caught. An external agent is seen only through ACP and
+git: its network access, what it reads, what it changes outside the repository,
+in files git ignores or is told to overlook (`assume-unchanged`,
+`skip-worktree`) or in a workspace that is not a git repository are invisible to
+nyq, and its permission requests are only the ones it chooses to send. In a
+shared workspace, anything else that changes a file while it runs (another
+child, a background command) is attributed to it too. The main agent's list of files
+written from untrusted content (downloads, web-tainted edits, an external
+agent's edits) is not saved with the session, so after a resume reading such a
+file is no longer flagged; named children save theirs.
 
 A project may add rules in `.nyq/permissions.json`, but only `ask` and `deny`: an
 `allow` there is ignored, so a repository can't grant itself permissions. A
