@@ -1,15 +1,20 @@
 //! Sandboxing for model-run shell commands.
 //!
 //! Linux re-executes nyq as `nyq __sandbox …`, which restricts its own
-//! process and then execs the shell, so the whole command tree inherits the
-//! policy. The helper layers three mechanisms:
+//! process and runs the shell as a child, so the whole command tree
+//! inherits the policy and the helper can re-check `.git` links when the
+//! child exits. The helper layers three mechanisms:
 //! - a user+mount namespace that re-binds `.git/hooks`, `.git/config` and
 //!   `.git/info` (for `attributes`) read-only over each writable root's `.git`,
 //!   so commits and branches keep working while planted hooks and config
 //!   redirects cannot run unsandboxed later. Self-bind mounts pin `.git`,
 //!   the directories holding it, discovered worktree/submodule gitdirs and
 //!   `core.hooksPath` targets, so `mv .git aside` fails with EBUSY instead
-//!   of carrying the read-only mounts along;
+//!   of carrying the read-only mounts along. `.git` paths that are
+//!   *symlinks* can never be mount points, so their identity (link text and
+//!   resolved dev/ino) is recorded before the command and re-checked after
+//!   it — also when it was killed: a swapped or deleted link is restored
+//!   and the replacement quarantined for inspection;
 //! - Landlock: reads everywhere, writes only to allowed roots, and TCP
 //!   bind/connect denied on ABI v4+ when the network policy is off;
 //! - a seccomp filter, also only when the network policy is off, that fails
@@ -19,7 +24,8 @@
 //!   IORING_OP_SOCKET cannot bypass the family check.
 //!
 //! macOS wraps the shell in `sandbox-exec` with an equivalent Seatbelt
-//! profile, including deny rules for the same `.git` paths. Other platforms
+//! profile, including deny rules for the same `.git` paths; the link-swap
+//! check runs in the outer process after `sandbox-exec` exits. Other platforms
 //! have no sandbox; `check` reports that. `NYQ_SANDBOX_GIT_WRITABLE=1` opts
 //! out of git-metadata protection on both, `NYQ_SANDBOX_GIT_STRICT=1`
 //! refuses to run when that protection cannot be applied (the default is a
@@ -50,7 +56,9 @@ pub struct Policy {
     /// Allow network access from sandboxed commands.
     pub network: bool,
     /// Permit AF_UNIX sockets even when `network` is denied
-    /// (`NYQ_SANDBOX_UNIX=1` sets the default).
+    /// (`NYQ_SANDBOX_UNIX=1` sets the default). Only read by the Linux
+    /// seccomp filter.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub unix_sockets: bool,
     /// Leave `.git/hooks`, `.git/config` and `.git/info` writable inside the
     /// sandbox, opting out of git-metadata protection
@@ -58,7 +66,9 @@ pub struct Policy {
     pub git_writable: bool,
     /// Refuse to run the command when `.git` metadata protection cannot be
     /// applied, instead of warning and continuing
-    /// (`NYQ_SANDBOX_GIT_STRICT=1` sets the default).
+    /// (`NYQ_SANDBOX_GIT_STRICT=1` sets the default). Only read by the
+    /// Linux helper.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub git_strict: bool,
     /// Extra writable roots besides the workspace (WorkspaceWrite only).
     pub writable: Vec<PathBuf>,
@@ -205,9 +215,236 @@ pub struct GitTargets {
     pub required: Vec<(PathBuf, Ensure)>,
     /// Paths to bind read-only when they exist.
     pub readonly: Vec<PathBuf>,
-    /// Coverage gaps worth telling the user about (e.g. `.git` is a
-    /// symlink, which can be renamed even though its target is bound).
+    /// `.git` paths that are symlinks. A symlink can never be a mount
+    /// point, so the link itself stays replaceable inside the sandbox;
+    /// [`verify_links`] re-checks them after the command and reverts a
+    /// swap. Recorded with their link text and resolved dev/ino.
+    pub links: Vec<WatchedLink>,
+    /// Coverage notes worth telling the user about (e.g. `.git` is a
+    /// symlink, which stays replaceable but is watched and reverted).
     pub notes: Vec<String>,
+}
+
+/// Identity of a `.git`-related symlink recorded before a sandboxed
+/// command runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchedLink {
+    /// The symlink's own path (e.g. `<repo>/.git`, `<gitdir>/hooks`).
+    pub path: PathBuf,
+    /// What `read_link` returned at snapshot time.
+    pub target: PathBuf,
+    /// dev+ino the link resolved to at snapshot time; `None` when it did
+    /// not resolve (a dangling link is still re-checked).
+    pub ident: Option<(u64, u64)>,
+}
+
+/// Record `path` as a protected symlink — its link text plus the dev/ino
+/// it resolves to — or `None` when it is not a symlink.
+#[cfg(unix)]
+fn watch_link(path: &Path) -> Option<WatchedLink> {
+    use std::os::unix::fs::MetadataExt;
+    if !path.is_symlink() {
+        return None;
+    }
+    let target = std::fs::read_link(path).ok()?;
+    let ident = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+    Some(WatchedLink {
+        path: path.to_path_buf(),
+        target,
+        ident,
+    })
+}
+
+/// Windows has no sandboxed commands; the link list stays empty.
+#[cfg(not(unix))]
+fn watch_link(_path: &Path) -> Option<WatchedLink> {
+    None
+}
+
+/// Move `path` aside to a `<name>.nyq-quarantine-<ts>` sibling so a planted
+/// replacement survives for inspection but cannot run.
+#[cfg(unix)]
+fn quarantine(path: &Path) -> Result<PathBuf, String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".into());
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    for i in 0..100u32 {
+        let suffix = if i == 0 {
+            format!("nyq-quarantine-{ts}")
+        } else {
+            format!("nyq-quarantine-{ts}-{i}")
+        };
+        let cand = parent.join(format!("{name}.{suffix}"));
+        if std::fs::symlink_metadata(&cand).is_err() {
+            return match std::fs::rename(path, &cand) {
+                Ok(()) => Ok(cand),
+                Err(e) => Err(format!("rename to {}: {e}", cand.display())),
+            };
+        }
+    }
+    Err(format!("no free quarantine name beside {}", path.display()))
+}
+
+/// Recreate a watched link with its recorded target.
+#[cfg(unix)]
+fn relink(w: &WatchedLink) -> Result<(), String> {
+    std::os::unix::fs::symlink(&w.target, &w.path).map_err(|e| e.to_string())
+}
+
+/// Re-check one watched `.git` link after a sandboxed command. `None` when
+/// it is untouched; otherwise the swap is reverted — the impostor moved to
+/// a quarantine name and the original link restored — and a loud warning
+/// is returned for the tool output.
+#[cfg(unix)]
+fn verify_link(w: &WatchedLink) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = w.path.display();
+    let md = match std::fs::symlink_metadata(&w.path) {
+        Ok(md) => md,
+        Err(_) => {
+            return Some(match relink(w) {
+                Ok(()) => format!(
+                    "SECURITY: {path} is a protected .git symlink that was deleted inside the \
+                     sandbox; the original link was restored"
+                ),
+                Err(e) => format!(
+                    "SECURITY: {path} is a protected .git symlink that was deleted inside the \
+                     sandbox; restoring it failed: {e}"
+                ),
+            });
+        }
+    };
+    if !md.file_type().is_symlink() {
+        // A real file/dir sits where the link was — the classic swap.
+        let kind = if md.is_dir() { "directory" } else { "file" };
+        return Some(
+            match quarantine(&w.path).and_then(|q| relink(w).map(|_| q)) {
+                Ok(q) => format!(
+                    "SECURITY: {path} is a protected .git symlink that was replaced by a real \
+                 {kind} inside the sandbox; it was quarantined to {} and the original link \
+                 restored — inspect it before deleting",
+                    q.display()
+                ),
+                Err(e) => format!(
+                    "SECURITY: {path} is a protected .git symlink that was replaced by a real \
+                 {kind} inside the sandbox; quarantining it and restoring the link failed: {e}"
+                ),
+            },
+        );
+    }
+    if std::fs::read_link(&w.path).ok().as_deref() != Some(w.target.as_path()) {
+        // The link itself was retargeted: quarantine the impostor link.
+        let new = std::fs::read_link(&w.path)
+            .map(|t| t.display().to_string())
+            .unwrap_or_default();
+        return Some(
+            match quarantine(&w.path).and_then(|q| relink(w).map(|_| q)) {
+                Ok(q) => format!(
+                    "SECURITY: {path} is a protected .git symlink that was retargeted to {new} \
+                 inside the sandbox; the new link was quarantined to {} and the original \
+                 restored",
+                    q.display()
+                ),
+                Err(e) => format!(
+                    "SECURITY: {path} is a protected .git symlink that was retargeted to {new} \
+                 inside the sandbox; quarantining it and restoring the link failed: {e}"
+                ),
+            },
+        );
+    }
+    // Same link text; make sure it still resolves to the same object —
+    // `mv realgit aside; mkdir realgit` keeps the link but plants a new
+    // gitdir behind it. Quarantine the impostor at the resolved path; the
+    // original inode was moved aside by the command and cannot be found.
+    let ident = std::fs::metadata(&w.path).ok().map(|m| (m.dev(), m.ino()));
+    if ident != w.ident {
+        let moved = std::fs::canonicalize(&w.path)
+            .ok()
+            .map(|real| match quarantine(&real) {
+                Ok(q) => format!(
+                    "; the impostor at {} was quarantined to {}",
+                    real.display(),
+                    q.display()
+                ),
+                Err(e) => format!(
+                    "; quarantining the impostor at {} failed: {e}",
+                    real.display()
+                ),
+            })
+            .unwrap_or_else(|| "; the impostor could not be located".into());
+        return Some(format!(
+            "SECURITY: the target of {path} (a protected .git symlink) was replaced inside the \
+             sandbox{moved}. The original {} was moved aside by the command; look for a renamed \
+             copy and check the repository before trusting it",
+            w.target.display()
+        ));
+    }
+    None
+}
+
+/// Re-check every watched `.git` link after a sandboxed command and return
+/// one warning per tampered link (empty when nothing was swapped).
+#[cfg(unix)]
+fn verify_links(watched: &[WatchedLink]) -> Vec<String> {
+    watched.iter().filter_map(verify_link).collect()
+}
+
+/// Windows has no sandboxed commands; nothing to re-check.
+#[cfg(not(unix))]
+fn verify_links(_watched: &[WatchedLink]) -> Vec<String> {
+    Vec::new()
+}
+
+/// Watches `.git` symlinks across a sandboxed command: `watch` records
+/// them before spawn and `finish` re-checks them afterwards — a swapped or
+/// deleted link is restored and the replacement quarantined for
+/// inspection. `Drop` runs the check too, so timeout, kill and
+/// early-return paths are covered as well.
+#[derive(Debug)]
+pub struct GitLinkGuard {
+    watched: Vec<WatchedLink>,
+    done: bool,
+}
+
+impl GitLinkGuard {
+    /// Snapshot the `.git` links a command in `cwd` could swap. Empty when
+    /// commands run unsandboxed or `.git` stays writable by policy.
+    pub fn watch(policy: &Policy, cwd: &Path) -> Self {
+        let watched = if policy.mode == Mode::Off || policy.git_writable {
+            Vec::new()
+        } else {
+            git_targets(cwd, &writable_roots(policy, cwd)).links
+        };
+        Self {
+            watched,
+            done: false,
+        }
+    }
+
+    /// Verify every watched link, quarantining replacements and restoring
+    /// originals; returns one warning per tampered link. Idempotent —
+    /// `Drop` runs whatever is left.
+    pub fn finish(&mut self) -> Vec<String> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        verify_links(&self.watched)
+    }
+}
+
+impl Drop for GitLinkGuard {
+    fn drop(&mut self) {
+        for warning in self.finish() {
+            crate::ui::error(&warning);
+        }
+    }
 }
 
 /// Collapse `.` and `..` lexically without touching the filesystem.
@@ -424,15 +661,18 @@ fn git_targets(cwd: &Path, writable: &[PathBuf]) -> GitTargets {
             Ok(m) if m.is_dir() => {
                 // `.git` a directory — or a symlink to one. A symlink cannot
                 // be a mount point, so the link itself stays replaceable
-                // (`mv .git aside` works); the resolved gitdir still gets
-                // pinned and read-only below, and the gap is reported.
+                // (`mv .git aside` works); it is recorded for the
+                // post-command check and the resolved gitdir still gets
+                // pinned and read-only below.
                 push_pin(out, pin_seen, dir, &under);
                 if let Ok(gd) = std::fs::canonicalize(&git) {
-                    if git.is_symlink() {
+                    if let Some(l) = watch_link(&git) {
                         out.notes.push(format!(
-                            "{} is a symlink; it can be renamed aside inside the sandbox",
+                            "{} is a symlink; it stays replaceable inside the sandbox, but a \
+                             swap is detected and reverted after the command",
                             git.display()
                         ));
+                        out.links.push(l);
                     }
                     push_pin(out, pin_seen, &gd, &under);
                     work.push((gd, Some(dir.to_path_buf())));
@@ -441,13 +681,27 @@ fn git_targets(cwd: &Path, writable: &[PathBuf]) -> GitTargets {
             Ok(_) => {
                 // A `gitdir:` pointer file (worktree, submodule): the file
                 // gets a read-only bind, which also pins it against rename.
+                // A *symlinked* pointer file is still replaceable, so it is
+                // recorded for the post-command check.
                 if let Some(gd) = resolve_gitfile(&git) {
+                    out.links.extend(watch_link(&git));
                     out.readonly.push(git);
                     push_pin(out, pin_seen, dir, &under);
                     work.push((gd, Some(dir.to_path_buf())));
                 }
             }
-            Err(_) => {}
+            Err(_) => {
+                // A dangling `.git` symlink resolves to nothing yet, but the
+                // link can still be swapped aside and replaced — record it.
+                if let Some(l) = watch_link(&git) {
+                    out.notes.push(format!(
+                        "{} is a symlink; it stays replaceable inside the sandbox, but a \
+                         swap is detected and reverted after the command",
+                        git.display()
+                    ));
+                    out.links.push(l);
+                }
+            }
         }
     };
     for root in writable {
@@ -472,23 +726,29 @@ fn git_targets(cwd: &Path, writable: &[PathBuf]) -> GitTargets {
             out.required.extend([
                 (common.join("config"), Ensure::File),
                 (common.join("hooks"), Ensure::Dir),
+                // `info` holds `attributes` and `exclude`, which steer later
+                // git runs the same way hooks do. Git creates it lazily, so
+                // it may be missing — require it so the whole directory is
+                // read-only even when it does not exist yet.
+                (common.join("info"), Ensure::Dir),
             ]);
-            let info = common.join("info");
-            if info.join("attributes").exists() {
-                out.readonly.push(info.join("attributes"));
-            } else if info.is_dir() {
-                out.readonly.push(info);
-            }
             // `hooks` may be a symlink whose target lives in a writable
             // root; the bind lands on the target through the link, but list
             // the real path too (it is what seatbelt matches). The link
-            // itself cannot be pinned — a symlink is never a mount point.
+            // itself cannot be pinned — a symlink is never a mount point —
+            // so it is recorded for the post-command check, as are the
+            // config/info links.
             let hooks = common.join("hooks");
-            if hooks.is_symlink() {
+            if let Some(l) = watch_link(&hooks) {
                 out.notes.push(format!(
-                    "{} is a symlink; it can be renamed aside inside the sandbox",
+                    "{} is a symlink; it stays replaceable inside the sandbox, but a \
+                     swap is detected and reverted after the command",
                     hooks.display()
                 ));
+                out.links.push(l);
+            }
+            for p in [common.join("config"), common.join("info")] {
+                out.links.extend(watch_link(&p));
             }
             if let Ok(real) = std::fs::canonicalize(&hooks) {
                 if real != hooks && under(&real) {
@@ -501,8 +761,9 @@ fn git_targets(cwd: &Path, writable: &[PathBuf]) -> GitTargets {
         for f in ["commondir", "gitdir", "config.worktree"] {
             let p = gitdir.join(f);
             if p.exists() {
-                out.readonly.push(p);
+                out.readonly.push(p.clone());
             }
+            out.links.extend(watch_link(&p));
         }
         if git_config_truthy(&common.join("config"), "extensions", "worktreeconfig") {
             out.required
@@ -511,6 +772,7 @@ fn git_targets(cwd: &Path, writable: &[PathBuf]) -> GitTargets {
         // Where hooks actually run when core.hooksPath is set.
         if let Some(hp) = hooks_path(&gitdir, &common, root.as_deref()) {
             if under(&hp) {
+                out.links.extend(watch_link(&hp));
                 out.required.push((hp.clone(), Ensure::DirAll));
                 push_pin(&mut out, &mut pin_seen, &hp, &under);
             }
@@ -538,6 +800,8 @@ fn git_targets(cwd: &Path, writable: &[PathBuf]) -> GitTargets {
     out.readonly.retain(|p| ro_seen.insert(p.clone()));
     let mut req_seen = std::collections::HashSet::new();
     out.required.retain(|(p, _)| req_seen.insert(p.clone()));
+    let mut link_seen = std::collections::HashSet::new();
+    out.links.retain(|l| link_seen.insert(l.path.clone()));
     out.notes.dedup();
     out
 }
@@ -730,13 +994,19 @@ fn seatbelt_profile(roots: &[PathBuf], network: bool, git: &GitTargets) -> Strin
     if has_ro {
         s.push_str(")\n");
     }
-    if !git.pin.is_empty() {
+    if !git.pin.is_empty() || !git.links.is_empty() {
         // Seatbelt cannot self-bind; denying file-write-unlink on the
         // directory node stops `mv .git aside` and `rmdir` the same way the
-        // mount-point EBUSY does on Linux.
+        // mount-point EBUSY does on Linux. Watched links are listed too:
+        // whether the literal matches the link or its target, the rename
+        // is refused — and the post-command link check reverts a swap that
+        // still gets through.
         s.push_str("(deny file-write-unlink");
         for p in &git.pin {
             s.push_str(&format!(" (literal {})", quote(p)));
+        }
+        for l in &git.links {
+            s.push_str(&format!(" (literal {})", quote(&l.path)));
         }
         s.push_str(")\n");
     }
@@ -780,6 +1050,8 @@ pub enum Enforcement {
     /// Every part of the policy is kernel-enforced.
     Full,
     /// The sandbox runs but some aspects are open, with the reasons.
+    /// Only the Linux status check produces it: Seatbelt is all-or-nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Partial(Vec<String>),
     /// Nothing is enforced (`--sandbox off` or no usable backend).
     None,
@@ -873,11 +1145,15 @@ pub fn describe(policy: &Policy) -> String {
         "network off"
     };
     let st = status(policy);
-    let engine = match st.backend {
+    let engine: String = match st.backend {
         #[cfg(target_os = "linux")]
         Backend::Landlock => linux::abi()
             .map(|abi| format!("landlock v{abi}"))
             .unwrap_or_else(|| "landlock unavailable".into()),
+        // Only `status` produces Landlock, and only on Linux; the variant
+        // must still be covered here.
+        #[cfg(not(target_os = "linux"))]
+        Backend::Landlock => "landlock".into(),
         Backend::Seatbelt => "seatbelt".into(),
         Backend::None => "unavailable".into(),
     };
@@ -905,7 +1181,6 @@ pub fn helper_main(args: Vec<String>) -> ! {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
 
     use landlock::{
@@ -1052,7 +1327,12 @@ mod linux {
                 Err(e) => fail(format!(".git metadata protection failed: {e}")),
             }
         }
-        if !spec.git_writable {
+        // The `.git` links are recorded here (before the command) and
+        // re-checked after it exits; the outer nyq process repeats the
+        // check for the kill paths it sees.
+        let links = if spec.git_writable {
+            Vec::new()
+        } else {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
             let targets = super::git_targets(&cwd, &spec.writable);
             for note in &targets.notes {
@@ -1064,7 +1344,8 @@ mod linux {
                 }
                 eprintln!("nyq sandbox: .git metadata stays writable: {e}");
             }
-        }
+            targets.links
+        };
         match restrict(&spec.writable, spec.network) {
             Ok(RulesetStatus::NotEnforced) => {
                 fail("Landlock is not enforced by this kernel; refusing to run unconfined".into())
@@ -1083,10 +1364,36 @@ mod linux {
                 Ok(()) => {}
             }
         }
-        let err = std::process::Command::new(&spec.argv[0])
+        // The command runs as a child (not exec) so the link check still
+        // runs when it exits abnormally; the status — or the signal — is
+        // propagated back unchanged.
+        let mut child = match std::process::Command::new(&spec.argv[0])
             .args(&spec.argv[1..])
-            .exec();
-        fail(format!("{}: {err}", spec.argv[0]))
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => fail(format!("{}: {e}", spec.argv[0])),
+        };
+        let status = child
+            .wait()
+            .unwrap_or_else(|e| fail(format!("waiting for {}: {e}", spec.argv[0])));
+        for note in super::verify_links(&links) {
+            eprintln!("nyq sandbox: {note}");
+        }
+        match status.code() {
+            Some(code) => std::process::exit(code),
+            None => {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    // Die the same way so callers see the real status.
+                    unsafe {
+                        libc::signal(sig, libc::SIG_DFL);
+                        libc::kill(libc::getpid(), sig);
+                    }
+                }
+                std::process::exit(1);
+            }
+        }
     }
 
     /// seccomp-bpf that makes `socket()` fail with EACCES for AF_INET,
@@ -1667,6 +1974,11 @@ mod tests {
                 (PathBuf::from("/w/.git/config"), Ensure::File),
             ],
             readonly: vec![PathBuf::from("/w/.git/info")],
+            links: vec![WatchedLink {
+                path: PathBuf::from("/w/.git"),
+                target: PathBuf::from("/w/realgit"),
+                ident: Some((1, 2)),
+            }],
             notes: Vec::new(),
         };
         let p = seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], false, &git);
@@ -1680,8 +1992,11 @@ mod tests {
         assert!(p.contains(r#"(subpath "/w/.git/hooks")"#));
         assert!(p.find(".git").unwrap() > p.find("allow file-write*").unwrap());
         // .git itself and the repo dir are denied rename/unlink so the
-        // deny rules cannot be moved aside (the Linux pins do the same).
-        assert!(p.contains(r#"(deny file-write-unlink (literal "/w") (literal "/w/.git"))"#));
+        // deny rules cannot be moved aside (the Linux pins do the same);
+        // a symlinked protected path joins the same deny list.
+        assert!(p.contains(
+            r#"(deny file-write-unlink (literal "/w") (literal "/w/.git") (literal "/w/.git"))"#
+        ));
         let empty = GitTargets::default();
         assert!(!seatbelt_profile(&[], true, &empty).contains("deny network"));
         assert!(!seatbelt_profile(&[], false, &empty).contains(".git"));
@@ -1705,7 +2020,10 @@ mod tests {
             t.required.contains(&(git.join("config"), Ensure::File)),
             "{t:?}"
         );
-        assert!(t.readonly.contains(&git.join("info")), "{t:?}");
+        assert!(
+            t.required.contains(&(git.join("info"), Ensure::Dir)),
+            "{t:?}"
+        );
         // The repo dir, `.git` and the writable root are pinned so `mv .git`
         // and `mv repo` fail with EBUSY.
         assert!(t.pin.contains(&canon(&git)), "{t:?}");
@@ -1783,6 +2101,172 @@ mod tests {
         assert!(t.pin.contains(&canon(&wt_gd)), "{t:?}");
         assert!(t.pin.contains(&canon(&git.join("modules"))), "{t:?}");
         assert!(t.pin.contains(&canon(&git.join("worktrees"))), "{t:?}");
+    }
+
+    #[test]
+    fn git_targets_require_info_and_cover_worktree_config() {
+        // `.git/info` is required even when it does not exist yet, so a
+        // planted `attributes`/`exclude` cannot apply outside the sandbox.
+        let root = tempfile::tempdir().unwrap();
+        let git = root.path().join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config"), "").unwrap();
+        assert!(!git.join("info").exists());
+        let t = git_targets(root.path(), &[root.path().to_path_buf()]);
+        assert!(
+            t.required.contains(&(git.join("info"), Ensure::Dir)),
+            "{t:?}"
+        );
+
+        // An existing config.worktree is bound read-only, and with
+        // extensions.worktreeConfig it is required even when missing.
+        std::fs::write(git.join("config.worktree"), "[core]\n\tbare = false\n").unwrap();
+        let t = git_targets(root.path(), &[root.path().to_path_buf()]);
+        assert!(t.readonly.contains(&git.join("config.worktree")), "{t:?}");
+        std::fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        let t = git_targets(root.path(), &[root.path().to_path_buf()]);
+        assert!(
+            t.required
+                .contains(&(git.join("config.worktree"), Ensure::File)),
+            "{t:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn repo_with_git_link() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("realgit");
+        std::fs::create_dir_all(real.join("hooks")).unwrap();
+        std::fs::write(real.join("config"), "").unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::os::unix::fs::symlink(&real, repo.join(".git")).unwrap();
+        (dir, real, repo)
+    }
+
+    /// Paths of `nyq-quarantine` siblings of `path`.
+    #[cfg(unix)]
+    fn quarantined(path: &Path) -> Vec<PathBuf> {
+        let parent = path.parent().unwrap_or(path);
+        let prefix = format!(
+            "{}.nyq-quarantine-",
+            path.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_guard_restores_a_swapped_git_symlink() {
+        let (_dir, real, repo) = repo_with_git_link();
+        let policy = Policy {
+            mode: Mode::WorkspaceWrite,
+            ..Default::default()
+        };
+        let mut guard = GitLinkGuard::watch(&policy, &repo);
+        assert_eq!(guard.watched.len(), 1, "{:?}", guard.watched);
+        // The attack: rename the link aside, plant a real .git with a hook.
+        std::fs::rename(repo.join(".git"), repo.join("kept")).unwrap();
+        std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+        std::fs::write(repo.join(".git/hooks/post-commit"), "#!/bin/sh").unwrap();
+
+        let warnings = guard.finish();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("SECURITY"), "{warnings:?}");
+        // The original link is back and the impostor was moved aside,
+        // hook and all — never deleted.
+        assert!(repo.join(".git").is_symlink());
+        assert_eq!(std::fs::read_link(repo.join(".git")).unwrap(), real);
+        assert!(!real.join("hooks/post-commit").exists());
+        let q = quarantined(&repo.join(".git"));
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].join("hooks/post-commit").exists());
+        // Idempotent: a second finish reports nothing.
+        assert!(guard.finish().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_guard_restores_a_deleted_hooks_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let git = repo.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "").unwrap();
+        let hooks_target = dir.path().join("hooks-target");
+        std::fs::create_dir(&hooks_target).unwrap();
+        std::os::unix::fs::symlink(&hooks_target, git.join("hooks")).unwrap();
+        let policy = Policy {
+            mode: Mode::WorkspaceWrite,
+            ..Default::default()
+        };
+        let mut guard = GitLinkGuard::watch(&policy, &repo);
+        assert!(
+            guard.watched.iter().any(|l| l.path == git.join("hooks")),
+            "{:?}",
+            guard.watched
+        );
+        // The command deletes the link outright: it is recreated.
+        std::fs::remove_file(git.join("hooks")).unwrap();
+        let warnings = guard.finish();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("deleted"), "{warnings:?}");
+        assert_eq!(std::fs::read_link(git.join("hooks")).unwrap(), hooks_target);
+
+        // A retargeted link is quarantined and the original restored.
+        let mut guard = GitLinkGuard::watch(&policy, &repo);
+        std::fs::remove_file(git.join("hooks")).unwrap();
+        std::os::unix::fs::symlink("/tmp", git.join("hooks")).unwrap();
+        let warnings = guard.finish();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("retargeted"), "{warnings:?}");
+        assert_eq!(std::fs::read_link(git.join("hooks")).unwrap(), hooks_target);
+        let q = quarantined(&git.join("hooks"));
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_guard_reports_an_untouched_link_as_clean() {
+        let (_dir, _real, repo) = repo_with_git_link();
+        let policy = Policy {
+            mode: Mode::WorkspaceWrite,
+            ..Default::default()
+        };
+        let mut guard = GitLinkGuard::watch(&policy, &repo);
+        assert!(guard.finish().is_empty());
+        // Mode::Off and git_writable watch nothing.
+        let off = GitLinkGuard::watch(
+            &Policy {
+                mode: Mode::Off,
+                ..Default::default()
+            },
+            &repo,
+        );
+        assert!(off.watched.is_empty());
+        let writable = GitLinkGuard::watch(
+            &Policy {
+                git_writable: true,
+                ..Default::default()
+            },
+            &repo,
+        );
+        assert!(writable.watched.is_empty());
     }
 
     #[test]

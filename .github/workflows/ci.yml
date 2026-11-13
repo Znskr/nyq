@@ -34,3 +34,19 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
+
+  # The macOS Seatbelt path is otherwise never compiled, let alone run.
+  # tests/sandbox.rs is Linux-only (it cfg's out), so this exercises the
+  # lib tests and the seatbelt-profile unit tests on a real runner.
+  macos:
+    name: test (macos)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: rustc --version && cargo --version
+      - run: cargo build --locked
+      - run: cargo test --locked --bin nyq
+      - run: cargo test --locked --test sandbox
+      - run: cargo clippy --locked --all-targets -- -D warnings
