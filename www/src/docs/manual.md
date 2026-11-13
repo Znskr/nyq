@@ -1039,7 +1039,13 @@ git dirs themselves are also pinned with private mounts, so they cannot be
 renamed aside and replaced; worktree and submodule gitdirs, `commondir`,
 `config.worktree` and a configured `core.hooksPath` get the same treatment,
 and `NYQ_SANDBOX_GIT_STRICT=1` refuses to run the command when the protection
-cannot be applied instead of only warning. Where a part
+cannot be applied instead of only warning. `.git` paths that are symlinks —
+`.git` itself, `.git/hooks`, a `core.hooksPath` target — can never be mount
+points, so nyq records their link target and resolved identity before each
+command and re-checks them afterwards (also when the command was killed):
+a swapped or deleted link is restored, the replacement moved aside to a
+`<name>.nyq-quarantine-<timestamp>` sibling for inspection, and the tool
+result flags the tamper. Where a part
 of the policy cannot be enforced — an old kernel, missing seccomp or
 user-namespace support — the banner and `nyq status --json` say `partial` and
 why. `write_file`/`edit_file` always ask before touching anything under `.git`,

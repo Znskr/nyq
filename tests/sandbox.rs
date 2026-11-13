@@ -471,7 +471,8 @@ fn worktree_submodule_and_hooks_path_are_protected() {
 /// A symlinked `.git` or `.git/hooks` gets its *target* protected: the
 /// resolved gitdir is pinned and its metadata read-only, and writes through
 /// the link are denied. The link itself is not a mount point and can still
-/// be renamed aside — an accepted gap that the helper warns about.
+/// be renamed aside — but the helper re-checks it when the command exits
+/// and reverts the swap, quarantining the replacement.
 #[test]
 fn symlinked_git_and_hooks_targets_are_protected() {
     if !landlock_available() || !on_path("git") {
@@ -508,10 +509,16 @@ fn symlinked_git_and_hooks_targets_are_protected() {
     let out = git_protected(&roots, &["bash", "-c", &script], &repo).unwrap();
     assert!(!out.status.success(), "target dir should be pinned");
     assert!(!base.path().join("r2").exists());
-    // The link can still be renamed — known limitation, warned above.
+    // The link can still be renamed inside the sandbox — but when the
+    // command exits the helper notices the missing link and restores it.
     let out = git_protected(&roots, &["bash", "-c", "mv .git l2"], &repo).unwrap();
     assert!(out.status.success());
     assert!(repo.join("l2").is_symlink());
+    assert!(
+        repo.join(".git").is_symlink(),
+        ".git link should be restored"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("SECURITY"));
 
     // A hooks dir that is a symlink: writes through it are denied and the
     // real target cannot be moved either.
@@ -530,6 +537,173 @@ fn symlinked_git_and_hooks_targets_are_protected() {
     }
     assert!(!hooks_target.join("planted").exists());
     assert!(!base.path().join("hooks-target2").exists());
+}
+
+/// Names of `nyq-quarantine` siblings created next to `path`.
+fn quarantined(path: &Path) -> Vec<std::path::PathBuf> {
+    let prefix = format!(
+        "{}.nyq-quarantine-",
+        path.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::read_dir(path.parent().unwrap_or(path))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        })
+        .collect()
+}
+
+/// The rename attack the pins cannot stop: `mv .git aside` works on a
+/// symlink because a symlink is never a mount point. When the command
+/// exits, the helper quarantines the planted `.git` directory — hook and
+/// all — and puts the original symlink back, and the tool output says so.
+#[test]
+fn swapped_git_symlink_is_restored_and_quarantined() {
+    if !landlock_available() || !on_path("git") {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let real = base.path().join("realgit");
+    std::fs::create_dir_all(real.join("hooks")).unwrap();
+    std::fs::write(real.join("config"), "").unwrap();
+    let repo = base.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::os::unix::fs::symlink(&real, repo.join(".git")).unwrap();
+    let roots: Vec<&Path> = vec![Path::new("/dev/null"), base.path()];
+
+    let script = "mv .git kept && mkdir .git .git/hooks \
+                  && echo '#!/bin/sh' > .git/hooks/post-commit && echo planted > .git/config";
+    let Some(out) = git_protected(&roots, &["bash", "-c", script], &repo) else {
+        return;
+    };
+    // The swap itself succeeded inside the sandbox…
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // …but the original link is back…
+    assert!(repo.join(".git").is_symlink(), ".git should be a symlink");
+    assert_eq!(std::fs::read_link(repo.join(".git")).unwrap(), real);
+    // …the planted directory was quarantined, not deleted…
+    let q = quarantined(&repo.join(".git"));
+    assert_eq!(q.len(), 1, "{q:?}");
+    assert!(q[0].join("hooks/post-commit").exists());
+    // …the real gitdir never got the hook…
+    assert!(!real.join("hooks/post-commit").exists());
+    // …and the output flags the tamper loudly.
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("SECURITY"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Same attack on a symlinked `.git/hooks`: the planted hooks directory is
+/// quarantined under `.git` and the link to the real hooks dir restored.
+#[test]
+fn swapped_hooks_symlink_is_restored_and_quarantined() {
+    if !landlock_available() || !on_path("git") {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let repo = base.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_at(&repo);
+    let hooks_target = base.path().join("hooks-target");
+    std::fs::rename(repo.join(".git/hooks"), &hooks_target).unwrap();
+    std::os::unix::fs::symlink(&hooks_target, repo.join(".git/hooks")).unwrap();
+    let roots: Vec<&Path> = vec![Path::new("/dev/null"), base.path()];
+
+    let script = "rm .git/hooks && mkdir .git/hooks && echo '#!/bin/sh' > .git/hooks/post-commit";
+    let Some(out) = git_protected(&roots, &["bash", "-c", script], &repo) else {
+        return;
+    };
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        repo.join(".git/hooks").is_symlink(),
+        ".git/hooks should be a symlink again"
+    );
+    assert_eq!(
+        std::fs::read_link(repo.join(".git/hooks")).unwrap(),
+        hooks_target
+    );
+    let q = quarantined(&repo.join(".git/hooks"));
+    assert_eq!(q.len(), 1, "{q:?}");
+    assert!(q[0].join("post-commit").exists());
+    assert!(!hooks_target.join("post-commit").exists());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("SECURITY"));
+}
+
+/// `.git/info` is bound read-only even when it did not exist before the
+/// command, so a planted `attributes` (which can run filters on a later,
+/// unsandboxed `git checkout`) cannot be created.
+#[test]
+fn git_info_is_protected_even_when_missing() {
+    if !landlock_available() || !on_path("git") {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git_repo_at(repo.path());
+    let _ = std::fs::remove_dir_all(repo.path().join(".git/info"));
+    let roots: Vec<&Path> = vec![Path::new("/dev/null"), repo.path()];
+
+    let script = "mkdir -p .git/info && echo '*.txt filter=evil' > .git/info/attributes";
+    let Some(out) = git_protected(&roots, &["bash", "-c", script], repo.path()) else {
+        return;
+    };
+    assert!(
+        !out.status.success(),
+        "writing .git/info/attributes should be denied"
+    );
+    // The directory itself was materialized (git does the same lazily) but
+    // stays empty: neither attributes nor exclude can be planted.
+    assert!(repo.path().join(".git/info").is_dir());
+    assert!(!repo.path().join(".git/info/attributes").exists());
+    assert!(!repo.path().join(".git/info/exclude").exists());
+}
+
+/// An existing `config.worktree` (per-worktree config read when
+/// `extensions.worktreeConfig` is set) is bound read-only like `config`.
+#[test]
+fn worktree_config_is_read_only() {
+    if !landlock_available() || !on_path("git") {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git_repo_at(repo.path());
+    std::fs::write(
+        repo.path().join(".git/config.worktree"),
+        "[core]\n\tsparseCheckout = true\n",
+    )
+    .unwrap();
+    let roots: Vec<&Path> = vec![Path::new("/dev/null"), repo.path()];
+
+    let Some(out) = git_protected(
+        &roots,
+        &["bash", "-c", "echo hacked > .git/config.worktree"],
+        repo.path(),
+    ) else {
+        return;
+    };
+    assert!(
+        !out.status.success(),
+        "config.worktree write should be denied"
+    );
+    assert!(
+        std::fs::read_to_string(repo.path().join(".git/config.worktree"))
+            .unwrap()
+            .contains("sparseCheckout")
+    );
 }
 
 /// `--git-probe` reports whether the mount protection applies (it feeds the

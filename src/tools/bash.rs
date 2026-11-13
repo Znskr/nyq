@@ -168,6 +168,9 @@ async fn run_command(
     timeout: Option<Duration>,
     store: Option<(std::path::PathBuf, String)>,
 ) -> ToolOutput {
+    // Records the .git symlinks a sandboxed command could swap; finish()
+    // after the wait (Drop on the early-return paths) reverts a swap.
+    let mut git_guard = crate::sandbox::GitLinkGuard::watch(sandbox, cwd);
     let child = match spawn(command, cwd, sandbox, false) {
         Ok((child, job)) => (child, job),
         Err(e) => return ToolOutput::err(format!("bash: {e}")),
@@ -227,6 +230,9 @@ async fn run_command(
         Outcome::TimedOut => (terminate(&mut child, pid, job.as_ref()).await, true),
     };
 
+    // The child is dead (exit or kill): revert any .git symlink swap it
+    // made before the output is rendered.
+    let link_warnings = git_guard.finish();
     finish_pumps(pumps).await;
     let bytes = tail.lock().unwrap_or_else(|e| e.into_inner()).render();
     let (exit, failed) = match status.as_ref().and_then(exit_note) {
@@ -240,7 +246,7 @@ async fn run_command(
         },
         None => (None, false),
     };
-    let is_error = timed_out || failed;
+    let mut is_error = timed_out || failed;
     let mut content = bytes;
     if timed_out {
         let secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
@@ -266,6 +272,14 @@ async fn run_command(
         && denied.iter().any(|d| content.contains(d))
     {
         push_line(&mut content, "(The sandbox blocks writes outside the workspace and, unless allowed, network access. If this command needs that, ask the user to rerun nyq with --sandbox off or --allow-network.)");
+    }
+    for warning in &link_warnings {
+        push_line(&mut content, warning);
+    }
+    // A swap the sandbox helper already reverted shows up in its stderr —
+    // flag it as an error too so the tamper cannot pass as a clean run.
+    if !link_warnings.is_empty() || content.contains("nyq sandbox: SECURITY") {
+        is_error = true;
     }
     ToolOutput {
         content,

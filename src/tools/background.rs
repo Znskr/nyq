@@ -159,6 +159,10 @@ pub(crate) fn start(
     sandbox: &crate::sandbox::Policy,
     interactive: bool,
 ) -> Result<u32, String> {
+    // Records the .git symlinks a sandboxed command could swap; the wait
+    // task re-checks them after the process exits (or is killed) and Drop
+    // covers a dropped task. Warnings land in the process output.
+    let mut git_guard = crate::sandbox::GitLinkGuard::watch(sandbox, cwd);
     let (mut child, job) = spawn(command, cwd, sandbox, interactive).map_err(|e| e.to_string())?;
     let pid = child.id().unwrap_or(0);
     let job = job.map(Arc::new);
@@ -200,7 +204,11 @@ pub(crate) fn start(
         let status = child.wait().await;
         reap_leftovers(&mut child, pid, job.as_deref()).await;
         finish_pumps(pumps).await;
+        let link_warnings = git_guard.finish();
         with_proc(id, |p| {
+            for warning in &link_warnings {
+                p.push(format!("\n{warning}").as_bytes());
+            }
             p.ended = Some(Instant::now());
             p.stdin = None;
             p.state = match status {
