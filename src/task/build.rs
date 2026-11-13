@@ -312,6 +312,17 @@ pub trait BuildSystem: Send + Sync {
     fn format_command(&self) -> Option<String> {
         None
     }
+    /// The command that adds the dependency `name` (at `version` when
+    /// given; a bare version pins it the ecosystem's usual way, and one that
+    /// starts with a comparison operator is passed through where the tool
+    /// takes one), as a dev dependency when `dev`. None when the build
+    /// system cannot add dependencies, cannot add this kind (Go and pip have
+    /// no dev dependencies), or `name`/`version` is not a plausible package
+    /// spec (empty, or starting with `-`, which a tool would read as a flag).
+    /// Library only: no model tool runs it.
+    fn add_dep_command(&self, _name: &str, _version: Option<&str>, _dev: bool) -> Option<String> {
+        None
+    }
     /// Whether `line` opens a new error block in the tool's output.
     fn is_error_start(&self, line: &str) -> bool;
     /// Names of failed tests in a test run's output, in order, without
@@ -638,6 +649,16 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// The package name and version of an `add_dep_command`, trimmed; None when
+/// the name is empty, either starts with `-` (a tool would read it as a flag)
+/// or holds whitespace. An empty version counts as none.
+fn dep_parts<'a>(name: &'a str, version: Option<&'a str>) -> Option<(&'a str, Option<&'a str>)> {
+    let ok = |s: &str| !s.is_empty() && !s.starts_with('-') && !s.contains(char::is_whitespace);
+    let name = name.trim();
+    let version = version.map(str::trim).filter(|v| !v.is_empty());
+    (ok(name) && version.is_none_or(ok)).then_some((name, version))
+}
+
 /// `path:12:5: message` or `path:12: message` at the start of a line.
 fn has_loc_prefix(line: &str) -> bool {
     let mut it = line.splitn(4, ':');
@@ -740,6 +761,15 @@ impl BuildSystem for Cargo {
     fn format_command(&self) -> Option<String> {
         Some("cargo fmt --all -- --check".into())
     }
+    fn add_dep_command(&self, name: &str, version: Option<&str>, dev: bool) -> Option<String> {
+        let (name, version) = dep_parts(name, version)?;
+        let spec = match version {
+            Some(v) => format!("{name}@{v}"),
+            None => name.to_string(),
+        };
+        let dev = if dev { " --dev" } else { "" };
+        Some(format!("cargo add {}{dev}", shell_quote(&spec)))
+    }
     fn is_error_start(&self, line: &str) -> bool {
         (line.starts_with("error")
             && !line.starts_with("error: aborting due to")
@@ -833,6 +863,18 @@ impl BuildSystem for Go {
     }
     fn lint_command(&self) -> Option<String> {
         Some("go vet ./...".into())
+    }
+    fn add_dep_command(&self, name: &str, version: Option<&str>, dev: bool) -> Option<String> {
+        // Go modules have no dev dependencies.
+        if dev {
+            return None;
+        }
+        let (name, version) = dep_parts(name, version)?;
+        let spec = match version {
+            Some(v) => format!("{name}@{v}"),
+            None => name.to_string(),
+        };
+        Some(format!("go get {}", shell_quote(&spec)))
     }
     fn format_command(&self) -> Option<String> {
         Some(
@@ -957,6 +999,23 @@ impl BuildSystem for Python {
     }
     fn format_command(&self) -> Option<String> {
         Some(format!("{}ruff format --check .", self.prefix))
+    }
+    fn add_dep_command(&self, name: &str, version: Option<&str>, dev: bool) -> Option<String> {
+        let (name, version) = dep_parts(name, version)?;
+        // A bare version pins it; `>=1.2`, `~=1.2` and the like are kept.
+        let spec = match version {
+            Some(v) if v.starts_with(['=', '<', '>', '~', '!']) => format!("{name}{v}"),
+            Some(v) => format!("{name}=={v}"),
+            None => name.to_string(),
+        };
+        let spec = shell_quote(&spec);
+        if self.prefix.is_empty() {
+            // pip installs into the environment; it has no dev dependencies.
+            (!dev).then(|| format!("python -m pip install {spec}"))
+        } else {
+            let dev = if dev { " --dev" } else { "" };
+            Some(format!("uv add {spec}{dev}"))
+        }
     }
     fn is_error_start(&self, line: &str) -> bool {
         (line.starts_with("___") && line.trim_end().ends_with("___"))
@@ -1087,6 +1146,22 @@ impl BuildSystem for Node {
     }
     fn lint_command(&self) -> Option<String> {
         self.has_script("lint").then(|| self.run_script("lint"))
+    }
+    fn add_dep_command(&self, name: &str, version: Option<&str>, dev: bool) -> Option<String> {
+        let (name, version) = dep_parts(name, version)?;
+        let spec = match version {
+            Some(v) => format!("{name}@{v}"),
+            None => name.to_string(),
+        };
+        let spec = shell_quote(&spec);
+        Some(match (self.pm, dev) {
+            ("npm", false) => format!("npm install {spec}"),
+            ("npm", true) => format!("npm install --save-dev {spec}"),
+            ("yarn", false) => format!("yarn add {spec}"),
+            ("yarn", true) => format!("yarn add --dev {spec}"),
+            (pm, false) => format!("{pm} add {spec}"),
+            (pm, true) => format!("{pm} add --save-dev {spec}"),
+        })
     }
     fn format_command(&self) -> Option<String> {
         [
@@ -1778,6 +1853,133 @@ error: aborting due to 3 previous errors\n";
         let d = dir_with(&[("pytest.ini", "")]);
         let p = Python::detect(d.path()).unwrap();
         assert_eq!(p.test_command(&TestScope::All).unwrap(), "pytest -q");
+    }
+
+    #[test]
+    fn add_dep_commands() {
+        // cargo
+        let c = cargo();
+        assert_eq!(
+            c.add_dep_command("serde", None, false).unwrap(),
+            "cargo add serde"
+        );
+        assert_eq!(
+            c.add_dep_command("serde", Some("1.0.200"), false).unwrap(),
+            "cargo add serde@1.0.200"
+        );
+        assert_eq!(
+            c.add_dep_command(" tempfile ", Some(" 3 "), true).unwrap(),
+            "cargo add tempfile@3 --dev"
+        );
+        // go: no dev dependencies.
+        let g = Go {
+            root: PathBuf::from("/proj"),
+        };
+        assert_eq!(
+            g.add_dep_command("github.com/pkg/errors", Some("v0.9.1"), false)
+                .unwrap(),
+            "go get github.com/pkg/errors@v0.9.1"
+        );
+        assert_eq!(
+            g.add_dep_command("golang.org/x/sync", None, false).unwrap(),
+            "go get golang.org/x/sync"
+        );
+        assert_eq!(g.add_dep_command("golang.org/x/sync", None, true), None);
+        // uv: a bare version pins, an operator is kept and quoted.
+        let d = dir_with(&[("pyproject.toml", ""), ("uv.lock", "")]);
+        let uv = Python::detect(d.path()).unwrap();
+        assert_eq!(
+            uv.add_dep_command("httpx", None, false).unwrap(),
+            "uv add httpx"
+        );
+        assert_eq!(
+            uv.add_dep_command("httpx", Some("0.27.0"), false).unwrap(),
+            "uv add httpx==0.27.0"
+        );
+        assert_eq!(
+            uv.add_dep_command("pytest", Some(">=8"), true).unwrap(),
+            "uv add 'pytest>=8' --dev"
+        );
+        // pip: installs, and has no dev dependencies.
+        let d = dir_with(&[("setup.py", "")]);
+        let pip = Python::detect(d.path()).unwrap();
+        assert_eq!(
+            pip.add_dep_command("requests", Some("~=2.31"), false)
+                .unwrap(),
+            "python -m pip install 'requests~=2.31'"
+        );
+        assert_eq!(pip.add_dep_command("pytest", None, true), None);
+        // npm, pnpm and yarn.
+        let npm = Node::detect(dir_with(&[("package.json", "{}")]).path()).unwrap();
+        assert_eq!(
+            npm.add_dep_command("left-pad", Some("1.3.0"), false)
+                .unwrap(),
+            "npm install left-pad@1.3.0"
+        );
+        assert_eq!(
+            npm.add_dep_command("@types/node", None, true).unwrap(),
+            "npm install --save-dev @types/node"
+        );
+        assert_eq!(
+            npm.add_dep_command("react", Some("^18"), false).unwrap(),
+            "npm install 'react@^18'"
+        );
+        let d = dir_with(&[("package.json", "{}"), ("pnpm-lock.yaml", "")]);
+        let pnpm = Node::detect(d.path()).unwrap();
+        assert_eq!(
+            pnpm.add_dep_command("vitest", None, true).unwrap(),
+            "pnpm add --save-dev vitest"
+        );
+        assert_eq!(
+            pnpm.add_dep_command("zod", None, false).unwrap(),
+            "pnpm add zod"
+        );
+        let d = dir_with(&[("package.json", "{}"), ("yarn.lock", "")]);
+        let yarn = Node::detect(d.path()).unwrap();
+        assert_eq!(
+            yarn.add_dep_command("zod", None, false).unwrap(),
+            "yarn add zod"
+        );
+        assert_eq!(
+            yarn.add_dep_command("jest", Some("29"), true).unwrap(),
+            "yarn add --dev jest@29"
+        );
+        // Make and CMake cannot add dependencies.
+        let d = dir_with(&[("Makefile", "all:\n\ttrue\n")]);
+        let make = detect_build_system(d.path()).unwrap();
+        assert_eq!(make.name(), "make");
+        assert_eq!(make.add_dep_command("x", None, false), None);
+        let d = dir_with(&[("CMakeLists.txt", "")]);
+        let cmake = detect_build_system(d.path()).unwrap();
+        assert_eq!(cmake.add_dep_command("x", None, false), None);
+        // Not a package spec: empty, a flag, or whitespace.
+        for (name, version) in [
+            ("", None),
+            ("  ", None),
+            ("--git=https://evil", None),
+            ("-x", None),
+            ("serde", Some("--path=/tmp")),
+            ("two words", None),
+            ("serde", Some("1 2")),
+        ] {
+            assert_eq!(
+                c.add_dep_command(name, version, false),
+                None,
+                "{name:?} {version:?}"
+            );
+            assert_eq!(npm.add_dep_command(name, version, false), None);
+            assert_eq!(uv.add_dep_command(name, version, false), None);
+            assert_eq!(g.add_dep_command(name, version, false), None);
+        }
+        // An empty version is no version; a quote is quoted.
+        assert_eq!(
+            c.add_dep_command("serde", Some(""), false).unwrap(),
+            "cargo add serde"
+        );
+        assert_eq!(
+            npm.add_dep_command("a'b", None, false).unwrap(),
+            "npm install 'a'\\''b'"
+        );
     }
 
     #[test]
