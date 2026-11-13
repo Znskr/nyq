@@ -3,7 +3,9 @@
 //! Line 1 is a header (`{"type":"session",...}`). Later metadata lines are
 //! `{"type":"title","title":...}` from `/rename`, `{"type":"prefs",...}` with
 //! the model settings in effect, and `{"type":"permissions","state":...}` with
-//! the session's permission grants (the latest of each wins). Every other
+//! the session's permission grants and, in an optional `taint` field, the
+//! main agent's taint ledger (`crate::taint::Ledger`: tainted inputs and
+//! files written from untrusted content), the latest of each wins. Every other
 //! line is one [`Item`]. Files are append-only, so a crash can at worst
 //! truncate the last line, which loading tolerates.
 //!
@@ -865,8 +867,51 @@ impl Session {
         self.flush_queue()
     }
 
-    /// Record the session's permission state (skipped when unchanged).
-    pub fn save_permissions(&mut self, state: serde_json::Value) -> Result<()> {
+    /// Record the session's permission state (skipped when unchanged). The
+    /// saved taint ledger (see [`Session::save_taint`]) is kept unless
+    /// `state` brings its own.
+    pub fn save_permissions(&mut self, mut state: serde_json::Value) -> Result<()> {
+        if let (Some(map), Some(taint)) = (
+            state.as_object_mut(),
+            self.permissions.as_ref().and_then(|p| p.get(TAINT_FIELD)),
+        ) {
+            map.entry(TAINT_FIELD).or_insert_with(|| taint.clone());
+        }
+        self.write_permissions(state)
+    }
+
+    /// Record the main agent's taint ledger in the permissions line's
+    /// optional `taint` field (skipped when unchanged). Older builds ignore
+    /// the field; older sessions without it restore an empty ledger.
+    pub fn save_taint(&mut self, ledger: &crate::taint::Ledger) -> Result<()> {
+        let current = self.permissions.as_ref().and_then(|p| p.get(TAINT_FIELD));
+        if ledger.is_empty() && current.is_none() {
+            return Ok(());
+        }
+        let value = serde_json::to_value(ledger)
+            .with_context(|| format!("encoding the taint ledger for {}", self.id))?;
+        if current == Some(&value) {
+            return Ok(());
+        }
+        let mut state = match &self.permissions {
+            Some(serde_json::Value::Object(map)) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        if ledger.is_empty() {
+            state.remove(TAINT_FIELD);
+        } else {
+            state.insert(TAINT_FIELD.into(), value);
+        }
+        self.write_permissions(serde_json::Value::Object(state))
+    }
+
+    /// The main agent's taint ledger saved with this session, read
+    /// leniently: empty when absent or unreadable.
+    pub fn saved_taint(&self) -> crate::taint::Ledger {
+        crate::taint::ledger_from(self.permissions.as_ref().and_then(|p| p.get(TAINT_FIELD)))
+    }
+
+    fn write_permissions(&mut self, state: serde_json::Value) -> Result<()> {
         if self.permissions.as_ref() == Some(&state) {
             return Ok(());
         }
@@ -1274,6 +1319,9 @@ pub fn generated_title(raw: &str) -> Result<String> {
     let title: String = title.chars().filter(|c| !c.is_control()).collect();
     validate_title(&title).map_err(|_| anyhow::anyhow!("the model did not return a usable title"))
 }
+
+/// The permissions state field holding the main agent's taint ledger.
+const TAINT_FIELD: &str = "taint";
 
 /// A `title`, `prefs`, `permissions`, `workset` or `intent` metadata line
 /// (not a transcript item).
@@ -3107,6 +3155,67 @@ mod tests {
         let lines = std::fs::read_to_string(&s2.path).unwrap();
         assert_eq!(lines.matches("\"type\":\"workset\"").count(), 1);
         assert_eq!(lines.matches("\"type\":\"intent\"").count(), 2);
+    }
+
+    /// The main agent's taint ledger rides on the permissions line in an
+    /// optional field: it survives a reload and later grant saves, an
+    /// empty ledger writes nothing, and a missing or unreadable field (an
+    /// older or newer session) loads as an empty ledger with the grants
+    /// intact.
+    #[test]
+    fn taint_ledger_rides_on_the_permissions_line() {
+        use crate::taint::{Label, Ledger, WrittenFile};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut s = Session::create(dir, Path::new("/w"), "m").unwrap();
+        s.append(&user("hi")).unwrap();
+        s.save_taint(&Ledger::default()).unwrap();
+        assert!(s.saved_permissions().is_none());
+        let ledger = Ledger {
+            inputs: Vec::new(),
+            files: vec![WrittenFile {
+                path: "/w/setup.sh".into(),
+                labels: vec![Label::Web("evil.example".into())],
+            }],
+        };
+        s.save_taint(&ledger).unwrap();
+        s.save_taint(&ledger).unwrap();
+        // A later grant save keeps the ledger.
+        s.save_permissions(serde_json::json!({"grants": ["bash:ls"], "rules": []}))
+            .unwrap();
+        assert_eq!(s.saved_taint(), ledger);
+        let id = s.id.clone();
+        let path = s.path.clone();
+        drop(s);
+
+        let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+        assert_eq!(items, vec![user("hi")]);
+        assert_eq!(s.saved_taint(), ledger);
+        assert_eq!(
+            s.saved_permissions().unwrap()["grants"],
+            serde_json::json!(["bash:ls"])
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"type\":\"permissions\"").count(), 2);
+        drop(s);
+
+        // An older session (no field) and an unreadable field both load.
+        for state in [
+            serde_json::json!({"grants": ["bash:ls"]}),
+            serde_json::json!({"grants": ["bash:ls"], "taint": {"files": "not a list"}}),
+        ] {
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            text.push_str(&serde_json::json!({"type": "permissions", "state": state}).to_string());
+            text.push('\n');
+            std::fs::write(&path, text).unwrap();
+            let (s, _, items) = load(dir, &id, Path::new("/w")).unwrap();
+            assert_eq!(items, vec![user("hi")]);
+            assert!(s.saved_taint().is_empty(), "{state}");
+            assert_eq!(
+                s.saved_permissions().unwrap()["grants"],
+                serde_json::json!(["bash:ls"])
+            );
+        }
     }
 
     #[test]
