@@ -1687,6 +1687,50 @@ mod tests {
         ));
         assert!(matches("subagent", "subagent", &sub("general"), false));
         assert!(matches("subagent:*", "subagent", &sub("general"), false));
+        // An external agent answers to its own key only.
+        let ext = |name: &str| sub(&format!("external:{name}"));
+        assert!(matches(
+            "subagent:external:claude",
+            "subagent",
+            &ext("claude"),
+            true
+        ));
+        assert!(!matches(
+            "subagent:external:claude",
+            "subagent",
+            &ext("codex"),
+            true
+        ));
+        assert!(!matches(
+            "subagent:external:claude",
+            "subagent",
+            &json!({"task": "x"}),
+            true
+        ));
+        assert!(!matches(
+            "subagent:explore",
+            "subagent",
+            &ext("claude"),
+            true
+        ));
+        assert!(!matches(
+            "subagent:general",
+            "subagent",
+            &ext("claude"),
+            true
+        ));
+        assert!(matches(
+            "subagent:external:*",
+            "subagent",
+            &ext("claude"),
+            true
+        ));
+        assert!(!matches(
+            "subagent:external:*",
+            "subagent",
+            &sub("general"),
+            true
+        ));
         assert!(matches(
             "web_fetch",
             "web_fetch",
@@ -1851,6 +1895,48 @@ mod tests {
                 p.decide(&none, "subagent", &json!({"task": "x"}), cwd, false, mode),
                 Decision::Deny(_)
             ));
+        }
+    }
+
+    /// A saved `allow` for one external agent skips the prompt for that
+    /// agent only; an allow saved before external agents had their own key
+    /// (`subagent:explore`) still asks for every external agent.
+    #[test]
+    fn saved_subagent_allows_keep_external_agents_apart() {
+        let cwd = Path::new("/w");
+        let none = HashSet::new();
+        let ext = |name: &str| json!({"mode": format!("external:{name}"), "task": "x"});
+        let general = json!({"mode": "general", "task": "x"});
+        for mode in [Mode::Ask, Mode::Auto] {
+            // Not covered: asked, or judged by the classifier in auto mode.
+            let ask = if mode == Mode::Ask {
+                Decision::Ask { forced: None }
+            } else {
+                Decision::Classify
+            };
+            let old = perms(&["subagent:explore"], &[], &[]);
+            assert_eq!(
+                old.decide(&none, "subagent", &ext("claude"), cwd, true, mode),
+                ask
+            );
+            let claude = perms(&["subagent:external:claude"], &[], &[]);
+            assert_eq!(
+                claude.decide(&none, "subagent", &ext("claude"), cwd, true, mode),
+                Decision::Run
+            );
+            assert_eq!(
+                claude.decide(&none, "subagent", &ext("codex"), cwd, true, mode),
+                ask
+            );
+            assert_eq!(
+                claude.decide(&none, "subagent", &general, cwd, true, mode),
+                ask
+            );
+            let gen = perms(&["subagent:general"], &[], &[]);
+            assert_eq!(
+                gen.decide(&none, "subagent", &ext("claude"), cwd, true, mode),
+                ask
+            );
         }
     }
 

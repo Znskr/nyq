@@ -2950,8 +2950,8 @@ mod tests {
             &seen,
         );
         agent.permission_mode = crate::permissions::Mode::Yolo;
-        // A grant that would otherwise cover an external call.
-        agent.allowed.insert("subagent:explore".into());
+        // A grant that would otherwise cover this external call.
+        agent.allowed.insert("subagent:external:fake".into());
         agent.permissions = Arc::new(crate::permissions::Permissions {
             deny: vec!["exec when tainted-by:external".into()],
             ..Default::default()
