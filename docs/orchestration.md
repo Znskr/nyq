@@ -152,7 +152,9 @@ args = ["acp"]
 - External agents run **outside nyq's sandbox**, with their own tools and
   their own permission system. Starting one is a risky call: it asks for
   approval (or goes to the classifier in auto mode), and the prompt shows the
-  command.
+  command. Its permission key is `subagent:external:<name>`: "always" (or an
+  `allow` rule) for one external agent never covers another, nor an
+  `explore`/`general` child.
 - nyq can't check an external agent's calls, so it labels what follows from
   them. The report carries `external:<name>` and the taint of the task; the
   files the agent changed, found by comparing `git status` and `HEAD` before
