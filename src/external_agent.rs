@@ -19,9 +19,16 @@
 //! nobody can be asked. The client advertises no file-system or terminal
 //! capabilities, so the agent uses its own. Only the user's own settings.toml
 //! may name a command: a repository's `.nyq/settings.toml` cannot.
+//!
+//! nyq can't check what the agent does, only what follows from it: its report
+//! is labelled `external:<name>` (with its prompt's taint, see `crate::taint`)
+//! and the files it changed are found by comparing git [`Snapshot`]s taken
+//! before and after the run. When the prompt follows untrusted content
+//! ([`Run::tainted`]) every permission request of the agent needs a person's
+//! answer, also in yolo mode.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -137,14 +144,18 @@ fn config_from(extra: &serde_json::Map<String, Value>, name: &str) -> anyhow::Re
 pub type ToolObserver = Box<dyn Fn(&str, &str) + Send + Sync>;
 
 /// One prompt to an external agent.
-pub struct Run<'a> {
-    pub task: &'a str,
+pub struct Run {
+    pub task: String,
     /// The session cwd sent in `session/new` and the process's cwd.
-    pub cwd: &'a Path,
+    pub cwd: PathBuf,
     /// Who answers the agent's `session/request_permission`; None denies.
     pub approver: Option<Arc<dyn Approver>>,
     /// Allow every permission request without asking (parent in yolo mode).
     pub auto_approve: bool,
+    /// The prompt follows untrusted content: no permission request is
+    /// allowed without a person's answer (`auto_approve` is ignored, and a
+    /// frontend that answers on its own denies).
+    pub tainted: bool,
     /// Shown with approval prompts, e.g. "external claude: fix the parser".
     pub origin: String,
     pub cancel: CancellationToken,
@@ -165,14 +176,14 @@ pub struct Outcome {
 }
 
 /// Launch `cfg` and run one prompt.
-pub async fn run(cfg: &Config, run: Run<'_>) -> anyhow::Result<Outcome> {
+pub async fn run(cfg: &Config, run: Run) -> anyhow::Result<Outcome> {
     use tokio::io::AsyncBufReadExt;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     let mut command = tokio::process::Command::new(&cfg.command);
     command
         .args(&cfg.args)
         .envs(&cfg.env)
-        .current_dir(run.cwd)
+        .current_dir(&run.cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -420,6 +431,8 @@ fn truncate(s: &str, max: usize) -> String {
 struct Permissions {
     approver: Option<Arc<dyn Approver>>,
     auto_approve: bool,
+    /// See [`Run::tainted`].
+    tainted: bool,
     origin: String,
     state: Arc<Mutex<Collected>>,
 }
@@ -440,7 +453,7 @@ impl Permissions {
             }
             None => acp::RequestPermissionOutcome::Cancelled,
         };
-        if self.auto_approve {
+        if self.auto_approve && !self.tainted {
             return selected(allow());
         }
         let Some(approver) = &self.approver else {
@@ -473,6 +486,7 @@ impl Permissions {
             preview: preview.as_deref(),
             rule: None,
             save_rule: None,
+            needs_person: self.tainted,
         };
         let answer = {
             let _turn = APPROVALS.lock().await;
@@ -498,19 +512,20 @@ enum End {
 /// [`run`] over an already connected transport (tests use in-memory pipes).
 pub async fn run_with_transport(
     transport: impl ConnectTo<sdk::Client> + 'static,
-    run: Run<'_>,
+    run: Run,
 ) -> anyhow::Result<Outcome> {
     let state = Arc::new(Mutex::new(Collected::default()));
     let on_tool: Option<OnTool> = run.on_tool.map(Arc::from);
     let permissions = Arc::new(Permissions {
         approver: run.approver.clone(),
         auto_approve: run.auto_approve,
+        tainted: run.tainted,
         origin: run.origin.clone(),
         state: state.clone(),
     });
     let (s1, t1, p1) = (state.clone(), on_tool.clone(), permissions.clone());
-    let task = run.task.to_string();
-    let cwd = run.cwd.to_path_buf();
+    let task = run.task;
+    let cwd = run.cwd;
     let cancel = run.cancel.clone();
     let timeout = run.timeout;
     let deadline = tokio::time::Instant::now() + timeout;
@@ -594,10 +609,357 @@ pub async fn run_with_transport(
     }
 }
 
+/// What git reports as changed in a workspace (tracked changes, staged or
+/// not, and untracked files), with a fingerprint of each file ([`stamp`]),
+/// plus `HEAD`. Taken before and after an external agent runs, it tells
+/// which files the agent changed ([`Snapshot::changed`]), committed ones
+/// included. Ignored files, files git is told to overlook, files outside the
+/// repository and a workspace that is no git repository are not seen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The repository root, as git spells it.
+    top: PathBuf,
+    head: Option<String>,
+    /// Status code and fingerprint of each listed path (repository-relative).
+    files: BTreeMap<String, (String, Option<[u8; 32]>)>,
+}
+
+impl Snapshot {
+    /// The state of the repository holding `dir`; None when there is none
+    /// (or git can't be run).
+    pub async fn take(dir: &Path) -> Option<Snapshot> {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Snapshot::take_now(&dir))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn take_now(dir: &Path) -> Option<Snapshot> {
+        let top = git_out(dir, &["rev-parse", "--show-toplevel"])?;
+        let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
+        let head = git_out(&top, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+            .map(|h| String::from_utf8_lossy(&h).trim().to_string())
+            .filter(|h| !h.is_empty());
+        let status = git_out(
+            &top,
+            &[
+                "-c",
+                "status.renames=false",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+        )?;
+        let mut files = BTreeMap::new();
+        let mut entries = status.split(|b| *b == 0).filter(|e| !e.is_empty());
+        while let Some(entry) = entries.next() {
+            if entry.len() < 4 {
+                continue;
+            }
+            let code = String::from_utf8_lossy(&entry[..2]).into_owned();
+            let path = String::from_utf8_lossy(&entry[3..]).into_owned();
+            // A rename or copy is followed by its source path.
+            if code.contains(['R', 'C']) {
+                if let Some(from) = entries.next() {
+                    let from = String::from_utf8_lossy(from).into_owned();
+                    let hash = stamp(&top.join(&from));
+                    files.insert(from, (code.clone(), hash));
+                }
+            }
+            let hash = stamp(&top.join(&path));
+            files.insert(path, (code, hash));
+        }
+        Some(Snapshot { top, head, files })
+    }
+
+    /// The files that differ between this snapshot (taken before) and the
+    /// repository's state now: changed, created, deleted or restored, and
+    /// every file a commit made in between touched. Paths under `dir` are
+    /// spelled under `dir` (a symlinked workspace keeps its spelling), and
+    /// also as git spells them when that differs.
+    pub async fn changed(&self, dir: &Path) -> Vec<PathBuf> {
+        let before = self.clone();
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || before.changed_now(&dir))
+            .await
+            .unwrap_or_default()
+    }
+
+    fn changed_now(&self, dir: &Path) -> Vec<PathBuf> {
+        let Some(after) = Snapshot::take_now(dir) else {
+            return Vec::new();
+        };
+        let mut rels: BTreeSet<String> = self
+            .files
+            .keys()
+            .chain(after.files.keys())
+            .filter(|p| self.files.get(*p) != after.files.get(*p))
+            .cloned()
+            .collect();
+        if self.head != after.head {
+            if let Some(new) = &after.head {
+                let listed = match &self.head {
+                    Some(old) => git_out(
+                        &after.top,
+                        &[
+                            "diff",
+                            "--name-only",
+                            "-z",
+                            "--no-renames",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            old,
+                            new,
+                        ],
+                    ),
+                    // The first commit: everything in it is new.
+                    None => git_out(&after.top, &["ls-tree", "-r", "--name-only", "-z", new]),
+                };
+                rels.extend(
+                    listed
+                        .unwrap_or_default()
+                        .split(|b| *b == 0)
+                        .filter(|p| !p.is_empty())
+                        .map(|p| String::from_utf8_lossy(p).into_owned()),
+                );
+            }
+        }
+        rels.iter()
+            .flat_map(|rel| spellings(dir, &after.top.join(rel)))
+            .collect()
+    }
+}
+
+/// `path` (as git spells it) and, when it lies under `dir` and `dir` is
+/// spelled differently (a symlinked workspace), the same file under `dir`:
+/// a later read names it either way.
+pub(crate) fn spellings(dir: &Path, path: &Path) -> Vec<PathBuf> {
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut out = Vec::new();
+    if let Ok(inside) = path.strip_prefix(&canonical) {
+        let spelled = dir.join(inside);
+        if spelled != path {
+            out.push(spelled);
+        }
+    }
+    out.push(path.to_path_buf());
+    out
+}
+
+/// `git` in `dir` for its output; None when it fails. No fsmonitor, hooks,
+/// external diff or text conversion: nothing repository-configured runs.
+fn git_out(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.quotepath=off",
+        ])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// A fingerprint of a file (or symlink) that any change to it moves; None
+/// when it is missing or neither. On Unix it is the metadata, so large
+/// untracked files are not read: every write moves `ctime`, which only the
+/// kernel sets (an agent can restore the contents and `mtime`, not `ctime`).
+/// Elsewhere it is a SHA-256 of the contents (a symlink's target).
+fn stamp(path: &Path) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() && !meta.file_type().is_symlink() {
+        return None;
+    }
+    let mut h = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for n in [
+            meta.size() as i64,
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+            meta.ino() as i64,
+            meta.dev() as i64,
+            i64::from(meta.mode()),
+        ] {
+            h.update(n.to_le_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    content_hash(&mut h, path, &meta)?;
+    Some(h.finalize().into())
+}
+
+#[cfg(not(unix))]
+fn content_hash(h: &mut sha2::Sha256, path: &Path, meta: &std::fs::Metadata) -> Option<()> {
+    use sha2::Digest;
+    use std::io::Read;
+    if meta.file_type().is_symlink() {
+        h.update(b"link:");
+        h.update(std::fs::read_link(path).ok()?.to_string_lossy().as_bytes());
+    } else if meta.is_file() {
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => h.update(&buf[..n]),
+                Err(_) => return None,
+            }
+        }
+    }
+    Some(())
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    /// What [`editor`] does when prompted.
+    #[derive(Clone, Default)]
+    pub(crate) struct Script {
+        /// Files written, relative to the session cwd: (path, contents).
+        pub(crate) writes: Vec<(String, String)>,
+        /// The final message (after " [allowed]"/" [denied]" when `ask`).
+        pub(crate) reply: String,
+        /// Ask permission for one tool call before writing; a denial
+        /// skips the writes.
+        pub(crate) ask: bool,
+    }
+
+    /// What an [`editor`] saw: its session cwd and prompts.
+    #[derive(Clone, Default)]
+    pub(crate) struct Seen {
+        pub(crate) cwd: Arc<Mutex<Option<PathBuf>>>,
+        pub(crate) prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// An in-process ACP agent that edits files in its session cwd.
+    pub(crate) fn editor(script: Script, seen: Seen) -> impl ConnectTo<sdk::Client> + 'static {
+        let (client_io, agent_io) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = tokio::io::split(client_io);
+        let (ar, aw) = tokio::io::split(agent_io);
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            let _ = sdk::Agent
+                .builder()
+                .name("editor")
+                .on_receive_request(
+                    async move |req: acp::InitializeRequest,
+                                responder: Responder<acp::InitializeResponse>,
+                                _cx: ConnectionTo<sdk::Client>| {
+                        responder.respond(acp::InitializeResponse::new(req.protocol_version))
+                    },
+                    sdk::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: acp::NewSessionRequest,
+                                responder: Responder<acp::NewSessionResponse>,
+                                _cx: ConnectionTo<sdk::Client>| {
+                        *lock(&seen2.cwd) = Some(req.cwd.clone());
+                        responder.respond(acp::NewSessionResponse::new(acp::SessionId::new("s1")))
+                    },
+                    sdk::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: acp::PromptRequest,
+                                responder: Responder<acp::PromptResponse>,
+                                cx: ConnectionTo<sdk::Client>| {
+                        let script = script.clone();
+                        let seen = seen.clone();
+                        tokio::spawn(async move {
+                            let text: String = req
+                                .prompt
+                                .iter()
+                                .filter_map(|b| match b {
+                                    acp::ContentBlock::Text(t) => Some(t.text.clone()),
+                                    _ => None,
+                                })
+                                .collect();
+                            lock(&seen.prompts).push(text);
+                            let sid = req.session_id.clone();
+                            let mut allowed = true;
+                            if script.ask {
+                                let ask = acp::RequestPermissionRequest::new(
+                                    sid.clone(),
+                                    acp::ToolCallUpdate::new(
+                                        "t1",
+                                        acp::ToolCallUpdateFields::new().title("Write files"),
+                                    ),
+                                    vec![
+                                        acp::PermissionOption::new(
+                                            "once",
+                                            "Allow",
+                                            acp::PermissionOptionKind::AllowOnce,
+                                        ),
+                                        acp::PermissionOption::new(
+                                            "no",
+                                            "Reject",
+                                            acp::PermissionOptionKind::RejectOnce,
+                                        ),
+                                    ],
+                                );
+                                allowed = match cx.send_request(ask).block_task().await {
+                                    Ok(r) => matches!(
+                                        r.outcome,
+                                        acp::RequestPermissionOutcome::Selected(s)
+                                            if &*s.option_id.0 == "once"
+                                    ),
+                                    Err(_) => false,
+                                };
+                            }
+                            let cwd = lock(&seen.cwd).clone().expect("session cwd");
+                            if allowed {
+                                for (path, contents) in &script.writes {
+                                    let full = cwd.join(path);
+                                    if let Some(parent) = full.parent() {
+                                        std::fs::create_dir_all(parent).unwrap();
+                                    }
+                                    std::fs::write(full, contents).unwrap();
+                                }
+                            }
+                            let reply = if script.ask {
+                                let verdict = if allowed { "[allowed]" } else { "[denied]" };
+                                format!("{verdict} {}", script.reply)
+                            } else {
+                                script.reply.clone()
+                            };
+                            let _ = cx.send_notification(acp::SessionNotification::new(
+                                sid,
+                                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                    reply.into(),
+                                )),
+                            ));
+                            let _ = responder
+                                .respond(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                        });
+                        Ok(())
+                    },
+                    sdk::on_receive_request!(),
+                )
+                .connect_to(sdk::ByteStreams::new(aw.compat_write(), ar.compat()))
+                .await;
+        });
+        sdk::ByteStreams::new(cw.compat_write(), cr.compat())
+    }
 
     /// Records what it was asked and answers `answer`.
     struct Recorder {
@@ -749,12 +1111,13 @@ mod tests {
         sdk::ByteStreams::new(cw.compat_write(), cr.compat())
     }
 
-    fn base(cwd: &Path) -> Run<'_> {
+    fn base(cwd: &Path) -> Run {
         Run {
-            task: "fix it",
-            cwd,
+            task: "fix it".into(),
+            cwd: cwd.to_path_buf(),
             approver: None,
             auto_approve: false,
+            tainted: false,
             origin: "external fake: fix it".into(),
             cancel: CancellationToken::new(),
             timeout: Duration::from_secs(10),
@@ -958,6 +1321,129 @@ mod tests {
         };
         let err = super::run(&cfg, base(dir.path())).await.unwrap_err();
         assert!(err.to_string().contains("could not start"), "{err}");
+    }
+
+    /// With a tainted prompt the agent's permission requests go to a person
+    /// even in yolo mode, flagged as needing one; nobody to ask denies.
+    #[tokio::test]
+    async fn a_tainted_prompt_never_auto_approves_the_agents_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = || Script {
+            writes: vec![("out.txt".into(), "x".into())],
+            reply: "wrote it".into(),
+            ask: true,
+        };
+        // Untainted yolo: allowed without asking.
+        let mut run = base(dir.path());
+        run.auto_approve = true;
+        let out = run_with_transport(editor(script(), Seen::default()), run)
+            .await
+            .unwrap();
+        assert_eq!(out.text, "[allowed] wrote it");
+
+        // Tainted yolo, nobody to ask: denied, nothing written.
+        std::fs::remove_file(dir.path().join("out.txt")).unwrap();
+        let mut run = base(dir.path());
+        run.auto_approve = true;
+        run.tainted = true;
+        let out = run_with_transport(editor(script(), Seen::default()), run)
+            .await
+            .unwrap();
+        assert_eq!(out.text, "[denied] wrote it");
+        assert!(!dir.path().join("out.txt").exists());
+
+        // Tainted yolo with an approver: asked, and the request says only
+        // a person may answer it.
+        struct Person(Mutex<Vec<bool>>);
+        #[async_trait::async_trait]
+        impl Approver for Person {
+            async fn approve(&self, _: &str, req: &ApprovalRequest<'_>) -> Approval {
+                lock(&self.0).push(req.needs_person);
+                Approval::Yes
+            }
+        }
+        let person = Arc::new(Person(Mutex::new(Vec::new())));
+        let mut run = base(dir.path());
+        run.auto_approve = true;
+        run.tainted = true;
+        run.approver = Some(person.clone());
+        let seen = Seen::default();
+        let out = run_with_transport(editor(script(), seen.clone()), run)
+            .await
+            .unwrap();
+        assert_eq!(out.text, "[allowed] wrote it");
+        assert_eq!(*lock(&person.0), [true]);
+        assert_eq!(*lock(&seen.prompts), ["fix it"]);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// Snapshots before and after find every file changed in between:
+    /// edited (clean or already dirty), created, deleted, restored, and
+    /// committed; untouched dirty files are not listed.
+    #[tokio::test]
+    async fn snapshots_find_the_files_an_agent_changed() {
+        let repo = crate::worktree::tests::repo();
+        let root = repo.path();
+        for f in ["b.txt", "c.txt", "d.txt", "e.txt"] {
+            std::fs::write(root.join(f), f).unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "more"]);
+        // Dirty before the run: a.txt and d.txt edited, u.txt untracked.
+        std::fs::write(root.join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(root.join("d.txt"), "dirty d\n").unwrap();
+        std::fs::write(root.join("u.txt"), "untracked\n").unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let before = Snapshot::take(root).await.unwrap();
+
+        // The "agent": edits a dirty file and a clean one, creates one in a
+        // new directory, deletes one, restores d.txt, and commits c.txt.
+        std::fs::write(root.join("a.txt"), "dirtier\n").unwrap();
+        std::fs::write(root.join("b.txt"), "edited\n").unwrap();
+        std::fs::write(sub.join("new.rs"), "fn main() {}\n").unwrap();
+        std::fs::remove_file(root.join("e.txt")).unwrap();
+        git(root, &["checkout", "--", "d.txt"]);
+        std::fs::write(root.join("c.txt"), "committed\n").unwrap();
+        git(root, &["add", "c.txt"]);
+        git(root, &["commit", "-q", "-m", "agent"]);
+
+        let top = std::fs::canonicalize(root).unwrap();
+        let mut changed: Vec<String> = before
+            .changed(root)
+            .await
+            .iter()
+            .filter_map(|p| p.strip_prefix(root).or_else(|_| p.strip_prefix(&top)).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        changed.sort();
+        changed.dedup();
+        assert_eq!(
+            changed,
+            ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "sub/new.rs"]
+        );
+        // Asked from a subdirectory, paths keep the caller's spelling.
+        let from_sub = Snapshot::take(&sub).await.unwrap();
+        std::fs::write(sub.join("new.rs"), "fn main() { todo!() }\n").unwrap();
+        let changed = from_sub.changed(&sub).await;
+        assert!(changed.contains(&sub.join("new.rs")), "{changed:?}");
+
+        // No repository, no snapshot.
+        let plain = tempfile::tempdir().unwrap();
+        assert!(Snapshot::take(plain.path()).await.is_none());
     }
 
     #[test]

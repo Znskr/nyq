@@ -39,8 +39,12 @@ graph, scripts). Old sessions, settings and permission files keep loading.
   `"deny": ["exec when tainted-by:web"]`, and apply in every mode. The
   classifier now reviews every tool, not only `bash`. `"taint": {"mode":
   "strict"}` turns on built-in rules. Taint follows a delegated task into the
-  subagent, sticks to every later call of a script that read untrusted
-  content, and stays on a script's result.
+  subagent (and across a named child's later messages and resumes), sticks to
+  every later call of a script that read untrusted content, and stays on a
+  script's result. An external agent's report and the files it changed (found
+  from git) carry `external:<name>` and its task's taint; a tainted task for
+  one always needs a person's approval (denied headless) and runs in its own
+  worktree when it can.
 - **Parallel waves and argument validation**: each tool declares its effects.
   Reads run in parallel, writes to disjoint paths run together, commands run
   alone. Arguments are checked against the tool's schema before anything runs

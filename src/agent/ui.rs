@@ -28,6 +28,10 @@ pub struct ApprovalRequest<'a> {
     /// The raw rule "always, and save" would write to permissions.json
     /// (e.g. `bash:cargo test`); None when saving isn't offered.
     pub save_rule: Option<String>,
+    /// Only a person may answer: a frontend that approves on its own (print
+    /// mode with yolo, the `ci` profile) denies instead. Set for a tainted
+    /// call to an external agent and for its permission requests.
+    pub needs_person: bool,
 }
 
 /// Everything the loop needs from a frontend.

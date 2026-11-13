@@ -69,6 +69,15 @@ pub struct Record {
     /// turn still treats that message as evidence (see `crate::taint`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<crate::taint::Delegation>,
+    /// What its taint index keeps across turns: the tainted messages it was
+    /// given and the files written from untrusted content (see
+    /// `crate::taint::Ledger`). Absent in records from older versions.
+    #[serde(
+        default,
+        deserialize_with = "crate::taint::de_ledger",
+        skip_serializing_if = "crate::taint::Ledger::is_empty"
+    )]
+    pub taint: crate::taint::Ledger,
 }
 
 impl Record {
@@ -88,6 +97,7 @@ impl Record {
             isolation: None,
             worktree: None,
             delegation: None,
+            taint: Default::default(),
         }
     }
 
