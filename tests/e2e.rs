@@ -815,7 +815,9 @@ fn env_sets_permission_mode_and_step_limit() {
         "NYQ_PERMISSION_MODE=yolo allows writes"
     );
 
-    let (url, _seen) = fake_server(vec![vec![tool_call("read_file", json!({"path": "x.txt"}))]]);
+    // A cap of 1 plus the 3-step grace: four model steps, then the notice.
+    let read = || vec![tool_call("read_file", json!({"path": "x.txt"}))];
+    let (url, seen) = fake_server(vec![read(), read(), read(), read()]);
     let out = ask_command(work.path(), home.path(), &url)
         .env("NYQ_MAX_AGENT_STEPS", "1")
         .args(["--json", "read x"])
@@ -828,10 +830,14 @@ fn env_sets_permission_mode_and_step_limit() {
         v["notices"][0]
             .as_str()
             .unwrap()
-            .contains("Stopped after 1 model steps"),
+            .contains("Stopped after 1 model steps (+3 to finish)"),
         "{v}"
     );
     assert_eq!(v["tool_calls"][0]["status"], "ok");
+    assert_eq!(v["tool_calls"].as_array().unwrap().len(), 4, "{v}");
+    // The model was told when the cap was reached.
+    let bodies = serde_json::to_string(&*seen.lock().unwrap()).unwrap();
+    assert!(bodies.contains("All 1 model steps are used"), "{bodies}");
 }
 
 /// A model endpoint that accepts connections and never answers.
