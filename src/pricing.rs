@@ -45,6 +45,39 @@ fn from_catalog(home: &Path, provider: &str, model: &str) -> Option<Price> {
         .or_else(|| lookup(provider, model))
 }
 
+/// DeepSeek's own API (api.deepseek.com) list prices, USD per million tokens,
+/// at the standard (peak) rate; DeepSeek's off-peak hours are half price.
+/// Source: api-docs.deepseek.com/quick_start/pricing (read 2026-11-13).
+pub fn deepseek_official(model: &str) -> Option<Price> {
+    let m = model.to_ascii_lowercase();
+    let (cached, input, output) = if m.starts_with("deepseek-v4-pro") {
+        (0.044, 1.32, 3.96)
+    } else if m.starts_with("deepseek-flash") {
+        (0.006, 0.3, 1.2)
+    } else {
+        return None;
+    };
+    Some(Price {
+        input,
+        output,
+        cached,
+        cache_write: input,
+    })
+}
+
+/// The price for a run's cost report. A `deepseek` route is priced only on
+/// DeepSeek's own API (the catalog, else [`deepseek_official`]); on any other
+/// endpoint serving a DeepSeek model the price is unknown.
+pub fn for_run(home: &Path, provider: &str, model: &str, endpoint: Option<&str>) -> Option<Price> {
+    if provider == "deepseek" {
+        if !endpoint.is_some_and(crate::provider::deepseek::is_official) {
+            return None;
+        }
+        return from_catalog(home, provider, model).or_else(|| deepseek_official(model));
+    }
+    lookup(home, provider, model)
+}
+
 pub fn lookup(home: &Path, provider: &str, model: &str) -> Option<Price> {
     if provider == "codex" || provider == "grok" {
         return None;
@@ -74,6 +107,39 @@ pub fn lookup(home: &Path, provider: &str, model: &str) -> Option<Price> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deepseek_is_priced_only_on_its_own_api() {
+        let home = tempfile::tempdir().unwrap();
+        let u = Usage {
+            input_tokens: 1_000_000,
+            cached_tokens: 500_000,
+            output_tokens: 100_000,
+            ..Usage::default()
+        };
+        let p = for_run(
+            home.path(),
+            "deepseek",
+            "deepseek-v4-pro",
+            Some("https://api.deepseek.com/anthropic/v1"),
+        )
+        .unwrap();
+        // 0.5M miss * 1.32 + 0.5M hit * 0.044 + 0.1M out * 3.96
+        assert!((p.cost(u) - (0.66 + 0.022 + 0.396)).abs() < 1e-9);
+        assert!(for_run(
+            home.path(),
+            "deepseek",
+            "deepseek-v4-pro",
+            Some("https://llm.example.test/v1")
+        )
+        .is_none());
+        assert!(for_run(
+            home.path(),
+            "deepseek",
+            "some-other-model",
+            Some("https://api.deepseek.com/v1")
+        )
+        .is_none());
+    }
     #[test]
     fn cached_input_is_not_billed_twice() {
         let p = Price {

@@ -1318,10 +1318,11 @@ async fn print_mode(
         let _ = s.flush();
     }
     if ask.json {
-        let price = pricing::lookup(
+        let price = pricing::for_run(
             &crate::config::home(),
             agent.provider.name(),
             agent.provider.model(),
+            agent.provider.endpoint().as_deref(),
         );
         let mut value = ask_json_usage(
             plain.record.as_ref(),
