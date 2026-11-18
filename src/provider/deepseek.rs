@@ -38,10 +38,37 @@ pub const TOOL_CHANGES_BETA: &str = "mid-conversation-tool-changes-2026-07-01";
 /// Conversation id header the endpoint uses for routing and caching.
 const SESSION_HEADER: &str = "x-deepseek-harness-session-id";
 
-/// Default per-request output cap.
+/// Default per-request output cap on DeepSeek's own API.
 pub const DEFAULT_MAX_TOKENS: u64 = 256_000;
-/// Context window when nothing describes the model.
+/// Context window when nothing describes the model, on DeepSeek's own API.
 pub const DEFAULT_CONTEXT: u64 = 1_000_000;
+/// Conservative context window for another endpoint that describes nothing.
+pub const FALLBACK_CONTEXT: u64 = 131_072;
+/// Conservative output cap for another endpoint that describes nothing (the
+/// server may reject a prompt whose size plus `max_tokens` exceeds its window).
+pub const FALLBACK_MAX_TOKENS: u64 = 32_768;
+
+/// Whether `base_url` is DeepSeek's own API (`api.deepseek.com`).
+pub fn is_official(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|h| h == "api.deepseek.com")
+}
+
+/// The configured output cap: `NYQ_MAX_OUTPUT_TOKENS`, else
+/// `max_output_tokens` in settings (positive values only).
+pub fn configured_max_output() -> Option<u64> {
+    std::env::var("NYQ_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .or_else(|| {
+            crate::settings::current()
+                .max_output_tokens
+                .filter(|n| *n > 0)
+        })
+}
 /// What the official listing declares for `deepseek-v4-pro`/`deepseek-flash`.
 const KNOWN_CONTEXT: u64 = 1_048_576;
 
@@ -120,26 +147,40 @@ pub fn capabilities(model: &str, listed: Option<&ListedModel>, meta: Option<&Mod
     }
 }
 
-/// The context window for a model: the listing, then the catalog, then
-/// the known 1,048,576 of `deepseek-v4-pro`/`deepseek-flash`, then 1M.
-pub fn context_window(model: &str, listed: Option<&ListedModel>, meta: Option<&ModelMeta>) -> u64 {
+/// The context window for a model: the listing, then the catalog; on
+/// DeepSeek's own API (`official`) then the known 1,048,576 of
+/// `deepseek-v4-pro`/`deepseek-flash`, then 1M; elsewhere a conservative
+/// [`FALLBACK_CONTEXT`].
+pub fn context_window(
+    model: &str,
+    listed: Option<&ListedModel>,
+    meta: Option<&ModelMeta>,
+    official: bool,
+) -> u64 {
     listed
         .and_then(|l| l.context)
         .or_else(|| meta.and_then(|m| m.context))
-        .unwrap_or(if is_flash(model) || is_pro(model) {
+        .unwrap_or(if !official {
+            FALLBACK_CONTEXT
+        } else if is_flash(model) || is_pro(model) {
             KNOWN_CONTEXT
         } else {
             DEFAULT_CONTEXT
         })
 }
 
-/// The output cap for a model: the listing's `max_output_tokens`, then
-/// the catalog's, then 256_000.
-pub fn max_tokens(listed: Option<&ListedModel>, meta: Option<&ModelMeta>) -> u64 {
-    listed
-        .and_then(|l| l.max_output)
+/// The output cap for a model: `NYQ_MAX_OUTPUT_TOKENS` / `max_output_tokens`,
+/// then the listing's `max_output_tokens`, then the catalog's; then 256,000
+/// on DeepSeek's own API and a conservative [`FALLBACK_MAX_TOKENS`] elsewhere.
+pub fn max_tokens(listed: Option<&ListedModel>, meta: Option<&ModelMeta>, official: bool) -> u64 {
+    configured_max_output()
+        .or_else(|| listed.and_then(|l| l.max_output))
         .or_else(|| meta.and_then(|m| m.output))
-        .unwrap_or(DEFAULT_MAX_TOKENS)
+        .unwrap_or(if official {
+            DEFAULT_MAX_TOKENS
+        } else {
+            FALLBACK_MAX_TOKENS
+        })
 }
 
 /// A `GET {origin}/models` entry, decoded per dsh's listing contract.
@@ -201,11 +242,21 @@ pub fn models_url(base_url: &str) -> String {
         .unwrap_or_else(|| format!("{}/models", base_url.trim_end_matches('/')))
 }
 
-/// Every model `GET {origin}/models` lists.
-pub async fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<ListedModel>> {
-    let url = models_url(base_url);
+/// Where to look for the model list: `{origin}/models` (DeepSeek's
+/// layout), then `{base}/models` (an OpenAI-style `/v1/models`, as many
+/// gateways serve it).
+fn listing_urls(base_url: &str) -> Vec<String> {
+    let mut urls = vec![models_url(base_url)];
+    let second = format!("{}/models", base_url.trim_end_matches('/'));
+    if !urls.contains(&second) {
+        urls.push(second);
+    }
+    urls
+}
+
+async fn list_models_at(url: &str, key: Option<&str>) -> Result<Vec<ListedModel>> {
     let request = crate::http::client()
-        .get(&url)
+        .get(url)
         .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
         .header("accept", "application/json")
         .timeout(std::time::Duration::from_secs(10));
@@ -215,9 +266,24 @@ pub async fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<Listed
     let data = page["data"]
         .as_array()
         .context("the model list has no data")?;
-    let models: Vec<ListedModel> = data.iter().filter_map(parse_listed).collect();
-    remember(base_url, &models);
-    Ok(models)
+    Ok(data.iter().filter_map(parse_listed).collect())
+}
+
+/// Every model the endpoint lists (the first listing URL that answers with
+/// one; see [`listing_urls`]).
+pub async fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<ListedModel>> {
+    let mut last = None;
+    for url in listing_urls(base_url) {
+        match list_models_at(&url, key).await {
+            Ok(models) if !models.is_empty() => {
+                remember(base_url, &models);
+                return Ok(models);
+            }
+            Ok(_) => last = Some(anyhow::anyhow!("{url}: the model list is empty")),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no model list")))
 }
 
 /// What the listing said per (models URL, model id); None = asked, no answer.
@@ -1105,6 +1171,29 @@ mod tests {
     }
 
     #[test]
+    fn the_listing_is_looked_for_at_the_origin_then_under_the_base() {
+        assert_eq!(
+            listing_urls("https://api.deepseek.com/anthropic/v1"),
+            vec![
+                "https://api.deepseek.com/models",
+                "https://api.deepseek.com/anthropic/v1/models"
+            ]
+        );
+        assert_eq!(
+            listing_urls("https://gateway.example/v1"),
+            vec![
+                "https://gateway.example/models",
+                "https://gateway.example/v1/models"
+            ]
+        );
+        // An OpenAI-style gateway row with only a context window.
+        let row =
+            parse_listed(&json!({"id": "m", "object": "model", "context_window": 524288})).unwrap();
+        assert_eq!(context_window("m", Some(&row), None, false), 524_288);
+        assert_eq!(max_tokens(Some(&row), None, false), FALLBACK_MAX_TOKENS);
+    }
+
+    #[test]
     fn listing_decoding() {
         let entry = json!({
             "id": "deepseek-flash",
@@ -1138,13 +1227,24 @@ mod tests {
         assert!(!caps.system_in_history && !caps.vision && caps.tool_update.is_none());
         // Context: listing > catalog > known 1,048,576 > 1M.
         assert_eq!(
-            context_window("deepseek-flash", Some(&listed), None),
+            context_window("deepseek-flash", Some(&listed), None, true),
             1_048_576
         );
-        assert_eq!(context_window("deepseek-v4-pro", None, None), 1_048_576);
-        assert_eq!(context_window("unknown", None, None), 1_000_000);
-        assert_eq!(max_tokens(Some(&listed), None), 256_000);
-        assert_eq!(max_tokens(None, None), 256_000);
+        assert_eq!(
+            context_window("deepseek-v4-pro", None, None, true),
+            1_048_576
+        );
+        assert_eq!(context_window("unknown", None, None, true), 1_000_000);
+        assert_eq!(max_tokens(Some(&listed), None, true), 256_000);
+        assert_eq!(max_tokens(None, None, true), 256_000);
+        // Another endpoint that describes nothing gets conservative limits.
+        assert_eq!(
+            context_window("deepseek-v4-pro", None, None, false),
+            FALLBACK_CONTEXT
+        );
+        assert_eq!(max_tokens(None, None, false), FALLBACK_MAX_TOKENS);
+        assert!(is_official("https://api.deepseek.com/anthropic/v1"));
+        assert!(!is_official("https://llm.example.test/v1"));
         assert_eq!(
             models_url("https://api.deepseek.com/anthropic/v1"),
             "https://api.deepseek.com/models"

@@ -592,7 +592,12 @@ impl HostedProvider {
             let meta = self.models.get(&id);
             ModelChoice {
                 provider: self.service.id().into(),
-                context_window: Some(deepseek::context_window(&id, listed, meta)),
+                context_window: Some(deepseek::context_window(
+                    &id,
+                    listed,
+                    meta,
+                    deepseek::is_official(&self.base_url),
+                )),
                 efforts: meta
                     .map(|m| m.efforts.clone())
                     .filter(|e| !e.is_empty())
@@ -699,6 +704,9 @@ impl HostedProvider {
         {
             provider.max_tokens = output.clamp(1_024, 64_000);
         }
+        if let Some(n) = deepseek::configured_max_output() {
+            provider.max_tokens = n;
+        }
         provider.stream(req, on_event).await
     }
 
@@ -713,9 +721,10 @@ impl HostedProvider {
         provider.effort = self.effort.clone();
         provider.headers = self.headers();
         provider.caps = deepseek::capabilities(&self.model, listed.as_ref(), self.meta());
-        provider.max_tokens = deepseek::max_tokens(listed.as_ref(), self.meta());
+        let official = deepseek::is_official(&self.base_url);
+        provider.max_tokens = deepseek::max_tokens(listed.as_ref(), self.meta(), official);
         provider.context_window =
-            deepseek::context_window(&self.model, listed.as_ref(), self.meta());
+            deepseek::context_window(&self.model, listed.as_ref(), self.meta(), official);
         provider.session = Some(self.session.clone());
         provider.state = Arc::clone(&self.deepseek);
         provider.stream(req, on_event).await
@@ -776,6 +785,7 @@ impl Provider for HostedProvider {
                 &self.model,
                 self.deepseek_info().as_ref(),
                 self.meta(),
+                deepseek::is_official(&self.base_url),
             ));
         }
         self.info()
@@ -783,12 +793,22 @@ impl Provider for HostedProvider {
             .or_else(|| self.meta().and_then(|m| m.context))
     }
     fn max_output_tokens(&self) -> Option<u64> {
-        // Matches the cap `stream_anthropic` sends; other protocols send none.
+        // Matches the cap `stream_deepseek` / `stream_anthropic` sends, so
+        // compaction keeps room for it; other protocols send none.
+        if self.is_deepseek() {
+            return Some(deepseek::max_tokens(
+                self.deepseek_info().as_ref(),
+                self.meta(),
+                deepseek::is_official(&self.base_url),
+            ));
+        }
         (self.service == Service::Anthropic).then(|| {
-            self.info()
-                .and_then(|i| i.max_output)
-                .or_else(|| self.meta().and_then(|m| m.output))
-                .map_or(32_000, |o| o.clamp(1_024, 64_000))
+            deepseek::configured_max_output().unwrap_or_else(|| {
+                self.info()
+                    .and_then(|i| i.max_output)
+                    .or_else(|| self.meta().and_then(|m| m.output))
+                    .map_or(32_000, |o| o.clamp(1_024, 64_000))
+            })
         })
     }
     fn set_conversation(&mut self, id: &str) {
@@ -1365,10 +1385,11 @@ mod tests {
         );
         assert!(request.contains("x-deepseek-harness-session-id: conv-ds"));
         let body = body_of(&request);
-        // The DeepSeek wire: effort in output_config, string system, big caps.
+        // The DeepSeek wire: effort in output_config, string system; a local
+        // endpoint whose listing gives no output cap gets the conservative one.
         assert_eq!(body["thinking"], json!({"type":"enabled"}));
         assert_eq!(body["output_config"]["effort"], "low");
-        assert_eq!(body["max_tokens"], 256_000);
+        assert_eq!(body["max_tokens"], super::deepseek::FALLBACK_MAX_TOKENS);
         assert_eq!(body["system"], "sys");
         assert!(!body.to_string().contains("budget_tokens"));
         task.await.unwrap();

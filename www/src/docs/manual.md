@@ -97,7 +97,13 @@ third-party tools to use consumer subscriptions.
 extensions: reasoning effort `off`, `low`, `high` (default) or `max`; models that
 support it get system-prompt and tool-list changes appended in the history, so the
 cached prefix survives; and DeepSeek's own cache-hit counters show in usage. The
-Anthropic-compatible setup above still works too.
+Anthropic-compatible setup above still works too. Model limits come from the endpoint's model
+listing (`GET {origin}/models`, then `{base}/models` as OpenAI-style gateways serve
+it): `context_window` and `max_output_tokens`. On `api.deepseek.com` an unlisted model
+gets 1M context and a 256k output cap; on any other endpoint that lists nothing, nyq
+assumes 128k context and a 32k output cap (a server rejects a request whose prompt plus
+`max_tokens` exceeds its window). `max_output_tokens` in settings.toml or
+`NYQ_MAX_OUTPUT_TOKENS` sets the output cap; `NYQ_CONTEXT_WINDOW` the window.
 
 **Any OpenAI-compatible API** (OpenAI, OpenRouter, vLLM, Ollama, llama.cpp, …):
 
@@ -1490,6 +1496,7 @@ compares two result files.
 |---|---|
 | `NYQ_PERMISSION_MODE=ask\|auto\|yolo` | default permission mode, below `--permission-mode`/`--yolo` and above settings (also applies to `-p`) |
 | `NYQ_DEBUG=1` | like `--debug`: developer-only features (the `/tools` menu) for this run |
+| `NYQ_MAX_OUTPUT_TOKENS=N` | per-request output cap (`max_tokens`) for the DeepSeek and Anthropic wires; also `max_output_tokens` in settings.toml. Default: the endpoint's listing or catalog value, else 256k on `api.deepseek.com` and 32k elsewhere |
 | `NYQ_MAX_AGENT_STEPS=N` | cap on model requests per turn (default unlimited; 0 is unlimited; also `max_agent_steps` in settings.toml). At 80% the model is told to make its best edit; after the cap it gets 3 steps to finish, then nyq stops with a notice |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `NYQ_ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` | the `anthropic` provider: key (`x-api-key`), bearer token, Anthropic-compatible endpoint, default model |
 | `NYQ_NO_OPEN_BROWSER=1` | sign-in flows print the URL instead of opening a browser (also when stdin is not a terminal) |

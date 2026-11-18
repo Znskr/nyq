@@ -251,6 +251,25 @@ impl Agent {
         specs
     }
 
+    /// Follow the provider's context window once it knows more (a listing
+    /// fetched during a request); `NYQ_CONTEXT_WINDOW` still wins.
+    pub(crate) fn refresh_context_window(&mut self) {
+        if self.context_window == 0 {
+            return; // compaction off (tests, or NYQ_CONTEXT_WINDOW=0)
+        }
+        // Only a window the provider reports: no report keeps what was set.
+        let Some(reported) = self.provider.context_window() else {
+            return;
+        };
+        let w = crate::config::context_window_for(self.provider.name(), Some(reported));
+        if w > 0 && w != self.context_window {
+            crate::trace::log("provider", || {
+                format!("context window {} -> {w}", self.context_window)
+            });
+            self.set_context_window(w);
+        }
+    }
+
     /// Start a fresh conversation (keeps provider, tools and grants).
     pub fn reset(&mut self, session: Option<Session>) {
         self.items.clear();

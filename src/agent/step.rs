@@ -322,6 +322,8 @@ impl Agent {
                 ui.notice("The reply was cut off at the output limit.");
             }
             self.account_usage(response.usage, ui);
+            // The first request may have fetched the endpoint's model listing.
+            self.refresh_context_window();
             // W9: token and cost budgets.
             self.task_spent(response.usage);
             if let Some(u) = response.usage {

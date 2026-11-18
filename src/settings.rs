@@ -256,6 +256,11 @@ pub struct Settings {
     /// warns at 80% and grants a short grace to finish.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_agent_steps: Option<usize>,
+    /// Per-request output cap sent to the model (`NYQ_MAX_OUTPUT_TOKENS`
+    /// overrides it). Unset: the endpoint's listing or catalog value, else a
+    /// default that depends on the endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     /// Show categories and skill sources in slash-command results.
     pub slash_menu_categories: bool,
     /// `auto` (follow the terminal background), `dark` or `light`. `NYQ_THEME` overrides it.
@@ -323,6 +328,7 @@ impl Default for Settings {
             prompt_history: true,
             auto_upgrade: true,
             max_agent_steps: None,
+            max_output_tokens: None,
             slash_menu_categories: true,
             theme: "auto".into(),
             theme_colors: Map::new(),
