@@ -261,7 +261,7 @@ pub(crate) fn read_new(id: u32) -> Result<String, String> {
         if slice.is_empty() {
             out.push_str("(no new output)");
         } else {
-            out.push_str(&render_output(slice, 0));
+            out.push_str(&crate::sandbox::first_notes_only(render_output(slice, 0)));
         }
         out
     })

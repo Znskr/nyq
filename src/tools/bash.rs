@@ -242,7 +242,7 @@ async fn run_command(
         None => (None, false),
     };
     let mut is_error = timed_out || failed;
-    let mut content = bytes;
+    let mut content = crate::sandbox::first_notes_only(bytes);
     if timed_out {
         let secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
         push_line(

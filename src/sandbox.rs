@@ -87,6 +87,27 @@ impl Default for Policy {
     }
 }
 
+/// Helper notes already shown to the model in this process.
+static SHOWN_NOTES: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// The sandbox helper prints its notes (e.g. ".git metadata stays writable"
+/// when a nested user namespace refuses the mounts) on every command. Keep
+/// each distinct note the first time only; `SECURITY` warnings always stay.
+pub fn first_notes_only(text: String) -> String {
+    if !text.contains("nyq sandbox: ") {
+        return text;
+    }
+    let mut shown = SHOWN_NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    let shown = shown.get_or_insert_with(Default::default);
+    text.split_inclusive('\n')
+        .filter(|line| {
+            let l = line.trim_end();
+            !l.starts_with("nyq sandbox: ") || l.contains("SECURITY") || shown.insert(l.to_string())
+        })
+        .collect()
+}
+
 /// First argument of the hidden re-exec helper: `nyq __sandbox ...`.
 pub const HELPER_ARG: &str = "__sandbox";
 
@@ -1921,6 +1942,22 @@ mod linux {
             assert!(parse(&["--net".into()]).is_err());
             assert!(parse(&["--bogus".into(), "--".into(), "x".into()]).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod note_tests {
+    #[test]
+    fn repeated_helper_notes_are_shown_once_security_always() {
+        let note =
+            "nyq sandbox: .git metadata stays writable: open_tree /x/.git: denied (note-test)\n";
+        let first = super::first_notes_only(format!("{note}hello\n"));
+        assert_eq!(first, format!("{note}hello\n"));
+        let again = super::first_notes_only(format!("{note}hello\n"));
+        assert_eq!(again, "hello\n");
+        let sec = "nyq sandbox: SECURITY: .git was swapped (note-test)\n";
+        assert_eq!(super::first_notes_only(sec.into()), sec);
+        assert_eq!(super::first_notes_only(sec.into()), sec);
     }
 }
 
