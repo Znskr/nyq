@@ -72,6 +72,8 @@ pub struct TaskRuntime {
     pub(crate) options: Option<TaskOptions>,
     pub(crate) runner: Option<Arc<dyn CommandRunner>>,
     pub(crate) judge: Option<Arc<dyn JudgeRunner>>,
+    /// Off-task drift in the running turn (plain turns too; see `drift.rs`).
+    pub(crate) drift: super::drift::Drift,
     /// Test seam: the step cap for `drive` (Some(None) = unlimited) instead of
     /// `step_limit()`'s settings/env lookup.
     pub(crate) step_cap: Option<Option<usize>>,
@@ -108,6 +110,11 @@ impl Agent {
         self.task.state = None;
         self.task.outcome = None;
         self.task.memo_evidence = None;
+    }
+
+    /// The running turn's task state, when the turn is managed.
+    pub(super) fn task_state_mut(&mut self) -> Option<&mut TaskState> {
+        self.task.state.as_mut()
     }
 
     pub fn task_spec(&self) -> Option<&TaskSpec> {
@@ -1098,6 +1105,9 @@ impl Agent {
                         StallReason::Cycle => "it keeps repeating itself",
                         StallReason::BudgetLow => "its budget is nearly gone",
                         StallReason::ConsecutiveFailures => "it keeps failing without progress",
+                        StallReason::OffTask => {
+                            "it keeps working outside the workspace without changing it"
+                        }
                     };
                     return self.escalate(why, ui, cancel).await;
                 }

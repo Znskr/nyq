@@ -686,7 +686,11 @@ streams keeps the partial text, marked `[interrupted by the user]`. A turn has n
 limit by default: it runs until the model finishes, you press Esc, or a task budget ends
 it. With an explicit cap (`max_agent_steps` / `NYQ_MAX_AGENT_STEPS`; 0 is unlimited) nyq
 tells the model at 80% to make its best edit now, gives it 3 more steps after the cap to
-finish, then stops with a notice instead of an error. If a file changes
+finish, then stops with a notice instead of an error. If 15 tool rounds in a row change nothing in the
+workspace while most of the calls download, install, or work in temporary or home
+directories outside it, nyq steers the model back to editing the code (in a typed task
+this is a stall for the escalation ladder); edits made through the shell in a git
+workspace count as changes. If a file changes
 while its edit or write waits for approval, the call is refused rather than applying a
 diff you didn't see.
 

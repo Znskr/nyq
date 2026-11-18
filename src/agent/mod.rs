@@ -4,6 +4,7 @@
 mod ask;
 mod compact;
 mod dispatch;
+mod drift;
 mod journal;
 mod note;
 mod permission_rules;

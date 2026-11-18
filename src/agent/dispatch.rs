@@ -363,6 +363,7 @@ impl Agent {
                 let (id, name, arguments) = &calls[i];
                 let out = self.run_script_call(id, name, arguments, ui, cancel).await;
                 self.task_observe(name, arguments, &out, None);
+                self.drift_observe(name, arguments, &out, None);
                 images.extend(self.record_result(id, name, out));
                 i += 1;
                 continue;
@@ -411,6 +412,12 @@ impl Agent {
             {
                 // W9: touched files, the background verifier, the cycle detector.
                 self.task_observe(
+                    name,
+                    arguments,
+                    &out,
+                    footprint.as_ref().map(Footprint::ran),
+                );
+                self.drift_observe(
                     name,
                     arguments,
                     &out,

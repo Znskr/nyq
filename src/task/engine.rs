@@ -780,6 +780,9 @@ pub fn stall_note(reason: StallReason, state: &TaskState) -> String {
             "[Task] Your budget is running low. {} Concentrate on getting a submission accepted.",
             budget_line(&state.budget)
         ),
+        StallReason::OffTask => "[Task] Many steps have changed nothing in the workspace and went to downloads, installs or \
+             files outside it. Make your best edit to the code here now, then check it with what is available locally."
+            .into(),
         StallReason::ConsecutiveFailures | StallReason::Cycle => format!(
             "[Task] This has now failed {} times. Repeating the same fix will not change the outcome: re-read the latest error, \
              check your assumptions about the code, and try a different approach.",

@@ -186,6 +186,9 @@ pub enum StallReason {
     BudgetLow,
     /// The build or the validators keep failing.
     ConsecutiveFailures,
+    /// Many rounds without a workspace change, mostly downloads, installs or
+    /// work outside the workspace (`agent::drift`).
+    OffTask,
 }
 
 /// The rungs, in order.

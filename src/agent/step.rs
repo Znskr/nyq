@@ -206,6 +206,7 @@ impl Agent {
         let warn_at = max_steps.map(|n| (n * 4).div_ceil(5).max(1));
         // W9: a fresh task state (budget, ladder, verifier baseline).
         self.task_begin();
+        self.drift_begin();
         // A Stop hook may keep the turn going once.
         let mut stop_continued = false;
         // Failing calls by (tool, arguments), to stop the model looping on one.
@@ -430,6 +431,9 @@ impl Agent {
                 );
                 self.push_counted(Item::User { text, images });
             }
+            // Many quiet rounds of off-site work: steer back to the code (a
+            // typed task gets a stall for its ladder instead).
+            self.drift_after_round(ui);
             // W9: an accepted `submit` or a spent budget ends the task; a
             // stall climbs the escalation ladder.
             if let Some(end) = self.task_after_round(ui, &cancel).await? {
