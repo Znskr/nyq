@@ -26,23 +26,18 @@ impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command in the workspace and return its combined stdout and \
-                stderr. Long output keeps its beginning and end; the full text is stored and can be read \
-                with read_tool_result. Non-zero exits are reported as errors with \"exit code N\" appended \
-                (except benign ones such as grep finding no match or diff finding differences). The command runs in its own process group with a \
-                timeout in seconds (default 120, max 600); on timeout or cancellation the whole \
-                group is terminated. Set run_in_background for servers, watchers and other long-running \
-                commands: it returns a process id at once; read new output with bash_output, wait for a line, \
-                port or exit with process_wait, and stop it with kill_shell. Add interactive to drive a REPL \
-                or prompt with process_write."
+            description: "Run a command with bash -c in the workspace; returns stdout and stderr. Long output keeps \
+                its start and end (the rest via read_tool_result). A non-zero exit is an error (\"exit code N\"). \
+                Timeout in seconds: default 120, max 600. run_in_background (servers, watchers) returns an id at \
+                once: read with bash_output, stop with kill_shell; process_wait and process_write via load_tools."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The command line to run with bash -c."},
-                    "timeout_secs": {"type": "integer", "description": "Kill the process group after this many seconds (default 120, max 600)."},
-                    "run_in_background": {"type": "boolean", "description": "Start the command in the background and return its id immediately (no timeout)."},
-                    "interactive": {"type": "boolean", "description": "With run_in_background: keep stdin open so process_write can send input (REPLs, prompts). Otherwise stdin is empty."}
+                    "command": {"type": "string"},
+                    "timeout_secs": {"type": "integer"},
+                    "run_in_background": {"type": "boolean"},
+                    "interactive": {"type": "boolean", "description": "Background only: keep stdin open for process_write."}
                 },
                 "required": ["command"]
             }),

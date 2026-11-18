@@ -7,6 +7,7 @@ mod bash;
 pub(crate) use bash::{live_tail, run_shell};
 mod fs;
 pub(crate) use fs::FileLedger;
+pub(crate) mod deferred;
 mod html;
 pub mod image;
 pub(crate) mod mcp_search;
@@ -659,6 +660,8 @@ pub struct Registry {
     tools: Vec<Entry>,
     /// MCP tools picked with `mcp_select_tool` while MCP tools are deferred.
     selected: HashSet<String>,
+    /// Deferred built-in tools loaded with `load_tools` (or by a direct call).
+    loaded: HashSet<String>,
     live: Option<LiveTools>,
     /// Tool changes from extensions (`crate::extensions`).
     extensions: Option<LiveTools>,
@@ -906,26 +909,60 @@ impl Registry {
             .collect()
     }
 
-    /// The tools offered to the model on the next request. When MCP tools are
-    /// too many to list, only selected ones are, plus the search/select tools.
+    /// Rarely needed built-in tools whose schemas are left out of requests
+    /// until loaded (`load_tools`, or a first direct call). `skill` is listed
+    /// directly when skills are installed.
+    fn deferred_builtin(&self, name: &str) -> bool {
+        deferred::DEFERRED.contains(&name)
+            && !self.loaded.contains(name)
+            && !(name == "skill" && !self.skills.is_empty())
+            && !deferred::disabled_by_env()
+    }
+
+    /// The tools offered to the model on the next request. Rarely needed
+    /// built-in tools are listed in `load_tools` instead of sent in full; when
+    /// MCP tools are too many to list, only selected ones are, plus the
+    /// search/select tools.
     pub fn advertised(&self) -> Vec<ToolSpec> {
-        let mcp = self.mcp_specs();
-        if !mcp_search::should_defer(&mcp) {
-            return self.specs();
-        }
-        let mut out: Vec<ToolSpec> = self
-            .specs()
-            .into_iter()
-            .filter(|s| !mcp_search::is_mcp(&s.name) || self.selected.contains(&s.name))
+        let all = self.specs();
+        let held: Vec<ToolSpec> = all
+            .iter()
+            .filter(|s| self.deferred_builtin(&s.name))
+            .cloned()
             .collect();
-        out.extend(mcp_search::meta_specs(&mcp));
+        let mcp = self.mcp_specs();
+        let defer_mcp = mcp_search::should_defer(&mcp);
+        let mut out: Vec<ToolSpec> = all
+            .into_iter()
+            .filter(|s| !self.deferred_builtin(&s.name))
+            .filter(|s| {
+                !defer_mcp || !mcp_search::is_mcp(&s.name) || self.selected.contains(&s.name)
+            })
+            .collect();
+        if defer_mcp {
+            out.extend(mcp_search::meta_specs(&mcp));
+        }
+        if !held.is_empty() {
+            out.push(deferred::load_spec(&held));
+        }
         out
     }
 
-    /// `mcp_search_tools` / `mcp_select_tool` while MCP tools are deferred.
+    /// `mcp_search_tools` / `mcp_select_tool` while MCP tools are deferred;
+    /// `load_tools` while built-in tools are deferred.
     pub fn is_meta(&self, name: &str) -> bool {
-        (name == mcp_search::SEARCH || name == mcp_search::SELECT)
-            && mcp_search::should_defer(&self.mcp_specs())
+        ((name == mcp_search::SEARCH || name == mcp_search::SELECT)
+            && mcp_search::should_defer(&self.mcp_specs()))
+            || (name == deferred::LOAD
+                && self.specs().iter().any(|s| self.deferred_builtin(&s.name)))
+    }
+
+    /// A direct call to a deferred built-in tool loads it, so its schema is
+    /// listed from the next request on.
+    pub fn note_called(&mut self, name: &str) {
+        if deferred::DEFERRED.contains(&name) {
+            self.loaded.insert(name.to_string());
+        }
     }
 
     /// A direct call to an MCP tool whose schema is hidden until it is selected.
@@ -947,6 +984,25 @@ impl Registry {
     /// Run `mcp_search_tools` / `mcp_select_tool` (None for any other call,
     /// or when MCP tools are not being deferred).
     pub fn handle_meta(&mut self, name: &str, arguments: &str) -> Option<ToolOutput> {
+        if name == deferred::LOAD {
+            let args: Value = serde_json::from_str(arguments).unwrap_or_default();
+            let available: Vec<String> = self
+                .specs()
+                .into_iter()
+                .filter(|s| deferred::DEFERRED.contains(&s.name.as_str()))
+                .map(|s| s.name)
+                .collect();
+            return Some(match deferred::load(&args, &available) {
+                Ok(names) => {
+                    self.loaded.extend(names.iter().cloned());
+                    ToolOutput::ok(format!(
+                        "Loaded {}. Their schemas are listed from the next step; call them then.",
+                        names.join(", ")
+                    ))
+                }
+                Err(e) => ToolOutput::err(e),
+            });
+        }
         if name != mcp_search::SEARCH && name != mcp_search::SELECT {
             return None;
         }
@@ -996,6 +1052,45 @@ impl SecretRoots {
 mod registry_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn rare_built_in_tools_are_deferred_behind_load_tools() {
+        let mut r = Registry::all_builtin();
+        let names = |r: &Registry| {
+            r.advertised()
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+        };
+        let listed = names(&r);
+        assert!(listed.contains(&"bash".to_string()) && listed.contains(&"edit_file".to_string()));
+        assert!(listed.contains(&deferred::LOAD.to_string()));
+        assert!(!listed.contains(&"session_search".to_string()));
+        // load_tools lists the held-back tools and loads them for the next request.
+        let load = r
+            .advertised()
+            .into_iter()
+            .find(|s| s.name == deferred::LOAD)
+            .unwrap();
+        assert!(load
+            .description
+            .contains("session_search (search past conversation)"));
+        assert!(r.is_meta(deferred::LOAD));
+        let out = r
+            .handle_meta(deferred::LOAD, r#"{"names": ["session_search"]}"#)
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(names(&r).contains(&"session_search".to_string()));
+        // A direct call loads a deferred tool too.
+        r.note_called("memory");
+        assert!(names(&r).contains(&"memory".to_string()));
+        // Unknown names are refused.
+        assert!(
+            r.handle_meta(deferred::LOAD, r#"{"names": ["bash"]}"#)
+                .unwrap()
+                .is_error
+        );
+    }
 
     /// Every built-in tool's static kind, decided here on purpose: a new
     /// tool fails this test until someone says what it is. (The default

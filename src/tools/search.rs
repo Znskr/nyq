@@ -100,19 +100,17 @@ impl Tool for GlobFiles {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "glob".into(),
-            description: "Find files matching a glob pattern (e.g. \"**/*.rs\", \"src/**/*.ts\"), \
-                respecting .gitignore. Returns paths relative to the search root, \
-                newest-modified first, 200 per page (use offset to page). With mode=\"count\", \
-                returns only the number of matching files."
+            description: "Find files by glob pattern, e.g. \"**/*.rs\" (respects .gitignore): paths newest first, \
+                200 per page; mode count returns only the number."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Glob pattern, matched against paths relative to the search root."},
-                    "path": {"type": "string", "description": "Directory to search (default: the workspace root)."},
-                    "mode": {"type": "string", "enum": ["list", "count"], "description": "\"list\" returns paths (default); \"count\" returns the number of matches."},
-                    "offset": {"type": "integer", "description": "Skip this many paths (for paging; default 0)."},
-                    "limit": {"type": "integer", "description": format!("Paths per page (default {MAX_GLOB}, max {MAX_PAGE}).")}
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string", "description": "Directory (default: the workspace)."},
+                    "mode": {"type": "string", "enum": ["list", "count"]},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer", "description": format!("Default {MAX_GLOB}, max {MAX_PAGE}.")}
                 },
                 "required": ["pattern"]
             }),
@@ -259,23 +257,21 @@ impl Tool for Grep {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep".into(),
-            description: "Search file contents with a regular expression, respecting .gitignore. \
-                Returns matching lines as \"path:line: text\" (300 per page, long lines truncated; \
-                `context` adds surrounding lines as \"path-line- text\"), with output=\"files\" just the \
-                paths of files containing matches, or with output=\"count\" the number of matching lines \
-                per file. Lines over 16 MiB return an error. Page with offset/limit. Use glob to restrict which files are searched."
+            description: "Search file contents by regex (respects .gitignore). Lines come back as \"path:line: text\" \
+                (context lines as \"path-line- text\"), 300 per page; output files/count gives paths or per-file counts. \
+                Page with offset/limit."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Regular expression to search for."},
-                    "path": {"type": "string", "description": "File or directory to search (default: the workspace root)."},
-                    "glob": {"type": "string", "description": "Only search files matching this glob pattern (e.g. \"*.rs\")."},
-                    "case_insensitive": {"type": "boolean", "description": "Match without regard to case (default false)."},
-                    "output": {"type": "string", "enum": ["content", "files", "count"], "description": "\"content\" returns matching lines (default); \"files\" the matching files; \"count\" matching lines per file."},
-                    "context": {"type": "integer", "description": format!("Lines of context before and after each match (content output; default 0, max {MAX_CONTEXT}).")},
-                    "offset": {"type": "integer", "description": "Skip this many results (lines, or files) for paging (default 0)."},
-                    "limit": {"type": "integer", "description": format!("Results per page (default {MAX_GREP}, max {MAX_PAGE}).")}
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string", "description": "File or directory (default: the workspace)."},
+                    "glob": {"type": "string", "description": "Only files matching this glob, e.g. \"*.rs\"."},
+                    "case_insensitive": {"type": "boolean"},
+                    "output": {"type": "string", "enum": ["content", "files", "count"]},
+                    "context": {"type": "integer", "description": format!("Lines around each match (max {MAX_CONTEXT}).")},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer", "description": format!("Default {MAX_GREP}, max {MAX_PAGE}.")}
                 },
                 "required": ["pattern"]
             }),

@@ -821,9 +821,9 @@ impl Tool for BashOutput {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "bash_output".into(),
-            description: "Read output from a background process started with bash run_in_background: returns \
-                only what it printed since the last read, plus whether it is still running or its exit status."
-                .into(),
+            description:
+                "New output of a background process since the last read, and whether it still runs."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {"id": {"type": "integer", "description": ID_SCHEMA}},

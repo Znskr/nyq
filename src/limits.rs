@@ -50,6 +50,11 @@ pub const LIMITS: &[(&str, Option<usize>, &str)] = &[
         None,
         "all project instructions together",
     ),
+    (
+        "read_file_bytes",
+        Some(12 * 1024),
+        "each read_file result, cut at a whole line (the rest via `offset`)",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

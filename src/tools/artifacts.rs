@@ -212,17 +212,16 @@ impl Tool for ReadToolResult {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: TOOL.into(),
-            description: "Read a large tool result that was stored because it was too long to show in full, by the id \
-                given in the truncated output. Page with offset/limit (bytes) or find lines with query. Only results \
-                from this session are available; it cannot read arbitrary files."
+            description: "Page through (offset/limit, bytes) or search (query) a large tool result stored in this \
+                session, by the id its truncated output gives."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Stored tool result id, copied exactly from the truncated output."},
-                    "offset": {"type": "integer", "description": "Byte offset to start at (default 0)."},
-                    "limit": {"type": "integer", "description": "Bytes to return (default 8192, max 65536)."},
-                    "query": {"type": "string", "description": "Instead of a range, return the lines containing this literal text."}
+                    "id": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer", "description": "Default 8192, max 65536."},
+                    "query": {"type": "string", "description": "Return the lines containing this text."}
                 },
                 "required": ["id"]
             }),

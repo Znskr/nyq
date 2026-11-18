@@ -395,18 +395,15 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: concat!(
-                "Read a text file from the workspace, returning numbered lines in the form \"     N\\tline\". ",
-                "Starts at 1-based line `offset` and returns up to `limit` lines (default 2000); ",
-                "long lines are truncated at 2000 chars. Use offset/limit to page through large files."
-            )
-            .into(),
+            description: "Read a text file as numbered lines (\"N\\tline\"), from line `offset` (1-based), up to \
+                `limit` lines or about 12 KB; a longer file ends with the offset to continue from."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path, relative to the workspace root or absolute."},
-                    "offset": {"type": "integer", "description": "1-based line number to start at."},
-                    "limit": {"type": "integer", "description": "Maximum number of lines to return (default 2000)."}
+                    "path": {"type": "string", "description": "Relative to the workspace, or absolute."},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer", "description": "Default 2000."}
                 },
                 "required": ["path"]
             }),
@@ -462,6 +459,9 @@ impl Tool for ReadFile {
         let mut line_no: u64 = 0;
         let mut emitted: u64 = 0;
         let mut more: u64 = 0;
+        // Whole lines up to the byte cap; the rest is paged with `offset`.
+        let cap = crate::limits::get("read_file_bytes");
+        let mut capped = false;
         let limit = limit as u64;
         let offset = offset as u64;
         loop {
@@ -482,9 +482,16 @@ impl Tool for ReadFile {
             if line_no < offset {
                 continue;
             }
-            if emitted < limit {
+            if emitted < limit && !capped {
+                let before = out.len();
                 push_numbered(&mut out, line_no, &text, exceeds);
-                emitted += 1;
+                if emitted > 0 && cap.is_some_and(|c| out.len() > c) {
+                    out.truncate(before);
+                    capped = true;
+                    more += 1;
+                } else {
+                    emitted += 1;
+                }
             } else {
                 more += 1;
             }
@@ -500,8 +507,13 @@ impl Tool for ReadFile {
             ));
         }
         if more > 0 {
+            let why = if capped {
+                format!("output capped at {} KB; ", cap.unwrap_or_default() / 1024)
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "({more} more lines below — use offset {} to read on)\n",
+                "({why}{more} more lines below — use offset {} to read on)\n",
                 offset + emitted
             ));
         }
@@ -520,13 +532,12 @@ impl Tool for ListDir {
         ToolSpec {
             name: "list_dir".into(),
             description:
-                "List the entries of a directory: sorted, one per line, up to 500 entries, \
-                directories suffixed with '/'. Defaults to the workspace root."
+                "List a directory (default: the workspace), sorted, up to 500 entries; directories end in '/'."
                     .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Directory to list, relative to the workspace root or absolute (default: the root)."}
+                    "path": {"type": "string"}
                 }
             }),
         }
@@ -627,14 +638,14 @@ impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
-            description: "Write text to a file, creating parent directories as needed. Overwrites \
-                any existing content; the approval prompt shows a diff of old vs new."
-                .into(),
+            description:
+                "Write a whole file (creating parent directories), replacing any existing content."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path, relative to the workspace root or absolute."},
-                    "content": {"type": "string", "description": "Full new content of the file."}
+                    "path": {"type": "string"},
+                    "content": {"type": "string", "description": "The whole new content."}
                 },
                 "required": ["path", "content"]
             }),
@@ -700,18 +711,16 @@ impl Tool for EditFile {
         ToolSpec {
             name: "edit_file".into(),
             description:
-                "Edit a text file by replacing `old_string` with `new_string` (exact text \
-                match). Fails if `old_string` is not found, or if it occurs more than once unless \
-                `replace_all` is true (then all occurrences are replaced). Preserves the file's \
-                existing line endings; the approval prompt shows the resulting diff."
+                "Replace `old_string` with `new_string` in a text file (exact match; line endings kept). \
+                Fails if it is missing, or not unique unless replace_all."
                     .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path, relative to the workspace root or absolute."},
-                    "old_string": {"type": "string", "description": "Exact text to replace (include surrounding lines to make it unique)."},
-                    "new_string": {"type": "string", "description": "Replacement text."},
-                    "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."}
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string", "description": "Exact text; include nearby lines to make it unique."},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"}
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
@@ -1028,24 +1037,21 @@ impl Tool for MultiEdit {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "multi_edit".into(),
-            description: "Apply a list of `edit_file`-style replacements to one file, in order, \
-                atomically: if any edit fails nothing is written and the error names the \
-                failing edit's index. Each edit is `{old_string, new_string, replace_all?}` \
-                with the same matching and CRLF rules as edit_file."
+            description: "Apply several edit_file replacements to one file in order, all or nothing (a failure \
+                names the edit's index)."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path, relative to the workspace root or absolute."},
+                    "path": {"type": "string"},
                     "edits": {
                         "type": "array",
-                        "description": "Replacements applied in order; all or nothing.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "old_string": {"type": "string", "description": "Exact text to replace."},
-                                "new_string": {"type": "string", "description": "Replacement text."},
-                                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."}
+                                "old_string": {"type": "string"},
+                                "new_string": {"type": "string"},
+                                "replace_all": {"type": "boolean"}
                             },
                             "required": ["old_string", "new_string"]
                         },
@@ -1529,17 +1535,13 @@ impl Tool for ApplyPatch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "apply_patch".into(),
-            description: "Apply a patch to one or more files. Accepts a standard unified diff \
-                (multi-file, tolerant of small line-offset and trailing-whitespace fuzz) \
-                and the Codex format (`*** Begin Patch` with `*** Update File:` / \
-                `*** Add File:` / `*** Delete File:` sections, ending `*** End Patch`). \
-                Every hunk of every file is validated before anything is written; on a \
-                mid-write failure earlier files are restored."
+            description: "Apply a unified diff (multi-file, small fuzz allowed) or a `*** Begin Patch` patch \
+                (Update/Add/Delete File sections). All hunks are checked before anything is written."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "patch": {"type": "string", "description": "The full patch text (unified diff or `*** Begin Patch` format)."}
+                    "patch": {"type": "string"}
                 },
                 "required": ["patch"]
             }),
@@ -1720,6 +1722,45 @@ mod tests {
     fn prime(ctx: &ToolCtx, path: &str) {
         let out = run_ctx(&ReadFile, json!({"path": path}), ctx);
         assert!(!out.is_error, "{}", out.content);
+    }
+
+    #[test]
+    fn read_caps_output_at_whole_lines_and_says_where_to_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=2000)
+            .map(|i| format!("line number {i:05} padding padding\n"))
+            .collect();
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        let out = run(&ReadFile, json!({"path": "big.txt"}), dir.path());
+        assert!(!out.is_error);
+        let cap = crate::limits::get("read_file_bytes").unwrap();
+        assert!(out.content.len() < cap + 200, "{}", out.content.len());
+        let last = out.content.lines().last().unwrap();
+        assert!(
+            last.contains("output capped at") && last.contains("use offset"),
+            "{last}"
+        );
+        // Continuing from the given offset picks up the next whole line.
+        let next: u64 = last
+            .rsplit("use offset ")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let out = run(
+            &ReadFile,
+            json!({"path": "big.txt", "offset": next}),
+            dir.path(),
+        );
+        assert!(
+            out.content
+                .starts_with(&format!("{next:>6}\tline number {next:05}")),
+            "{}",
+            &out.content[..60]
+        );
     }
 
     #[test]

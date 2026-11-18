@@ -1236,6 +1236,8 @@ impl Agent {
         if let Some(msg) = self.tools.deferred_block(name) {
             return done(ui, name, &summary, ToolOutput::err(msg));
         }
+        // A deferred built-in called directly: list its schema from now on.
+        self.tools.note_called(name);
         let preview = self
             .tools
             .get(name)

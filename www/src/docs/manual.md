@@ -653,6 +653,14 @@ max_focused = 4      # more focused files show as outlines
 max_tokens_pct = 25  # share of the context window for file contents
 ```
 
+**Deferred tools.** To keep every request small, rarely needed built-in tools are not
+sent in full: `load_tools` lists them with a few words each (`edit_range`,
+`process_write`, `process_wait`, `session_search`, `memory`, `skill` when no skills are
+installed, `install_skill`, `workflow`, `run_code`, `send_message`, `wait_agent`, the
+`team_task_*` tools, the working-set tools and `note_intent`) and adds their schemas from
+the next step. Calling one directly also works and loads it. `NYQ_DEFER_TOOLS=0` sends
+every tool's schema on every request.
+
 **Tools menu** (with `--debug` or `NYQ_DEBUG=1`; otherwise `/tools` only says so and
 stays out of `/`, `/help` and completion). `/tools` lists every tool in tabs: built-in,
 each MCP server, and extensions, with a one-line description and badges: `off`
@@ -1496,4 +1504,6 @@ compares two result files.
 a larger SKILL.md or skill resource is not loaded), `skill_chunk_bytes` (32 KiB; the
 `skill` tool returns larger content in parts), `mcp_description_bytes`
 (off), `mcp_content_block_bytes` (8 KiB), `mcp_content_total_bytes` (32 KiB),
-`project_instruction_file_bytes` (off) and `project_instructions_total_bytes` (off).
+`project_instruction_file_bytes` (off), `project_instructions_total_bytes` (off) and
+`read_file_bytes` (12 KiB: a `read_file` result ends at the last whole line that fits, with
+the offset to continue from).
