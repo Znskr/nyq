@@ -682,9 +682,11 @@ ends with a note that is never saved (so the cached prompt prefix stays the same
 the task and its budget, the latest build state, the working set, recent intents,
 and the session state (permission mode, whether it can ask questions, and which
 background processes are running, with any server URL they printed). Pressing Esc while a reply
-streams keeps the partial text, marked `[interrupted by the user]`, and a turn that
-reaches the step limit (100, or `max_agent_steps` / `NYQ_MAX_AGENT_STEPS`) stops with a
-notice instead of an error. If a file changes
+streams keeps the partial text, marked `[interrupted by the user]`. A turn has no step
+limit by default: it runs until the model finishes, you press Esc, or a task budget ends
+it. With an explicit cap (`max_agent_steps` / `NYQ_MAX_AGENT_STEPS`; 0 is unlimited) nyq
+tells the model at 80% to make its best edit now, gives it 3 more steps after the cap to
+finish, then stops with a notice instead of an error. If a file changes
 while its edit or write waits for approval, the call is refused rather than applying a
 diff you didn't see.
 
@@ -1476,7 +1478,7 @@ compares two result files.
 |---|---|
 | `NYQ_PERMISSION_MODE=ask\|auto\|yolo` | default permission mode, below `--permission-mode`/`--yolo` and above settings (also applies to `-p`) |
 | `NYQ_DEBUG=1` | like `--debug`: developer-only features (the `/tools` menu) for this run |
-| `NYQ_MAX_AGENT_STEPS=N` | model requests per turn before nyq stops with a notice (default 100; also `max_agent_steps` in settings.toml) |
+| `NYQ_MAX_AGENT_STEPS=N` | cap on model requests per turn (default unlimited; 0 is unlimited; also `max_agent_steps` in settings.toml). At 80% the model is told to make its best edit; after the cap it gets 3 steps to finish, then nyq stops with a notice |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `NYQ_ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` | the `anthropic` provider: key (`x-api-key`), bearer token, Anthropic-compatible endpoint, default model |
 | `NYQ_NO_OPEN_BROWSER=1` | sign-in flows print the URL instead of opening a browser (also when stdin is not a terminal) |
 | `NYQ_SOUND=off\|on\|max` | overrides the sound setting |

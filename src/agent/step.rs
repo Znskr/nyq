@@ -13,31 +13,48 @@ use super::{Agent, TurnEnd, Ui};
 use crate::tools::ToolCtx;
 use crate::types::{Item, Request, StreamEvent};
 
-/// Default upper bound on model round-trips per user turn.
-const MAX_STEPS: usize = 100;
+/// Extra model steps after an explicit step cap is reached, so a turn that
+/// hits the cap still gets to make its final edit and answer.
+const GRACE_STEPS: usize = 3;
 
-/// The step limit: `NYQ_MAX_AGENT_STEPS`, else `max_agent_steps` in
-/// settings, else [`MAX_STEPS`], with where it came from.
-pub fn step_limit() -> (usize, &'static str) {
-    let parse = |v: &str| v.trim().parse::<usize>().ok().filter(|n| *n > 0);
+/// The step cap: `NYQ_MAX_AGENT_STEPS`, else `max_agent_steps` in settings,
+/// with where it came from. None (the default, or an explicit 0) is
+/// unlimited: a turn runs until the model stops, the user cancels, or a task
+/// budget ends it.
+pub fn step_limit() -> (Option<usize>, &'static str) {
+    let parse = |v: &str| v.trim().parse::<usize>().ok();
     if let Some(n) = std::env::var("NYQ_MAX_AGENT_STEPS")
         .ok()
         .as_deref()
         .and_then(parse)
     {
-        return (n, "NYQ_MAX_AGENT_STEPS");
+        return ((n > 0).then_some(n), "NYQ_MAX_AGENT_STEPS");
     }
-    match crate::settings::current()
-        .max_agent_steps
-        .filter(|n| *n > 0)
-    {
-        Some(n) => (n, "settings"),
-        None => (MAX_STEPS, "default"),
+    match crate::settings::current().max_agent_steps {
+        Some(n) => ((n > 0).then_some(n), "settings"),
+        None => (None, "default"),
     }
 }
 
-fn max_steps() -> usize {
-    step_limit().0
+/// The step cap for display: a number, or "unlimited".
+pub fn describe_step_limit(limit: Option<usize>) -> String {
+    limit.map_or_else(|| "unlimited".into(), |n| n.to_string())
+}
+
+/// Sent once when 80% of an explicit step cap is used.
+fn budget_note(used: usize, max: usize) -> String {
+    format!(
+        "[Step budget] {used} of {max} model steps used. The budget is nearly spent: make your best edit now, \
+         then finish with a short summary of what changed and what is left."
+    )
+}
+
+/// Sent when an explicit step cap is reached; a short grace follows.
+fn final_note(max: usize) -> String {
+    format!(
+        "[Step budget] All {max} model steps are used. You have {GRACE_STEPS} more: if the change is not in \
+         yet, make your best edit now; then stop and give your final answer."
+    )
 }
 
 const CONTINUE_NOTE: &str = "\n\nThe previous response was interrupted or cut off. Continue from where you stopped. Do not repeat text you already wrote.";
@@ -185,7 +202,8 @@ impl Agent {
         continue_note: bool,
     ) -> Result<TurnEnd> {
         // W9: a task's own step budget may raise the limit.
-        let max_steps = self.task_max_steps(max_steps());
+        let max_steps = self.task_max_steps(self.task.step_cap.unwrap_or_else(|| step_limit().0));
+        let warn_at = max_steps.map(|n| (n * 4).div_ceil(5).max(1));
         // W9: a fresh task state (budget, ladder, verifier baseline).
         self.task_begin();
         // A Stop hook may keep the turn going once.
@@ -194,9 +212,19 @@ impl Agent {
         let mut failures: HashMap<(String, String), usize> = HashMap::new();
         // A context-overflow error is retried once after compacting.
         let mut overflow_retried = false;
-        for step in 0..max_steps {
+        for step in 0.. {
             if cancel.is_cancelled() {
                 return Ok(TurnEnd::Cancelled);
+            }
+            if let Some(max) = max_steps {
+                if step >= max + GRACE_STEPS {
+                    break;
+                }
+                if step == max {
+                    self.push_counted(Item::user(final_note(max)));
+                } else if Some(step) == warn_at && step < max {
+                    self.push_counted(Item::user(budget_note(step, max)));
+                }
             }
             self.child_results(ui, &cancel, false).await?;
             self.sync_estimate();
@@ -411,12 +439,15 @@ impl Agent {
                 self.push_counted(item);
             }
         }
+        // Only an explicit cap ends the loop (see `step_limit`).
+        let max_steps = max_steps.unwrap_or_default();
         // W9: a typed task that never got a result is exhausted.
         self.task_out_of_steps(ui);
         // Not an error: the work so far is kept and the user can go on.
         ui.notice(&format!(
-            "Stopped after {max_steps} model steps without a final answer. Send a message to continue \
-             (the limit is NYQ_MAX_AGENT_STEPS or max_agent_steps in settings)."
+            "Stopped after {max_steps} model steps (+{GRACE_STEPS} to finish) without a final answer. Send a \
+             message to continue (the cap is NYQ_MAX_AGENT_STEPS or max_agent_steps in settings; 0 or unset \
+             is unlimited)."
         ));
         self.submitted = self.items.len();
         Ok(TurnEnd::Done)
@@ -506,13 +537,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_step_limit_ends_the_turn_with_a_notice() {
+    async fn an_explicit_step_cap_warns_then_grants_a_grace_then_ends_the_turn() {
+        const CAP: usize = 10;
         let (tool, _) = probe("mcp__x__go", unknown_fx, false);
-        let script = (0..MAX_STEPS)
+        let script = (0..CAP + GRACE_STEPS)
             .map(|_| reply(vec![call("a", "mcp__x__go", serde_json::json!({}))]))
             .collect();
         let mut agent = scripted(script);
         agent.tools.add(Box::new(tool));
+        agent.task.step_cap = Some(Some(CAP));
         let mut ui = NoticeCatch(Vec::new());
         let end = agent
             .turn(Item::user("go"), &mut ui, CancellationToken::new())
@@ -520,10 +553,65 @@ mod tests {
             .unwrap();
         assert!(matches!(end, TurnEnd::Done));
         assert!(
-            ui.0.iter().any(|n| n.contains("Stopped after")),
+            ui.0.iter().any(|n| n.contains("Stopped after 10")),
             "{:?}",
             ui.0
         );
+        let notes: Vec<&str> = agent
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::User { text, .. } if text.starts_with("[Step budget]") => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("8 of 10") && notes[0].contains("make your best edit now"));
+        assert!(notes[1].contains("All 10 model steps"));
+        // The grace steps ran: every scripted reply was used.
+        let calls = agent
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::ToolCall { .. }))
+            .count();
+        assert_eq!(calls, CAP + GRACE_STEPS);
+    }
+
+    #[tokio::test]
+    async fn without_a_cap_the_turn_runs_past_the_old_limit() {
+        // 120 steps: more than the former default of 100.
+        let (tool, _) = probe("mcp__x__go", unknown_fx, false);
+        let mut script: Vec<Response> = (0..120)
+            .map(|_| reply(vec![call("a", "mcp__x__go", serde_json::json!({}))]))
+            .collect();
+        script.push(Response {
+            truncated: false,
+            items: vec![Item::Assistant {
+                text: "done".into(),
+            }],
+            usage: None,
+        });
+        let mut agent = scripted(script);
+        agent.tools.add(Box::new(tool));
+        agent.task.step_cap = Some(None);
+        let mut ui = NoticeCatch(Vec::new());
+        let end = agent
+            .turn(Item::user("go"), &mut ui, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(end, TurnEnd::Done));
+        assert!(
+            !ui.0.iter().any(|n| n.contains("Stopped after")),
+            "{:?}",
+            ui.0
+        );
+        assert!(matches!(agent.items.last(), Some(Item::Assistant { text }) if text == "done"));
+    }
+
+    #[test]
+    fn step_limit_zero_or_unset_is_unlimited() {
+        assert_eq!(describe_step_limit(None), "unlimited");
+        assert_eq!(describe_step_limit(Some(40)), "40");
     }
 
     #[tokio::test]

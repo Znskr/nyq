@@ -251,8 +251,9 @@ pub struct Settings {
     pub prompt_history: bool,
     /// Download and install new releases in the background (interactive sessions).
     pub auto_upgrade: bool,
-    /// Model round-trips per turn before nyq stops (default 100;
-    /// `NYQ_MAX_AGENT_STEPS` overrides it).
+    /// Model round-trips per turn before nyq stops (default: unlimited; 0 is
+    /// unlimited too; `NYQ_MAX_AGENT_STEPS` overrides it). With a cap, nyq
+    /// warns at 80% and grants a short grace to finish.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_agent_steps: Option<usize>,
     /// Show categories and skill sources in slash-command results.
@@ -861,7 +862,25 @@ pub fn note_cli_overrides(applied: Map<String, Value>) {
 /// for `--set`; for a merged list such as `disabled_tools` it is the
 /// highest contributing layer).
 pub fn dump_config() -> Value {
-    dump_config_with(&current(), &overrides())
+    let mut v = dump_config_with(&current(), &overrides());
+    // The effective step cap, also when unset (unlimited) or set by env.
+    let (limit, source) = crate::agent::step_limit();
+    if let Some(settings) = v.get_mut("settings").and_then(Value::as_object_mut) {
+        settings.insert(
+            "max_agent_steps".into(),
+            serde_json::json!({
+                "value": crate::agent::describe_step_limit(limit),
+                "source": if source == "NYQ_MAX_AGENT_STEPS" { "env" } else if limit.is_some() || source == "settings" {
+                    settings
+                        .get("max_agent_steps")
+                        .and_then(|e| e.get("source"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("settings")
+                } else { "default" },
+            }),
+        );
+    }
+    v
 }
 
 /// `dump_config` for a specific resolved pair (tests pass their own layers

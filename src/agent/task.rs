@@ -72,6 +72,9 @@ pub struct TaskRuntime {
     pub(crate) options: Option<TaskOptions>,
     pub(crate) runner: Option<Arc<dyn CommandRunner>>,
     pub(crate) judge: Option<Arc<dyn JudgeRunner>>,
+    /// Test seam: the step cap for `drive` (Some(None) = unlimited) instead of
+    /// `step_limit()`'s settings/env lookup.
+    pub(crate) step_cap: Option<Option<usize>>,
     /// What the accepted result's `--memo` entry keeps from this run.
     memo_evidence: Option<MemoEvidence>,
 }
@@ -257,10 +260,11 @@ impl Agent {
     // Step loop
     // -----------------------------------------------------------------
 
-    /// The loop's step limit, raised to a task's own step budget.
-    pub(super) fn task_max_steps(&self, limit: usize) -> usize {
+    /// The loop's step cap (None: unlimited), raised to a task's own step
+    /// budget; the task engine enforces that budget itself.
+    pub(super) fn task_max_steps(&self, limit: Option<usize>) -> Option<usize> {
         match &self.task.spec {
-            Some(s) if self.task_explicit() => limit.max(s.limits.steps as usize),
+            Some(s) if self.task_explicit() => limit.map(|l| l.max(s.limits.steps as usize)),
             _ => limit,
         }
     }
@@ -1540,7 +1544,7 @@ mod tests {
             assert!(!seen[0].last.contains("[Task]"), "{}", seen[0].last);
             assert!(f.agent.task_state().is_none());
             assert!(f.agent.take_task_outcome().is_none());
-            assert_eq!(f.agent.task_max_steps(7), 7);
+            assert_eq!(f.agent.task_max_steps(Some(7)), Some(7));
         }
     }
 

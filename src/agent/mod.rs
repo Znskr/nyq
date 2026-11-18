@@ -28,7 +28,7 @@ pub(crate) use permission_rules::{
     builtin_tool, file_grant_ok, file_grant_ok_in, inside, inside_any, is_file_tool, lexical,
     normalize_url, path_under_git, paths_under_git, program_base, resolved, subagent_mode,
 };
-pub use step::step_limit;
+pub use step::{describe_step_limit, step_limit};
 pub use task::TaskRuntime;
 #[cfg(test)]
 pub(crate) use test_support::test_agent;
