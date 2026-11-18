@@ -277,13 +277,6 @@ async fn run() -> Result<()> {
     for w in settings_warnings.into_iter().chain(color_warnings) {
         ui::error(&w);
     }
-    if cli.dump_config {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&settings::dump_config())?
-        );
-        return Ok(());
-    }
     limits::configure(&settings::current(), &cli.context_limit)?;
     let env_mode = env_permission_mode();
     let (permission_mode, mode_warning) = permissions::resolve_mode(
@@ -295,6 +288,42 @@ async fn run() -> Result<()> {
     )?;
     if let Some(w) = &mode_warning {
         ui::error(w);
+    }
+    if cli.dump_config {
+        // The settings layers, plus what this invocation's flags and env make
+        // effective (`--permission-mode`/`--yolo`/`NYQ_PERMISSION_MODE`, `--sandbox`).
+        let mut v = settings::dump_config();
+        if let Some(map) = v
+            .get_mut("settings")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            let source = if cli.permission_mode.is_some() || cli.yolo {
+                Some("cli")
+            } else if env_mode.is_some() {
+                Some("env")
+            } else {
+                None
+            };
+            if let Some(source) = source {
+                map.insert(
+                    "permission_mode".into(),
+                    serde_json::json!({"value": permission_mode.as_str(), "source": source}),
+                );
+            }
+            if let Some(sb) = cli.sandbox {
+                use clap::ValueEnum;
+                let name = sb
+                    .to_possible_value()
+                    .map(|p| p.get_name().to_string())
+                    .unwrap_or_default();
+                map.insert(
+                    "sandbox".into(),
+                    serde_json::json!({"value": name, "source": "cli"}),
+                );
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
     }
 
     // A profile's permission_mode counts as requested for this run (like an
