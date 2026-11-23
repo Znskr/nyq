@@ -710,8 +710,11 @@ diff you didn't see.
 
 **Agent effort.** `agent_effort` (`low`, `medium`, `high`; `NYQ_AGENT_EFFORT` overrides
 it) sets how much nyq checks its own code changes. Unset, headless runs (`-p`) use
-`medium` and interactive turns `low`, which adds nothing. At `medium`, when the model is about
-to answer after changing code, it is sent back once if nothing has run the changed code since the last change
+`medium` and interactive turns `low`, which adds nothing. At `medium`, a request that reads
+like a bug to fix gets one short note after it (reproduce the problem first, work out the
+expected behaviour from the code, set up the project's environment if it cannot run, fix
+the cause, work from the workspace); and when the model is about to answer after changing
+code, it is sent back once if nothing has run the changed code since the last change
 (a shell command that runs tests, a script or `python -c`; reading, editing and installing
 do not count), or if the last such run reported failures (a non-zero exit, or failure
 markers such as `1 failed`, `FAILED (errors=2)` or a traceback in the output). `high`

@@ -3,9 +3,13 @@
 //!
 //! Plausible but wrong changes mostly come from turns that end without
 //! running the changed code, that ship a test failure they saw, or that fix
-//! where a problem shows up instead of where it starts. One generic
-//! behaviour addresses that, using only what the turn itself did:
+//! where a problem shows up instead of where it starts. Two generic
+//! behaviours address that, using only what the turn itself did:
 //!
+//! * **approach** (medium and up): when a request reads like a bug to fix, one
+//!   short note after it: reproduce first, take the expected behaviour from
+//!   the code, set up the project's environment, fix the cause, and work from
+//!   the workspace;
 //! * **verify** (medium and up): when the model is about to answer and the
 //!   turn changed code, it is sent back if nothing ran the code since the last
 //!   change, or if the last such run reported failures (medium: once, high: up
@@ -220,6 +224,19 @@ pub fn run_failed(out: &ToolOutput) -> bool {
     out.is_error || FAILED.is_match(&text[start..])
 }
 
+/// A request that reads like something to fix.
+static BUG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(bugs?|fix(es|ed|ing)?|fail(s|ed|ing|ure)?|errors?|exceptions?|traceback|crash(es|ed|ing)?|broken|incorrect(ly)?|wrong|regression|raises?|doesn'?t work|not working|unexpected(ly)?|issue)\b",
+    )
+    .expect("bug regex")
+});
+
+pub fn looks_like_bug_fix(request: &str) -> bool {
+    let head = request.get(..8000).unwrap_or(request);
+    BUG.is_match(head)
+}
+
 /// Source files, by extension: a change to anything else (notes, data,
 /// generated output) does not ask for a test run.
 const CODE_EXTENSIONS: &[&str] = &[
@@ -336,6 +353,14 @@ pub(super) fn code_fingerprint(cwd: &std::path::Path) -> Option<u64> {
     Some(h.finish())
 }
 
+pub(crate) const APPROACH_NOTE: &str = "[Approach] This reads like a problem to fix in the code. Before editing, \
+reproduce it: a small script or test that shows the wrong behaviour, run to confirm it fails. Work out the correct \
+behaviour from the code, its tests and docs, not only from the report's example, and try a few variants of the \
+input. If the project cannot be imported or its tests cannot run, set up its environment first (a virtualenv, or \
+`python -m ensurepip`, with the configured package index) rather than stubbing parts out. Fix the cause where the \
+wrong value is produced, not only where it shows up. Work from the code here: looking elsewhere for a ready-made \
+fix costs time.";
+
 pub(crate) const VERIFY_NOTE: &str = "[Verify] You changed code and nothing has run it since the last change. \
 Before your final answer, run your reproduction and the existing tests closest to the change (the test modules for \
 the files you edited; a narrow selection with a timeout, so a slow suite does not stall you). If a test fails, fix \
@@ -347,7 +372,8 @@ above). Find out whether your change caused them, fix the cause and run the test
 happens on the original code may stay, and your answer must say so.";
 
 impl Agent {
-    /// Start of a turn: the effort in use and the git baseline.
+    /// Start of a turn: the effort in use, the git baseline, and the approach
+    /// note for a request that reads like a bug to fix.
     pub(super) fn diligence_begin(&mut self) {
         let root = self.usage_session_id.is_none();
         let headless = self.task.headless;
@@ -371,6 +397,19 @@ impl Agent {
             },
             ..Diligence::default()
         };
+        if !active {
+            return;
+        }
+        let request = self.items.iter().rev().find_map(|i| match i {
+            Item::User { text, .. } if !text.starts_with('[') => Some(text.as_str()),
+            _ => None,
+        });
+        if request.is_some_and(looks_like_bug_fix) {
+            crate::trace::log("task", || {
+                format!("agent effort {}: approach note", effort.name())
+            });
+            self.push_counted(Item::user(APPROACH_NOTE));
+        }
     }
 
     /// One tool call's result (next to [`Agent::drift_observe`]).
@@ -514,6 +553,19 @@ mod tests {
         assert!(!run_failed(&ok("0 failed")));
     }
 
+    #[test]
+    fn bug_fix_requests_are_recognised() {
+        assert!(looks_like_bug_fix(
+            "QuerySet.exclude() raises FieldError on annotated relations"
+        ));
+        assert!(looks_like_bug_fix(
+            "The parser gives the wrong result for empty input"
+        ));
+        assert!(looks_like_bug_fix("Fix the crash in the exporter"));
+        assert!(!looks_like_bug_fix("Add a --verbose flag to the CLI"));
+        assert!(!looks_like_bug_fix("Summarise what this module does"));
+    }
+
     use crate::agent::test_support::*;
     use crate::agent::TurnEnd;
     use crate::types::Response;
@@ -647,6 +699,7 @@ mod tests {
         )
         .await;
         assert!(ok);
+        assert_eq!(notes(&agent, "[Approach]"), 1);
         assert_eq!(notes(&agent, "[Verify]"), 1);
         assert!(
             notices.iter().any(|n| n.contains("asking for a test run")),
@@ -673,6 +726,7 @@ mod tests {
         )
         .await;
         assert!(ok);
+        assert_eq!(notes(&agent, "[Approach]"), 0);
         assert_eq!(notes(&agent, "[Verify] The last run"), 1);
     }
 
