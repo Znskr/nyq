@@ -114,7 +114,7 @@ pub(crate) fn classify(
 
 /// A hash of the workspace's git state (status and unstaged/staged diff), to
 /// notice changes made through the shell. None outside a git work tree.
-fn fingerprint(cwd: &Path) -> Option<u64> {
+pub(super) fn fingerprint(cwd: &Path) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let run = |args: &[&str]| {
         std::process::Command::new("git")

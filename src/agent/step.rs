@@ -207,6 +207,7 @@ impl Agent {
         // W9: a fresh task state (budget, ladder, verifier baseline).
         self.task_begin();
         self.drift_begin();
+        self.diligence_begin();
         // A Stop hook may keep the turn going once.
         let mut stop_continued = false;
         // Failing calls by (tool, arguments), to stop the model looping on one.
@@ -391,6 +392,12 @@ impl Agent {
                         }
                         Some(NoSubmit::End) => return Ok(TurnEnd::Done),
                         None => {}
+                    }
+                    // Agent effort: unverified or failing code changes, and
+                    // (high) the diff review, keep the turn going.
+                    if let Some(note) = self.diligence_finish(ui) {
+                        self.push_counted(note);
+                        continue;
                     }
                     self.sync_estimate();
                     let reason = crate::hooks::stop(self, &cancel).await;

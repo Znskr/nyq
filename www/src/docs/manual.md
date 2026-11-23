@@ -708,6 +708,18 @@ workspace count as changes. If a file changes
 while its edit or write waits for approval, the call is refused rather than applying a
 diff you didn't see.
 
+**Agent effort.** `agent_effort` (`low`, `medium`, `high`; `NYQ_AGENT_EFFORT` overrides
+it) sets how much nyq checks its own code changes. Unset, headless runs (`-p`) use
+`medium` and interactive turns `low`, which adds nothing. At `medium`, when the model is about
+to answer after changing code, it is sent back once if nothing has run the changed code since the last change
+(a shell command that runs tests, a script or `python -c`; reading, editing and installing
+do not count), or if the last such run reported failures (a non-zero exit, or failure
+markers such as `1 failed`, `FAILED (errors=2)` or a traceback in the output). `high`
+allows up to three such rounds. The same state of the code is never sent
+back twice, so a model that explains why nothing can run is not asked again. Turns that
+change no code, subagents and typed tasks are not affected, and nothing is added to the
+system prompt. `nyq doctor` and `--dump-config` show the setting.
+
 **Memory.** When you ask nyq to remember something, the `memory` tool (`add`, `list`,
 `remove`) saves it to `~/.nyq/memory.json`; saved facts are listed in the system
 prompt of later sessions (capped at 50 facts / 4000 characters). `/memory` lists
@@ -1497,6 +1509,7 @@ compares two result files.
 | `NYQ_PERMISSION_MODE=ask\|auto\|yolo` | default permission mode, below `--permission-mode`/`--yolo` and above settings (also applies to `-p`) |
 | `NYQ_DEBUG=1` | like `--debug`: developer-only features (the `/tools` menu) for this run |
 | `NYQ_MAX_OUTPUT_TOKENS=N` | per-request output cap (`max_tokens`) for the DeepSeek and Anthropic wires; also `max_output_tokens` in settings.toml. Default: the endpoint's listing or catalog value, else 256k on `api.deepseek.com` and 32k elsewhere |
+| `NYQ_AGENT_EFFORT=low\|medium\|high` | how much nyq checks its own code changes (see "Agent effort"); also `agent_effort` in settings.toml. Default: medium for `-p`, low interactively |
 | `NYQ_MAX_AGENT_STEPS=N` | cap on model requests per turn (default unlimited; 0 is unlimited; also `max_agent_steps` in settings.toml). At 80% the model is told to make its best edit; after the cap it gets 3 steps to finish, then nyq stops with a notice |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `NYQ_ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` | the `anthropic` provider: key (`x-api-key`), bearer token, Anthropic-compatible endpoint, default model |
 | `NYQ_NO_OPEN_BROWSER=1` | sign-in flows print the URL instead of opening a browser (also when stdin is not a terminal) |

@@ -74,6 +74,12 @@ pub struct TaskRuntime {
     pub(crate) judge: Option<Arc<dyn JudgeRunner>>,
     /// Off-task drift in the running turn (plain turns too; see `drift.rs`).
     pub(crate) drift: super::drift::Drift,
+    /// Verification and review of the turn's code changes (`diligence.rs`).
+    pub(crate) diligence: super::diligence::Diligence,
+    /// A print-mode (`-p`) run: diligence defaults to medium.
+    pub(crate) headless: bool,
+    /// The agent effort for this agent, over the setting (tests, embeddings).
+    pub(crate) effort: Option<super::diligence::Effort>,
     /// Test seam: the step cap for `drive` (Some(None) = unlimited) instead of
     /// `step_limit()`'s settings/env lookup.
     pub(crate) step_cap: Option<Option<usize>>,
@@ -156,7 +162,7 @@ impl Agent {
             .unwrap_or_else(TaskOptions::current)
     }
 
-    fn task_typed(&self) -> bool {
+    pub(super) fn task_typed(&self) -> bool {
         self.task.spec.as_ref().is_some_and(TaskSpec::is_typed)
     }
 

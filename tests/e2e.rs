@@ -173,6 +173,49 @@ fn print_mode_denies_mutations_without_yolo() {
         .contains("denied"));
 }
 
+#[test]
+fn print_mode_asks_to_run_changed_code_before_finishing() {
+    // Agent effort (headless default medium): a source change that nothing
+    // ran is sent back once with a [Verify] note; after a run the turn ends.
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let write_call = delta(
+        json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+        "function": {"name": "write_file", "arguments": "{\"path\":\"calc.py\",\"content\":\"print(1 + 1)\\n\"}"}}]}),
+    );
+    let run_call = delta(
+        json!({"tool_calls": [{"index": 0, "id": "call_2", "type": "function",
+        "function": {"name": "bash", "arguments": "{\"command\":\"python3 calc.py\"}"}}]}),
+    );
+    let (url, seen) = fake_server(vec![
+        vec![write_call],
+        vec![delta(json!({"content": "Written."}))],
+        vec![run_call],
+        vec![delta(json!({"content": "Ran it: prints 2."}))],
+    ]);
+    let out = Command::new(env!("CARGO_BIN_EXE_nyq"))
+        .args(["--print", "--yolo", "--sandbox", "off", "add calc.py"])
+        .current_dir(work.path())
+        .env("NYQ_HOME", home.path())
+        .env("HOME", home.path())
+        .env("NYQ_BASE_URL", &url)
+        .env("NYQ_MODEL", "fake-model")
+        .env_remove("NYQ_API_KEY")
+        .env_remove("NYQ_PROVIDER")
+        .env_remove("NYQ_AGENT_EFFORT")
+        .output()
+        .unwrap();
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Ran it: prints 2."), "stdout: {stdout}");
+    let bodies = serde_json::to_string(&*seen.lock().unwrap()).unwrap();
+    assert_eq!(
+        bodies.matches("[Verify] You changed code").count(),
+        2,
+        "sent with requests 3 and 4"
+    );
+}
+
 fn print_command(work: &std::path::Path, home: &std::path::Path, url: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nyq"));
     cmd.args([

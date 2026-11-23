@@ -1209,6 +1209,8 @@ async fn print_mode(
 ) -> Result<()> {
     let (cancel, signal) = cancel_on_signal();
     let mut plain = ui::PlainUi::new(agent.permission_mode.is_yolo());
+    // Agent effort: print mode defaults to medium (see agent/diligence.rs).
+    agent.task.headless = true;
     // W9: a typed task's stdout is its JSON result alone.
     plain.quiet = ask.quiet || ask.json || ask.task.is_task();
     plain.prompt = ask.prompt_permissions;

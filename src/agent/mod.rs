@@ -3,6 +3,7 @@
 
 mod ask;
 mod compact;
+mod diligence;
 mod dispatch;
 mod drift;
 mod journal;
@@ -19,6 +20,7 @@ mod ui;
 // workstreams' code, hence the `allow`.
 pub use ask::{AskUserTool, ASK_USER};
 pub use compact::set_auto_compact_percent;
+pub use diligence::{describe_effort, effort_setting};
 pub(crate) use journal::is_pure_read;
 #[allow(unused_imports)]
 pub use permission_rules::{

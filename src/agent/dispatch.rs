@@ -364,6 +364,7 @@ impl Agent {
                 let out = self.run_script_call(id, name, arguments, ui, cancel).await;
                 self.task_observe(name, arguments, &out, None);
                 self.drift_observe(name, arguments, &out, None);
+                self.diligence_observe(name, arguments, &out, None);
                 images.extend(self.record_result(id, name, out));
                 i += 1;
                 continue;
@@ -418,6 +419,12 @@ impl Agent {
                     footprint.as_ref().map(Footprint::ran),
                 );
                 self.drift_observe(
+                    name,
+                    arguments,
+                    &out,
+                    footprint.as_ref().map(Footprint::ran),
+                );
+                self.diligence_observe(
                     name,
                     arguments,
                     &out,

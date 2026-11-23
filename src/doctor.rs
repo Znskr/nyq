@@ -68,7 +68,8 @@ pub fn status(
         "mcp": servers.iter().map(|s| json!({"name": s.name, "connected": connected.iter().any(|(name, _)| name == &s.name)})).collect::<Vec<_>>(),
         "skills_count": skills_count, "permissions_file": crate::permissions::user_path(home),
         "project_permissions_file": crate::permissions::project_path(cwd), "context_window": context,
-        "max_agent_steps": crate::agent::describe_step_limit(crate::agent::step_limit().0), "trace": crate::trace::describe(),
+        "max_agent_steps": crate::agent::describe_step_limit(crate::agent::step_limit().0),
+        "agent_effort": crate::agent::describe_effort(crate::agent::effort_setting().0), "trace": crate::trace::describe(),
         "system_prompt_files": crate::prompt::prompt_files(cwd, home),
         "disabled_tools": crate::settings::current().disabled_tools,
         "disabled_skills": crate::settings::current().disabled_skills,
@@ -95,6 +96,7 @@ pub fn show_status(value: &Value, as_json: bool) -> Result<()> {
             "project_permissions_file",
             "context_window",
             "max_agent_steps",
+            "agent_effort",
             "trace",
             "system_prompt_files",
             "disabled_tools",
@@ -430,13 +432,15 @@ pub async fn doctor(
     ));
     checks.push(sessions_check(facts.sessions_dir));
     let (steps, steps_source) = crate::agent::step_limit();
+    let (effort, effort_source) = crate::agent::effort_setting();
     checks.push(info(
         "agent",
         true,
         format!(
-            "permission mode {} · step limit {} ({steps_source})",
+            "permission mode {} · step limit {} ({steps_source}) · agent effort {} ({effort_source})",
             facts.permission_mode.as_str(),
-            crate::agent::describe_step_limit(steps)
+            crate::agent::describe_step_limit(steps),
+            crate::agent::describe_effort(effort)
         ),
         "",
     ));

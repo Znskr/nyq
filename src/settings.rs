@@ -256,6 +256,12 @@ pub struct Settings {
     /// warns at 80% and grants a short grace to finish.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_agent_steps: Option<usize>,
+    /// How much nyq checks its own code changes in a turn: `low` (nothing
+    /// extra), `medium` (run changed code before finishing, fix failures)
+    /// or `high` (more rounds). Unset: `medium` for headless runs (`-p`), `low` interactively.
+    /// `NYQ_AGENT_EFFORT` overrides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_effort: Option<String>,
     /// Per-request output cap sent to the model (`NYQ_MAX_OUTPUT_TOKENS`
     /// overrides it). Unset: the endpoint's listing or catalog value, else a
     /// default that depends on the endpoint.
@@ -328,6 +334,7 @@ impl Default for Settings {
             prompt_history: true,
             auto_upgrade: true,
             max_agent_steps: None,
+            agent_effort: None,
             max_output_tokens: None,
             slash_menu_categories: true,
             theme: "auto".into(),
@@ -884,6 +891,21 @@ pub fn dump_config() -> Value {
                         .unwrap_or("settings")
                 } else { "default" },
             }),
+        );
+        // The effective agent effort, also when unset or set by env.
+        let (effort, source) = crate::agent::effort_setting();
+        let source = match source {
+            "NYQ_AGENT_EFFORT" => "env",
+            "settings" => settings
+                .get("agent_effort")
+                .and_then(|e| e.get("source"))
+                .and_then(Value::as_str)
+                .unwrap_or("settings"),
+            _ => "default",
+        };
+        settings.insert(
+            "agent_effort".into(),
+            serde_json::json!({"value": crate::agent::describe_effort(effort), "source": source}),
         );
     }
     v
