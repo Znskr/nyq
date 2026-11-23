@@ -718,7 +718,9 @@ code, it is sent back once if nothing has run the changed code since the last ch
 (a shell command that runs tests, a script or `python -c`; reading, editing and installing
 do not count), or if the last such run reported failures (a non-zero exit, or failure
 markers such as `1 failed`, `FAILED (errors=2)` or a traceback in the output). `high`
-allows up to three such rounds. The same state of the code is never sent
+allows up to three such rounds and adds one review of the diff before the final answer
+(source of the problem, other call sites, edge cases, preconditions of code it now calls,
+compatibility, and reporting exactly what ran). The same state of the code is never sent
 back twice, so a model that explains why nothing can run is not asked again. Turns that
 change no code, subagents and typed tasks are not affected, and nothing is added to the
 system prompt. `nyq doctor` and `--dump-config` show the setting.

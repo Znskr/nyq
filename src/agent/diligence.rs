@@ -3,7 +3,7 @@
 //!
 //! Plausible but wrong changes mostly come from turns that end without
 //! running the changed code, that ship a test failure they saw, or that fix
-//! where a problem shows up instead of where it starts. Two generic
+//! where a problem shows up instead of where it starts. Three generic
 //! behaviours address that, using only what the turn itself did:
 //!
 //! * **approach** (medium and up): when a request reads like a bug to fix, one
@@ -14,6 +14,9 @@
 //!   turn changed code, it is sent back if nothing ran the code since the last
 //!   change, or if the last such run reported failures (medium: once, high: up
 //!   to three times, never twice for the same state of the code);
+//! * **review** (high): once, a self-review of the diff before the final
+//!   answer (source of the problem, other call sites, edge cases,
+//!   preconditions, compatibility, honest reporting).
 //!
 //! A run is a shell command that executes code (tests, scripts, `python -c`,
 //! build tools: [`runs_code`]); a change is a file tool's write or a change in
@@ -120,6 +123,7 @@ pub struct Diligence {
     /// Git state when the last verify note was sent: the same state does not
     /// get a second one (the model said why it could not run anything).
     noted_at: Option<Option<u64>>,
+    reviewed: bool,
 }
 
 /// Wrappers and launchers that run the command after them.
@@ -371,6 +375,13 @@ pub(crate) const FAILED_NOTE: &str = "[Verify] The last run after your change re
 above). Find out whether your change caused them, fix the cause and run the tests again. Only a failure that also \
 happens on the original code may stay, and your answer must say so.";
 
+pub(crate) const REVIEW_NOTE: &str = "[Review] Before your final answer, review your diff (`git diff`). Is the fix \
+at the source of the problem rather than where it shows up? Do other call sites, subclasses or overrides of what \
+you changed need the same change? Which inputs and edge cases does it handle (empty or missing values, other forms \
+of the same input)? Does code you now call have preconditions you must meet? Is existing behaviour kept where it \
+should be? Fix what you find and rerun the related tests. Then answer, stating exactly what you ran and what \
+passed.";
+
 impl Agent {
     /// Start of a turn: the effort in use, the git baseline, and the approach
     /// note for a request that reads like a bug to fix.
@@ -446,7 +457,8 @@ impl Agent {
     }
 
     /// The model is about to give its final answer: the note to send back
-    /// instead, if the turn's code changes are unverified or failing.
+    /// instead, if the turn's code changes are unverified, failing, or (high)
+    /// not yet reviewed.
     pub(super) fn diligence_finish(&mut self, ui: &mut dyn Ui) -> Option<Item> {
         if !self.task.diligence.active {
             return None;
@@ -474,6 +486,12 @@ impl Agent {
                     "The last test run after the change failed: asking for a fix before finishing.",
                 )
             }
+        } else if d.effort == Effort::High && !d.reviewed {
+            d.reviewed = true;
+            (
+                REVIEW_NOTE,
+                "Asking for a review of the diff before finishing.",
+            )
         } else {
             return None;
         };
@@ -701,6 +719,7 @@ mod tests {
         assert!(ok);
         assert_eq!(notes(&agent, "[Approach]"), 1);
         assert_eq!(notes(&agent, "[Verify]"), 1);
+        assert_eq!(notes(&agent, "[Review]"), 0);
         assert!(
             notices.iter().any(|n| n.contains("asking for a test run")),
             "{notices:?}"
@@ -708,9 +727,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failing_run_is_sent_back() {
+    async fn a_failing_run_and_the_review_at_high() {
         // edit, failing run, answer -> failure note; edit, passing run,
-        // answer -> done.
+        // answer -> review note; answer -> done.
         let (agent, _, ok) = run_turn(
             vec![
                 bash("1", "sed -i 's/a/b/' x.py"),
@@ -719,6 +738,7 @@ mod tests {
                 bash("3", "sed -i 's/b/c/' x.py"),
                 bash("4", "python -m pytest tests"),
                 answer("fixed"),
+                answer("reviewed, 4 passed"),
             ],
             true,
             Some("high"),
@@ -728,6 +748,7 @@ mod tests {
         assert!(ok);
         assert_eq!(notes(&agent, "[Approach]"), 0);
         assert_eq!(notes(&agent, "[Verify] The last run"), 1);
+        assert_eq!(notes(&agent, "[Review]"), 1);
     }
 
     #[tokio::test]
@@ -738,6 +759,7 @@ mod tests {
                 bash("1", "sed -i 's/a/b/' x.py"),
                 answer("done"),
                 answer("nothing can run here: no interpreter"),
+                answer("reviewed; nothing could be run"),
             ],
             true,
             Some("high"),
@@ -746,6 +768,8 @@ mod tests {
         .await;
         assert!(ok);
         assert_eq!(notes(&agent, "[Verify]"), 1);
+        // High still asks for the review once.
+        assert_eq!(notes(&agent, "[Review]"), 1);
     }
 
     #[tokio::test]
@@ -770,7 +794,7 @@ mod tests {
         )
         .await;
         assert!(ok);
-        assert_eq!(notes(&agent, "[Verify]"), 0);
+        assert_eq!(notes(&agent, "[Verify]") + notes(&agent, "[Review]"), 0);
     }
 
     #[test]
@@ -796,6 +820,6 @@ mod tests {
         )
         .await;
         assert!(ok);
-        assert_eq!(notes(&agent, "[Verify]"), 0);
+        assert_eq!(notes(&agent, "[Verify]") + notes(&agent, "[Review]"), 0);
     }
 }

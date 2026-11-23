@@ -258,7 +258,8 @@ pub struct Settings {
     pub max_agent_steps: Option<usize>,
     /// How much nyq checks its own code changes in a turn: `low` (nothing
     /// extra), `medium` (reproduce bug reports first; run changed code before
-    /// finishing, fix failures) or `high` (more rounds). Unset: `medium` for headless runs (`-p`), `low` interactively.
+    /// finishing, fix failures) or `high` (also more rounds and a diff
+    /// review). Unset: `medium` for headless runs (`-p`), `low` interactively.
     /// `NYQ_AGENT_EFFORT` overrides it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_effort: Option<String>,
