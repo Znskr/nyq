@@ -1,8 +1,8 @@
 # nyq
 
-A small, friendly coding agent for your terminal. Use the ChatGPT or Grok plan
-you already pay for, an Anthropic or OpenAI key, or a local model, with
-sandboxed shell commands.
+A small, friendly coding agent for your terminal. Use the nyq Pro, ChatGPT or
+Grok plan you already pay for, an Anthropic or OpenAI key, or a local model,
+with sandboxed shell commands.
 
 **Docs:** [nyq.zalthar.com/docs](https://nyq.zalthar.com/docs) ·
 **Changes:** [CHANGELOG.md](CHANGELOG.md)

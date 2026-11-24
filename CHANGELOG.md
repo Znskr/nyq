@@ -9,6 +9,17 @@ graph, scripts). Old sessions, settings and permission files keep loading.
 
 ### Models
 
+- **nyq Pro (Zalthar subscription).** `nyq login zalthar` signs in through the
+  browser (loopback callback, state and PKCE; `--no-browser` prints the URL,
+  `--api-key` pastes a key checked against `/api/cli/whoami`), stores the key
+  and account details in `auth.json`, and `nyq logout zalthar` removes them.
+  The `zalthar` provider (`--provider zalthar`, aliases `nyq-pro`, `nyqpro`)
+  talks to the OpenAI-compatible gateway at `api.zalthar.com/v1` with the
+  plan's default model, `nyq-pro/deepseek-flash` (DeepSeek Flash V4.1, 1M
+  context, 65,536 max output) unless it says otherwise. Plan usage is reported
+  as subscription requests with no per-token cost; a `plan_quota_exceeded`
+  429 is never retried and reports when the window resets. `nyq setup` shows
+  the plan and remaining window quotas from whoami.
 - **Native DeepSeek provider.** `nyq login deepseek` or `DEEPSEEK_API_KEY`, then
   `--provider deepseek`. It speaks DeepSeek's Messages API with its extensions:
   reasoning effort `off|low|high|max`, in-history system prompt updates and

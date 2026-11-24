@@ -7,6 +7,7 @@ import Showcase from "../components/Showcase.astro";
 import Benefits from "../components/Benefits.astro";
 import Tagline from "../components/Tagline.astro";
 import HowItWorks from "../components/HowItWorks.astro";
+import Pro from "../components/Pro.astro";
 import Faq from "../components/Faq.astro";
 import FinalCta from "../components/FinalCta.astro";
 import { faq } from "../faq";
@@ -37,7 +38,7 @@ const structured = [
 ---
 <Base
   title="nyq: code with any model from your terminal"
-  description="nyq is an open source coding agent for your terminal. Use your ChatGPT or Grok subscription, an Anthropic or OpenAI key, or a local model, with sandboxed shell commands."
+  description="nyq is an open source coding agent for your terminal. Use the nyq Pro, ChatGPT or Grok subscription, an Anthropic or OpenAI key, or a local model, with sandboxed shell commands."
 >
   <script slot="head" type="application/ld+json" set:html={JSON.stringify(structured)} />
   <Hero />
@@ -47,6 +48,7 @@ const structured = [
   <Benefits />
   <Tagline />
   <HowItWorks />
+  <Pro />
   <Faq />
   <FinalCta />
 </Base>

@@ -1,7 +1,7 @@
 nyq is a small coding agent for your terminal. It reads your code, runs your
-tests and edits files, using the ChatGPT or Grok plan you already pay for, an
-Anthropic or OpenAI key, or a local model. Shell commands run in a sandbox, and you
-choose how much it may do without asking.
+tests and edits files, using the nyq Pro, ChatGPT or Grok plan you already pay
+for, an Anthropic or OpenAI key, or a local model. Shell commands run in a
+sandbox, and you choose how much it may do without asking.
 
 ## Install
 
@@ -63,6 +63,29 @@ Model names, reasoning efforts and context windows come from that proxy. This
 is separate from an xAI API key (`XAI_API_KEY` or `nyq login xai`). The default
 model is `grok-4`.
 
+**nyq Pro (Zalthar subscription, $10/month).** Run `nyq login zalthar` to sign
+in through your browser: nyq listens on a loopback port for the callback,
+checks the sign-in's `state` and finishes a PKCE exchange. The sign-in URL is
+always printed; `--no-browser` (or `NYQ_NO_OPEN_BROWSER`) skips launching the
+browser, and the flow gives up after five minutes. `nyq login zalthar
+--api-key` pastes a key instead: it is checked against
+`GET {api}/api/cli/whoami` and refused keys are not saved. The sign-in stores a
+Zalthar API key plus the org, endpoint and default-model details in
+`~/.nyq/auth.json` (mode 0600); `nyq logout zalthar` removes them, and
+`ZALTHAR_API_KEY` stands in when it is set. Chat goes to
+`https://api.zalthar.com/v1`, an OpenAI-compatible gateway
+(`NYQ_ZALTHAR_BASE_URL` overrides it; `NYQ_ZALTHAR_APP_URL` and
+`NYQ_ZALTHAR_API_URL` retarget the sign-in itself). The default model is
+`nyq-pro/deepseek-flash` — DeepSeek Flash V4.1 at roughly 1000 tok/s with a 1M
+context window and a 65,536-token output cap — or the `default_model` the plan
+returned (`NYQ_ZALTHAR_MODEL` overrides). Plan usage counts against the
+subscription windows — 600 requests / 4M tokens per rolling five hours, 4,000
+requests / 25M tokens per week — not a per-token price: `nyq usage` reports the
+requests as subscription usage and `--json` runs carry no `cost_usd`. When a
+window is spent the gateway answers `plan_quota_exceeded` with a reset time; nyq
+reports that instead of retrying. `nyq setup` shows the plan and how much of
+each window is left.
+
 **Anthropic API, or any Anthropic-compatible endpoint.** Set `ANTHROPIC_API_KEY`
 or run `nyq login anthropic` (alias `claude`), then `--provider anthropic` or
 `nyq provider anthropic`. The key is checked against `GET /v1/models` (with
@@ -119,6 +142,7 @@ export NYQ_API_KEY=sk-...                       # if the endpoint needs one
 
 | Provider | Key | Endpoint |
 |---|---|---|
+| `zalthar` (aliases `nyq-pro`, `nyqpro`) | `nyq login zalthar` (browser, or `--api-key`), or `ZALTHAR_API_KEY` | `https://api.zalthar.com/v1` (OpenAI-compatible); `NYQ_ZALTHAR_BASE_URL` |
 | `anthropic` (alias `claude`) | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` (bearer), or `nyq login anthropic` | `https://api.anthropic.com/v1` (Messages API); `ANTHROPIC_BASE_URL` / `NYQ_ANTHROPIC_BASE_URL` |
 | `opencode-go` | `OPENCODE_API_KEY`, the OpenCode CLI's login, or `nyq login opencode-go` | `https://opencode.ai/zen/go/v1` |
 | `opencode` (Zen) | `OPENCODE_API_KEY`, the OpenCode CLI's login, or `nyq login opencode` | `https://opencode.ai/zen/v1` |
@@ -136,7 +160,7 @@ completions. Model names, context sizes, reasoning efforts and prices come from
 models.dev, refreshed at most daily into `~/.nyq/models.json` (falling back to the
 OpenCode CLI's cache). Every provider with a key gets its own tab in the model switcher.
 
-`--provider codex|grok|anthropic|openai|ollama|opencode-go|opencode|xai` and `--model NAME`
+`--provider codex|grok|zalthar|anthropic|openai|ollama|opencode-go|opencode|xai` and `--model NAME`
 override the choice. `NYQ_HOME` relocates `~/.nyq`.
 
 A request that fails before anything was streamed (HTTP 429, 500, 502, 503, 504,
@@ -144,7 +168,8 @@ Anthropic's 529 overload, the same errors reported inside the stream, or a
 connection error or timeout) is retried up to three times with backoff,
 honoring the server's `Retry-After` up to 8 seconds; the status line shows
 `Retrying in Ns`. A `Retry-After` over a minute (a spent quota) is reported at
-once. Errors with a JSON body read like
+once, and Zalthar's `plan_quota_exceeded` 429 is never retried: the message
+says when the plan window resets. Errors with a JSON body read like
 `API access denied · HTTP 403 · Provider: X · code: message`.
 
 ### Add a compatible provider (no config editing)
@@ -177,7 +202,7 @@ built-in provider's environment key.
 
 | Command | |
 |---|---|
-| `/login [provider]` | ChatGPT or Grok browser sign-in (paste the code if the browser does not return), or an API key typed into a masked prompt (never echoed or kept in history); without a provider, a menu |
+| `/login [provider]` | ChatGPT, nyq Pro or Grok browser sign-in (paste the code if the browser does not return), or an API key typed into a masked prompt (never echoed or kept in history); without a provider, a menu |
 | `/logout [provider]` | forget nyq's stored sign-in (a menu of the stored ones without a provider) |
 | `/setup` | connections (sign in, add compatible provider, replace a key, sign out or remove a custom endpoint), model provider, model, credential source |
 | `nyq provider [NAME]` | set the default provider (`settings.toml` `provider` plus `last-model.json`, so the next start uses it); aliases `chatgpt`, `claude`, `zen`, `go` work. `grok` is the Grok subscription, not the xAI API key |
@@ -214,6 +239,7 @@ nyq workspace add ../other  # remember another directory for this folder
 nyq --add-dir ../other      # add a directory for this run only
 nyq --no-additional-dirs    # ignore directories saved for this folder
 nyq login                   # sign in with your ChatGPT subscription
+nyq login zalthar           # sign in with nyq Pro (--no-browser prints the URL, --api-key pastes a key)
 nyq login grok              # sign in with a Grok subscription (SuperGrok / X Premium)
 nyq login anthropic         # store an API key (anthropic, opencode-go, opencode, xai)
 ```
@@ -1472,8 +1498,8 @@ model's share of tokens; the default is 30 days, and `/usage session` totals thi
 conversation.
 Costs are estimates using local models.dev data in `~/.nyq/models.json` or
 `~/.cache/opencode/models.json`, then a small built-in OpenAI pricing table.
-Unknown pricing is reported separately; Codex and Grok subscription requests show
-**subscription**, with no dollar cost. Cached input is included in input totals and
+Unknown pricing is reported separately; Codex, Grok and nyq Pro subscription
+requests show **subscription**, with no dollar cost. Cached input is included in input totals and
 priced separately; Anthropic prompt-cache writes are priced at the catalog's
 cache-write rate, and reasoning tokens (part of output) are shown when the provider
 reports them. The log drops records older than 35 days once it grows past 8 MB, and

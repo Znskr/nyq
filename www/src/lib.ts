@@ -14,6 +14,7 @@ export function href(path = ""): string {
 }
 
 export const REPO = "https://github.com/Znskr/nyq";
+export const NYQ_PRO = "https://app.zalthar.com/billing";
 export const INSTALL = "curl -fsSL https://nyq.zalthar.com/install.sh | sh";
 export const INSTALL_WINDOWS = "irm https://nyq.zalthar.com/install.ps1 | iex";
 

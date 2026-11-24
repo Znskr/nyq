@@ -5,8 +5,12 @@ export const faq: { q: string; a: string }[] = [
     a: "Yes. nyq is open source under the GNU AGPL v3. You pay your model provider through the subscription or API key you already have, and local models through Ollama cost nothing.",
   },
   {
+    q: "What is nyq Pro?",
+    a: "A $10/month Zalthar subscription that bundles the model with nyq: DeepSeek Flash V4.1 at roughly 1000 tokens a second with a 1M token context, served through an OpenAI compatible endpoint. Sign in with nyq login zalthar; plan usage counts against generous request and token windows instead of a per token price.",
+  },
+  {
     q: "Which models and providers does it support?",
-    a: "ChatGPT subscriptions (the Codex backend), Grok subscriptions (SuperGrok and X Premium), the Anthropic API and Anthropic compatible endpoints such as DeepSeek or Kimi, the xAI API, OpenCode Zen and OpenCode Go, and any OpenAI compatible API, including OpenAI, OpenRouter, vLLM, llama.cpp and Ollama.",
+    a: "nyq Pro (DeepSeek Flash V4.1, via nyq login zalthar), ChatGPT subscriptions (the Codex backend), Grok subscriptions (SuperGrok and X Premium), the Anthropic API and Anthropic compatible endpoints such as DeepSeek or Kimi, the xAI API, OpenCode Zen and OpenCode Go, and any OpenAI compatible API, including OpenAI, OpenRouter, vLLM, llama.cpp and Ollama.",
   },
   {
     q: "Can I use my Claude Pro or Max subscription?",
