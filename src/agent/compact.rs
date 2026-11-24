@@ -1734,6 +1734,7 @@ mod tests {
             crate::provider::sse::HttpError {
                 status: 400,
                 retry_after: None,
+                plan_quota: false,
                 message: "API request failed · HTTP 400 · invalid_request_error: prompt is too long: 10500 tokens > 10000 maximum".into(),
             }
             .into()
@@ -1900,6 +1901,7 @@ mod tests {
             crate::provider::sse::HttpError {
                 status,
                 retry_after: None,
+                plan_quota: false,
                 message: message.into(),
             }
             .into()

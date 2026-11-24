@@ -64,6 +64,9 @@ pub fn normalize_id(id: &str) -> Result<String> {
             "codex"
                 | "chatgpt"
                 | "grok"
+                | "zalthar"
+                | "nyq-pro"
+                | "nyqpro"
                 | "openai"
                 | "ollama"
                 | "anthropic"
@@ -324,6 +327,7 @@ async fn discover_inner(d: &Definition) -> Result<Vec<ModelChoice>> {
             return Err(sse::HttpError {
                 status: status.as_u16(),
                 retry_after: None,
+                plan_quota: false,
                 message: if matches!(status.as_u16(), 401 | 403) {
                     format!(
                         "API access denied · HTTP {} · check this provider's API key",
@@ -563,6 +567,7 @@ impl Provider for CustomProvider {
                 sse::HttpError {
                     status: http.status,
                     retry_after: http.retry_after,
+                    plan_quota: http.plan_quota,
                     message: text,
                 }
                 .into()

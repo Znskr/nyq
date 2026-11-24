@@ -10,6 +10,7 @@ pub mod hosted;
 pub mod openai;
 pub mod responses;
 pub(crate) mod sse;
+pub mod zalthar;
 
 use std::time::Duration;
 
@@ -138,6 +139,10 @@ fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
             return Some(Some(backoff));
         }
         if let Some(e) = cause.downcast_ref::<sse::HttpError>() {
+            // A plan quota window's reset is known: do not retry into it.
+            if e.plan_quota {
+                return Some(None);
+            }
             if !matches!(e.status, 429 | 500 | 502 | 503 | 504 | 529) {
                 return Some(None);
             }
@@ -272,6 +277,20 @@ mod tests {
         let (result, events, _) = run(vec![(429, "Retry-After: 3600\r\n", "limit")]).await;
         assert!(result.unwrap_err().to_string().contains("429"));
         assert!(events.is_empty());
+        // Zalthar's plan_quota_exceeded reports the reset and never retries,
+        // even with a short Retry-After.
+        let (result, events, seen) = run(vec![(
+            429,
+            "x-zalthar-quota-reset: 9999999999\r\nRetry-After: 1\r\n",
+            r#"{"error":{"code":"plan_quota_exceeded","message":"five-hour window spent"}}"#,
+        )])
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("plan_quota_exceeded") && error.contains("plan quota resets in"),
+            "{error}"
+        );
+        assert!(events.is_empty() && seen == 1);
         // Four attempts at most.
         let (result, events, seen) = run(vec![
             (500, "", "a"),

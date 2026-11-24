@@ -9,6 +9,9 @@ pub struct HttpError {
     pub status: u16,
     /// The `Retry-After` header, when given in seconds.
     pub retry_after: Option<std::time::Duration>,
+    /// A subscription-plan quota window (Zalthar `plan_quota_exceeded`):
+    /// retrying before the reset cannot help, whatever `Retry-After` says.
+    pub plan_quota: bool,
     pub message: String,
 }
 
@@ -43,15 +46,79 @@ pub async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(std::time::Duration::from_secs);
+        let quota_reset = response
+            .headers()
+            .get("x-zalthar-quota-reset")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let body = response.text().await?;
+        let (plan_quota, message) =
+            match quota_message(status, &body, quota_reset.as_deref(), retry_after) {
+                Some(message) => (true, message),
+                None => (false, http_error(status, &body)),
+            };
         return Err(HttpError {
             status: status.as_u16(),
             retry_after,
-            message: http_error(status, &body),
+            plan_quota,
+            message,
         }
         .into());
     }
     Ok(response)
+}
+
+/// The reset time of a `plan_quota_exceeded` reply: the
+/// `x-zalthar-quota-reset` header (epoch seconds or RFC 3339) or
+/// `Retry-After`, phrased relative to now.
+fn quota_reset(reset: Option<&str>, retry_after: Option<std::time::Duration>) -> Option<String> {
+    let at = reset.and_then(|v| {
+        let v = v.trim();
+        v.parse::<i64>()
+            .ok()
+            .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(v)
+                    .ok()
+                    .map(|d| d.with_timezone(&chrono::Utc))
+            })
+    });
+    if let Some(at) = at {
+        let now = chrono::Utc::now();
+        return Some(if at > now {
+            format!(
+                "in {}",
+                crate::provider::zalthar::describe_duration(
+                    (at - now).to_std().unwrap_or_default()
+                )
+            )
+        } else {
+            format!("at {}", at.format("%Y-%m-%d %H:%M UTC"))
+        });
+    }
+    retry_after.map(|d| format!("in {}", crate::provider::zalthar::describe_duration(d)))
+}
+
+/// "… · plan quota resets in 4h 12m" for a `plan_quota_exceeded` body; None
+/// for any other error.
+fn quota_message(
+    status: reqwest::StatusCode,
+    body: &str,
+    reset: Option<&str>,
+    retry_after: Option<std::time::Duration>,
+) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    if parsed["error"]["code"].as_str() != Some("plan_quota_exceeded") {
+        return None;
+    }
+    Some(match quota_reset(reset, retry_after) {
+        Some(at) => format!("{} · plan quota resets {at}", http_error(status, body)),
+        None => format!(
+            "{} · plan quota resets at an unknown time",
+            http_error(status, body)
+        ),
+    })
 }
 
 /// "API access denied · HTTP 403 · Provider: X · code: message" from a JSON

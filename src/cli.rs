@@ -212,11 +212,18 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Sign in: ChatGPT subscription (default, Codex models), a Grok
-    /// subscription, a hosted API key, or add a compatible provider with `custom`.
+    /// Sign in: ChatGPT subscription (default, Codex models), Zalthar (nyq
+    /// Pro), a Grok subscription, a hosted API key, or add a compatible
+    /// provider with `custom`.
     Login {
-        /// codex (default), grok, anthropic, deepseek, opencode-go, opencode, xai, custom or a saved id.
+        /// codex (default), zalthar, grok, anthropic, deepseek, opencode-go, opencode, xai, custom or a saved id.
         provider: Option<String>,
+        /// Paste an API key on stdin instead of a browser sign-in.
+        #[arg(long)]
+        api_key: bool,
+        /// Print the sign-in URL without opening a browser.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Remove nyq's stored login for a provider, or every stored login.
     Logout {
@@ -455,7 +462,11 @@ impl Ctx<'_> {
                 .await?
             }
             Command::Models { json } => doctor::models(self.home, json).await?,
-            Command::Login { provider } => self.login(provider).await?,
+            Command::Login {
+                provider,
+                api_key,
+                no_browser,
+            } => self.login(provider, api_key, no_browser).await?,
             Command::Logout { provider } => self.logout(provider).await?,
             Command::Acp { log_file } => self.acp(log_file).await?,
             Command::Pr {
@@ -570,8 +581,13 @@ impl Ctx<'_> {
     }
 
     /// `nyq login [provider]`: a browser sign-in, or a stored API key.
-    async fn login(&self, provider: Option<String>) -> Result<()> {
-        let msg = account::cli_login(self.home, provider.as_deref().unwrap_or("codex")).await?;
+    async fn login(&self, provider: Option<String>, api_key: bool, no_browser: bool) -> Result<()> {
+        let opts = account::LoginOpts {
+            api_key,
+            no_browser,
+        };
+        let msg =
+            account::cli_login(self.home, provider.as_deref().unwrap_or("codex"), &opts).await?;
         println!("{msg}");
         Ok(())
     }
@@ -692,14 +708,26 @@ mod tests {
 
     #[test]
     fn compatible_account_commands_accept_ids_but_not_key_arguments() {
-        for id in ["custom", "work-gateway", "anthropic", "grok"] {
+        for id in ["custom", "work-gateway", "anthropic", "grok", "zalthar"] {
             let cli = Cli::try_parse_from(["nyq", "login", id]).unwrap();
-            assert!(matches!(cli.command, Some(Command::Login { provider: Some(p) }) if p == id));
+            assert!(
+                matches!(cli.command, Some(Command::Login { provider: Some(p), .. }) if p == id)
+            );
         }
         let cli = Cli::try_parse_from(["nyq", "login"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Login { provider: None })
+            Some(Command::Login { provider: None, .. })
+        ));
+        let cli =
+            Cli::try_parse_from(["nyq", "login", "zalthar", "--api-key", "--no-browser"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Login {
+                provider: Some(p),
+                api_key: true,
+                no_browser: true,
+            }) if p == "zalthar"
         ));
         let cli = Cli::try_parse_from(["nyq", "logout", "work-gateway"]).unwrap();
         assert!(

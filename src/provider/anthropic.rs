@@ -444,6 +444,7 @@ pub async fn read_stream_opts(
                 return Err(sse::HttpError {
                     status,
                     retry_after: None,
+                    plan_quota: false,
                     message: format!("{label}: {}", sse::failure(&data)),
                 }
                 .into());

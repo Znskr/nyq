@@ -1,11 +1,12 @@
-//! API-key model services: OpenCode Go, OpenCode Zen, xAI, the Anthropic
-//! API and DeepSeek. OpenCode speaks OpenAI-compatible chat completions and
-//! serves some models over the Responses or Anthropic Messages protocol
-//! (per model, from models.dev); xAI is used through the Responses API;
-//! Anthropic (or any Anthropic-compatible endpoint, via
+//! API-key model services: Zalthar (nyq Pro), OpenCode Go, OpenCode Zen,
+//! xAI, the Anthropic API and DeepSeek. OpenCode speaks OpenAI-compatible
+//! chat completions and serves some models over the Responses or Anthropic
+//! Messages protocol (per model, from models.dev); xAI is used through the
+//! Responses API; Anthropic (or any Anthropic-compatible endpoint, via
 //! `ANTHROPIC_BASE_URL`) through the Messages API; DeepSeek through its own
 //! Messages adapter — also picked when an Anthropic-compatible endpoint
-//! lives on a `deepseek.com` host.
+//! lives on a `deepseek.com` host. Zalthar speaks OpenAI-compatible chat
+//! completions (see [`crate::provider::zalthar`]).
 //!
 //! API keys: the service's environment variable (for Anthropic also
 //! `ANTHROPIC_AUTH_TOKEN`, sent as a bearer token), else (OpenCode only) the
@@ -35,6 +36,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Service {
+    Zalthar,
     OpencodeGo,
     Opencode,
     Xai,
@@ -49,7 +51,8 @@ pub const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1";
 pub const ANTHROPIC_AUTH_TOKEN: &str = "ANTHROPIC_AUTH_TOKEN";
 
 impl Service {
-    pub const ALL: [Service; 5] = [
+    pub const ALL: [Service; 6] = [
+        Service::Zalthar,
         Service::OpencodeGo,
         Service::Opencode,
         Service::Xai,
@@ -60,6 +63,7 @@ impl Service {
     /// Provider id, as used by `--provider`, the switcher tab and models.dev.
     pub fn id(self) -> &'static str {
         match self {
+            Service::Zalthar => "zalthar",
             Service::OpencodeGo => "opencode-go",
             Service::Opencode => "opencode",
             Service::Xai => "xai",
@@ -70,6 +74,7 @@ impl Service {
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
+            "zalthar" | "nyq-pro" | "nyqpro" => Some(Service::Zalthar),
             "opencode-go" | "go" => Some(Service::OpencodeGo),
             "opencode" | "zen" | "opencode-zen" => Some(Service::Opencode),
             "xai" => Some(Service::Xai),
@@ -81,6 +86,7 @@ impl Service {
 
     pub fn title(self) -> &'static str {
         match self {
+            Service::Zalthar => "Zalthar (nyq Pro)",
             Service::OpencodeGo => "OpenCode Go",
             Service::Opencode => "OpenCode Zen",
             Service::Xai => "xAI",
@@ -92,6 +98,7 @@ impl Service {
     /// The environment variable holding the API key.
     pub fn key_env(self) -> &'static str {
         match self {
+            Service::Zalthar => "ZALTHAR_API_KEY",
             Service::OpencodeGo | Service::Opencode => "OPENCODE_API_KEY",
             Service::Xai => "XAI_API_KEY",
             Service::Anthropic => "ANTHROPIC_API_KEY",
@@ -103,6 +110,8 @@ impl Service {
     /// when set, as compatible endpoints document it).
     pub fn default_model(self) -> String {
         match self {
+            Service::Zalthar => env("NYQ_ZALTHAR_MODEL")
+                .unwrap_or_else(|| crate::provider::zalthar::DEFAULT_MODEL.into()),
             Service::OpencodeGo => "glm-5.3".into(),
             Service::Opencode => "claude-sonnet-5-5".into(),
             Service::Xai => "grok-4.7".into(),
@@ -115,9 +124,19 @@ impl Service {
 
     /// API base URL; `NYQ_<SERVICE>_BASE_URL` overrides it (for Anthropic
     /// also `ANTHROPIC_BASE_URL`, for DeepSeek also `DEEPSEEK_BASE_URL`,
-    /// each given with or without the `/v1`).
+    /// each given with or without the `/v1`). For Zalthar, the `base_url`
+    /// stored by `nyq login zalthar` takes precedence when a profile is
+    /// known — see [`crate::provider::zalthar::chat_base_url`].
     pub fn base_url(self) -> String {
         let (var, default) = match self {
+            Service::Zalthar => {
+                return env("NYQ_ZALTHAR_BASE_URL").unwrap_or_else(|| {
+                    format!(
+                        "{}/v1",
+                        crate::provider::zalthar::api_url().trim_end_matches('/')
+                    )
+                })
+            }
             Service::OpencodeGo => ("NYQ_OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1"),
             Service::Opencode => ("NYQ_OPENCODE_BASE_URL", "https://opencode.ai/zen/v1"),
             Service::Xai => ("NYQ_XAI_BASE_URL", "https://api.x.ai/v1"),
@@ -302,10 +321,12 @@ pub enum KeyCheck {
 
 /// Probe `base_url` with `key` through the models list (Anthropic: with
 /// `x-api-key` and `anthropic-version`; DeepSeek: `x-api-key` on the
-/// listing at the origin).
+/// listing at the origin; Zalthar: `GET {api}/api/cli/whoami`).
 pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck {
     let deepseek_route = service == Service::DeepSeek || host_is(base_url, "deepseek.com");
-    let url = if deepseek_route {
+    let url = if service == Service::Zalthar {
+        crate::provider::zalthar::whoami_url(base_url)
+    } else if deepseek_route {
         deepseek::models_url(base_url)
     } else {
         format!("{}/models", base_url.trim_end_matches('/'))
@@ -321,6 +342,7 @@ pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck 
         _ if deepseek_route => request.header("x-api-key", key.trim()),
         _ => request.bearer_auth(key.trim()),
     };
+
     let response = match request.send().await {
         Ok(r) => r,
         Err(e) => return KeyCheck::Unknown(format!("{e}")),
@@ -400,14 +422,21 @@ impl HostedProvider {
         })?;
         let catalog = service.catalog_id();
         let models = crate::catalog::load(home, catalog);
-        let mut provider = Self::new(
-            service,
-            service.base_url(),
-            key,
-            model,
-            effort,
-            Arc::new(models),
-        );
+        // Zalthar's sign-in stores the gateway's `base_url`/`default_model`;
+        // they win over the compiled defaults (the env overrides still win).
+        let (base_url, model) = if service == Service::Zalthar {
+            (
+                crate::provider::zalthar::chat_base_url(home),
+                if model == service.default_model() {
+                    crate::provider::zalthar::default_model(home)
+                } else {
+                    model
+                },
+            )
+        } else {
+            (service.base_url(), model)
+        };
+        let mut provider = Self::new(service, base_url, key, model, effort, Arc::new(models));
         provider.bearer = bearer(service);
         provider.catalog = catalog.into();
         Ok(provider)
@@ -440,6 +469,7 @@ impl HostedProvider {
 
     pub fn protocol(&self) -> Protocol {
         match self.service {
+            Service::Zalthar => Protocol::Chat,
             Service::Xai => Protocol::Responses,
             Service::Anthropic | Service::DeepSeek => Protocol::Anthropic,
             // A missing catalog used to force chat completions for every model.
@@ -461,7 +491,7 @@ impl HostedProvider {
             // Routes a conversation to the same cache.
             Service::Xai => headers.push(("x-grok-conv-id".into(), self.session.clone())),
             // DeepSeek sends its conversation id on the request itself.
-            Service::Anthropic | Service::DeepSeek => {}
+            Service::Zalthar | Service::Anthropic | Service::DeepSeek => {}
         }
         headers
     }
@@ -484,6 +514,9 @@ impl HostedProvider {
     /// Image, video and embedding models, and models served over protocols
     /// nyq does not speak, are left out.
     pub async fn list_models(&self) -> Result<Vec<ModelChoice>> {
+        if self.service == Service::Zalthar {
+            return self.list_zalthar().await;
+        }
         if self.is_deepseek() {
             return self.list_deepseek().await;
         }
@@ -523,6 +556,49 @@ impl HostedProvider {
 }
 
 impl HostedProvider {
+    /// `GET {base}/models` on the Zalthar gateway; the configured model
+    /// alone when the listing is empty or unreachable (a refused key still
+    /// fails). Listed models default to the bundled model's context.
+    async fn list_zalthar(&self) -> Result<Vec<ModelChoice>> {
+        let choice = |id: String, context: Option<u64>| ModelChoice {
+            provider: self.service.id().into(),
+            context_window: Some(context.unwrap_or(crate::provider::zalthar::CONTEXT_WINDOW)),
+            price: Some("included in nyq Pro".into()),
+            model: id,
+            ..Default::default()
+        };
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            self.chat().list_models_detailed(),
+        )
+        .await
+        .context("timed out listing models");
+        let error = match listed {
+            Ok(Ok(models)) if !models.is_empty() => {
+                super::remember_listing(
+                    self.service.id(),
+                    models.iter().map(|m| m.id.clone()).collect(),
+                    Vec::new(),
+                );
+                return Ok(models
+                    .into_iter()
+                    .map(|m| choice(m.id, m.context_window))
+                    .collect());
+            }
+            Ok(Ok(_)) => anyhow::anyhow!("the endpoint lists no models"),
+            Ok(Err(e)) => e,
+            Err(e) => e,
+        };
+        // A refused key is not something the default model can paper over.
+        if error.chain().any(|c| {
+            c.downcast_ref::<super::sse::HttpError>()
+                .is_some_and(|e| matches!(e.status, 401 | 403))
+        }) {
+            return Err(error);
+        }
+        Ok(vec![choice(self.model.clone(), None)])
+    }
+
     /// The Models API's list; when the endpoint has none (many compatible
     /// ones), the models.dev catalog for it plus the current model.
     async fn list_anthropic(&self) -> Result<Vec<ModelChoice>> {
@@ -780,6 +856,13 @@ impl Provider for HostedProvider {
         self.meta().map(|m| m.efforts.clone()).unwrap_or_default()
     }
     fn context_window(&self) -> Option<u64> {
+        if self.service == Service::Zalthar {
+            return Some(
+                self.meta()
+                    .and_then(|m| m.context)
+                    .unwrap_or(crate::provider::zalthar::CONTEXT_WINDOW),
+            );
+        }
         if self.is_deepseek() {
             return Some(deepseek::context_window(
                 &self.model,
@@ -794,7 +877,11 @@ impl Provider for HostedProvider {
     }
     fn max_output_tokens(&self) -> Option<u64> {
         // Matches the cap `stream_deepseek` / `stream_anthropic` sends, so
-        // compaction keeps room for it; other protocols send none.
+        // compaction keeps room for it; other protocols send none. Zalthar's
+        // cap is server-side but compaction should still keep room for it.
+        if self.service == Service::Zalthar {
+            return Some(crate::provider::zalthar::MAX_OUTPUT_TOKENS);
+        }
         if self.is_deepseek() {
             return Some(deepseek::max_tokens(
                 self.deepseek_info().as_ref(),

@@ -79,7 +79,8 @@ pub fn for_run(home: &Path, provider: &str, model: &str, endpoint: Option<&str>)
 }
 
 pub fn lookup(home: &Path, provider: &str, model: &str) -> Option<Price> {
-    if provider == "codex" || provider == "grok" {
+    // Subscription plans: usage counts against the plan, not a token price.
+    if provider == "codex" || provider == "grok" || provider == "zalthar" {
         return None;
     }
     if let Some(price) = from_catalog(home, provider, model) {

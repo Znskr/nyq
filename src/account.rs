@@ -16,7 +16,8 @@ use crate::provider::hosted::{self, Service};
 use crate::ui::{self, tui::Tui};
 
 /// Built-in providers, in menu order; saved compatible providers follow these.
-pub const PROVIDERS: [&str; 9] = [
+pub const PROVIDERS: [&str; 10] = [
+    "zalthar",
     "codex",
     "grok",
     "anthropic",
@@ -28,7 +29,8 @@ pub const PROVIDERS: [&str; 9] = [
     "ollama",
 ];
 /// Providers `/login` can sign in to (the rest are configured by endpoint).
-const LOGIN: [&str; 7] = [
+const LOGIN: [&str; 8] = [
+    "zalthar",
     "codex",
     "grok",
     "anthropic",
@@ -192,6 +194,7 @@ fn default_model(home: &Path, id: &str) -> Option<String> {
     match id {
         "codex" => Some(config::DEFAULT_CODEX_MODEL.into()),
         "grok" => Some(crate::provider::grok::DEFAULT_MODEL.into()),
+        "zalthar" => Some(crate::provider::zalthar::default_model(home)),
         "openai" => config::openai_config(home).ok().and_then(|c| c.2),
         "ollama" => None,
         other => Service::parse(other)
@@ -298,6 +301,10 @@ fn source_lines(home: &Path) -> Vec<String> {
         "ChatGPT: NYQ_CODEX_AUTH, then a valid codex CLI login, then nyq's own sign-in.".into(),
     );
     lines.push("Grok subscription: nyq's sign-in in grok-auth.json.".into());
+    lines.push(format!(
+        "Zalthar (nyq Pro): ZALTHAR_API_KEY, then nyq's auth.json (written by `nyq login zalthar`) · endpoint {} (NYQ_ZALTHAR_BASE_URL)",
+        crate::provider::zalthar::chat_base_url(home)
+    ));
     lines.push("Compatible providers: each named endpoint's own key in providers.json (or explicitly no key); built-in environment keys are not inherited.".into());
     lines.push(format!(
         "Anthropic: ANTHROPIC_API_KEY, then ANTHROPIC_AUTH_TOKEN (sent as a bearer token), then nyq's auth.json · endpoint {} (ANTHROPIC_BASE_URL)",
@@ -576,8 +583,17 @@ async fn store_custom_key(
     Ok(custom_saved(&definition.id))
 }
 
+/// How `nyq login` signs in: a browser sign-in (default) or a pasted key.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoginOpts {
+    /// Read an API key from stdin instead of running the browser sign-in.
+    pub api_key: bool,
+    /// Print the sign-in URL without launching a browser.
+    pub no_browser: bool,
+}
+
 /// Sign in to `id` from the command line (browser or hidden key prompt).
-pub async fn cli_login(home: &Path, id: &str) -> Result<String> {
+pub async fn cli_login(home: &Path, id: &str, opts: &LoginOpts) -> Result<String> {
     if id.eq_ignore_ascii_case("custom") {
         return add_custom(home, &ConnectionPrompt(None)).await;
     }
@@ -590,15 +606,29 @@ pub async fn cli_login(home: &Path, id: &str) -> Result<String> {
         )
         .await;
     }
-    match id.as_str() {
-        "codex" => {
-            crate::login::login(home, |url| {
-                eprintln!("{}", crate::login::sign_in_prompt(url));
-                crate::login::open_browser(url);
-            })
-            .await
+    let no_browser = opts.no_browser;
+    let opener = move |url: &str| {
+        eprintln!("{}", crate::login::sign_in_prompt(url));
+        if !no_browser {
+            crate::login::open_browser(url);
         }
-        "grok" => crate::login::login_grok(home, crate::provider::grok::stdin_code()).await,
+    };
+    match id.as_str() {
+        "codex" => crate::login::login(home, opener).await,
+        "grok" => crate::login::login_grok(home, crate::provider::grok::stdin_code(), opener).await,
+        "zalthar" => {
+            let msg = if opts.api_key {
+                eprintln!(
+                    "{} and press Enter:",
+                    crate::login::key_prompt(Service::Zalthar)
+                );
+                let key = crate::login::read_secret()?;
+                crate::provider::zalthar::login_key(home, &key).await?
+            } else {
+                crate::provider::zalthar::login(home, opener).await?
+            };
+            Ok(crate::provider::zalthar::with_plan_lines(home, msg).await)
+        }
         "openai" => Ok(OPENAI_HELP.into()),
         "ollama" => Ok(OLLAMA_HELP.into()),
         other => {
@@ -612,6 +642,11 @@ pub async fn cli_login(home: &Path, id: &str) -> Result<String> {
 pub async fn cli_setup(home: &Path) -> Result<()> {
     use std::io::IsTerminal;
     summary_lines(home).iter().for_each(|l| println!("{l}"));
+    if let Some(status) = crate::provider::zalthar::status(home).await {
+        crate::provider::zalthar::status_lines(&status)
+            .iter()
+            .for_each(|l| println!("{l}"));
+    }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         println!("\nSign in with `nyq login NAME`, add a compatible endpoint with `nyq login custom`, choose the default with `nyq provider NAME`, or run /setup inside nyq.");
         return Ok(());
@@ -632,7 +667,7 @@ pub async fn cli_setup(home: &Path) -> Result<()> {
                 options.push("Add compatible provider".into());
                 if let Some(i) = choose("Connections", &options)? {
                     let id = ids.get(i).map_or("custom", String::as_str);
-                    match cli_login(home, id).await {
+                    match cli_login(home, id, &LoginOpts::default()).await {
                         Ok(msg) => println!("{msg}"),
                         Err(e) => ui::error(&format!("{e:#}")),
                     }
@@ -747,13 +782,36 @@ async fn tui_login(home: &Path, tui: &Tui, name: Option<&str>) -> Result<()> {
             let prompt =
                 "Paste the Grok authorization code if the browser does not return (hidden)";
             let result = tokio::select! {
-                r = crate::login::login_grok(home, async { Ok(tui.secret(prompt).await) }) => Some(r),
+                r = crate::login::login_grok(home, async { Ok(tui.secret(prompt).await) }, |url| {
+                    ui::info(&format!("Sign in to Grok in your browser (waiting up to 5 minutes):\n  {url}"));
+                    crate::login::open_browser(url);
+                }) => Some(r),
                 _ = cancel.cancelled() => None,
             };
             drop(_hide);
             tui.screen().idle();
             match result {
                 Some(r) => ui::info(&format!("{} Pick a Grok model with /model.", r?)),
+                None => ui::info("Sign-in cancelled."),
+            }
+        }
+        "zalthar" => {
+            let cancel = CancellationToken::new();
+            tui.screen()
+                .set_busy(Some("Signing in to nyq Pro"), Some(cancel.clone()));
+            let result = tokio::select! {
+                r = crate::provider::zalthar::login(home, |url| {
+                    ui::info(&format!("Sign in to nyq Pro in your browser (waiting up to 5 minutes):\n  {url}"));
+                    crate::login::open_browser(url);
+                }) => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            tui.screen().idle();
+            match result {
+                Some(r) => {
+                    let msg = crate::provider::zalthar::with_plan_lines(home, r?).await;
+                    ui::info(&format!("{msg} Pick a model with /model."));
+                }
                 None => ui::info("Sign-in cancelled."),
             }
         }
@@ -895,7 +953,7 @@ async fn tui_connections(home: &Path, tui: &Tui) -> Result<()> {
     if !stored_by_nyq(home, id) {
         return tui_login(home, tui, Some(id)).await;
     }
-    let again = if id == "codex" || id == "grok" {
+    let again = if id == "codex" || id == "grok" || id == "zalthar" {
         "Sign in again"
     } else {
         "Replace the API key"
@@ -1096,12 +1154,13 @@ mod tests {
         assert_eq!(saved.api_key.as_deref(), Some("new-key"));
         assert_eq!(saved.base_url, definition.base_url);
         assert_eq!(saved.model, definition.model);
-        assert!(cli_login(home, "missing").await.is_err());
-        assert!(cli_login(home, "OPENAI")
+        let opts = LoginOpts::default();
+        assert!(cli_login(home, "missing", &opts).await.is_err());
+        assert!(cli_login(home, "OPENAI", &opts)
             .await
             .unwrap()
             .contains("nyq login custom"));
-        assert!(cli_login(home, "Ollama")
+        assert!(cli_login(home, "Ollama", &opts)
             .await
             .unwrap()
             .contains("no sign-in"));

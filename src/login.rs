@@ -24,7 +24,7 @@ fn redirect(port: u16) -> String {
     format!("http://localhost:{port}/auth/callback")
 }
 
-fn secret() -> String {
+pub(crate) fn secret() -> String {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
     bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -32,7 +32,7 @@ fn secret() -> String {
 }
 
 // SHA-256 for PKCE, kept here because the crate has no direct hash dependency.
-fn challenge(verifier: &str) -> String {
+pub(crate) fn challenge(verifier: &str) -> String {
     use sha2::{Digest, Sha256};
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
@@ -380,6 +380,7 @@ pub fn key_prompt(service: Service) -> String {
 /// Where to get an API key for `service`.
 pub fn key_site(service: Service) -> &'static str {
     match service {
+        Service::Zalthar => "https://app.zalthar.com",
         Service::OpencodeGo | Service::Opencode => "https://opencode.ai/auth",
         Service::Xai => "https://console.x.ai",
         Service::Anthropic => "https://console.anthropic.com/settings/keys",
@@ -420,7 +421,7 @@ async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) 
                 "OPENCODE_API_KEY or the OpenCode CLI's login"
             }
             Service::Anthropic => "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN",
-            Service::Xai | Service::DeepSeek => service.key_env(),
+            Service::Zalthar | Service::Xai | Service::DeepSeek => service.key_env(),
         };
         msg.push_str(&format!("\nNote: {other} is set and takes precedence."));
     }
@@ -428,23 +429,14 @@ async fn store_key_at(home: &Path, service: Service, key: &str, base_url: &str) 
 }
 
 /// Browser sign-in for a Grok subscription. `manual` is a pasted code, or
-/// `None` when stdin closes without one. The URL is always printed;
-/// `NYQ_NO_OPEN_BROWSER` skips opening it.
+/// `None` when stdin closes without one. `open` announces the URL and
+/// launches a browser unless disabled.
 pub async fn login_grok(
     home: &Path,
     manual: impl std::future::Future<Output = Result<Option<String>>>,
+    open: impl Fn(&str),
 ) -> Result<String> {
-    crate::provider::grok::login(
-        home,
-        |url| {
-            crate::ui::info(&format!(
-                "Sign in to Grok in your browser (waiting up to 5 minutes):\n  {url}"
-            ));
-        },
-        open_browser,
-        manual,
-    )
-    .await
+    crate::provider::grok::login(home, &open, |_| {}, manual).await
 }
 
 /// `nyq logout <provider>`: forget nyq's stored credentials.
@@ -476,7 +468,7 @@ pub async fn logout(home: &Path, provider: &str) -> Result<String> {
         });
     }
     let service = Service::parse(provider)
-        .with_context(|| format!("unknown provider `{provider}` (expected codex, grok, anthropic, opencode-go, opencode or xai)"))?;
+        .with_context(|| format!("unknown provider `{provider}` (expected codex, grok, zalthar, anthropic, deepseek, opencode-go, opencode or xai)"))?;
     Ok(if hosted::remove_key(home, service)? {
         format!("Removed the stored {} key.", service.title())
     } else {
