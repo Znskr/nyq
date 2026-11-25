@@ -528,6 +528,42 @@ async fn whoami_at(api: &str, key: &str) -> Result<Whoami> {
         .context("invalid Zalthar whoami response")
 }
 
+/// What happened to the stored key on the server during `nyq logout zalthar`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Revoke {
+    /// The key was revoked (or was already dead).
+    Revoked,
+    /// The key wasn't minted by `nyq login`, so it was left active.
+    NotCliKey,
+    /// The server couldn't be asked (offline, older server, error).
+    Unknown,
+}
+
+async fn revoke_at(api: &str, key: &str) -> Revoke {
+    let sent = crate::http::authed_client()
+        .post(cli_url(api, "logout"))
+        .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
+        .bearer_auth(key.trim())
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await;
+    match sent.map(|r| r.status().as_u16()) {
+        Ok(204) | Ok(401) => Revoke::Revoked,
+        Ok(403) => Revoke::NotCliKey,
+        _ => Revoke::Unknown,
+    }
+}
+
+/// Revoke the key `nyq login zalthar` stored (never `ZALTHAR_API_KEY`) on
+/// the server, best effort, before it is forgotten locally.
+pub async fn revoke_stored(home: &Path) -> Option<Revoke> {
+    let stored = stored(home)?;
+    if stored.key.trim().is_empty() {
+        return None;
+    }
+    Some(revoke_at(&api_url(), &stored.key).await)
+}
+
 /// Who the configured Zalthar key belongs to (stored key or `ZALTHAR_API_KEY`).
 pub async fn whoami(home: &Path) -> Result<Whoami> {
     let key = api_key(home).context("no Zalthar sign-in: run `nyq login zalthar`")?;
@@ -886,6 +922,28 @@ mod tests {
             "{err}"
         );
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_revocation_outcomes() {
+        for (status, want) in [
+            (204, Revoke::Revoked),
+            (401, Revoke::Revoked),
+            (403, Revoke::NotCliKey),
+            (404, Revoke::Unknown),
+            (500, Revoke::Unknown),
+        ] {
+            let (url, mut requests, task) = server(vec![(status, String::new())]).await;
+            assert_eq!(revoke_at(&url, "zk-key").await, want, "status {status}");
+            let req = requests.recv().await.unwrap();
+            assert!(req.starts_with("POST /api/cli/logout "), "{req}");
+            assert!(
+                req.to_ascii_lowercase()
+                    .contains("authorization: bearer zk-key"),
+                "{req}"
+            );
+            task.await.unwrap();
+        }
     }
 
     /// A mock Zalthar API that accepts the token exchange and drives the

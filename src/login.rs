@@ -468,10 +468,28 @@ pub async fn logout(home: &Path, provider: &str) -> Result<String> {
     }
     let service = Service::parse(provider)
         .with_context(|| format!("unknown provider `{provider}` (expected codex, grok, zalthar, anthropic, deepseek, opencode-go, opencode or xai)"))?;
+    if service == Service::Zalthar {
+        return zalthar_logout(home).await;
+    }
     Ok(if hosted::remove_key(home, service)? {
         format!("Removed the stored {} key.", service.title())
     } else {
         format!("No {} key stored by nyq.", service.title())
+    })
+}
+
+/// `nyq logout zalthar`: revoke the CLI key on the server (best effort),
+/// then forget it locally.
+async fn zalthar_logout(home: &Path) -> Result<String> {
+    use crate::provider::zalthar::{revoke_stored, Revoke};
+    let revoked = revoke_stored(home).await;
+    if !hosted::remove_key(home, Service::Zalthar)? {
+        return Ok("No Zalthar key stored by nyq.".into());
+    }
+    Ok(match revoked {
+        Some(Revoke::Revoked) => "Signed out of Zalthar and revoked the key.".into(),
+        Some(Revoke::NotCliKey) => "Removed the stored Zalthar key. It was created in the console, so it is still active; revoke it there if you no longer need it.".into(),
+        _ => "Removed the stored Zalthar key. Couldn't reach Zalthar to revoke it; revoke it from Settings → API keys if needed.".into(),
     })
 }
 
@@ -485,6 +503,10 @@ pub async fn logout_all(home: &Path) -> Result<String> {
         done.push(crate::provider::grok::logout(home).await?);
     }
     for service in Service::ALL {
+        if service == Service::Zalthar && crate::provider::zalthar::stored(home).is_some() {
+            done.push(zalthar_logout(home).await?);
+            continue;
+        }
         if hosted::remove_key(home, service)? {
             done.push(format!("Removed the stored {} key.", service.title()));
         }
