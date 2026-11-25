@@ -58,14 +58,44 @@ fn env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// The console origin for the authorize page (`NYQ_ZALTHAR_APP_URL`).
-pub fn app_url() -> String {
-    env(APP_URL_ENV).unwrap_or_else(|| APP_URL.into())
+/// Whether `url` may carry a Zalthar key or sign-in code: `https://`, or
+/// plain `http://` only to a loopback host (local development). Anything
+/// else would send credentials in cleartext or to a non-URL.
+fn secure_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => {
+            let bare = host.trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || bare
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        _ => false,
+    }
 }
 
-/// The API origin for CLI endpoints (`NYQ_ZALTHAR_API_URL`).
+/// An override from `name`, ignored unless it is a [`secure_url`].
+fn secure_env(name: &str) -> Option<String> {
+    env(name).filter(|v| secure_url(v))
+}
+
+/// The console origin for the authorize page (`NYQ_ZALTHAR_APP_URL`, honoured
+/// only when https or loopback http).
+pub fn app_url() -> String {
+    secure_env(APP_URL_ENV).unwrap_or_else(|| APP_URL.into())
+}
+
+/// The API origin for CLI endpoints (`NYQ_ZALTHAR_API_URL`, honoured only
+/// when https or loopback http).
 pub fn api_url() -> String {
-    env(API_URL_ENV).unwrap_or_else(|| API_URL.into())
+    secure_env(API_URL_ENV).unwrap_or_else(|| API_URL.into())
 }
 
 fn cli_url(api: &str, endpoint: &str) -> String {
@@ -83,10 +113,13 @@ pub fn whoami_url(base_url: &str) -> String {
 /// The OpenAI-compatible chat base: `NYQ_ZALTHAR_BASE_URL`, then the
 /// `base_url` the token exchange returned, then `{api}/v1`.
 pub fn chat_base_url(home: &Path) -> String {
-    if let Some(url) = env(BASE_URL_ENV) {
+    if let Some(url) = secure_env(BASE_URL_ENV) {
         return url.trim_end_matches('/').to_owned();
     }
-    if let Some(url) = stored(home).and_then(|s| s.base_url) {
+    if let Some(url) = stored(home)
+        .and_then(|s| s.base_url)
+        .filter(|u| secure_url(u))
+    {
         return url;
     }
     format!("{}/v1", api_url().trim_end_matches('/'))
@@ -178,12 +211,15 @@ enum Callback {
     /// `error=access_denied` (or any error) on a verified state.
     Denied,
     /// Wrong or missing state, or a broken request.
-    Rejected(String),
+    Rejected,
 }
 
 fn callback(target: &str, state: &str) -> Callback {
+    if !target.starts_with('/') {
+        return Callback::Rejected;
+    }
     let Ok(url) = reqwest::Url::parse(&format!("http://localhost{target}")) else {
-        return Callback::Rejected("malformed callback request".into());
+        return Callback::Rejected;
     };
     if url.path() != CALLBACK_PATH {
         return Callback::Unrelated;
@@ -209,12 +245,14 @@ fn callback(target: &str, state: &str) -> Callback {
     };
     match read() {
         Ok(result) => result,
-        Err(e) => Callback::Rejected(format!("{e}")),
+        Err(_) => Callback::Rejected,
     }
 }
 
-/// Serve the loopback callback until a `GET /callback` arrives; browsers get
-/// a small page either way.
+/// Serve the loopback callback until a `GET /callback` with the right state
+/// arrives; browsers get a small page either way. A request with a wrong or
+/// missing state is answered and ignored, so another local process or web
+/// page probing the port cannot abort the sign-in.
 async fn wait_callback(listener: &TcpListener, state: &str) -> Result<String> {
     loop {
         let (mut socket, _) = listener.accept().await?;
@@ -252,7 +290,7 @@ async fn wait_callback(listener: &TcpListener, state: &str) -> Result<String> {
                 "400 Bad Request",
                 "Sign-in was denied. Return to your terminal.",
             ),
-            Callback::Rejected(_) => (
+            Callback::Rejected => (
                 "400 Bad Request",
                 "Sign-in failed. Return to your terminal.",
             ),
@@ -271,8 +309,7 @@ async fn wait_callback(listener: &TcpListener, state: &str) -> Result<String> {
             Callback::Denied => {
                 bail!("Zalthar sign-in was denied")
             }
-            Callback::Rejected(e) => bail!("Zalthar sign-in failed: {e}"),
-            Callback::Unrelated => {}
+            Callback::Rejected | Callback::Unrelated => {}
         }
     }
 }
@@ -316,6 +353,10 @@ async fn exchange(api: &str, code: &str, verifier: &str) -> Result<Account> {
     anyhow::ensure!(
         !account.api_key.trim().is_empty(),
         "invalid Zalthar token response"
+    );
+    anyhow::ensure!(
+        secure_url(account.base_url.trim()),
+        "invalid Zalthar token response: base_url must be https"
     );
     Ok(account)
 }
@@ -678,6 +719,38 @@ mod tests {
     }
 
     #[test]
+    fn secure_urls_only() {
+        for ok in [
+            "https://api.zalthar.com",
+            "https://api.zalthar.com/v1",
+            "http://127.0.0.1:8080",
+            "http://localhost:3000/v1",
+            "http://[::1]:9000",
+        ] {
+            assert!(secure_url(ok), "{ok}");
+        }
+        for bad in [
+            "http://evil.example",
+            "http://10.0.0.1",
+            "http://localhost.evil.example",
+            "ftp://api.zalthar.com",
+            "javascript:alert(1)",
+            "api.zalthar.com",
+            "",
+        ] {
+            assert!(!secure_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn callback_requires_absolute_path() {
+        assert!(matches!(
+            callback("x/callback?code=c&state=s", "s"),
+            Callback::Rejected
+        ));
+    }
+
+    #[test]
     fn callback_params() {
         assert!(matches!(
             callback("/callback?code=c&state=s", "s"),
@@ -685,7 +758,7 @@ mod tests {
         ));
         assert!(matches!(
             callback("/callback?code=c&state=wrong", "s"),
-            Callback::Rejected(_)
+            Callback::Rejected
         ));
         assert!(matches!(
             callback("/callback?error=access_denied&state=s", "s"),
@@ -693,11 +766,11 @@ mod tests {
         ));
         assert!(matches!(
             callback("/callback?code=c", "s"),
-            Callback::Rejected(_)
+            Callback::Rejected
         ));
         assert!(matches!(
             callback("/callback?code=c&state=s&state=s", "s"),
-            Callback::Rejected(_)
+            Callback::Rejected
         ));
         assert!(matches!(callback("/favicon.ico", "s"), Callback::Unrelated));
     }
@@ -941,22 +1014,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_and_denied_callbacks_fail() {
-        for (target, error) in [
-            ("/callback?code=c&state=other", "state mismatch"),
-            ("/callback?code=c", "state mismatch"),
-            ("/callback?error=access_denied&state=expected", "denied"),
-        ] {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let (result, response) = tokio::join!(
-                wait_callback(&listener, "expected"),
-                reqwest::get(format!("http://127.0.0.1:{port}{target}")),
-            );
-            assert_eq!(response.unwrap().status(), 400, "{target}");
-            let err = result.unwrap_err().to_string();
-            assert!(err.contains(error), "{err}");
-        }
+    async fn rejected_callbacks_are_ignored_until_the_real_one() {
+        // A forged or broken callback (wrong/missing state) gets a 400 but
+        // must not abort the sign-in: another local process or web page
+        // could otherwise kill it by probing the port.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let probes = async {
+            for target in ["/callback?code=c&state=other", "/callback?code=c"] {
+                let res = crate::http::builder()
+                    .build()
+                    .unwrap()
+                    .get(format!("http://127.0.0.1:{port}{target}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), 400, "{target}");
+            }
+            crate::http::builder()
+                .build()
+                .unwrap()
+                .get(format!(
+                    "http://127.0.0.1:{port}/callback?code=real&state=expected"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        };
+        let (result, status) = tokio::join!(wait_callback(&listener, "expected"), probes);
+        assert_eq!(status, 200);
+        assert_eq!(result.unwrap(), "real");
+    }
+
+    #[tokio::test]
+    async fn denied_callback_fails() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (result, response) = tokio::join!(
+            wait_callback(&listener, "expected"),
+            crate::http::builder()
+                .build()
+                .unwrap()
+                .get(format!(
+                    "http://127.0.0.1:{port}/callback?error=access_denied&state=expected"
+                ))
+                .send(),
+        );
+        assert_eq!(response.unwrap().status(), 400);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("denied"), "{err}");
     }
 
     #[tokio::test]
