@@ -285,8 +285,7 @@ pub async fn discover(definition: &Definition) -> Result<Vec<ModelChoice>> {
 }
 
 async fn discover_inner(d: &Definition) -> Result<Vec<ModelChoice>> {
-    let client = crate::http::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let client = crate::http::no_redirect_builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(5))
         .build()

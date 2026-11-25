@@ -521,8 +521,7 @@ impl Provider for AnthropicProvider {
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
         // x-api-key is not an Authorization header: never forward it through
         // redirects (including redirects to another host).
-        let client = crate::http::builder()
-            .redirect(reqwest::redirect::Policy::none())
+        let client = crate::http::no_redirect_builder()
             .build()
             .context("creating Messages client")?;
         let request = client
@@ -631,7 +630,7 @@ pub async fn list_models(
     key: Option<&str>,
     bearer: bool,
 ) -> Result<Vec<ModelInfo>> {
-    let client = crate::http::client();
+    let client = crate::http::authed_client();
     let base = base_url.trim_end_matches('/');
     let mut models = Vec::new();
     let mut after: Option<String> = None;
@@ -683,7 +682,7 @@ pub async fn retrieve_model(
     model: &str,
 ) -> Option<ModelInfo> {
     let url = format!("{}/models/{}", base_url.trim_end_matches('/'), model);
-    let response = models_request(&crate::http::client(), url, key, bearer)
+    let response = models_request(&crate::http::authed_client(), url, key, bearer)
         .timeout(std::time::Duration::from_secs(4))
         .send()
         .await

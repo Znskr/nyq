@@ -78,7 +78,7 @@ impl OpenAiProvider {
             #[serde(default)]
             context_window: Option<u64>,
         }
-        let client = crate::http::builder()
+        let client = crate::http::no_redirect_builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
@@ -228,7 +228,7 @@ impl Provider for OpenAiProvider {
     }
 
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
-        let client = crate::http::client();
+        let client = crate::http::authed_client();
         let mut request = client
             .post(format!(
                 "{}/chat/completions",

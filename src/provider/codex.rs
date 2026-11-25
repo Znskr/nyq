@@ -158,7 +158,7 @@ impl CodexProvider {
             fast: false,
             auth: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4().to_string(),
-            client: crate::http::client(),
+            client: crate::http::authed_client(),
         }
     }
 

@@ -337,7 +337,7 @@ pub async fn check_key(service: Service, base_url: &str, key: &str) -> KeyCheck 
     } else {
         format!("{}/models", base_url.trim_end_matches('/'))
     };
-    let request = crate::http::client()
+    let request = crate::http::authed_client()
         .get(url)
         .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
         .timeout(std::time::Duration::from_secs(10));

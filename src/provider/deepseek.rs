@@ -255,7 +255,7 @@ fn listing_urls(base_url: &str) -> Vec<String> {
 }
 
 async fn list_models_at(url: &str, key: Option<&str>) -> Result<Vec<ListedModel>> {
-    let request = crate::http::client()
+    let request = crate::http::authed_client()
         .get(url)
         .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
         .header("accept", "application/json")
@@ -698,8 +698,7 @@ impl Provider for DeepSeekProvider {
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
         // x-api-key is not an Authorization header: never forward it
         // through redirects (including redirects to another host).
-        let client = crate::http::builder()
-            .redirect(reqwest::redirect::Policy::none())
+        let client = crate::http::no_redirect_builder()
             .build()
             .context("creating Messages client")?;
         let (body, tool_changes) = self.body(req);

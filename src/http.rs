@@ -31,6 +31,20 @@ pub fn client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
+/// A client builder that never follows redirects, for requests that carry
+/// a key or token: reqwest forwards custom headers such as `x-api-key`
+/// across a redirect, even to another host.
+pub fn no_redirect_builder() -> reqwest::ClientBuilder {
+    builder().redirect(reqwest::redirect::Policy::none())
+}
+
+/// A [`no_redirect_builder`] client, for one-shot authenticated requests.
+pub fn authed_client() -> reqwest::Client {
+    no_redirect_builder()
+        .build()
+        .expect("failed to build the HTTP client")
+}
+
 /// Whether `url` may carry credentials: `https://`, or plain `http://` only
 /// to a loopback host (local development). Anything else would send
 /// credentials in cleartext or to a non-URL.
@@ -111,3 +125,6 @@ mod tests {
         assert_eq!(secure_env(VAR).as_deref(), Some("https://api.example/v1"));
         std::env::set_var(VAR, " http://localhost:3000 ");
         assert_eq!(secure_env(VAR).as_deref(), Some("http://localhost:3000"));
+        std::env::remove_var(VAR);
+    }
+}

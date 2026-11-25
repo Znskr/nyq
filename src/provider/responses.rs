@@ -199,7 +199,7 @@ pub struct ResponsesProvider {
 impl ResponsesProvider {
     pub async fn send(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
         let body = body(&self.model, self.effort.as_deref(), req, Options::default());
-        let mut request = crate::http::client()
+        let mut request = crate::http::authed_client()
             .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
             .header("accept", "text/event-stream")
             .json(&body);

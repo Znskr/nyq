@@ -300,8 +300,7 @@ pub struct Account {
 }
 
 async fn exchange(api: &str, code: &str, verifier: &str) -> Result<Account> {
-    let response = crate::http::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let response = crate::http::no_redirect_builder()
         .build()?
         .post(cli_url(api, "token"))
         .timeout(Duration::from_secs(30))
@@ -514,7 +513,7 @@ pub struct Window {
 }
 
 async fn whoami_at(api: &str, key: &str) -> Result<Whoami> {
-    let response = crate::http::client()
+    let response = crate::http::authed_client()
         .get(cli_url(api, "whoami"))
         .header(reqwest::header::USER_AGENT, crate::config::USER_AGENT)
         .bearer_auth(key.trim())

@@ -229,10 +229,7 @@ fn loopback_http(url: &str) -> bool {
 }
 
 fn http_client() -> reqwest::Client {
-    crate::http::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_else(|_| crate::http::client())
+    crate::http::authed_client()
 }
 
 fn form(pairs: &[(&str, &str)]) -> String {

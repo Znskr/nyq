@@ -192,8 +192,7 @@ async fn login_with_issuer(
         ("code_verifier", &verifier),
     ]);
 
-    let response = crate::http::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let response = crate::http::no_redirect_builder()
         .build()?
         .post(format!("{}/oauth/token", issuer.trim_end_matches('/')))
         .timeout(Duration::from_secs(30))
