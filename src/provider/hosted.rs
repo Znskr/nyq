@@ -124,13 +124,15 @@ impl Service {
 
     /// API base URL; `NYQ_<SERVICE>_BASE_URL` overrides it (for Anthropic
     /// also `ANTHROPIC_BASE_URL`, for DeepSeek also `DEEPSEEK_BASE_URL`,
-    /// each given with or without the `/v1`). For Zalthar, the `base_url`
-    /// stored by `nyq login zalthar` takes precedence when a profile is
-    /// known — see [`crate::provider::zalthar::chat_base_url`].
+    /// each given with or without the `/v1`). Overrides are honoured only
+    /// when they are secure URLs (https, or http to a loopback host). For
+    /// Zalthar, the `base_url` stored by `nyq login zalthar` takes
+    /// precedence when a profile is known — see
+    /// [`crate::provider::zalthar::chat_base_url`].
     pub fn base_url(self) -> String {
         let (var, default) = match self {
             Service::Zalthar => {
-                return env("NYQ_ZALTHAR_BASE_URL").unwrap_or_else(|| {
+                return crate::http::secure_env("NYQ_ZALTHAR_BASE_URL").unwrap_or_else(|| {
                     format!(
                         "{}/v1",
                         crate::provider::zalthar::api_url().trim_end_matches('/')
@@ -141,19 +143,23 @@ impl Service {
             Service::Opencode => ("NYQ_OPENCODE_BASE_URL", "https://opencode.ai/zen/v1"),
             Service::Xai => ("NYQ_XAI_BASE_URL", "https://api.x.ai/v1"),
             Service::Anthropic => {
-                return match env("NYQ_ANTHROPIC_BASE_URL").or_else(|| env("ANTHROPIC_BASE_URL")) {
+                return match crate::http::secure_env("NYQ_ANTHROPIC_BASE_URL")
+                    .or_else(|| crate::http::secure_env("ANTHROPIC_BASE_URL"))
+                {
                     Some(url) => anthropic_base(&url),
                     None => ANTHROPIC_URL.into(),
                 };
             }
             Service::DeepSeek => {
-                return match env("NYQ_DEEPSEEK_BASE_URL").or_else(|| env("DEEPSEEK_BASE_URL")) {
+                return match crate::http::secure_env("NYQ_DEEPSEEK_BASE_URL")
+                    .or_else(|| crate::http::secure_env("DEEPSEEK_BASE_URL"))
+                {
                     Some(url) => anthropic_base(&url),
                     None => anthropic_base("https://api.deepseek.com/anthropic"),
                 };
             }
         };
-        env(var).unwrap_or_else(|| default.into())
+        crate::http::secure_env(var).unwrap_or_else(|| default.into())
     }
 
     /// The models.dev provider whose catalog describes (and prices) this
@@ -1425,6 +1431,46 @@ mod tests {
         assert_eq!(api_key(home, d).as_deref(), Some("sk-ds-env"));
         assert_eq!(key_source(home, d).as_deref(), Some("DEEPSEEK_API_KEY"));
         assert!(!bearer(d));
+    }
+
+    #[test]
+    fn insecure_base_url_overrides_are_ignored() {
+        let _env = AnthropicEnv::new();
+        let vars = [
+            "NYQ_ZALTHAR_BASE_URL",
+            "NYQ_OPENCODE_BASE_URL",
+            "NYQ_OPENCODE_GO_BASE_URL",
+            "NYQ_XAI_BASE_URL",
+        ];
+        let saved: Vec<_> = vars.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in vars {
+            std::env::remove_var(k);
+        }
+        let defaults: Vec<_> = Service::ALL.iter().map(|s| (*s, s.base_url())).collect();
+        for bad in ["http://evil.example", "http://10.0.0.1", "not a url"] {
+            for (var, service) in [
+                ("NYQ_ZALTHAR_BASE_URL", Service::Zalthar),
+                ("NYQ_OPENCODE_BASE_URL", Service::Opencode),
+                ("NYQ_OPENCODE_GO_BASE_URL", Service::OpencodeGo),
+                ("NYQ_XAI_BASE_URL", Service::Xai),
+                ("NYQ_ANTHROPIC_BASE_URL", Service::Anthropic),
+                ("NYQ_DEEPSEEK_BASE_URL", Service::DeepSeek),
+            ] {
+                let expected = &defaults.iter().find(|(s, _)| *s == service).unwrap().1;
+                std::env::set_var(var, bad);
+                assert_eq!(&service.base_url(), expected, "{var}={bad}");
+                std::env::remove_var(var);
+            }
+        }
+        // A cleartext override on a loopback host is still honoured.
+        std::env::set_var("NYQ_XAI_BASE_URL", "http://localhost:4000/v1");
+        assert_eq!(Service::Xai.base_url(), "http://localhost:4000/v1");
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     #[tokio::test]

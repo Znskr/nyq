@@ -58,44 +58,16 @@ fn env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Whether `url` may carry a Zalthar key or sign-in code: `https://`, or
-/// plain `http://` only to a loopback host (local development). Anything
-/// else would send credentials in cleartext or to a non-URL.
-fn secure_url(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
-        return false;
-    };
-    match parsed.scheme() {
-        "https" => true,
-        "http" => {
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            host.eq_ignore_ascii_case("localhost")
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        }
-        _ => false,
-    }
-}
-
-/// An override from `name`, ignored unless it is a [`secure_url`].
-fn secure_env(name: &str) -> Option<String> {
-    env(name).filter(|v| secure_url(v))
-}
-
 /// The console origin for the authorize page (`NYQ_ZALTHAR_APP_URL`, honoured
 /// only when https or loopback http).
 pub fn app_url() -> String {
-    secure_env(APP_URL_ENV).unwrap_or_else(|| APP_URL.into())
+    crate::http::secure_env(APP_URL_ENV).unwrap_or_else(|| APP_URL.into())
 }
 
 /// The API origin for CLI endpoints (`NYQ_ZALTHAR_API_URL`, honoured only
 /// when https or loopback http).
 pub fn api_url() -> String {
-    secure_env(API_URL_ENV).unwrap_or_else(|| API_URL.into())
+    crate::http::secure_env(API_URL_ENV).unwrap_or_else(|| API_URL.into())
 }
 
 fn cli_url(api: &str, endpoint: &str) -> String {
@@ -113,12 +85,12 @@ pub fn whoami_url(base_url: &str) -> String {
 /// The OpenAI-compatible chat base: `NYQ_ZALTHAR_BASE_URL`, then the
 /// `base_url` the token exchange returned, then `{api}/v1`.
 pub fn chat_base_url(home: &Path) -> String {
-    if let Some(url) = secure_env(BASE_URL_ENV) {
+    if let Some(url) = crate::http::secure_env(BASE_URL_ENV) {
         return url.trim_end_matches('/').to_owned();
     }
     if let Some(url) = stored(home)
         .and_then(|s| s.base_url)
-        .filter(|u| secure_url(u))
+        .filter(|u| crate::http::secure_url(u))
     {
         return url;
     }
@@ -355,7 +327,7 @@ async fn exchange(api: &str, code: &str, verifier: &str) -> Result<Account> {
         "invalid Zalthar token response"
     );
     anyhow::ensure!(
-        secure_url(account.base_url.trim()),
+        crate::http::secure_url(account.base_url.trim()),
         "invalid Zalthar token response: base_url must be https"
     );
     Ok(account)
@@ -716,30 +688,6 @@ mod tests {
         assert_eq!(params["state"], "state-x");
         assert_eq!(params["code_challenge"], "challenge-y");
         assert!(!params["device_name"].is_empty());
-    }
-
-    #[test]
-    fn secure_urls_only() {
-        for ok in [
-            "https://api.zalthar.com",
-            "https://api.zalthar.com/v1",
-            "http://127.0.0.1:8080",
-            "http://localhost:3000/v1",
-            "http://[::1]:9000",
-        ] {
-            assert!(secure_url(ok), "{ok}");
-        }
-        for bad in [
-            "http://evil.example",
-            "http://10.0.0.1",
-            "http://localhost.evil.example",
-            "ftp://api.zalthar.com",
-            "javascript:alert(1)",
-            "api.zalthar.com",
-            "",
-        ] {
-            assert!(!secure_url(bad), "{bad}");
-        }
     }
 
     #[test]

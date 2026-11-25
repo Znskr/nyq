@@ -184,9 +184,9 @@ impl CodexProvider {
         struct Level {
             effort: String,
         }
-        let url = match std::env::var("NYQ_CODEX_MODELS_URL") {
-            Ok(url) => url,
-            Err(_) => format!(
+        let url = match crate::http::secure_env("NYQ_CODEX_MODELS_URL") {
+            Some(url) => url,
+            None => format!(
                 "https://chatgpt.com/backend-api/codex/models?client_version={}",
                 client_version().await
             ),
@@ -273,9 +273,9 @@ impl CodexProvider {
     }
 
     async fn refresh(&self, auth: &Auth) -> Result<Auth> {
-        let url = std::env::var("NYQ_CODEX_TOKEN_URL").unwrap_or_else(|_| {
-            let issuer = std::env::var("NYQ_CODEX_ISSUER")
-                .unwrap_or_else(|_| "https://auth.openai.com".into());
+        let url = crate::http::secure_env("NYQ_CODEX_TOKEN_URL").unwrap_or_else(|| {
+            let issuer = crate::http::secure_env("NYQ_CODEX_ISSUER")
+                .unwrap_or_else(|| "https://auth.openai.com".into());
             format!("{}/oauth/token", issuer.trim_end_matches('/'))
         });
         let result: Value = sse::checked(
@@ -391,8 +391,8 @@ impl CodexProvider {
 impl Provider for CodexProvider {
     fn endpoint(&self) -> Option<String> {
         Some(
-            std::env::var("NYQ_CODEX_URL")
-                .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".into()),
+            crate::http::secure_env("NYQ_CODEX_URL")
+                .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex/responses".into()),
         )
     }
 
@@ -450,8 +450,8 @@ impl Provider for CodexProvider {
 
     async fn stream(&self, req: Request<'_>, on_event: EventSink<'_>) -> Result<Response> {
         let body = self.body(req);
-        let url = std::env::var("NYQ_CODEX_URL")
-            .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".into());
+        let url = crate::http::secure_env("NYQ_CODEX_URL")
+            .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex/responses".into());
         let auth = self.token(None).await?;
         let mut http = self.send(&url, &body, &auth).await?;
         if http.status() == reqwest::StatusCode::UNAUTHORIZED {
