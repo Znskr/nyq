@@ -320,7 +320,7 @@ impl ToolApproval {
             ToolApproval::Allowed(r) => format!("Runs without asking: always allowed by `{}`.", rule(r)),
             ToolApproval::Session => "Runs without asking: you answered \"always\" this session.".into(),
             ToolApproval::Mode(Mode::Ask) => "Asks before each call (ask mode).".into(),
-            ToolApproval::Mode(Mode::Auto) => "The classifier allows, asks or denies each call (auto mode).".into(),
+            ToolApproval::Mode(Mode::Auto) => "The classifier allows, asks or denies each call (auto mode; risky in a repository you do not trust).".into(),
             ToolApproval::Mode(Mode::Yolo) => "Runs without asking (yolo mode).".into(),
         }
     }

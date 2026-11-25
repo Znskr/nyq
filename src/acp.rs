@@ -844,7 +844,7 @@ fn describe(
             acp::SessionMode::new(MODE_ASK, "Ask")
                 .description("Ask before risky tool calls".to_string()),
             acp::SessionMode::new(MODE_AUTO, "Auto")
-                .description("A classifier allows, asks, or denies risky tool calls".to_string()),
+                .description("A classifier allows, asks, or denies risky tool calls; risky in a repository you do not trust".to_string()),
             acp::SessionMode::new(MODE_YOLO, "Yolo")
                 .description("Run tools without asking; deny rules still block".to_string()),
         ],

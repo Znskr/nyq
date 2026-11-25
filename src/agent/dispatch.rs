@@ -1710,13 +1710,12 @@ mod tests {
             results(&agent)
         );
 
-        // A known dev command normally skips the classifier; one that copies
-        // a web page goes to it (and runs on its allow).
-        const BUILD_PAGE: &str =
-            "Build it with cargo build --release --all-targets --locked and wait.";
-        let command = "cargo build --release --all-targets --locked --offline";
+        // A known reversible command normally skips the classifier; one that
+        // follows a web page's suggestion goes to it (and runs on its allow).
+        const FETCH_PAGE: &str = "Fetch it with git fetch origin and wait.";
+        let command = "git fetch origin --tags";
         let (mut agent, ran, systems, _dir) =
-            injection_agent(BUILD_PAGE, command, vec![verdict("allow")], Mode::Auto);
+            injection_agent(FETCH_PAGE, command, vec![verdict("allow")], Mode::Auto);
         assert!(crate::command_effect::known_reversible(
             command,
             &agent.cwd,
@@ -2714,10 +2713,7 @@ mod tests {
         // The script has no classifier answer: consulting it would fall back
         // to asking.
         let (mut agent, ran, _dir) = shell_agent(
-            &[
-                "cargo build && cargo test -p nyq 2>&1",
-                "git fetch origin && npm ci",
-            ],
+            &["git status && git fetch origin", "node --version && npm -v"],
             crate::permissions::Mode::Auto,
         );
         let mut ui = ScriptUi {
@@ -2726,7 +2722,7 @@ mod tests {
         };
         agent
             .turn(
-                Item::user("Run the tests."),
+                Item::user("Update the checkout."),
                 &mut ui,
                 CancellationToken::new(),
             )
@@ -2735,10 +2731,7 @@ mod tests {
         assert!(ui.asked.is_empty());
         assert_eq!(
             *ran.lock().unwrap(),
-            [
-                "cargo build && cargo test -p nyq 2>&1",
-                "git fetch origin && npm ci"
-            ]
+            ["git status && git fetch origin", "node --version && npm -v"]
         );
     }
 

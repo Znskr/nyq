@@ -62,6 +62,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub yolo: bool,
     /// Permission mode: ask (default), auto, or yolo. Overrides --yolo and settings.
+    /// In a repository you do not trust, auto is risky: the classifier approves
+    /// most changes without asking.
     #[arg(long, global = true, value_name = "MODE")]
     pub permission_mode: Option<String>,
     /// Confine shell commands the model runs [default: workspace-write where supported].

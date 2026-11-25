@@ -8,12 +8,14 @@
 //! the parsed words (re-quoted, with `git` hardened against repository config
 //! that would run programs), so the shell sees exactly what was checked.
 //!
-//! [`known_reversible`] admits `&&` chains of ordinary development commands
-//! (`git status`/`fetch`, package installs and tests, `cargo build`…) that
-//! auto mode runs without asking the classifier. An install or `run` that
-//! passes a global flag, a config file, `--config.*`, or a directory
-//! (`--prefix`, `--dir`, `-C`, `--modules-dir`) is not included: those can
-//! write outside the project.
+//! [`known_reversible`] admits `&&` chains of commands that cannot execute
+//! repository-defined code — read-only commands, `--version` probes, git
+//! listings and `git fetch` — and lets auto mode run them without asking the
+//! classifier. Package installs and script runners (`npm install`, `npm
+//! run`, `cargo build`/`test`/`check`…) are *not* admitted: they run the
+//! repository's own lifecycle scripts, `package.json` scripts, `build.rs`
+//! and proc-macros, so they go through the classifier like any other
+//! side-effecting command.
 //!
 //! Anything else — redirections, substitutions, variables, globs, `~`,
 //! backslashes, assignments, unknown programs or options, and paths that leave
@@ -841,7 +843,7 @@ fn git_stage(args: &[&str], paths: &dyn Fn(&[&str]) -> bool) -> Option<Vec<Strin
 }
 
 /// Whether auto mode may run `cmd` without the classifier: a `&&` chain of
-/// read-only commands and known, reversible development commands.
+/// read-only commands and known commands that cannot run repository code.
 pub fn known_reversible(cmd: &str, cwd: &Path, extra: &[PathBuf]) -> bool {
     let Some(stages) = stages(cmd, "&&", true) else {
         return false;
@@ -875,6 +877,10 @@ fn reversible_stage(w: &[&str]) -> bool {
         ("git", ["worktree", "list", rest @ ..]) => rest
             .iter()
             .all(|a| matches!(*a, "--porcelain" | "-v" | "--verbose")),
+        // `git fetch` executes no repository-defined code: git has no
+        // client-side fetch hooks and a fetch does not scan the worktree
+        // (no fsmonitor). The flags stay whitelisted so `--upload-pack` and
+        // friends never reach the fast path.
         ("git", ["fetch", rest @ ..]) => rest.iter().all(|a| {
             matches!(
                 *a,
@@ -889,70 +895,8 @@ fn reversible_stage(w: &[&str]) -> bool {
             ) || a.strip_prefix("--depth=").is_some_and(digits)
                 || (!is_flag(a) && !a.contains("::"))
         }),
-        ("npm", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test" | "t") => {
-            !install_escapes(rest)
-        }
-        ("pnpm" | "bun", [sub, rest @ ..]) if matches!(*sub, "install" | "i" | "ci" | "test") => {
-            !install_escapes(rest)
-        }
-        ("npm" | "pnpm" | "bun", ["run", script, rest @ ..]) => {
-            !is_flag(script) && !install_escapes(rest)
-        }
-        ("cargo", [sub, rest @ ..]) => {
-            let outside = rest.iter().any(|a| {
-                [
-                    "--config",
-                    "-Z",
-                    "--manifest-path",
-                    "--target-dir",
-                    "--out-dir",
-                    "--artifact-dir",
-                ]
-                .iter()
-                .any(|f| a == f || a.strip_prefix(f).is_some_and(|r| r.starts_with('=')))
-                    || a.starts_with("-Z")
-            });
-            !outside
-                && (matches!(
-                    *sub,
-                    "build" | "b" | "test" | "t" | "check" | "c" | "clippy"
-                ) || (*sub == "fmt" && rest.contains(&"--check")))
-        }
         _ => false,
     }
-}
-
-/// Whether an `npm`/`pnpm`/`bun` install or `run` argument can leave the
-/// project. `--global=true` is a global install; a config file or
-/// `--config.*` can set `global`, `prefix`, or a script shell; `--dir`,
-/// `-C` and `--modules-dir` write another directory.
-fn install_escapes(args: &[&str]) -> bool {
-    args.iter().any(|a| {
-        matches!(
-            *a,
-            "-g" | "--global"
-                | "--location"
-                | "--prefix"
-                | "--userconfig"
-                | "--globalconfig"
-                | "--config"
-                | "-C"
-                | "--dir"
-                | "--modules-dir"
-        ) || [
-            "--location=",
-            "--prefix=",
-            "--global=",
-            "--userconfig=",
-            "--globalconfig=",
-            "--config.",
-            "--config=",
-            "--dir=",
-            "--modules-dir=",
-        ]
-        .iter()
-        .any(|p| a.starts_with(p))
-    })
 }
 
 #[cfg(test)]
@@ -1195,19 +1139,25 @@ mod tests {
             "git status && git fetch origin main",
             "git remote -v",
             "git worktree list",
-            "npm install 2>&1",
-            "npm ci && npm test",
-            "pnpm install && pnpm run build",
-            "bun test",
-            "cargo build --release && cargo test -p nyq",
-            "cargo clippy --all-targets -- -D warnings",
-            "cargo fmt --check",
+            "git fetch --all --tags",
             "node --version && npm -v",
-            "cargo check && git diff --stat",
+            "git status && git diff --stat",
         ] {
             assert!(ok(cmd), "{cmd}");
         }
         for cmd in [
+            // These execute repository-defined code (lifecycle scripts,
+            // package.json scripts, build.rs, proc-macros, .cargo/config):
+            // auto mode must send them to the classifier.
+            "npm install 2>&1",
+            "npm ci && npm test",
+            "pnpm install && pnpm run build",
+            "bun test",
+            "npm run build",
+            "cargo build --release && cargo test -p nyq",
+            "cargo clippy --all-targets -- -D warnings",
+            "cargo fmt --check",
+            "cargo check && git diff --stat",
             "git fetch --prune origin",
             "git fetch --upload-pack=evil origin",
             "git push origin HEAD",
